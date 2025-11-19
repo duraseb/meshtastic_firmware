@@ -80,6 +80,9 @@
 #if !MESHTASTIC_EXCLUDE_GENERIC_THREAD_MODULE
 #include "modules/GenericThreadModule.h"
 #endif
+#if HAS_WIFI && HAS_ALERTING
+#include "modules/RCBAlertModule.h"
+#endif
 
 #ifdef ARCH_ESP32
 #if defined(USE_SX1280) && !MESHTASTIC_EXCLUDE_AUDIO
@@ -161,6 +164,10 @@ void setupModules()
 #endif
 #if !MESHTASTIC_EXCLUDE_GENERIC_THREAD_MODULE
     new GenericThreadModule();
+#endif
+    // Run RCB alert fetcher on devices with networking
+#if HAS_WIFI && HAS_ALERTING
+    new RCBAlertModule();
 #endif
     // Note: if the rest of meshtastic doesn't need to explicitly use your module, you do not need to assign the instance
     // to a global variable.
