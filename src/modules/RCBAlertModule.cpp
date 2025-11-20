@@ -23,7 +23,7 @@ RCBAlertModule::RCBAlertModule() : OSThread("RCBAlertModule")
     // Defaults
     fetchUrl = "https://www.gov.pl/web/rcb/komunikaty"; // fallback - expected to be an HTML page
     aiEndpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent";
-    aiApiKey = "AIzaSyDBCBqp7_JjTjseWX349A87Au6tCDIBbKg";
+    aiApiKey = GEMINI_API_KEY; // Defined in platformio_private.ini
     intervalMs = 5 * 60 * 1000; // 5 minutes
     lastSeenId = loadLastSeen();
     rcbAlertModule = this;
@@ -505,11 +505,19 @@ bool RCBAlertModule::callAIForExtraction(const String &title, const String &intr
     }
 
     // Build extraction prompt focusing on intro as primary content
-    String prompt = "You are an emergency alert parser. Extract ONLY the critical information from this Polish RCB alert.\n"
-                    "FOCUS ON THE INTRO TEXT - it contains the main information.\n"
-                    "Use TITLE as context only.\n"
-                    "Return ONLY this JSON format (no other text):\n"
-                    "{\"what\": \"action/hazard (2-5 words)\", \"when\": \"date/time\", \"where\": \"location/region\"}\n\n"
+    String prompt = "You are a precise emergency alert parser for Polish RCB alerts. Your task is to extract ONLY the most critical information.\n\n"
+                    "Rules:\n"
+                    "- Focus primarily on the INTRO text — it contains the main warning and details.\n"
+                    "- Use TITLE only as additional context (e.g., hazard type or broader area).\n"
+                    "- For \"where\": extract ONLY the real geographical location (gmina, powiat, miasto, wieś, województwo, etc.). Use the associated administrative area (gmina and powiat) if found.\n"
+                    "- Dates/Times:\n"
+                    "  - Look for explicit start and end date/time of the hazard in the text.\n"
+                    "  - Keep Polish date/number formatting exactly as in the source.\n"
+                    "  - If no specific validity period is mentioned, use the value PUB_DATE value for BOTH \"start\" and \"end\".\n"
+                    "  - If only a start is mentioned, use it for \"start\" and PUB_DATE value (or mentioned end) for \"end\".\n"
+                    "- Message: concise summary of the action/advice + hazard in Polish (100 - 210 characters total, including spaces). Use the original wording as much as possible. Include the dates in the message if they are specified in the alert.\n\n"
+                    "Return EXCLUSIVELY this JSON (no explanations, no extra text, no markdown):\n"
+                    {\"message\": \"concise warning in Polish with action/hazard and dates if available\", \"start\": \"DD.MM.RRRR or DD.MM.RRRR HH:MM\", \"end\": \"DD.MM.RRRR or DD.MM.RRRR HH:MM\", \"where\": \"geographical area only, max 30 chars\"}\n\n"
                     "TITLE: " + title + "\n"
                     "INTRO: " + intro + "\n"
                     "PUB_DATE: " + pubDate;
