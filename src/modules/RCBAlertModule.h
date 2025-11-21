@@ -23,10 +23,14 @@ class RCBAlertModule : public concurrency::OSThread {
     String id;
     String title;
     String link;
-    String valid_from; // ISO-ish or original string
-    String valid_to;
+    String valid_from; // YYYY-MM-DD hh:mm:ss format
+    String valid_to;   // YYYY-MM-DD hh:mm:ss format
     String location;   // Extracted powiat/region
     String alert_type; // Short alert summary
+    String message;    // Processed message for sending (max 200 bytes)
+    uint8_t severity; // 0=critical (war, large disaster) to 10=very local/unimportant
+    unsigned long lastSent; // Last time this alert was sent (millis)
+    unsigned long addedAt;  // When this alert was first added (millis)
   };
 
   // Stored alerts
@@ -51,15 +55,39 @@ class RCBAlertModule : public concurrency::OSThread {
   void extractCriticalInfo(Alert &alert, const String &pubDateStr, const String &intro = "");
 
   // AI-based extraction with heuristic fallback
+  // Returns severity in outSeverity (0-10, where 0=critical, 10=least important)
   bool callAIForExtraction(const String &title, const String &intro, const String &pubDate,
-                           String &outWhat, String &outWhen, String &outWhere);
+                           String &outMessage, String &outStart, String &outEnd, String &outWhere, uint8_t &outSeverity);
 
   // Parse JSON response from AI service
-  bool parseAIResponse(const String &response, String &outWhat, String &outWhen, String &outWhere);
+  bool parseAIResponse(const String &response, String &outMessage, String &outStart, String &outEnd, String &outWhere, uint8_t &outSeverity);
 
   // Heuristic extraction fallback when AI is not available
+  // Note: severity is not extracted in heuristic mode, will use base severity only
   bool extractInfoHeuristic(const String &title, const String &intro, const String &pubDateStr,
-                            String &outWhat, String &outWhen, String &outWhere);
+                            String &outMessage, String &outStart, String &outEnd, String &outWhere);
+
+  // Determine base severity from source/content (0-10, where 0=critical, 10=least important)
+  uint8_t determineBaseSeverity(const String &title, const String &intro);
+
+  // Combine base severity with AI-extracted severity (if available)
+  uint8_t combineSeverity(uint8_t baseSeverity, uint8_t aiSeverity);
+
+  // Get send interval based on severity (in milliseconds)
+  // Severity 0 = 30 minutes, severity 10 = 4 hours, proportional in between
+  unsigned long getSendInterval(uint8_t severity);
+
+  // Check if alert is still valid (within valid_from and valid_to dates)
+  bool isAlertValid(const Alert &alert);
+
+  // Send alert to mesh network
+  bool sendAlertToMesh(const Alert &alert);
+
+  // Calculate UTF-8 byte length of a string
+  size_t utf8ByteLength(const String &str);
+
+  // Parse date string (YYYY-MM-DD hh:mm:ss or DD.MM.YYYY formats) to time_t
+  time_t parseDateString(const String &dateStr);
 };
 
 #endif // HAS_ALERTING

@@ -23,10 +23,17 @@ RCBAlertModule::RCBAlertModule() : OSThread("RCBAlertModule")
     // Defaults
     fetchUrl = "https://www.gov.pl/web/rcb/komunikaty"; // fallback - expected to be an HTML page
     aiEndpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent";
+#ifdef GEMINI_API_KEY
     aiApiKey = GEMINI_API_KEY; // Defined in platformio_private.ini
+#else
+    aiApiKey = ""; // Not defined, will use heuristic extraction
+#endif
     intervalMs = 5 * 60 * 1000; // 5 minutes
     lastSeenId = loadLastSeen();
     rcbAlertModule = this;
+
+    // Load existing alerts from disk on startup
+    loadAlertsFromDisk();
 }
 
 RCBAlertModule::~RCBAlertModule() {}
@@ -242,8 +249,14 @@ String RCBAlertModule::extractLatestFromHTML(const String &payload, String &outI
              a.title = title;
              a.valid_from = dateStr;  // publication date from page HTML
              a.valid_to = String();
+             a.location = String();
+             a.message = String();
+             a.alert_type = String();
+             a.severity = 0;
+             a.addedAt = 0;
+             a.lastSent = 0;
 
-             // Extract critical info (location, alert_type, etc.) with intro text for AI extraction
+             // Extract critical info (location, alert_type, message, etc.) with intro text for AI extraction
              extractCriticalInfo(a, dateStr, intro);
 
              if (!alertExists(a.id)) found.push_back(a);
@@ -282,7 +295,21 @@ bool RCBAlertModule::saveAlertsToDisk()
         // escape minimal
         String title = a.title;
         title.replace("\"", "\\\"");
-        f.print("{\"id\":\""); f.print(a.id); f.print("\",\"title\":\""); f.print(title); f.print("\",\"link\":\""); f.print(a.link); f.print("\",\"valid_from\":\""); f.print(a.valid_from); f.print("\",\"valid_to\":\""); f.print(a.valid_to); f.print("\"}");
+        String message = a.message;
+        message.replace("\"", "\\\"");
+        String location = a.location;
+        location.replace("\"", "\\\"");
+        f.print("{\"id\":\""); f.print(a.id);
+        f.print("\",\"title\":\""); f.print(title);
+        f.print("\",\"link\":\""); f.print(a.link);
+        f.print("\",\"valid_from\":\""); f.print(a.valid_from);
+        f.print("\",\"valid_to\":\""); f.print(a.valid_to);
+        f.print("\",\"location\":\""); f.print(location);
+        f.print("\",\"message\":\""); f.print(message);
+        f.print("\",\"severity\":"); f.print(a.severity);
+        f.print(",\"addedAt\":"); f.print(a.addedAt);
+        f.print(",\"lastSent\":"); f.print(a.lastSent);
+        f.print("}");
     }
     f.print("\n]");
     f.flush();
@@ -298,7 +325,7 @@ bool RCBAlertModule::loadAlertsFromDisk()
         return false;
     String s = f.readString();
     f.close();
-    // Very small JSON parser: find objects with id/title/link/valid_from/valid_to
+    // Very small JSON parser: find objects with all alert fields
     alerts.clear();
     int pos = 0;
     while (true) {
@@ -308,12 +335,33 @@ bool RCBAlertModule::loadAlertsFromDisk()
         if (end < 0) break;
         String objStr = s.substring(obj+1, end);
         auto extractField = [&](const char *name)->String {
-            String key = String("\"") + name + "\"\s*:\s*\"";
+            String key = String("\"") + name + "\":\"";
             int k = objStr.indexOf(key);
-            if (k < 0) return String();
+            if (k < 0) {
+                // Try numeric field
+                key = String("\"") + name + "\":";
+                k = objStr.indexOf(key);
+                if (k < 0) return String();
+                int vstart = k + key.length();
+                // Skip whitespace
+                while (vstart < objStr.length() && (objStr.charAt(vstart) == ' ' || objStr.charAt(vstart) == '\t')) {
+                    vstart++;
+                }
+                int vend = vstart;
+                while (vend < objStr.length() && objStr.charAt(vend) >= '0' && objStr.charAt(vend) <= '9') {
+                    vend++;
+                }
+                return objStr.substring(vstart, vend);
+            }
             int vstart = k + key.length();
-            int vend = objStr.indexOf('"', vstart);
-            if (vend < 0) return String();
+            int vend = vstart;
+            while (vend < objStr.length()) {
+                if (objStr.charAt(vend) == '"' && objStr.charAt(vend - 1) != '\\') {
+                    break;
+                }
+                vend++;
+            }
+            if (vend >= objStr.length()) return String();
             return objStr.substring(vstart, vend);
         };
         Alert a;
@@ -322,6 +370,21 @@ bool RCBAlertModule::loadAlertsFromDisk()
         a.link = extractField("link");
         a.valid_from = extractField("valid_from");
         a.valid_to = extractField("valid_to");
+        a.location = extractField("location");
+        a.message = extractField("message");
+        String severityStr = extractField("severity");
+        a.severity = severityStr.length() > 0 ? atoi(severityStr.c_str()) : 0;
+        String addedAtStr = extractField("addedAt");
+        a.addedAt = addedAtStr.length() > 0 ? strtoul(addedAtStr.c_str(), nullptr, 10) : millis();
+        String lastSentStr = extractField("lastSent");
+        a.lastSent = lastSentStr.length() > 0 ? strtoul(lastSentStr.c_str(), nullptr, 10) : 0;
+        a.alert_type = a.title; // Restore from title
+
+        // If message is empty, use title
+        if (a.message.length() == 0) {
+            a.message = a.title;
+        }
+
         if (a.id.length()) alerts.push_back(a);
         pos = end + 1;
     }
@@ -399,134 +462,111 @@ int32_t RCBAlertModule::runOnce()
     if (!isWifiAvailable())
         return 60000; // check again in 60s
 
-    int httpCode = 0;
-    String payload = httpGet(fetchUrl.c_str(), httpCode);
-    if (payload.length() == 0)
-        return intervalMs;
-    // Parse and save all alerts from the Komunikaty page
-    parseAlertsFromHTML(payload);
-    saveAlertsToDisk();
+    unsigned long now = millis();
+    bool alertsUpdated = false;
 
-    String id, title, link, content;
-    String titleFound = extractLatestFromRSS(payload, id, title, link, content);
-    String dateStr;
-    String htmlFound;
-    if (titleFound.length() == 0) {
-        // Could not parse RSS/Atom - try HTML scraping for alert links (alert-rcb entries)
-        htmlFound = extractLatestFromHTML(payload, id, dateStr, title);
-    }
-
-    if (id.length() == 0)
-        return intervalMs;
-
-    // If we parsed HTML, dateStr may contain the date from the anchor. Check whether it matches today's date.
-    if (dateStr.length()) {
-        time_t now = time(nullptr);
-        struct tm *lt = localtime(&now);
-        char today[16] = {0};
-        strftime(today, sizeof(today), "%d.%m.%Y", lt);
-        String todayStr = String(today);
-        if (dateStr != todayStr) {
-            // Not valid for today
-            return intervalMs;
+    // First, check existing alerts for periodic re-sending
+    for (auto &alert : alerts) {
+        if (!isAlertValid(alert)) {
+            continue; // Skip invalid alerts
         }
-    }
 
-    if (id == lastSeenId) {
-        // nothing new
-        return intervalMs;
-    }
-
-    // Summarize (use title/description if available) and shorten link
-    String core = title;
-    if (content.length()) {
-        core += String(" - ") + content;
-    }
-    // Trim whitespace
-    while (core.length() && isspace(core.charAt(core.length() - 1)))
-        core.remove(core.length() - 1);
-
-    String shortLink = shortenUrlIfNeeded(link);
-
-    // Compose message ensuring we don't exceed data payload length from mesh constants
-    const int maxPayload = meshtastic_Constants_DATA_PAYLOAD_LEN;
-    String msg;
-    if (shortLink.length()) {
-        int need = shortLink.length() + 1; // space
-        if (core.length() + need <= maxPayload) {
-            msg = core + " " + shortLink;
-        } else {
-            int allowedCore = maxPayload - need;
-            if (allowedCore <= 0) {
-                msg = shortLink.substring(0, maxPayload);
-            } else {
-                msg = core.substring(0, allowedCore);
-                // trim trailing space
-                while (msg.length() && isspace(msg.charAt(msg.length() - 1)))
-                    msg.remove(msg.length() - 1);
-                if (msg.length() + 1 + shortLink.length() <= maxPayload)
-                    msg = msg + " " + shortLink;
-                else {
-                    // fallback: just include truncated core
-                    msg = core.substring(0, maxPayload);
-                }
+        unsigned long interval = getSendInterval(alert.severity);
+        if (alert.lastSent == 0 || (now - alert.lastSent) >= interval) {
+            // Time to re-send this alert
+            if (sendAlertToMesh(alert)) {
+                alert.lastSent = now;
+                alertsUpdated = true;
             }
         }
-    } else {
-        if (core.length() > maxPayload)
-            msg = core.substring(0, maxPayload);
-        else
-            msg = core;
     }
 
-    // Publish message to mesh: use broadcast. Allocate via router to match other modules.
-    meshtastic_MeshPacket *p = router->allocForSending();
-    p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
-    p->to = 0xffffffff;
-    p->channel = 0;
-    p->want_ack = true;
-    p->decoded.payload.size = msg.length();
-    memcpy(p->decoded.payload.bytes, msg.c_str(), p->decoded.payload.size);
-    service->sendToMesh(p, RX_SRC_LOCAL, true);
+    // Then, fetch and parse new alerts from the web
+    int httpCode = 0;
+    String payload = httpGet(fetchUrl.c_str(), httpCode);
+    if (payload.length() == 0) {
+        // If fetch failed, still return shorter interval to check for re-sends
+        return 60000; // 1 minute
+    }
 
-    saveLastSeen(id);
+    // Parse and save all alerts from the Komunikaty page
+    size_t alertsBefore = alerts.size();
+    parseAlertsFromHTML(payload);
 
-    return intervalMs;
+    // Send newly discovered alerts immediately
+    for (size_t i = alertsBefore; i < alerts.size(); i++) {
+        Alert &alert = alerts[i];
+        if (sendAlertToMesh(alert)) {
+            alert.lastSent = now;
+            alertsUpdated = true;
+        }
+    }
+
+    // Save alerts to disk if updated
+    if (alertsUpdated || alerts.size() != alertsBefore) {
+        saveAlertsToDisk();
+    }
+
+    // Return interval for next check (use minimum of fetch interval and shortest alert interval)
+    unsigned long minInterval = intervalMs;
+    for (const auto &alert : alerts) {
+        if (isAlertValid(alert)) {
+            unsigned long alertInterval = getSendInterval(alert.severity);
+            if (alert.lastSent > 0) {
+                unsigned long timeUntilNext = alertInterval - (now - alert.lastSent);
+                if (timeUntilNext < minInterval) {
+                    minInterval = timeUntilNext;
+                }
+            } else {
+                // New alert, should send soon
+                minInterval = 10000; // 10 seconds
+            }
+        }
+    }
+
+    return minInterval > 0 ? minInterval : intervalMs;
 }
 
-bool RCBAlertModule::callAIForExtraction(const String &title, const String &intro, const String &pubDate, String &outWhat, String &outWhen, String &outWhere)
+bool RCBAlertModule::callAIForExtraction(const String &title, const String &intro, const String &pubDate, String &outMessage, String &outStart, String &outEnd, String &outWhere, uint8_t &outSeverity)
 {
     // Try to extract using AI service if configured
     // Otherwise fall back to heuristic extraction
 
-    if (aiEndpoint.length() == 0) {
+    if (aiEndpoint.length() == 0 || aiApiKey.length() == 0) {
         // AI endpoint not configured, use heuristic extraction
-        return extractInfoHeuristic(title, intro, pubDate, outWhat, outWhen, outWhere);
+        outSeverity = 5; // Default to middle severity
+        return extractInfoHeuristic(title, intro, pubDate, outMessage, outStart, outEnd, outWhere);
     }
 
-    // Build extraction prompt focusing on intro as primary content
-    String prompt = "You are a precise emergency alert parser for Polish RCB alerts. Your task is to extract ONLY the most critical information.\n\n"
-                    "Rules:\n"
-                    "- Focus primarily on the INTRO text — it contains the main warning and details.\n"
-                    "- Use TITLE only as additional context (e.g., hazard type or broader area).\n"
-                    "- For \"where\": extract ONLY the real geographical location (gmina, powiat, miasto, wieś, województwo, etc.). Use the associated administrative area (gmina and powiat) if found.\n"
-                    "- Dates/Times:\n"
-                    "  - Look for explicit start and end date/time of the hazard in the text.\n"
-                    "  - Keep Polish date/number formatting exactly as in the source.\n"
-                    "  - If no specific validity period is mentioned, use the value PUB_DATE value for BOTH \"start\" and \"end\".\n"
-                    "  - If only a start is mentioned, use it for \"start\" and PUB_DATE value (or mentioned end) for \"end\".\n"
-                    "- Message: concise summary of the action/advice + hazard in Polish (100 - 210 characters total, including spaces). Use the original wording as much as possible. Include the dates in the message if they are specified in the alert.\n\n"
-                    "Return EXCLUSIVELY this JSON (no explanations, no extra text, no markdown):\n"
-                    {\"message\": \"concise warning in Polish with action/hazard and dates if available\", \"start\": \"DD.MM.RRRR or DD.MM.RRRR HH:MM\", \"end\": \"DD.MM.RRRR or DD.MM.RRRR HH:MM\", \"where\": \"geographical area only, max 30 chars\"}\n\n"
+    // Build extraction prompt using the optimized Polish prompt (exactly as provided by user)
+    String prompt = "Jesteś parserem alertów. Twoim jedynym zadaniem jest zwrócić dokładnie ten JSON (nic więcej, zero dodatkowego tekstu):\n\n"
+                    "{\"message\":\"...\",\"start\":\"YYYY-MM-DD hh:mm:ss\",\"end\":\"YYYY-MM-DD hh:mm:ss\",\"where\":\"...\",\"severity\":0}\n\n"
+                    "Zasady (bardzo krótkie):\n\n"
+                    "- \"message\":\n"
+                    "  - jeśli cały oryginalny alert (TITLE + INTRO) ≤ 200 znaków → wklej go dosłownie\n"
+                    "  - jeśli dłuższy → zrób zwięzłe streszczenie po polsku (max 200 znaków), zachowaj sens zagrożenia, lokalizację i zalecenia. Używaj maksymalnie 5 skrótów (np. gm., pow., woj.).\n\n"
+                    "- \"where\": tylko nazwa geograficzna (max 30 znaków). Zawsze podaj powiat jeśli jest. Skracaj: gm., pow., woj.\n\n"
+                    "- \"start\" i \"end\": format YYYY-MM-DD hh:mm:ss\n"
+                    "  - szukaj dat/godzin w tekście\n"
+                    "  - jeśli brak → użyj PUB_DATE jako obu dat\n"
+                    "  - jeśli tylko data → start 00:00:00, end 23:59:59\n\n"
+                    "- \"severity\": 0-10 gdzie 0=krytyczne (wojna, katastrofa na dużą skalę), 10=bardzo lokalne i mało ważne\n\n"
+                    "- skup się głównie na INTRO, TITLE traktuj jako kontekst/dodatek\n\n"
+                    "PUB_DATE: " + pubDate + "\n"
                     "TITLE: " + title + "\n"
-                    "INTRO: " + intro + "\n"
-                    "PUB_DATE: " + pubDate;
+                    "INTRO: " + intro;
 
     // Call AI endpoint with POST
     HTTPClient http;
     WiFiClientSecure client;
     client.setInsecure();
-    http.begin(client, aiEndpoint.c_str());
+
+    // Add API key to URL as query parameter for Gemini API
+    String url = aiEndpoint;
+    if (aiApiKey.length() > 0) {
+        url += "?key=" + aiApiKey;
+    }
+    http.begin(client, url.c_str());
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(15000); // 15 second timeout for AI service
 
@@ -555,7 +595,7 @@ bool RCBAlertModule::callAIForExtraction(const String &title, const String &intr
 
     if (httpCode == HTTP_CODE_OK) {
         String response = http.getString();
-        success = parseAIResponse(response, outWhat, outWhen, outWhere);
+        success = parseAIResponse(response, outMessage, outStart, outEnd, outWhere, outSeverity);
     }
     http.end();
 
@@ -564,25 +604,45 @@ bool RCBAlertModule::callAIForExtraction(const String &title, const String &intr
     }
 
     // Fall back to heuristic extraction if AI fails
-    return extractInfoHeuristic(title, intro, pubDate, outWhat, outWhen, outWhere);
+    outSeverity = 5; // Default to middle severity
+    return extractInfoHeuristic(title, intro, pubDate, outMessage, outStart, outEnd, outWhere);
 }
 
-bool RCBAlertModule::parseAIResponse(const String &response, String &outWhat, String &outWhen, String &outWhere)
+bool RCBAlertModule::parseAIResponse(const String &response, String &outMessage, String &outStart, String &outEnd, String &outWhere, uint8_t &outSeverity)
 {
-    // Gemini API response format: {"candidates":[{"content":{"parts":[{"text":"{\"what\":\"...\",\"when\":\"...\",\"where\":\"...\"}"}]}}]}
+    // Gemini API response format: {"candidates":[{"content":{"parts":[{"text":"{\"message\":\"...\",\"start\":\"...\",\"end\":\"...\",\"where\":\"...\"}"}]}}]}
     // We need to extract the text field, then parse the inner JSON
 
     int textStart = response.indexOf("\"text\":\"");
-    if (textStart < 0) return false;
+    if (textStart < 0) {
+        return false;
+    }
     textStart += 8; // Move past "text":"
 
+    // Find the end of the escaped JSON string by tracking escaped quotes
     int textEnd = textStart;
+    bool escaped = false;
     while (textEnd < response.length()) {
-        if (response.charAt(textEnd) == '"' && response.charAt(textEnd - 1) != '\\') {
-            break;
+        char c = response.charAt(textEnd);
+        if (escaped) {
+            escaped = false;
+        } else if (c == '\\') {
+            escaped = true;
+        } else if (c == '"') {
+            // Check if this is the closing quote (not escaped)
+            // Look ahead to see if we're at the end of the text field
+            int nextChar = textEnd + 1;
+            while (nextChar < response.length() && (response.charAt(nextChar) == ' ' || response.charAt(nextChar) == '\t' || response.charAt(nextChar) == '\n' || response.charAt(nextChar) == '\r')) {
+                nextChar++;
+            }
+            if (nextChar < response.length() && (response.charAt(nextChar) == '}' || response.charAt(nextChar) == ']' || response.charAt(nextChar) == ',')) {
+                // This looks like the end of the text field
+                break;
+            }
         }
         textEnd++;
     }
+
     if (textEnd >= response.length()) return false;
 
     String innerJson = response.substring(textStart, textEnd);
@@ -593,7 +653,7 @@ bool RCBAlertModule::parseAIResponse(const String &response, String &outWhat, St
     innerJson.replace("\\t", "\t");
     innerJson.replace("\\\\", "\\");
 
-    // Now parse the inner JSON for what, when, where
+    // Now parse the inner JSON for message, start, end, where
     auto extractField = [&](const char *fieldName) -> String {
         String key = String("\"") + fieldName + "\"";
         int keyPos = innerJson.indexOf(key);
@@ -620,19 +680,49 @@ bool RCBAlertModule::parseAIResponse(const String &response, String &outWhat, St
         return value;
     };
 
-    outWhat = extractField("what");
-    outWhen = extractField("when");
+    outMessage = extractField("message");
+    outStart = extractField("start");
+    outEnd = extractField("end");
     outWhere = extractField("where");
 
-    return (outWhat.length() > 0 && outWhen.length() > 0 && outWhere.length() > 0);
+    // Extract severity (numeric field, not quoted)
+    String severityKey = String("\"severity\":");
+    int severityPos = innerJson.indexOf(severityKey);
+    if (severityPos >= 0) {
+        int valueStart = severityPos + severityKey.length();
+        // Skip whitespace
+        while (valueStart < innerJson.length() && (innerJson.charAt(valueStart) == ' ' || innerJson.charAt(valueStart) == '\t')) {
+            valueStart++;
+        }
+        int valueEnd = valueStart;
+        while (valueEnd < innerJson.length() && innerJson.charAt(valueEnd) >= '0' && innerJson.charAt(valueEnd) <= '9') {
+            valueEnd++;
+        }
+        if (valueEnd > valueStart) {
+            String severityStr = innerJson.substring(valueStart, valueEnd);
+            int sev = atoi(severityStr.c_str());
+            if (sev >= 0 && sev <= 10) {
+                outSeverity = sev;
+            } else {
+                outSeverity = 5; // Default if out of range
+            }
+        } else {
+            outSeverity = 5; // Default if not found
+        }
+    } else {
+        outSeverity = 5; // Default if not found
+    }
+
+    return (outMessage.length() > 0 && outStart.length() > 0 && outEnd.length() > 0 && outWhere.length() > 0);
 }
 
-bool RCBAlertModule::extractInfoHeuristic(const String &title, const String &intro, const String &pubDateStr, String &outWhat, String &outWhen, String &outWhere)
+bool RCBAlertModule::extractInfoHeuristic(const String &title, const String &intro, const String &pubDateStr, String &outMessage, String &outStart, String &outEnd, String &outWhere)
 {
     // Fallback heuristic extraction when AI is not available
     outWhere = "Poland";
-    outWhen = pubDateStr;
-    outWhat = title;
+    outStart = pubDateStr;
+    outEnd = pubDateStr;
+    outMessage = title;
 
     String fullText = title + " " + intro;
 
@@ -671,17 +761,26 @@ bool RCBAlertModule::extractInfoHeuristic(const String &title, const String &int
         }
     }
 
-    // Extract alert_type: remove "Alert RCB - " prefix and trailing date
-    outWhat = title;
-    outWhat.replace("Alert RCB - ", "");
+    // Extract message: remove "Alert RCB - " prefix and trailing date, combine with intro
+    outMessage = title;
+    outMessage.replace("Alert RCB - ", "");
 
     // Remove trailing date patterns like "(19.11)"
-    int parenPos = outWhat.lastIndexOf('(');
+    int parenPos = outMessage.lastIndexOf('(');
     if (parenPos >= 0) {
-        String trailing = outWhat.substring(parenPos);
+        String trailing = outMessage.substring(parenPos);
         if (trailing.indexOf('.') >= 0 && trailing.indexOf(')') > trailing.indexOf('.')) {
-            outWhat = outWhat.substring(0, parenPos);
-            outWhat.trim();
+            outMessage = outMessage.substring(0, parenPos);
+            outMessage.trim();
+        }
+    }
+
+    // Add intro if available and message is short
+    if (intro.length() > 0 && outMessage.length() < 150) {
+        outMessage += " - " + intro;
+        // Truncate to reasonable length
+        if (outMessage.length() > 200) {
+            outMessage = outMessage.substring(0, 197) + "...";
         }
     }
 
@@ -690,16 +789,286 @@ bool RCBAlertModule::extractInfoHeuristic(const String &title, const String &int
 
 void RCBAlertModule::extractCriticalInfo(Alert &alert, const String &pubDateStr, const String &intro)
 {
-    // Extract location, date_from, date_to, and alert_type from alert title and intro using AI or heuristics
-    String what, when, where;
+    // Extract location, date_from, date_to, message, and alert_type from alert title and intro using AI or heuristics
+    String message, start, end, where;
+    uint8_t aiSeverity = 5; // Default
+
+    // Determine base severity from source/content
+    uint8_t baseSeverity = determineBaseSeverity(alert.title, intro);
 
     // Try AI extraction, fall back to heuristics if not available
-    callAIForExtraction(alert.title, intro, pubDateStr, what, when, where);
+    bool aiSuccess = callAIForExtraction(alert.title, intro, pubDateStr, message, start, end, where, aiSeverity);
+
+    // Combine base severity with AI-extracted severity
+    alert.severity = combineSeverity(baseSeverity, aiSeverity);
 
     alert.location = where;
-    alert.alert_type = what;
-    alert.valid_from = pubDateStr;
-    // valid_to would need more sophisticated date parsing - for now leave it empty
+    alert.alert_type = alert.title; // Keep original title as alert type
+    alert.message = message.length() > 0 ? message : alert.title; // Use extracted message or fallback to title
+
+    // Ensure message doesn't exceed 200 bytes (we'll add geolocation later)
+    const int maxMessageBytes = 200;
+    if (utf8ByteLength(alert.message) > maxMessageBytes) {
+        // Truncate to fit
+        int truncatePos = 0;
+        size_t byteCount = 0;
+        while (truncatePos < alert.message.length() && byteCount < maxMessageBytes - 3) {
+            char c = alert.message.charAt(truncatePos);
+            if ((c & 0x80) == 0) {
+                byteCount++; // ASCII
+            } else if ((c & 0xE0) == 0xC0) {
+                byteCount += 2; // 2-byte UTF-8
+            } else if ((c & 0xF0) == 0xE0) {
+                byteCount += 3; // 3-byte UTF-8
+            } else if ((c & 0xF8) == 0xF0) {
+                byteCount += 4; // 4-byte UTF-8
+            } else {
+                byteCount++; // Invalid, treat as single byte
+            }
+            if (byteCount <= maxMessageBytes - 3) {
+                truncatePos++;
+            } else {
+                break;
+            }
+        }
+        alert.message = alert.message.substring(0, truncatePos) + "...";
+    }
+
+    alert.valid_from = start.length() > 0 ? start : pubDateStr;
+    alert.valid_to = end.length() > 0 ? end : pubDateStr;
+    alert.addedAt = millis();
+    alert.lastSent = 0; // Never sent yet
+}
+
+uint8_t RCBAlertModule::determineBaseSeverity(const String &title, const String &intro)
+{
+    String combined = title + " " + intro;
+    combined.toLowerCase();
+
+    // Critical (0): war, large-scale disasters
+    if (combined.indexOf("wojna") >= 0 || combined.indexOf("katastrofa") >= 0 ||
+        combined.indexOf("trzęsienie") >= 0 || combined.indexOf("powódź") >= 0) {
+        return 0; // Critical
+    }
+
+    // Very high (1-2): life-threatening situations
+    if (combined.indexOf("woda niezdatna") >= 0 || combined.indexOf("woda niezdatna do spożycia") >= 0 ||
+        combined.indexOf("woda niezdatna do picia") >= 0) {
+        return 1; // Very high
+    }
+
+    // High (3-4): severe weather, health hazards
+    if (combined.indexOf("intensywne opady") >= 0 || combined.indexOf("burza") >= 0 ||
+        combined.indexOf("smog") >= 0 || combined.indexOf("zła jakość powietrza") >= 0 ||
+        combined.indexOf("pm10") >= 0) {
+        return 3; // High
+    }
+
+    // Medium (5-6): warnings, exercises
+    if (combined.indexOf("ćwiczenie") >= 0 || combined.indexOf("ostrzeżenie") >= 0) {
+        return 6; // Medium
+    }
+
+    // Low (7-8): vaccinations, informational
+    if (combined.indexOf("szczepienie") >= 0) {
+        return 8; // Low
+    }
+
+    // Very low (9-10): very local, not very important
+    return 9; // Default to low importance
+}
+
+uint8_t RCBAlertModule::combineSeverity(uint8_t baseSeverity, uint8_t aiSeverity)
+{
+    // Combine base severity (from source/content analysis) with AI-extracted severity
+    // Use weighted average: 60% base, 40% AI (rounded)
+    // This allows AI to adjust but keeps source analysis as primary
+    uint16_t combined = (baseSeverity * 6 + aiSeverity * 4) / 10;
+    if (combined > 10) combined = 10;
+    return (uint8_t)combined;
+}
+
+unsigned long RCBAlertModule::getSendInterval(uint8_t severity)
+{
+    // Severity 0 = 30 minutes, severity 10 = 4 hours
+    // Linear interpolation: interval = 30min + (severity * (4h - 30min) / 10)
+    // 4 hours = 240 minutes, 30 minutes = 30 minutes
+    // interval = 30 + (severity * 21) minutes
+    unsigned long baseIntervalMs = 30 * 60 * 1000; // 30 minutes
+    unsigned long maxIntervalMs = 4 * 60 * 60 * 1000; // 4 hours
+    unsigned long rangeMs = maxIntervalMs - baseIntervalMs;
+
+    // Calculate proportional interval
+    unsigned long intervalMs = baseIntervalMs + (severity * rangeMs / 10);
+
+    return intervalMs;
+}
+
+bool RCBAlertModule::isAlertValid(const Alert &alert)
+{
+    time_t now = time(nullptr);
+    time_t validFrom = parseDateString(alert.valid_from);
+    time_t validTo = parseDateString(alert.valid_to);
+
+    // If parsing failed, assume alert is valid if valid_to is empty or in the future
+    if (validFrom == 0 && validTo == 0) {
+        // Try to parse valid_to, if it's empty assume it's valid
+        if (alert.valid_to.length() == 0) {
+            return true; // No end date, assume valid
+        }
+        return true; // Can't parse, assume valid for safety
+    }
+
+    return (now >= validFrom && now <= validTo);
+}
+
+bool RCBAlertModule::sendAlertToMesh(const Alert &alert)
+{
+    if (!isWifiAvailable()) {
+        return false;
+    }
+
+    // Prepare message with geolocation suffix
+    // Message body is limited to 200 bytes, then we add location
+    String msg = alert.message;
+
+    // Add location if available (format: " [location]")
+    if (alert.location.length() > 0) {
+        String locationSuffix = " [" + alert.location + "]";
+        size_t msgBytes = utf8ByteLength(msg);
+        size_t suffixBytes = utf8ByteLength(locationSuffix);
+        const int maxPayload = meshtastic_Constants_DATA_PAYLOAD_LEN;
+
+        // Check if we can fit the location suffix
+        if (msgBytes + suffixBytes <= maxPayload) {
+            msg += locationSuffix;
+        } else {
+            // Truncate message to make room for location
+            int availableBytes = maxPayload - suffixBytes - 3; // -3 for "..."
+            if (availableBytes > 0) {
+                // Truncate message to fit
+                int truncatePos = 0;
+                size_t byteCount = 0;
+                while (truncatePos < msg.length() && byteCount < availableBytes) {
+                    char c = msg.charAt(truncatePos);
+                    if ((c & 0x80) == 0) {
+                        byteCount++; // ASCII
+                    } else if ((c & 0xE0) == 0xC0) {
+                        byteCount += 2; // 2-byte UTF-8
+                    } else if ((c & 0xF0) == 0xE0) {
+                        byteCount += 3; // 3-byte UTF-8
+                    } else if ((c & 0xF8) == 0xF0) {
+                        byteCount += 4; // 4-byte UTF-8
+                    } else {
+                        byteCount++; // Invalid, treat as single byte
+                    }
+                    if (byteCount <= availableBytes) {
+                        truncatePos++;
+                    } else {
+                        break;
+                    }
+                }
+                msg = msg.substring(0, truncatePos) + "..." + locationSuffix;
+            } else {
+                // Can't fit location, just use truncated message
+                msg = msg.substring(0, maxPayload - 3) + "...";
+            }
+        }
+    }
+
+    // Final check: ensure total message fits in payload
+    const int maxPayload = meshtastic_Constants_DATA_PAYLOAD_LEN;
+    size_t msgBytes = utf8ByteLength(msg);
+    if (msgBytes > maxPayload) {
+        // Truncate to fit, being careful with UTF-8
+        int truncatePos = 0;
+        size_t byteCount = 0;
+        while (truncatePos < msg.length() && byteCount < maxPayload - 3) {
+            char c = msg.charAt(truncatePos);
+            if ((c & 0x80) == 0) {
+                byteCount++; // ASCII
+            } else if ((c & 0xE0) == 0xC0) {
+                byteCount += 2; // 2-byte UTF-8
+            } else if ((c & 0xF0) == 0xE0) {
+                byteCount += 3; // 3-byte UTF-8
+            } else if ((c & 0xF8) == 0xF0) {
+                byteCount += 4; // 4-byte UTF-8
+            } else {
+                byteCount++; // Invalid, treat as single byte
+            }
+            if (byteCount <= maxPayload - 3) {
+                truncatePos++;
+            } else {
+                break;
+            }
+        }
+        msg = msg.substring(0, truncatePos) + "...";
+    }
+
+    // Publish message to mesh: use broadcast
+    meshtastic_MeshPacket *p = router->allocForSending();
+    p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+    p->to = 0xffffffff;
+    p->channel = 0;
+    p->want_ack = true;
+    
+    // Set priority based on severity (0-2 = HIGH, 3-10 = RELIABLE)
+    if (alert.severity <= 2) {
+        p->priority = meshtastic_MeshPacket_Priority_HIGH;
+    } else {
+        p->priority = meshtastic_MeshPacket_Priority_RELIABLE;
+    }
+    
+    p->decoded.payload.size = utf8ByteLength(msg);
+    memcpy(p->decoded.payload.bytes, msg.c_str(), p->decoded.payload.size);
+    service->sendToMesh(p, RX_SRC_LOCAL, true);
+
+    return true;
+}
+
+size_t RCBAlertModule::utf8ByteLength(const String &str)
+{
+    // String.length() in Arduino returns byte length, which is what we need for UTF-8
+    return str.length();
+}
+
+time_t RCBAlertModule::parseDateString(const String &dateStr)
+{
+    if (dateStr.length() == 0) {
+        return 0;
+    }
+
+    struct tm tm = {0};
+    int day, month, year, hour = 0, minute = 0, second = 0;
+
+    // Try YYYY-MM-DD hh:mm:ss format first (from AI)
+    if (sscanf(dateStr.c_str(), "%d-%d-%d %d:%d:%d", &year, &month, &day, &hour, &minute, &second) >= 3) {
+        tm.tm_mday = day;
+        tm.tm_mon = month - 1; // tm_mon is 0-11
+        tm.tm_year = year - 1900; // tm_year is years since 1900
+        tm.tm_hour = hour;
+        tm.tm_min = minute;
+        tm.tm_sec = second;
+        tm.tm_isdst = -1; // Let system determine DST
+
+        return mktime(&tm);
+    }
+
+    // Try DD.MM.YYYY or DD.MM.YYYY HH:MM format (from HTML parsing)
+    if (sscanf(dateStr.c_str(), "%d.%d.%d %d:%d", &day, &month, &year, &hour, &minute) >= 3 ||
+        sscanf(dateStr.c_str(), "%d.%d.%d", &day, &month, &year) >= 3) {
+        tm.tm_mday = day;
+        tm.tm_mon = month - 1; // tm_mon is 0-11
+        tm.tm_year = year - 1900; // tm_year is years since 1900
+        tm.tm_hour = hour;
+        tm.tm_min = minute;
+        tm.tm_sec = 0;
+        tm.tm_isdst = -1; // Let system determine DST
+
+        return mktime(&tm);
+    }
+
+    return 0; // Parsing failed
 }
 
 #endif // HAS_ALERTING
