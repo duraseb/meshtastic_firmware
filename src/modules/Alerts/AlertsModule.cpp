@@ -1643,24 +1643,37 @@ ChannelIndex AlertsModule::ensureAlertChannel()
         LOG_DEBUG("Using primary channel");
         return channels.getPrimaryIndex();
     }
-    
-    // Check if Alert channel exists
+
+    // Check if Alert channel exists with correct PSK
     for (ChannelIndex i = 0; i < channels.getNumChannels(); i++) {
         const char *channelName = channels.getName(i);
         if (channelName && strcasecmp(channelName, alertChannelName.c_str()) == 0) {
             meshtastic_Channel &ch = channels.getByIndex(i);
             if (ch.role != meshtastic_Channel_Role_DISABLED) {
-                LOG_DEBUG("Found Alert channel at index %d", i);
-                return i;
+                // Check if PSK matches expected value
+                if (ch.settings.psk.size == 1 && ch.settings.psk.bytes[0] == ALERT_CHANNEL_PSK) {
+                    LOG_DEBUG("Found Alert channel at index %d with correct PSK", i);
+                    return i;
+                } else {
+                    LOG_WARN("Found Alert channel at index %d but PSK mismatch (size=%d, first byte=0x%02x), updating",
+                             i, ch.settings.psk.size, ch.settings.psk.bytes[0]);
+                    // Update the channel with correct PSK
+                    meshtastic_Channel updatedChannel = ch;
+                    updatedChannel.settings.psk.bytes[0] = ALERT_CHANNEL_PSK;
+                    updatedChannel.settings.psk.size = 1;
+                    channels.setChannel(updatedChannel);
+                    LOG_INFO("Updated Alert channel PSK at index %d", i);
+                    return i;
+                }
             }
         }
     }
-    
+
     // Channel doesn't exist, create it
     LOG_INFO("Creating Alert channel: %s", alertChannelName.c_str());
     for (ChannelIndex i = 1; i < channels.getNumChannels(); i++) {
         meshtastic_Channel &ch = channels.getByIndex(i);
-        if (ch.role == meshtastic_Channel_Role_DISABLED || 
+        if (ch.role == meshtastic_Channel_Role_DISABLED ||
             (ch.role == meshtastic_Channel_Role_SECONDARY && (!ch.has_settings || ch.settings.name[0] == '\0'))) {
             meshtastic_Channel newChannel = {};
             newChannel.index = i;
@@ -1672,13 +1685,13 @@ ChannelIndex AlertsModule::ensureAlertChannel()
             newChannel.settings.psk.size = 1;
             newChannel.settings.uplink_enabled = true;
             newChannel.settings.downlink_enabled = true;
-            
+
             channels.setChannel(newChannel);
             LOG_INFO("Successfully created Alert channel at index %d", i);
             return i;
         }
     }
-    
+
     LOG_WARN("No available channel slot, using primary channel");
     return channels.getPrimaryIndex();
 }
