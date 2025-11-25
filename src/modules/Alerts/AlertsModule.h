@@ -96,7 +96,7 @@ class AlertsModule : public concurrency::OSThread {
     // Performance and throttling settings
     static constexpr unsigned long ALERT_PROCESSING_YIELD_MS = 100;
     static constexpr unsigned long RESEND_CHECK_YIELD_MS = 50;
-    static constexpr unsigned long MAX_RUNONCE_INTERVAL_MS = 30000;
+    static constexpr unsigned long MAX_RUNONCE_INTERVAL_MS = 15000;
     static constexpr int MAX_ALERTS_PER_CYCLE = 1;
 
     // Memory management settings

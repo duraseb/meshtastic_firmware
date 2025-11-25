@@ -799,6 +799,32 @@ int32_t AlertsModule::runOnce()
                 }
 
                 if (!alreadyPending) {
+                    // For sources with structured dates, check if alert is already expired
+                    // This saves AI tokens by not processing already-expired alerts
+                    if (rawAlert.structuredEndDate.length() > 0) {
+                        time_t endTime = parseDateString(rawAlert.structuredEndDate);
+                        time_t now = time(nullptr);
+                        if (endTime > 0 && now >= MIN_VALID_EPOCH && now > endTime) {
+                            LOG_DEBUG("Alert already expired (end: %s), marking as processed: %s",
+                                     rawAlert.structuredEndDate.c_str(), rawAlert.title.c_str());
+                            // Save empty marker to prevent re-processing
+                            Alert expiredMarker;
+                            expiredMarker.id = rawAlert.id;
+                            expiredMarker.title = rawAlert.title;
+                            expiredMarker.valid_from = rawAlert.structuredStartDate;
+                            expiredMarker.valid_to = rawAlert.structuredEndDate;
+                            expiredMarker.source = sources[currentSourceIndex]->getSourceId();
+                            expiredMarker.message = "";
+                            expiredMarker.location = "";
+                            expiredMarker.severity = 10;
+                            expiredMarker.addedAt = now;
+                            expiredMarker.lastSent = 0;
+                            expiredMarker.nextSendAt = 0;
+                            saveAlertToDisk(expiredMarker);
+                            continue;
+                        }
+                    }
+
                     // Queue alert for full content fetching - don't fetch here to avoid watchdog
                     PendingAlert pending;
                     pending.source = sources[currentSourceIndex];
