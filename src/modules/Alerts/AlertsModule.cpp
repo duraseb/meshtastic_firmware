@@ -20,20 +20,33 @@
 #include <vector>
 #include <sstream>
 
+#ifdef ARCH_ESP32
+#include "esp_task_wdt.h"
+#endif
+
 #ifndef DISABLE_NTP
 #include <NTPClient.h>
 #include <WiFiUdp.h>
 #endif
 
+// Helper to reset watchdog timer (architecture-aware)
+static inline void feedWatchdog()
+{
+#ifdef ARCH_ESP32
+    esp_task_wdt_reset();
+#endif
+}
+
 AlertsModule *alertsModule = nullptr;
 
 AlertsModule::AlertsModule() : OSThread("AlertsModule")
 {
-    LOG_INFO("AlertsModule: Initializing Multi-Source Alert System");
+    LOG_INFO("Initializing Multi-Source Alert System");
 
     currentState = ModuleState::INIT;
     initializationDone = false;
     lastCleanupTime = 0;
+    intervalMs = 5 * 60 * 1000; // Default 5 minute check interval
 
     lastMemoryCheckTime = 0;
     lastReportedMemoryUsage = 0;
@@ -48,7 +61,7 @@ AlertsModule::AlertsModule() : OSThread("AlertsModule")
     // Register RCB source
     sources[numSources] = new RCBAlertSource();
     sourceLastFetchTime[numSources] = 0;
-    LOG_INFO("AlertsModule: Registered source: %s (fetch every %lu min)",
+    LOG_INFO("Registered source: %s (fetch every %lu min)",
              sources[numSources]->getSourceId().c_str(),
              sources[numSources]->getFetchIntervalMs() / 60000);
     numSources++;
@@ -56,12 +69,12 @@ AlertsModule::AlertsModule() : OSThread("AlertsModule")
     // Register IMGW source
     sources[numSources] = new IMGWAlertSource();
     sourceLastFetchTime[numSources] = 0;
-    LOG_INFO("AlertsModule: Registered source: %s (fetch every %lu min)",
+    LOG_INFO("Registered source: %s (fetch every %lu min)",
              sources[numSources]->getSourceId().c_str(),
              sources[numSources]->getFetchIntervalMs() / 60000);
     numSources++;
 
-    LOG_INFO("AlertsModule: Total sources registered: %d", numSources);
+    LOG_INFO("Total sources registered: %d", numSources);
     // AI provider fallback chain (Gemini → Perplexity → Mistral → Groq)
     aiProviders[0].name = "Gemini-2.5";
     aiProviders[0].endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
@@ -108,31 +121,31 @@ AlertsModule::AlertsModule() : OSThread("AlertsModule")
     int configuredCount = 0;
     for (int i = 0; i < MAX_AI_PROVIDERS; i++) {
         if (aiProviders[i].apiKey.length() > 0) {
-            LOG_INFO("AlertsModule: AI provider configured: %s", aiProviders[i].name.c_str());
+            LOG_INFO("AI provider configured: %s", aiProviders[i].name.c_str());
             configuredCount++;
         }
     }
     
     if (configuredCount == 0) {
         LOG_ERROR("==============================================================================");
-        LOG_ERROR("AlertsModule: FATAL - No AI providers configured!");
+        LOG_ERROR("FATAL - No AI providers configured!");
         LOG_ERROR("At least one API key must be set in .env file:");
-        LOG_ERROR("  - GEMINI_API_KEY (free tier: 1500 req/day, recommended)");
-        LOG_ERROR("  - PERPLEXITY_API_KEY (Pro: $5/month credit)");
-        LOG_ERROR("  - MISTRAL_API_KEY (free tier, good for Polish)");
-        LOG_ERROR("  - GROQ_API_KEY (free tier: 14,400 req/day, fallback)");
+        LOG_ERROR(" - GEMINI_API_KEY (free tier: 1500 req/day, recommended)");
+        LOG_ERROR(" - PERPLEXITY_API_KEY (Pro: $5/month credit)");
+        LOG_ERROR(" - MISTRAL_API_KEY (free tier, good for Polish)");
+        LOG_ERROR(" - GROQ_API_KEY (free tier: 14,400 req/day, fallback)");
         LOG_ERROR("See src/modules/Alerts/ALERTING_SETUP.md for setup instructions");
         LOG_ERROR("==============================================================================");
         // Module will still initialize but AI extraction will always fail
     } else {
-        LOG_INFO("AlertsModule: %d AI provider(s) available", configuredCount);
+        LOG_INFO("%d AI provider(s) available", configuredCount);
     }
     
     alertChannelName = "Alert";
     
     alertsModule = this;
     
-    LOG_DEBUG("AlertsModule: Constructor completed - initialization deferred to runOnce()");
+    LOG_DEBUG("Constructor completed - initialization deferred to runOnce()");
 }
 
 AlertsModule::~AlertsModule() {
@@ -155,18 +168,18 @@ String AlertsModule::httpGet(const char *url, int &httpCode)
     httpCode = -1;
 
     if (!isWifiAvailable()) {
-        LOG_DEBUG("AlertsModule: WiFi not available for HTTP request");
+        LOG_DEBUG("WiFi not available for HTTP request");
         return payload;
     }
 
-    LOG_DEBUG("AlertsModule: Fetching URL: %s", url);
+    LOG_DEBUG("Fetching URL: %s", url);
 
     // Use unique_ptr for automatic cleanup
     std::unique_ptr<HTTPClient> http(new HTTPClient());
     std::unique_ptr<WiFiClientSecure> client(new WiFiClientSecure());
 
     if (!http || !client) {
-        LOG_ERROR("AlertsModule: Failed to allocate HTTP client resources");
+        LOG_ERROR("Failed to allocate HTTP client resources");
         return payload;
     }
 
@@ -180,21 +193,24 @@ String AlertsModule::httpGet(const char *url, int &httpCode)
 
     httpCode = http->GET();
 
+    // Reset watchdog after potentially long HTTP operation
+    feedWatchdog();
+
     if (httpCode > 0) {
         if (httpCode == HTTP_CODE_OK) {
             payload = http->getString();
-            LOG_DEBUG("AlertsModule: HTTP GET successful, received %d bytes", payload.length());
+            LOG_DEBUG("HTTP GET successful, received %d bytes", payload.length());
 
             // Sanity check payload size (prevent memory exhaustion)
             if (payload.length() > 50000) { // 50KB limit
-                LOG_WARN("AlertsModule: Response too large (%d bytes), truncating", payload.length());
+                LOG_WARN("Response too large (%d bytes), truncating", payload.length());
                 payload = payload.substring(0, 50000);
             }
         } else {
-            LOG_WARN("AlertsModule: HTTP GET returned code %d", httpCode);
+            LOG_WARN("HTTP GET returned code %d", httpCode);
         }
     } else {
-        LOG_ERROR("AlertsModule: HTTP GET failed with code %d", httpCode);
+        LOG_ERROR("HTTP GET failed with code %d", httpCode);
     }
 
     // Explicit cleanup (unique_ptr will handle it, but be explicit)
@@ -324,7 +340,7 @@ bool AlertsModule::saveAlertToFile(const Alert &alert, uint32_t id, const String
     concurrency::LockGuard g(spiLock);
 
     if (id == 0) {
-        LOG_ERROR("AlertsModule: Cannot save alert with invalid ID");
+        LOG_ERROR("Cannot save alert with invalid ID");
         return false;
     }
 
@@ -363,7 +379,7 @@ bool AlertsModule::saveAlertToFile(const Alert &alert, uint32_t id, const String
 
     File f = FSCom.open(tempFilename.c_str(), FILE_O_WRITE);
     if (!f) {
-        LOG_ERROR("AlertsModule: Failed to open temp file for writing: %s", tempFilename.c_str());
+        LOG_ERROR("Failed to open temp file for writing: %s", tempFilename.c_str());
         return false;
     }
 
@@ -372,7 +388,7 @@ bool AlertsModule::saveAlertToFile(const Alert &alert, uint32_t id, const String
     bool flushOk = (written == sizeof(AlertBinary));
 
     if (written != sizeof(AlertBinary) || !flushOk) {
-        LOG_ERROR("AlertsModule: Failed to write/flush temp file %s (wrote %d bytes, flush: %s)",
+        LOG_ERROR("Failed to write/flush temp file %s (wrote %d bytes, flush: %s)",
                   tempFilename.c_str(), written, flushOk ? "ok" : "failed");
         f.close();
         FSCom.remove(tempFilename.c_str());
@@ -382,30 +398,33 @@ bool AlertsModule::saveAlertToFile(const Alert &alert, uint32_t id, const String
     f.close();
 
     if (!FSCom.rename(tempFilename.c_str(), filename.c_str())) {
-        LOG_ERROR("AlertsModule: Failed to rename temp file to %s", filename.c_str());
+        LOG_ERROR("Failed to rename temp file to %s", filename.c_str());
         FSCom.remove(tempFilename.c_str());
         return false;
     }
 
-    LOG_DEBUG("AlertsModule: Saved binary alert file: %s (%d bytes)", filename.c_str(), written);
+    LOG_DEBUG("Saved binary alert file: %s (%d bytes)", filename.c_str(), written);
     return true;
 }
 
 bool AlertsModule::loadAlertsFromDisk()
 {
-    LOG_DEBUG("AlertsModule: Loading alerts from disk (memory limited)");
+    LOG_DEBUG("Loading alerts from disk (memory limited)");
     alerts.clear();
+
+    concurrency::LockGuard g(spiLock);
 
     FSCom.mkdir(ALERTS_DIR);
     File root = FSCom.open(ALERTS_DIR, FILE_O_READ);
 
     if (!root || !root.isDirectory()) {
         if (root) root.close();
-        LOG_DEBUG("AlertsModule: %s directory does not exist or is not a directory", ALERTS_DIR);
+        LOG_DEBUG("%s directory does not exist or is not a directory", ALERTS_DIR);
         return false;
     }
 
     std::vector<std::pair<String, uint32_t>> alertFiles;
+    int filesScanned = 0;
 
     File file = root.openNextFile();
     while (file) {
@@ -419,7 +438,7 @@ bool AlertsModule::loadAlertsFromDisk()
                 if (bytesRead == sizeof(AlertBinary) && binAlert.id > 0) {
                     alertFiles.push_back(std::make_pair(filename, binAlert.addedAt));
                 } else {
-                    LOG_WARN("AlertsModule: Invalid binary alert file: %s (%d bytes, expected %d)",
+                    LOG_WARN("Invalid binary alert file: %s (%d bytes, expected %d)",
                              filename.c_str(), bytesRead, sizeof(AlertBinary));
                 }
             } else {
@@ -428,9 +447,19 @@ bool AlertsModule::loadAlertsFromDisk()
         } else {
             file.close();
         }
+
+        // Reset watchdog periodically during file scanning
+        filesScanned++;
+        if (filesScanned % 10 == 0) {
+            feedWatchdog();
+        }
+
         file = root.openNextFile();
     }
     root.close();
+
+    // Reset watchdog after scanning
+    feedWatchdog();
 
     std::sort(alertFiles.begin(), alertFiles.end(),
               [](const std::pair<String, uint32_t>& a, const std::pair<String, uint32_t>& b) {
@@ -440,7 +469,7 @@ bool AlertsModule::loadAlertsFromDisk()
     int loadedCount = 0;
     for (const auto& fileInfo : alertFiles) {
         if (loadedCount >= MAX_ALERTS_IN_MEMORY) {
-            LOG_INFO("AlertsModule: Memory limit reached (%d alerts), skipping older alerts. Total available: %d",
+            LOG_INFO("Memory limit reached (%d alerts), skipping older alerts. Total available: %d",
                      MAX_ALERTS_IN_MEMORY, alertFiles.size());
             break;
         }
@@ -474,13 +503,18 @@ bool AlertsModule::loadAlertsFromDisk()
                     alerts.push_back(a);
                     loadedCount++;
                 } else {
-                    LOG_DEBUG("AlertsModule: Skipping expired alert during load: %s", a.title.c_str());
+                    LOG_DEBUG("Skipping expired alert during load: %s", a.title.c_str());
                 }
             }
         }
+
+        // Reset watchdog periodically during loading
+        if (loadedCount % 10 == 0) {
+            feedWatchdog();
+        }
     }
 
-    LOG_INFO("AlertsModule: Loaded %d valid (non-expired) alerts from disk (of %d total files)", loadedCount, alertFiles.size());
+    LOG_INFO("Loaded %d valid (non-expired) alerts from disk (of %d total files)", loadedCount, alertFiles.size());
     return loadedCount > 0;
 }
 
@@ -498,13 +532,13 @@ int32_t AlertsModule::runOnce()
         size_t currentMemoryUsage = alerts.size() * sizeof(Alert);
         if (currentMemoryUsage != lastReportedMemoryUsage ||
             alerts.size() >= MAX_ALERTS_IN_MEMORY * 0.8) { // Report when >80% of limit
-            LOG_INFO("AlertsModule: Memory usage - %d alerts (%d bytes), limit: %d alerts",
+            LOG_INFO("Memory usage - %d alerts (%d bytes), limit: %d alerts",
                      alerts.size(), currentMemoryUsage, MAX_ALERTS_IN_MEMORY);
             lastReportedMemoryUsage = currentMemoryUsage;
         }
 
         if (alerts.size() >= MAX_ALERTS_IN_MEMORY) {
-            LOG_WARN("AlertsModule: Alert count at memory limit (%d), consider cleanup", MAX_ALERTS_IN_MEMORY);
+            LOG_WARN("Alert count at memory limit (%d), consider cleanup", MAX_ALERTS_IN_MEMORY);
         }
 
         lastMemoryCheckTime = currentMillis;
@@ -514,22 +548,22 @@ int32_t AlertsModule::runOnce()
     switch (currentState) {
         case ModuleState::INIT: {
             // Initialization state - run once
-            LOG_INFO("AlertsModule: Quick initialization - minimal operations");
+            LOG_INFO("Quick initialization - minimal operations");
             
             // Purge all alerts on boot if configured
             if (PURGE_ALERTS_ON_BOOT) {
-                LOG_INFO("AlertsModule: Purging all alerts on boot (PURGE_ALERTS_ON_BOOT=true)");
+                LOG_INFO("Purging all alerts on boot (PURGE_ALERTS_ON_BOOT=true)");
                 purgeAllAlerts();
                 alerts.clear(); // Clear in-memory cache too
             } else {
                 // Load existing alerts from disk
-                LOG_INFO("AlertsModule: Loading existing alerts from storage");
+                LOG_INFO("Loading existing alerts from storage");
                 loadAlertsFromDisk();
             }
             
             initializationDone = true;
             currentState = ModuleState::IDLE;
-            LOG_INFO("AlertsModule: Initialization complete - system responsive");
+            LOG_INFO("Initialization complete - system responsive");
             return ALERT_PROCESSING_YIELD_MS; // Quick return to continue
         }
         
@@ -565,10 +599,10 @@ int32_t AlertsModule::runOnce()
                             unsigned long interval = getSendInterval(alert.severity);
                             alert.nextSendAt = currentMillis + interval;
                             saveAlertToDisk(alert);
-                            LOG_INFO("AlertsModule: Re-sent alert [%s, sev:%d]: %s (next in %lu min)",
+                            LOG_INFO("Re-sent alert [%s, sev:%d]: %s (next in %lu min)",
                                      alert.source.c_str(), alert.severity, alert.title.c_str(), interval / 60000);
                         } else {
-                            LOG_WARN("AlertsModule: Failed to re-send alert [%s, sev:%d]: %s",
+                            LOG_WARN("Failed to re-send alert [%s, sev:%d]: %s",
                                      alert.source.c_str(), alert.severity, alert.title.c_str());
                         }
                         // Only resend one alert per cycle to avoid blocking
@@ -580,10 +614,10 @@ int32_t AlertsModule::runOnce()
                         unsigned long remainingSec = remainingMs / 1000;
                         if (remainingSec > 120) {
                             unsigned long remainingMin = remainingSec / 60;
-                            LOG_DEBUG("AlertsModule: Alert pending (will send in %lu min, source: %s, severity: %d): %s",
+                            LOG_DEBUG("Alert pending (will send in %lu min, source: %s, severity: %d): %s",
                                       remainingMin, alert.source.c_str(), alert.severity, alert.title.c_str());
                         } else {
-                            LOG_DEBUG("AlertsModule: Alert pending (will send in %lu sec, source: %s, severity: %d): %s",
+                            LOG_DEBUG("Alert pending (will send in %lu sec, source: %s, severity: %d): %s",
                                       remainingSec, alert.source.c_str(), alert.severity, alert.title.c_str());
                         }
                     }
@@ -593,22 +627,45 @@ int32_t AlertsModule::runOnce()
                 lastCheckedIndex = (lastCheckedIndex + alertsCheckedThisCycle) % alerts.size();
             }
             
-            // Priority 2: Process pending alerts (send to mesh) - requires WiFi for AI processing
-            // This processes queued alerts one at a time from the source plugins
+            // Priority 2: Fetch full content for pending alerts (one at a time to avoid watchdog)
             if (!pendingAlerts.empty() && !processingCtx.active) {
-                // Start processing the first pending alert
+                // Find first alert that needs full content fetch
+                for (auto& pending : pendingAlerts) {
+                    if (pending.needsFullFetch) {
+                        LOG_INFO("Fetching full content for alert: %s (queue: %d)",
+                                 pending.rawAlert.title.c_str(), pendingAlerts.size());
+
+                        // Create HTTP GET callback
+                        auto httpGetCallback = [this](const char* url, int& httpCode) -> String {
+                            return httpGet(url, httpCode);
+                        };
+
+                        // Fetch full content for this one alert
+                        AlertSource::RawAlert fullAlert = pending.source->fetchFullAlertContent(
+                            pending.rawAlert, httpGetCallback);
+                        pending.rawAlert = fullAlert;
+                        pending.needsFullFetch = false;
+
+                        LOG_DEBUG("Full content fetched for: %s", fullAlert.title.c_str());
+
+                        // Return to main loop to reset watchdog before processing next alert
+                        return ALERT_PROCESSING_YIELD_MS;
+                    }
+                }
+
+                // All content fetched, start AI processing for first alert
                 PendingAlert pending = pendingAlerts.front();
                 pendingAlerts.erase(pendingAlerts.begin());
-                
+
                 processingCtx.active = true;
                 processingCtx.source = pending.source;
                 processingCtx.rawAlert = pending.rawAlert;
                 processingCtx.stateStartTime = currentMillis;
-                
-                LOG_INFO("AlertsModule: Processing alert from [%s]: %s (queue: %d remaining)", 
+
+                LOG_INFO("Processing alert from [%s]: %s (queue: %d remaining)",
                          pending.source->getSourceId().c_str(), pending.rawAlert.title.c_str(), pendingAlerts.size());
-                
-                // Skip directly to CALLING_AI since source plugins fetch everything
+
+                // Proceed to AI extraction
                 currentState = ModuleState::CALLING_AI;
                 return ALERT_PROCESSING_YIELD_MS; // Yield before starting AI request
             }
@@ -621,7 +678,7 @@ int32_t AlertsModule::runOnce()
 #endif
             
             if (!wifiConnected) {
-                LOG_DEBUG("AlertsModule: WiFi not connected (status=%d), waiting 60s (mesh resends still active)", 
+                LOG_DEBUG("WiFi not connected (status=%d), waiting 60s (mesh resends still active)", 
 #if HAS_WIFI && !defined(ARCH_PORTDUINO)
                          WiFi.status()
 #else
@@ -633,7 +690,7 @@ int32_t AlertsModule::runOnce()
             
             // Also check if time is synced before fetching (need valid dates)
             if (currentTime == 0 || currentTime < MIN_VALID_EPOCH) {
-                LOG_DEBUG("AlertsModule: Time not synced yet (now=%lu), waiting 60s", currentTime);
+                LOG_DEBUG("Time not synced yet (now=%lu), waiting 60s", currentTime);
                 return MAX_RUNONCE_INTERVAL_MS; // Return 1 minute, not TIME_SYNC_WAIT_MS
             }
             
@@ -648,10 +705,10 @@ int32_t AlertsModule::runOnce()
                 if (lastFetch == 0 || (currentMillis - lastFetch) >= fetchInterval) {
                     currentSourceIndex = i;
                     if (lastFetch == 0) {
-                        LOG_INFO("AlertsModule: Initial fetch for source %s - WiFi connected and time synced", 
+                        LOG_INFO("Initial fetch for source %s - WiFi connected and time synced", 
                                  sources[i]->getSourceId().c_str());
                     } else {
-                        LOG_INFO("AlertsModule: Fetch interval elapsed for source %s (%lu min), fetching new alerts", 
+                        LOG_INFO("Fetch interval elapsed for source %s (%lu min), fetching new alerts", 
                                  sources[i]->getSourceId().c_str(), fetchInterval / 60000);
                     }
                     currentState = ModuleState::FETCHING_PAGE;
@@ -661,7 +718,7 @@ int32_t AlertsModule::runOnce()
             
             // Priority 4: Run cleanup if needed
             if (lastCleanupTime == 0 || (currentMillis - lastCleanupTime) > CLEANUP_INTERVAL_MS) {
-                LOG_DEBUG("AlertsModule: Running cleanup");
+                LOG_DEBUG("Running cleanup");
                 cleanupOldAlerts();
                 lastCleanupTime = currentMillis;
             }
@@ -693,42 +750,43 @@ int32_t AlertsModule::runOnce()
                 minInterval = MAX_RUNONCE_INTERVAL_MS;
             }
             
-            LOG_DEBUG("AlertsModule: Idle, next check in %lu seconds", minInterval / 1000);
+            LOG_DEBUG("Idle, next check in %lu seconds", minInterval / 1000);
             return minInterval > 0 ? minInterval : MAX_RUNONCE_INTERVAL_MS;
         }
         
         case ModuleState::FETCHING_PAGE: {
-            LOG_INFO("AlertsModule: Fetching alerts from source [%s]...", sources[currentSourceIndex]->getSourceId().c_str());
-            
+            LOG_INFO("Fetching alerts from source [%s]...", sources[currentSourceIndex]->getSourceId().c_str());
+
             // Create HTTP GET callback for the source to use
             auto httpGetCallback = [this](const char* url, int& httpCode) -> String {
                 return httpGet(url, httpCode);
             };
-            
+
             // Call source plugin to fetch and parse alerts (first pass - minimal data)
             std::vector<AlertSource::RawAlert> rawAlerts = sources[currentSourceIndex]->fetchAndParseAlerts(httpGetCallback);
-            
+
             // Update last fetch time for this source
             sourceLastFetchTime[currentSourceIndex] = currentMillis;
-            
+
             if (rawAlerts.empty()) {
-                LOG_INFO("AlertsModule: No new alerts from source %s", sources[currentSourceIndex]->getSourceId().c_str());
+                LOG_INFO("No new alerts from source %s", sources[currentSourceIndex]->getSourceId().c_str());
                 currentState = ModuleState::IDLE;
                 return ALERT_PROCESSING_YIELD_MS;
             }
-            
-            LOG_INFO("AlertsModule: Found %d new alerts from source %s", 
+
+            LOG_INFO("Found %d new alerts from source %s",
                      rawAlerts.size(), sources[currentSourceIndex]->getSourceId().c_str());
-            
-            // Queue raw alerts for processing, checking for duplicates
+
+            // Queue raw alerts for full content fetching (without fetching content yet)
+            // Content will be fetched one-at-a-time in FETCHING_ARTICLE state
             int queuedCount = 0;
             for (const auto& rawAlert : rawAlerts) {
                 // Check if this alert has already been processed
                 if (isAlertProcessed(rawAlert.id)) {
-                    LOG_DEBUG("AlertsModule: Alert already processed (ID: 0x%x), skipping", rawAlert.id);
+                    LOG_DEBUG("Alert already processed (ID: 0x%x), skipping", rawAlert.id);
                     continue;
                 }
-                
+
                 // Check if already in pending queue
                 bool alreadyPending = false;
                 for (const auto &pending : pendingAlerts) {
@@ -737,30 +795,29 @@ int32_t AlertsModule::runOnce()
                         break;
                     }
                 }
-                
+
                 if (!alreadyPending) {
-                    // Fetch full content for this new alert (if source needs two-phase fetching)
-                    AlertSource::RawAlert fullAlert = sources[currentSourceIndex]->fetchFullAlertContent(rawAlert, httpGetCallback);
-                    
+                    // Queue alert for full content fetching - don't fetch here to avoid watchdog
                     PendingAlert pending;
                     pending.source = sources[currentSourceIndex];
-                    pending.rawAlert = fullAlert;
+                    pending.rawAlert = rawAlert;  // Store raw alert, will fetch full content later
+                    pending.needsFullFetch = true; // Flag to indicate content needs fetching
                     pendingAlerts.push_back(pending);
                     queuedCount++;
-                    LOG_DEBUG("AlertsModule: Queued new alert: %s (ID: 0x%x)", 
-                             fullAlert.title.c_str(), fullAlert.id);
+                    LOG_DEBUG("Queued alert for fetching: %s (ID: 0x%x)",
+                             rawAlert.title.c_str(), rawAlert.id);
                 }
             }
-            
+
             if (queuedCount > 0) {
-                LOG_INFO("AlertsModule: Queued %d new alerts from [%s] (skipped %d duplicates)", 
-                         queuedCount, sources[currentSourceIndex]->getSourceId().c_str(), 
+                LOG_INFO("Queued %d new alerts from [%s] for content fetching (skipped %d duplicates)",
+                         queuedCount, sources[currentSourceIndex]->getSourceId().c_str(),
                          rawAlerts.size() - queuedCount);
             } else {
-                LOG_DEBUG("AlertsModule: No new alerts from [%s] (%d duplicates skipped)", 
+                LOG_DEBUG("No new alerts from [%s] (%d duplicates skipped)",
                           sources[currentSourceIndex]->getSourceId().c_str(), rawAlerts.size());
             }
-            
+
             currentState = ModuleState::IDLE;
             return ALERT_PROCESSING_YIELD_MS; // Quick return to start processing
         }
@@ -787,7 +844,7 @@ int32_t AlertsModule::runOnce()
                                        processingCtx.rawAlert.structuredEndDate.length() > 0);
             
             if (hasStructuredDates) {
-                LOG_DEBUG("AlertsModule: Source %s provided structured dates: %s to %s", 
+                LOG_DEBUG("Source %s provided structured dates: %s to %s", 
                          processingCtx.source->getSourceId().c_str(),
                          processingCtx.rawAlert.structuredStartDate.c_str(), 
                          processingCtx.rawAlert.structuredEndDate.c_str());
@@ -797,12 +854,12 @@ int32_t AlertsModule::runOnce()
             String message, aiStart, aiEnd, where;
             uint8_t aiSeverity = processingCtx.source->getDefaultSeverity();
             
-            LOG_DEBUG("AlertsModule: Calling AI for extraction (source: %s)", 
+            LOG_DEBUG("Calling AI for extraction (source: %s)", 
                      processingCtx.source->getSourceId().c_str());
             
             if (!callAIForExtraction(processingCtx.source, processingCtx.rawAlert, 
                                     message, aiStart, aiEnd, where, aiSeverity)) {
-                LOG_ERROR("AlertsModule: AI extraction failed for alert: %s", 
+                LOG_ERROR("AI extraction failed for alert: %s", 
                          processingCtx.alert.title.c_str());
                 processingCtx.active = false;
                 currentState = ModuleState::IDLE;
@@ -821,7 +878,7 @@ int32_t AlertsModule::runOnce()
                 } else {
                     // Fallback to source's publish date
                     processingCtx.alert.valid_from = processingCtx.rawAlert.dateStr;
-                    LOG_DEBUG("AlertsModule: No start date from AI, using publish date: %s", 
+                    LOG_DEBUG("No start date from AI, using publish date: %s", 
                              processingCtx.rawAlert.dateStr.c_str());
                 }
                 
@@ -843,22 +900,22 @@ int32_t AlertsModule::runOnce()
             
             // Let source plugin validate and cleanup if needed
             if (!processingCtx.source->validateAndCleanup(processingCtx.alert)) {
-                LOG_WARN("AlertsModule: Alert validation failed, skipping");
+                LOG_WARN("Alert validation failed, skipping");
                 processingCtx.active = false;
                 currentState = ModuleState::IDLE;
                 return ALERT_PROCESSING_YIELD_MS;
             }
             
             // Save to disk
-            LOG_DEBUG("AlertsModule: Saving alert to disk");
+            LOG_DEBUG("Saving alert to disk");
             if (!saveAlertToDisk(processingCtx.alert)) {
-                LOG_ERROR("AlertsModule: Failed to save alert to disk");
+                LOG_ERROR("Failed to save alert to disk");
                 processingCtx.active = false;
                 currentState = ModuleState::IDLE;
                 return ALERT_PROCESSING_YIELD_MS;
             }
             
-            LOG_DEBUG("AlertsModule: AI extraction successful - severity: %d, location: %s", 
+            LOG_DEBUG("AI extraction successful - severity: %d, location: %s", 
                      processingCtx.alert.severity, processingCtx.alert.location.c_str());
             
             currentState = ModuleState::SAVING_ALERT;
@@ -871,13 +928,13 @@ int32_t AlertsModule::runOnce()
             
             // Save to disk
             if (!saveAlertToFile(processingCtx.alert, id, processingCtx.alert.valid_from)) {
-                LOG_ERROR("AlertsModule: Failed to save alert to disk");
+                LOG_ERROR("Failed to save alert to disk");
                 processingCtx.active = false;
                 currentState = ModuleState::IDLE;
                 return ALERT_PROCESSING_YIELD_MS;
             }
             
-            LOG_DEBUG("AlertsModule: Alert saved to disk");
+            LOG_DEBUG("Alert saved to disk");
             
             currentState = ModuleState::SENDING_ALERT;
             return ALERT_PROCESSING_YIELD_MS; // Yield before sending
@@ -889,7 +946,7 @@ int32_t AlertsModule::runOnce()
             
             // Check if alert is still valid before sending
             if (!isAlertValid(processingCtx.alert)) {
-                LOG_WARN("AlertsModule: Alert expired before sending, skipping: %s", 
+                LOG_WARN("Alert expired before sending, skipping: %s", 
                         processingCtx.alert.title.c_str());
                 processingCtx.active = false;
                 currentState = ModuleState::IDLE;
@@ -905,19 +962,19 @@ int32_t AlertsModule::runOnce()
                     unsigned long interval = getSendInterval(processingCtx.alert.severity);
                     processingCtx.alert.nextSendAt = currentMillis + interval;
                     saveAlertToFile(processingCtx.alert, id, processingCtx.alert.valid_from);
-                    LOG_INFO("AlertsModule: Sent NEW alert [%s, sev:%d]: %s (next in %lu min)", 
+                    LOG_INFO("Sent NEW alert [%s, sev:%d]: %s (next in %lu min)", 
                              processingCtx.alert.source.c_str(), processingCtx.alert.severity,
                              processingCtx.alert.title.c_str(), interval / 60000);
                 } else {
-                    LOG_ERROR("AlertsModule: Failed to send new alert [%s, sev:%d]: %s", 
+                    LOG_ERROR("Failed to send new alert [%s, sev:%d]: %s", 
                               processingCtx.alert.source.c_str(), processingCtx.alert.severity,
                               processingCtx.alert.title.c_str());
                 }
                 
                 alerts.push_back(processingCtx.alert);
-                LOG_INFO("AlertsModule: Alert processed successfully (total in memory: %d)", alerts.size());
+                LOG_INFO("Alert processed successfully (total in memory: %d)", alerts.size());
             } else {
-                LOG_DEBUG("AlertsModule: Alert already exists in memory");
+                LOG_DEBUG("Alert already exists in memory");
             }
             
             // Done processing this alert
@@ -927,7 +984,7 @@ int32_t AlertsModule::runOnce()
         }
         
         default:
-            LOG_ERROR("AlertsModule: Invalid state %d", (int)currentState);
+            LOG_ERROR("Invalid state %d", (int)currentState);
             currentState = ModuleState::IDLE;
             return MAX_RUNONCE_INTERVAL_MS; // Return 1 minute on error
     }
@@ -936,7 +993,7 @@ int32_t AlertsModule::runOnce()
 bool AlertsModule::callAIForExtraction(AlertSource* source, const AlertSource::RawAlert &rawAlert,
                                        String &outMessage, String &outStart, String &outEnd, String &outWhere, uint8_t &outSeverity)
 {
-    LOG_DEBUG("AlertsModule: Calling AI for extraction (source: %s)", source->getSourceId().c_str());
+    LOG_DEBUG("Calling AI for extraction (source: %s)", source->getSourceId().c_str());
     
     // Calculate source prefix dynamically
     String sourcePrefixStr = "[" + source->getSourceId() + "] ";
@@ -954,7 +1011,7 @@ bool AlertsModule::callAIForExtraction(AlertSource* source, const AlertSource::R
     // Get source-specific prompt
     String prompt = source->buildAIPrompt(rawAlert, maxMessageBytes, maxLocationChars);
     
-    LOG_DEBUG("AlertsModule: AI prompt built (%d bytes)", prompt.length());
+    LOG_DEBUG("AI prompt built (%d bytes)", prompt.length());
     
     // Try each configured AI provider until one succeeds
     for (int providerIdx = 0; providerIdx < MAX_AI_PROVIDERS; providerIdx++) {
@@ -962,11 +1019,11 @@ bool AlertsModule::callAIForExtraction(AlertSource* source, const AlertSource::R
         
         // Skip if provider not configured
         if (provider.endpoint.length() == 0 || provider.apiKey.length() == 0) {
-            LOG_DEBUG("AlertsModule: Skipping provider %s (not configured)", provider.name.c_str());
+            LOG_DEBUG("Skipping provider %s (not configured)", provider.name.c_str());
             continue;
         }
         
-        LOG_INFO("AlertsModule: Attempting AI extraction with [%s]...", provider.name.c_str());
+        LOG_INFO("Attempting AI extraction with [%s]...", provider.name.c_str());
         
         bool success = false;
         if (provider.requestFormat == "gemini") {
@@ -980,15 +1037,15 @@ bool AlertsModule::callAIForExtraction(AlertSource* source, const AlertSource::R
         }
         
         if (success) {
-            LOG_INFO("AlertsModule: AI extraction successful with [%s]", provider.name.c_str());
+            LOG_INFO("AI extraction successful with [%s]", provider.name.c_str());
             currentAIProviderIndex = providerIdx; // Remember successful provider for next time
             return true;
         } else {
-            LOG_WARN("AlertsModule: Provider [%s] failed, trying next fallback...", provider.name.c_str());
+            LOG_WARN("Provider [%s] failed, trying next fallback...", provider.name.c_str());
         }
     }
     
-    LOG_ERROR("AlertsModule: All AI providers failed");
+    LOG_ERROR("All AI providers failed");
     return false;
 }
 
@@ -1029,28 +1086,32 @@ bool AlertsModule::callGeminiAPI(const AIProvider &provider, const String &promp
     }
     body += "\"}]}]}";
 
-    LOG_DEBUG("AlertsModule: Sending AI request to %s (prompt length: %d)", provider.name.c_str(), prompt.length());
+    LOG_DEBUG("Sending AI request to %s (prompt length: %d)", provider.name.c_str(), prompt.length());
     int httpCode = http.POST(body);
+
+    // Reset watchdog after potentially long AI API call
+    feedWatchdog();
+
     bool success = false;
 
     if (httpCode == HTTP_CODE_OK) {
         String response = http.getString();
-        LOG_DEBUG("AlertsModule: AI response received from %s (%d bytes)", provider.name.c_str(), response.length());
+        LOG_DEBUG("AI response received from %s (%d bytes)", provider.name.c_str(), response.length());
         success = parseAIResponse(response, outMessage, outStart, outEnd, outWhere, outSeverity);
         if (success) {
-            LOG_INFO("AlertsModule: AI extraction successful - severity: %d, location: %s", outSeverity, outWhere.c_str());
+            LOG_INFO("AI extraction successful - severity: %d, location: %s", outSeverity, outWhere.c_str());
         } else {
             // Log truncated response for debugging (first 500 chars)
             String truncatedResponse = response;
             if (truncatedResponse.length() > 500) {
                 truncatedResponse = truncatedResponse.substring(0, 500) + "...";
             }
-            LOG_ERROR("AlertsModule: Failed to parse AI response from %s. Response (first 500 chars): %s", 
+            LOG_ERROR("Failed to parse AI response from %s. Response (first 500 chars): %s", 
                      provider.name.c_str(), truncatedResponse.c_str());
         }
     } else {
         String errorResponse = http.getString();
-        LOG_ERROR("AlertsModule: AI request to %s failed with HTTP code %d. Response: %s", 
+        LOG_ERROR("AI request to %s failed with HTTP code %d. Response: %s", 
                  provider.name.c_str(), httpCode, errorResponse.c_str());
     }
     http.end();
@@ -1125,18 +1186,22 @@ bool AlertsModule::callMistralAPI(const AIProvider &provider, const String &prom
     }
     body += "\"}],\"temperature\":0.1,\"max_tokens\":500}";
 
-    LOG_DEBUG("AlertsModule: Sending AI request to %s (prompt length: %d)", provider.name.c_str(), prompt.length());
+    LOG_DEBUG("Sending AI request to %s (prompt length: %d)", provider.name.c_str(), prompt.length());
     int httpCode = http.POST(body);
+
+    // Reset watchdog after potentially long AI API call
+    feedWatchdog();
+
     bool success = false;
 
     if (httpCode == HTTP_CODE_OK) {
         String response = http.getString();
-        LOG_DEBUG("AlertsModule: AI response received from %s (%d bytes)", provider.name.c_str(), response.length());
-        
+        LOG_DEBUG("AI response received from %s (%d bytes)", provider.name.c_str(), response.length());
+
         // Parse Mistral/OpenAI response format: {"choices":[{"message":{"content":"..."}}]}
         int contentPos = response.indexOf("\"content\"");
         if (contentPos < 0) {
-            LOG_ERROR("AlertsModule: 'content' field not found in Mistral response");
+            LOG_ERROR("'content' field not found in Mistral response");
             http.end();
             return false;
         }
@@ -1163,7 +1228,7 @@ bool AlertsModule::callMistralAPI(const AIProvider &provider, const String &prom
         }
         
         if (textEnd >= response.length()) {
-            LOG_ERROR("AlertsModule: Could not parse Mistral response");
+            LOG_ERROR("Could not parse Mistral response");
             http.end();
             return false;
         }
@@ -1183,7 +1248,7 @@ bool AlertsModule::callMistralAPI(const AIProvider &provider, const String &prom
         success = parseAIResponse(geminiStyleResponse, outMessage, outStart, outEnd, outWhere, outSeverity);
     } else {
         String errorResponse = http.getString();
-        LOG_ERROR("AlertsModule: AI request to %s failed with HTTP code %d. Response: %s",
+        LOG_ERROR("AI request to %s failed with HTTP code %d. Response: %s",
                  provider.name.c_str(), httpCode, errorResponse.c_str());
     }
     http.end();
@@ -1223,18 +1288,22 @@ bool AlertsModule::callGroqAPI(const AIProvider &provider, const String &prompt,
     }
     body += "\"}],\"temperature\":0.1,\"max_tokens\":500}";
 
-    LOG_DEBUG("AlertsModule: Sending AI request to %s (prompt length: %d)", provider.name.c_str(), prompt.length());
+    LOG_DEBUG("Sending AI request to %s (prompt length: %d)", provider.name.c_str(), prompt.length());
     int httpCode = http.POST(body);
+
+    // Reset watchdog after potentially long AI API call
+    feedWatchdog();
+
     bool success = false;
 
     if (httpCode == HTTP_CODE_OK) {
         String response = http.getString();
-        LOG_DEBUG("AlertsModule: AI response received from %s (%d bytes)", provider.name.c_str(), response.length());
-        
+        LOG_DEBUG("AI response received from %s (%d bytes)", provider.name.c_str(), response.length());
+
         // Parse Groq/OpenAI response format: {"choices":[{"message":{"content":"..."}}]}
         int contentPos = response.indexOf("\"content\"");
         if (contentPos < 0) {
-            LOG_ERROR("AlertsModule: 'content' field not found in Groq response");
+            LOG_ERROR("'content' field not found in Groq response");
             http.end();
             return false;
         }
@@ -1261,7 +1330,7 @@ bool AlertsModule::callGroqAPI(const AIProvider &provider, const String &prompt,
         }
         
         if (textEnd >= response.length()) {
-            LOG_ERROR("AlertsModule: Could not parse Groq response");
+            LOG_ERROR("Could not parse Groq response");
             http.end();
             return false;
         }
@@ -1276,11 +1345,11 @@ bool AlertsModule::callGroqAPI(const AIProvider &provider, const String &prompt,
         success = parseAIResponse(geminiStyleResponse, outMessage, outStart, outEnd, outWhere, outSeverity);
         
         if (success) {
-            LOG_INFO("AlertsModule: AI extraction successful - severity: %d, location: %s", outSeverity, outWhere.c_str());
+            LOG_INFO("AI extraction successful - severity: %d, location: %s", outSeverity, outWhere.c_str());
         }
     } else {
         String errorResponse = http.getString();
-        LOG_ERROR("AlertsModule: AI request to %s failed with HTTP code %d. Response: %s",
+        LOG_ERROR("AI request to %s failed with HTTP code %d. Response: %s",
                  provider.name.c_str(), httpCode, errorResponse.c_str());
     }
     http.end();
@@ -1296,14 +1365,14 @@ bool AlertsModule::parseAIResponse(const String &response, String &outMessage, S
     // Find "text" field - handle whitespace variations
     int textKeyPos = response.indexOf("\"text\"");
     if (textKeyPos < 0) {
-        LOG_WARN("AlertsModule: 'text' field not found in AI response");
+        LOG_WARN("'text' field not found in AI response");
         return false;
     }
     
     // Find the colon after "text"
     int colonPos = response.indexOf(':', textKeyPos);
     if (colonPos < 0) {
-        LOG_WARN("AlertsModule: Colon not found after 'text' field");
+        LOG_WARN("Colon not found after 'text' field");
         return false;
     }
     
@@ -1314,7 +1383,7 @@ bool AlertsModule::parseAIResponse(const String &response, String &outMessage, S
     }
     
     if (textStart >= response.length() || response.charAt(textStart) != '"') {
-        LOG_WARN("AlertsModule: Opening quote not found for 'text' value");
+        LOG_WARN("Opening quote not found for 'text' value");
         return false;
     }
     textStart++; // Move past the opening quote
@@ -1344,7 +1413,7 @@ bool AlertsModule::parseAIResponse(const String &response, String &outMessage, S
     }
 
     if (textEnd >= response.length()) {
-        LOG_WARN("AlertsModule: Could not find end of 'text' field (reached end of response)");
+        LOG_WARN("Could not find end of 'text' field (reached end of response)");
         return false;
     }
 
@@ -1359,9 +1428,9 @@ bool AlertsModule::parseAIResponse(const String &response, String &outMessage, S
     
     // Log the extracted data for debugging (truncate if too long)
     if (delimitedData.length() > 200) {
-        LOG_DEBUG("AlertsModule: Extracted data (first 200 chars): %s...", delimitedData.substring(0, 200).c_str());
+        LOG_DEBUG("Extracted data (first 200 chars): %s...", delimitedData.substring(0, 200).c_str());
     } else {
-        LOG_DEBUG("AlertsModule: Extracted data: %s", delimitedData.c_str());
+        LOG_DEBUG("Extracted data: %s", delimitedData.c_str());
     }
     
     // Parse delimited format: message|||___|||start|||___|||end|||___|||where|||___|||severity
@@ -1398,7 +1467,7 @@ bool AlertsModule::parseAIResponse(const String &response, String &outMessage, S
                 outSeverity = value.toInt();
                 // Validate severity range
                 if (outSeverity > 10) {
-                    LOG_WARN("AlertsModule: Severity out of range (%d), using default 3", outSeverity);
+                    LOG_WARN("Severity out of range (%d), using default 3", outSeverity);
                     outSeverity = 3;
                 }
                 break;
@@ -1412,9 +1481,9 @@ bool AlertsModule::parseAIResponse(const String &response, String &outMessage, S
     bool valid = (field == 5 && outMessage.length() > 0 && outStart.length() > 0 && outEnd.length() > 0 && outWhere.length() > 0);
     
     if (!valid) {
-        LOG_WARN("AlertsModule: Missing required fields in parsed data - fields found: %d, message: %d, start: %d, end: %d, where: %d", 
+        LOG_WARN("Missing required fields in parsed data - fields found: %d, message: %d, start: %d, end: %d, where: %d", 
                  field, outMessage.length(), outStart.length(), outEnd.length(), outWhere.length());
-        LOG_DEBUG("AlertsModule: Parsed values - message: '%s', start: '%s', end: '%s', where: '%s', severity: %d", 
+        LOG_DEBUG("Parsed values - message: '%s', start: '%s', end: '%s', where: '%s', severity: %d", 
                   outMessage.c_str(), outStart.c_str(), outEnd.c_str(), outWhere.c_str(), outSeverity);
     }
     
@@ -1470,7 +1539,7 @@ bool AlertsModule::isAlertValid(const Alert &alert)
 
 bool AlertsModule::sendAlertToMesh(const Alert &alert)
 {
-    LOG_DEBUG("AlertsModule: Sending alert to mesh - source: %s, severity: %d", alert.source.c_str(), alert.severity);
+    LOG_DEBUG("Sending alert to mesh - source: %s, severity: %d", alert.source.c_str(), alert.severity);
 
     // Prepare message with source prefix and geolocation suffix
     String sourcePrefix = "[" + alert.source + "] ";
@@ -1524,16 +1593,16 @@ bool AlertsModule::sendAlertToMesh(const Alert &alert)
     p->decoded.payload.size = utf8ByteLength(msg);
     memcpy(p->decoded.payload.bytes, msg.c_str(), p->decoded.payload.size);
     
-    LOG_INFO("AlertsModule: Sending alert to mesh - channel: %d, size: %d, priority: %d", 
+    LOG_INFO("Sending alert to mesh - channel: %d, size: %d, priority: %d", 
              alertChannelIndex, p->decoded.payload.size, p->priority);
-    LOG_INFO("AlertsModule: Message: %s", msg.c_str());
+    LOG_INFO("Message: %s", msg.c_str());
     
     if (service) {
         p->from = nodeDB->getNodeNum();
         service->sendToMesh(p, RX_SRC_USER, true);
-        LOG_DEBUG("AlertsModule: Alert sent to mesh network");
+        LOG_DEBUG("Alert sent to mesh network");
     } else {
-        LOG_ERROR("AlertsModule: MeshService not available");
+        LOG_ERROR("MeshService not available");
     }
 
     return true;
@@ -1543,7 +1612,7 @@ ChannelIndex AlertsModule::ensureAlertChannel()
 {
     // If channel name is empty, use primary channel
     if (alertChannelName.length() == 0) {
-        LOG_DEBUG("AlertsModule: Using primary channel");
+        LOG_DEBUG("Using primary channel");
         return channels.getPrimaryIndex();
     }
     
@@ -1553,14 +1622,14 @@ ChannelIndex AlertsModule::ensureAlertChannel()
         if (channelName && strcasecmp(channelName, alertChannelName.c_str()) == 0) {
             meshtastic_Channel &ch = channels.getByIndex(i);
             if (ch.role != meshtastic_Channel_Role_DISABLED) {
-                LOG_DEBUG("AlertsModule: Found Alert channel at index %d", i);
+                LOG_DEBUG("Found Alert channel at index %d", i);
                 return i;
             }
         }
     }
     
     // Channel doesn't exist, create it
-    LOG_INFO("AlertsModule: Creating Alert channel: %s", alertChannelName.c_str());
+    LOG_INFO("Creating Alert channel: %s", alertChannelName.c_str());
     for (ChannelIndex i = 1; i < channels.getNumChannels(); i++) {
         meshtastic_Channel &ch = channels.getByIndex(i);
         if (ch.role == meshtastic_Channel_Role_DISABLED || 
@@ -1577,12 +1646,12 @@ ChannelIndex AlertsModule::ensureAlertChannel()
             newChannel.settings.downlink_enabled = true;
             
             channels.setChannel(newChannel);
-            LOG_INFO("AlertsModule: Successfully created Alert channel at index %d", i);
+            LOG_INFO("Successfully created Alert channel at index %d", i);
             return i;
         }
     }
     
-    LOG_WARN("AlertsModule: No available channel slot, using primary channel");
+    LOG_WARN("No available channel slot, using primary channel");
     return channels.getPrimaryIndex();
 }
 
@@ -1651,7 +1720,7 @@ uint32_t AlertsModule::hashLink(const String &link)
 
 void AlertsModule::cleanupOldAlerts()
 {
-    LOG_DEBUG("AlertsModule: Starting cleanup of old alerts");
+    LOG_DEBUG("Starting cleanup of old alerts");
     concurrency::LockGuard g(spiLock);
 
     // Calculate cutoff date (configured retention period ago) in YYYYMMDD format
@@ -1659,7 +1728,7 @@ void AlertsModule::cleanupOldAlerts()
 
     // If time is not available, skip cleanup (time might not be synced yet)
     if (now == 0 || now < MIN_VALID_EPOCH) {
-        LOG_DEBUG("AlertsModule: Time not synced yet (now=%lu), skipping cleanup", now);
+        LOG_DEBUG("Time not synced yet (now=%lu), skipping cleanup", now);
         return;
     }
 
@@ -1671,7 +1740,7 @@ void AlertsModule::cleanupOldAlerts()
              cutoffTm->tm_year + 1900, cutoffTm->tm_mon + 1, cutoffTm->tm_mday);
     String cutoffDate = String(cutoffDateStr);
 
-    LOG_DEBUG("AlertsModule: Cleanup cutoff date: %s (%d days ago)", cutoffDate.c_str(), ALERT_RETENTION_DAYS);
+    LOG_DEBUG("Cleanup cutoff date: %s (%d days ago)", cutoffDate.c_str(), ALERT_RETENTION_DAYS);
 
     // Create directory if it doesn't exist
     FSCom.mkdir(ALERTS_DIR);
@@ -1680,13 +1749,14 @@ void AlertsModule::cleanupOldAlerts()
     File root = FSCom.open(ALERTS_DIR, FILE_O_READ);
     if (!root || !root.isDirectory()) {
         if (root) root.close();
-        LOG_DEBUG("AlertsModule: %s directory not found, skipping cleanup", ALERTS_DIR);
+        LOG_DEBUG("%s directory not found, skipping cleanup", ALERTS_DIR);
         return;
     }
 
     // Collect IDs of expired alerts (don't delete files - keep as processed markers)
     std::vector<uint32_t> idsToRemoveFromMemory;
 
+    int filesScanned = 0;
     File file = root.openNextFile();
     while (file) {
         if (!file.isDirectory()) {
@@ -1699,7 +1769,7 @@ void AlertsModule::cleanupOldAlerts()
                 if (fileDate.length() == 8) {
                     // Check if this file is for an expired alert
                     if (fileDate < cutoffDate) {
-                        LOG_DEBUG("AlertsModule: Found expired alert file (keeping as processed marker): %s (date: %s)",
+                        LOG_DEBUG("Found expired alert file (keeping as processed marker): %s (date: %s)",
                                  filename.c_str(), fileDate.c_str());
 
                         // Extract ID from filename for memory cleanup
@@ -1715,11 +1785,18 @@ void AlertsModule::cleanupOldAlerts()
                     }
                 } else {
                     // Invalid date format, skip (might be legacy file without date prefix)
-                    LOG_DEBUG("AlertsModule: Skipping file with invalid date format: %s", filename.c_str());
+                    LOG_DEBUG("Skipping file with invalid date format: %s", filename.c_str());
                 }
             }
         }
         file.close();
+
+        // Reset watchdog periodically during cleanup
+        filesScanned++;
+        if (filesScanned % 10 == 0) {
+            feedWatchdog();
+        }
+
         file = root.openNextFile();
     }
     root.close();
@@ -1729,7 +1806,7 @@ void AlertsModule::cleanupOldAlerts()
     for (uint32_t id : idsToRemoveFromMemory) {
         for (auto it = alerts.begin(); it != alerts.end();) {
             if (it->id == id) {
-                LOG_DEBUG("AlertsModule: Removing expired alert from memory: %s", it->title.c_str());
+                LOG_DEBUG("Removing expired alert from memory: %s", it->title.c_str());
                 it = alerts.erase(it);
                 memoryRemoved++;
                 break; // Only one alert per ID
@@ -1743,7 +1820,7 @@ void AlertsModule::cleanupOldAlerts()
     int expiredInMemory = 0;
     for (auto it = alerts.begin(); it != alerts.end();) {
         if (!isAlertValid(*it)) {
-            LOG_DEBUG("AlertsModule: Found and removing expired alert from memory: %s", it->title.c_str());
+            LOG_DEBUG("Found and removing expired alert from memory: %s", it->title.c_str());
             it = alerts.erase(it);
             expiredInMemory++;
         } else {
@@ -1752,17 +1829,17 @@ void AlertsModule::cleanupOldAlerts()
     }
 
     if (memoryRemoved > 0 || expiredInMemory > 0) {
-        LOG_INFO("AlertsModule: Cleanup completed - kept %d expired files as processed markers, removed %d from memory, found %d extra expired in memory",
+        LOG_INFO("Cleanup completed - kept %d expired files as processed markers, removed %d from memory, found %d extra expired in memory",
                  (int)idsToRemoveFromMemory.size(), memoryRemoved, expiredInMemory);
     } else {
-        LOG_DEBUG("AlertsModule: Cleanup completed - no expired alerts in memory to remove");
+        LOG_DEBUG("Cleanup completed - no expired alerts in memory to remove");
     }
 }
 
 
 void AlertsModule::purgeAllAlerts()
 {
-    LOG_INFO("AlertsModule: Purging all alerts");
+    LOG_INFO("Purging all alerts");
     concurrency::LockGuard g(spiLock);
     
     // Create directory if it doesn't exist (shouldn't happen, but safe)
@@ -1772,16 +1849,17 @@ void AlertsModule::purgeAllAlerts()
     File root = FSCom.open(ALERTS_DIR, FILE_O_READ);
     if (!root || !root.isDirectory()) {
         if (root) root.close();
-        LOG_DEBUG("AlertsModule: %s directory not found or is not a directory", ALERTS_DIR);
+        LOG_DEBUG("%s directory not found or is not a directory", ALERTS_DIR);
         return;
     }
     
     int deletedCount = 0;
+    int filesProcessed = 0;
     File file = root.openNextFile();
     while (file) {
         String filename;
         bool isAlertFile = false;
-        
+
         if (!file.isDirectory()) {
             filename = file.name();
             // Only process .bin files (binary format)
@@ -1789,11 +1867,11 @@ void AlertsModule::purgeAllAlerts()
                 isAlertFile = true;
             }
         }
-        
+
         // IMPORTANT: Close the file before trying to delete it
         // LittleFS cannot delete files that are currently open
         file.close();
-        
+
         // Now try to delete if it's an alert file
         if (isAlertFile && filename.length() > 0) {
             // file.name() might return full path or just filename
@@ -1803,13 +1881,13 @@ void AlertsModule::purgeAllAlerts()
                 fullPath = filename;
             } else {
                 // Just filename, construct full path
-                    fullPath = String(ALERTS_DIR) + "/" + filename;
+                fullPath = String(ALERTS_DIR) + "/" + filename;
             }
-            
+
             // Try to delete the file
             if (FSCom.remove(fullPath.c_str())) {
                 deletedCount++;
-                LOG_DEBUG("AlertsModule: Deleted alert file: %s", fullPath.c_str());
+                LOG_DEBUG("Deleted alert file: %s", fullPath.c_str());
             } else {
                 // Try alternative: if fullPath failed, try just filename
                 if (filename.startsWith("/")) {
@@ -1817,16 +1895,22 @@ void AlertsModule::purgeAllAlerts()
                     String altPath = filename.substring(1);
                     if (FSCom.remove(altPath.c_str())) {
                         deletedCount++;
-                        LOG_DEBUG("AlertsModule: Deleted alert file (alt path): %s", altPath.c_str());
+                        LOG_DEBUG("Deleted alert file (alt path): %s", altPath.c_str());
                     } else {
-                        LOG_ERROR("AlertsModule: Failed to delete alert file: %s (also tried: %s)", fullPath.c_str(), altPath.c_str());
+                        LOG_ERROR("Failed to delete alert file: %s (also tried: %s)", fullPath.c_str(), altPath.c_str());
                     }
                 } else {
-                    LOG_ERROR("AlertsModule: Failed to delete alert file: %s", fullPath.c_str());
+                    LOG_ERROR("Failed to delete alert file: %s", fullPath.c_str());
                 }
             }
         }
-        
+
+        // Reset watchdog periodically during purge
+        filesProcessed++;
+        if (filesProcessed % 10 == 0) {
+            feedWatchdog();
+        }
+
         // Get next file
         file = root.openNextFile();
     }
@@ -1834,7 +1918,7 @@ void AlertsModule::purgeAllAlerts()
     
     // Clear the in-memory alerts vector
     alerts.clear();
-    LOG_INFO("AlertsModule: Purged %d alert files and cleared in-memory cache", deletedCount);
+    LOG_INFO("Purged %d alert files and cleared in-memory cache", deletedCount);
 }
 
 #endif // HAS_ALERTING

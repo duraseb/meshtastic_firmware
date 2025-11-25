@@ -157,6 +157,7 @@ class AlertsModule : public concurrency::OSThread {
     struct PendingAlert {
         AlertSource* source;
         AlertSource::RawAlert rawAlert;
+        bool needsFullFetch;  // True if full content still needs to be fetched
     };
     std::vector<PendingAlert> pendingAlerts;
 
