@@ -41,7 +41,7 @@ AlertsModule *alertsModule = nullptr;
 
 AlertsModule::AlertsModule() : OSThread("AlertsModule")
 {
-    LOG_INFO("Initializing Multi-Source Alert System");
+    LOG_INFO("[AlertsModule] Initializing Multi-Source Alert System");
 
     currentState = ModuleState::INIT;
     initializationDone = false;
@@ -61,7 +61,7 @@ AlertsModule::AlertsModule() : OSThread("AlertsModule")
     // Register RCB source
     sources[numSources] = new RCBAlertSource();
     sourceLastFetchTime[numSources] = 0;
-    LOG_INFO("Registered source: %s (fetch every %lu min)",
+    LOG_INFO("[AlertsModule] Registered source: %s (fetch every %lu min)",
              sources[numSources]->getSourceId().c_str(),
              sources[numSources]->getFetchIntervalMs() / 60000);
     numSources++;
@@ -69,12 +69,12 @@ AlertsModule::AlertsModule() : OSThread("AlertsModule")
     // Register IMGW source
     sources[numSources] = new IMGWAlertSource();
     sourceLastFetchTime[numSources] = 0;
-    LOG_INFO("Registered source: %s (fetch every %lu min)",
+    LOG_INFO("[AlertsModule] Registered source: %s (fetch every %lu min)",
              sources[numSources]->getSourceId().c_str(),
              sources[numSources]->getFetchIntervalMs() / 60000);
     numSources++;
 
-    LOG_INFO("Total sources registered: %d", numSources);
+    LOG_INFO("[AlertsModule] Total sources registered: %d", numSources);
     // AI provider fallback chain (Gemini → Perplexity → Mistral → Groq)
     aiProviders[0].name = "Gemini-2.5";
     aiProviders[0].endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
@@ -121,31 +121,31 @@ AlertsModule::AlertsModule() : OSThread("AlertsModule")
     int configuredCount = 0;
     for (int i = 0; i < MAX_AI_PROVIDERS; i++) {
         if (aiProviders[i].apiKey.length() > 0) {
-            LOG_INFO("AI provider configured: %s", aiProviders[i].name.c_str());
+            LOG_INFO("[AlertsModule] AI provider configured: %s", aiProviders[i].name.c_str());
             configuredCount++;
         }
     }
-    
+
     if (configuredCount == 0) {
-        LOG_ERROR("==============================================================================");
-        LOG_ERROR("FATAL - No AI providers configured!");
-        LOG_ERROR("At least one API key must be set in .env file:");
-        LOG_ERROR(" - GEMINI_API_KEY (free tier: 1500 req/day, recommended)");
-        LOG_ERROR(" - PERPLEXITY_API_KEY (Pro: $5/month credit)");
-        LOG_ERROR(" - MISTRAL_API_KEY (free tier, good for Polish)");
-        LOG_ERROR(" - GROQ_API_KEY (free tier: 14,400 req/day, fallback)");
-        LOG_ERROR("See src/modules/Alerts/ALERTING_SETUP.md for setup instructions");
-        LOG_ERROR("==============================================================================");
+        LOG_ERROR("[AlertsModule] ==============================================================================");
+        LOG_ERROR("[AlertsModule] FATAL - No AI providers configured!");
+        LOG_ERROR("[AlertsModule] At least one API key must be set in .env file:");
+        LOG_ERROR("[AlertsModule]  - GEMINI_API_KEY (free tier: 1500 req/day, recommended)");
+        LOG_ERROR("[AlertsModule]  - PERPLEXITY_API_KEY (Pro: $5/month credit)");
+        LOG_ERROR("[AlertsModule]  - MISTRAL_API_KEY (free tier, good for Polish)");
+        LOG_ERROR("[AlertsModule]  - GROQ_API_KEY (free tier: 14,400 req/day, fallback)");
+        LOG_ERROR("[AlertsModule] See src/modules/Alerts/ALERTING_SETUP.md for setup instructions");
+        LOG_ERROR("[AlertsModule] ==============================================================================");
         // Module will still initialize but AI extraction will always fail
     } else {
-        LOG_INFO("%d AI provider(s) available", configuredCount);
+        LOG_INFO("[AlertsModule] %d AI provider(s) available", configuredCount);
     }
-    
+
     alertChannelName = "Alert";
-    
+
     alertsModule = this;
-    
-    LOG_DEBUG("Constructor completed - initialization deferred to runOnce()");
+
+    LOG_DEBUG("[AlertsModule] Constructor completed - initialization deferred to runOnce()");
 }
 
 AlertsModule::~AlertsModule() {
@@ -623,8 +623,10 @@ int32_t AlertsModule::runOnce()
                     }
                 }
 
-                // Update starting index for next cycle
-                lastCheckedIndex = (lastCheckedIndex + alertsCheckedThisCycle) % alerts.size();
+                // Update starting index for next cycle (guard against division by zero)
+                if (!alerts.empty()) {
+                    lastCheckedIndex = (lastCheckedIndex + alertsCheckedThisCycle) % alerts.size();
+                }
             }
             
             // Priority 2: Fetch full content for pending alerts (one at a time to avoid watchdog)
