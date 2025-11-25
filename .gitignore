@@ -43,6 +43,11 @@ src/mesh/raspihttp/private_key.pem
 # Ignore logo (set at build time with platformio-custom.py)
 data/boot/logo.*
 
+# Ignore development/temporary files in tmp/ directory
+tmp/*
+!tmp/.gitkeep
+.env
+
 # pioarduino platform
 managed_components/*
 arduino-lib-builder*

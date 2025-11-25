@@ -97,6 +97,10 @@
 #include "modules/SerialModule.h"
 #endif
 
+#if HAS_WIFI && HAS_ALERTING
+#include "modules/Alerts/AlertsModule.h"
+#endif
+
 #if !MESHTASTIC_EXCLUDE_DROPZONE
 #include "modules/DropzoneModule.h"
 #endif
@@ -179,6 +183,10 @@ void setupModules()
 #endif
     // Note: if the rest of meshtastic doesn't need to explicitly use your module, you do not need to assign the instance
     // to a global variable.
+
+#if HAS_WIFI && HAS_ALERTING
+    new AlertsModule();
+#endif
 
 #if !MESHTASTIC_EXCLUDE_REMOTEHARDWARE
     new RemoteHardwareModule();
