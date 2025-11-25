@@ -494,10 +494,14 @@ bool AlertsModule::loadAlertsFromDisk()
                 a.source = String(binAlert.source);
                 a.severity = binAlert.severity;
                 a.addedAt = binAlert.addedAt;
-                a.lastSent = binAlert.lastSent * 1000UL;
-                a.nextSendAt = binAlert.nextSendAt * 1000UL;
                 a.id = binAlert.id;
                 a.alert_type = a.title;
+
+                // Reset millis()-based timestamps on load since they don't persist across reboots
+                // Set lastSent to 0 and nextSendAt to 0 so alerts are checked immediately
+                // after time sync, proper intervals will be applied after first resend
+                a.lastSent = 0;
+                a.nextSendAt = 0;
 
                 if (isAlertValid(a)) {
                     alerts.push_back(a);
@@ -602,8 +606,8 @@ int32_t AlertsModule::runOnce()
                             LOG_INFO("Re-sent alert [%s, sev:%d]: %s (next in %lu min)",
                                      alert.source.c_str(), alert.severity, alert.title.c_str(), interval / 60000);
                         } else {
-                            LOG_WARN("Failed to re-send alert [%s, sev:%d]: %s",
-                                     alert.source.c_str(), alert.severity, alert.title.c_str());
+                            // Failed to send - set retry delay to avoid tight loop
+                            alert.nextSendAt = currentMillis + 60000; // Retry in 1 minute
                         }
                         // Only resend one alert per cycle to avoid blocking
                         lastCheckedIndex = (checkIndex + 1) % alerts.size(); // Resume after this alert
@@ -933,19 +937,10 @@ int32_t AlertsModule::runOnce()
                 currentState = ModuleState::IDLE;
                 return ALERT_PROCESSING_YIELD_MS;
             }
-            
-            // Save to disk
-            LOG_DEBUG("Saving alert to disk");
-            if (!saveAlertToDisk(processingCtx.alert)) {
-                LOG_ERROR("Failed to save alert to disk");
-                processingCtx.active = false;
-                currentState = ModuleState::IDLE;
-                return ALERT_PROCESSING_YIELD_MS;
-            }
-            
-            LOG_DEBUG("AI extraction successful - severity: %d, location: %s", 
+
+            LOG_DEBUG("AI extraction successful - severity: %d, location: %s",
                      processingCtx.alert.severity, processingCtx.alert.location.c_str());
-            
+
             currentState = ModuleState::SAVING_ALERT;
             return ALERT_PROCESSING_YIELD_MS; // Yield before disk I/O
         }
@@ -953,17 +948,18 @@ int32_t AlertsModule::runOnce()
         case ModuleState::SAVING_ALERT: {
             // Use alert ID from raw alert (hash of URL, UUID, RSS GUID, etc.)
             uint32_t id = processingCtx.rawAlert.id;
-            
+
             // Save to disk
+            LOG_DEBUG("Saving alert to disk");
             if (!saveAlertToFile(processingCtx.alert, id, processingCtx.alert.valid_from)) {
                 LOG_ERROR("Failed to save alert to disk");
                 processingCtx.active = false;
                 currentState = ModuleState::IDLE;
                 return ALERT_PROCESSING_YIELD_MS;
             }
-            
+
             LOG_DEBUG("Alert saved to disk");
-            
+
             currentState = ModuleState::SENDING_ALERT;
             return ALERT_PROCESSING_YIELD_MS; // Yield before sending
         }
@@ -990,15 +986,18 @@ int32_t AlertsModule::runOnce()
                     unsigned long interval = getSendInterval(processingCtx.alert.severity);
                     processingCtx.alert.nextSendAt = currentMillis + interval;
                     saveAlertToFile(processingCtx.alert, id, processingCtx.alert.valid_from);
-                    LOG_INFO("Sent NEW alert [%s, sev:%d]: %s (next in %lu min)", 
+                    LOG_INFO("Sent NEW alert [%s, sev:%d]: %s (next in %lu min)",
                              processingCtx.alert.source.c_str(), processingCtx.alert.severity,
                              processingCtx.alert.title.c_str(), interval / 60000);
                 } else {
-                    LOG_ERROR("Failed to send new alert [%s, sev:%d]: %s", 
-                              processingCtx.alert.source.c_str(), processingCtx.alert.severity,
-                              processingCtx.alert.title.c_str());
+                    // Failed to send - set retry delay to avoid tight loop
+                    processingCtx.alert.nextSendAt = currentMillis + 60000; // Retry in 1 minute
+                    saveAlertToFile(processingCtx.alert, id, processingCtx.alert.valid_from);
+                    LOG_WARN("Failed to send new alert, will retry in 1 min [%s, sev:%d]: %s",
+                             processingCtx.alert.source.c_str(), processingCtx.alert.severity,
+                             processingCtx.alert.title.c_str());
                 }
-                
+
                 alerts.push_back(processingCtx.alert);
                 LOG_INFO("Alert processed successfully (total in memory: %d)", alerts.size());
             } else {
@@ -1543,26 +1542,22 @@ size_t AlertsModule::utf8ByteLength(const String &str)
 bool AlertsModule::isAlertValid(const Alert &alert)
 {
     time_t now = time(nullptr);
-    
-    // If current time is not valid, we can't check expiry
+
+    // If current time is not valid, assume alert is valid
+    // We'll check again when time is synced
     if (now < MIN_VALID_EPOCH) {
-        return false; // Don't process alerts without valid time
+        return true; // Assume valid until we can check properly
     }
-    
-    time_t validFrom = parseDateString(alert.valid_from);
+
     time_t validTo = parseDateString(alert.valid_to);
 
-    // If we have a valid_to date and can parse it, check expiry
+    // Only check expiry - we WANT to broadcast alerts about future events
+    // An alert is invalid only if it has expired (past validTo date)
     if (validTo > 0 && now > validTo) {
         return false; // Expired
     }
-    
-    // If we have a valid_from date and can parse it, check if it's started
-    if (validFrom > 0 && now < validFrom) {
-        return false; // Not yet valid
-    }
 
-    return true; // Alert is valid
+    return true; // Alert is valid (current or future)
 }
 
 bool AlertsModule::sendAlertToMesh(const Alert &alert)
@@ -1606,8 +1601,12 @@ bool AlertsModule::sendAlertToMesh(const Alert &alert)
     meshtastic_MeshPacket *p = router->allocForSending();
     p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
     p->to = 0xffffffff; // Broadcast
-    
-    ChannelIndex alertChannelIndex = ensureAlertChannel();
+
+    int8_t alertChannelIndex = findAlertChannel();
+    if (alertChannelIndex < 0) {
+        packetPool.release(p);
+        return false;
+    }
     p->channel = alertChannelIndex;
     p->want_ack = true;
     
@@ -1636,64 +1635,41 @@ bool AlertsModule::sendAlertToMesh(const Alert &alert)
     return true;
 }
 
-ChannelIndex AlertsModule::ensureAlertChannel()
+int8_t AlertsModule::findAlertChannel()
 {
     // If channel name is empty, use primary channel
     if (alertChannelName.length() == 0) {
-        LOG_DEBUG("Using primary channel");
         return channels.getPrimaryIndex();
     }
 
-    // Check if Alert channel exists with correct PSK
+    // Look for existing channel with matching name
+    int8_t foundIndex = -1;
     for (ChannelIndex i = 0; i < channels.getNumChannels(); i++) {
-        const char *channelName = channels.getName(i);
-        if (channelName && strcasecmp(channelName, alertChannelName.c_str()) == 0) {
-            meshtastic_Channel &ch = channels.getByIndex(i);
-            if (ch.role != meshtastic_Channel_Role_DISABLED) {
-                // Check if PSK matches expected value
-                if (ch.settings.psk.size == 1 && ch.settings.psk.bytes[0] == ALERT_CHANNEL_PSK) {
-                    LOG_DEBUG("Found Alert channel at index %d with correct PSK", i);
-                    return i;
-                } else {
-                    LOG_WARN("Found Alert channel at index %d but PSK mismatch (size=%d, first byte=0x%02x), updating",
-                             i, ch.settings.psk.size, ch.settings.psk.bytes[0]);
-                    // Update the channel with correct PSK
-                    meshtastic_Channel updatedChannel = ch;
-                    updatedChannel.settings.psk.bytes[0] = ALERT_CHANNEL_PSK;
-                    updatedChannel.settings.psk.size = 1;
-                    channels.setChannel(updatedChannel);
-                    LOG_INFO("Updated Alert channel PSK at index %d", i);
-                    return i;
-                }
-            }
-        }
-    }
-
-    // Channel doesn't exist, create it
-    LOG_INFO("Creating Alert channel: %s", alertChannelName.c_str());
-    for (ChannelIndex i = 1; i < channels.getNumChannels(); i++) {
         meshtastic_Channel &ch = channels.getByIndex(i);
-        if (ch.role == meshtastic_Channel_Role_DISABLED ||
-            (ch.role == meshtastic_Channel_Role_SECONDARY && (!ch.has_settings || ch.settings.name[0] == '\0'))) {
-            meshtastic_Channel newChannel = {};
-            newChannel.index = i;
-            newChannel.role = meshtastic_Channel_Role_SECONDARY;
-            newChannel.has_settings = true;
-            strncpy(newChannel.settings.name, alertChannelName.c_str(), sizeof(newChannel.settings.name) - 1);
-            newChannel.settings.name[sizeof(newChannel.settings.name) - 1] = '\0';
-            newChannel.settings.psk.bytes[0] = ALERT_CHANNEL_PSK;
-            newChannel.settings.psk.size = 1;
-            newChannel.settings.uplink_enabled = true;
-            newChannel.settings.downlink_enabled = true;
+        if (ch.role == meshtastic_Channel_Role_DISABLED) {
+            continue;
+        }
 
-            channels.setChannel(newChannel);
-            LOG_INFO("Successfully created Alert channel at index %d", i);
-            return i;
+        const char *channelName = channels.getName(i);
+        if (strcasecmp(channelName, alertChannelName.c_str()) == 0) {
+            foundIndex = i;
+            break;
         }
     }
 
-    LOG_WARN("No available channel slot, using primary channel");
-    return channels.getPrimaryIndex();
+    // Log state changes only
+    if (foundIndex >= 0 && lastKnownChannelIndex < 0) {
+        LOG_INFO("Channel '%s' found at index %d - alerts will be sent", alertChannelName.c_str(), foundIndex);
+    } else if (foundIndex < 0 && lastKnownChannelIndex >= 0) {
+        LOG_WARN("Channel '%s' no longer available - alerts will not be sent", alertChannelName.c_str());
+    } else if (foundIndex < 0 && lastKnownChannelIndex == -2) {
+        LOG_ERROR("Channel '%s' not found - please create it manually", alertChannelName.c_str());
+    } else if (foundIndex >= 0 && lastKnownChannelIndex >= 0 && foundIndex != lastKnownChannelIndex) {
+        LOG_INFO("Channel '%s' moved from index %d to %d", alertChannelName.c_str(), lastKnownChannelIndex, foundIndex);
+    }
+
+    lastKnownChannelIndex = foundIndex;
+    return foundIndex;
 }
 
 unsigned long AlertsModule::getSendInterval(uint8_t severity)

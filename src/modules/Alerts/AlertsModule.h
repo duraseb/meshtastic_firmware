@@ -74,7 +74,7 @@ class AlertsModule : public concurrency::OSThread {
 
     // Severity-based send intervals
     static constexpr unsigned long SEVERITY_0_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes for critical (severity 0)
-    static constexpr unsigned long SEVERITY_10_INTERVAL_MS = 12 * 60 * 60 * 1000; // 12 hours for least important (severity 10)
+    static constexpr unsigned long SEVERITY_10_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours for least important (severity 10)
     static constexpr uint8_t DEFAULT_SOURCE_SEVERITY = 3;
 
     // New alert send delay
@@ -86,8 +86,8 @@ class AlertsModule : public concurrency::OSThread {
 
     // Channel settings
     String alertChannelName; // Channel name (empty string = use default/primary channel)
-    static constexpr uint8_t ALERT_CHANNEL_PSK = 0x01;
-    
+    int8_t lastKnownChannelIndex = -2; // -2 = unknown, -1 = not found, 0+ = channel index
+
     // Storage paths
     static constexpr const char* ALERTS_DIR = "/alerts";
     
@@ -226,8 +226,8 @@ class AlertsModule : public concurrency::OSThread {
     // Check if alert is still valid (within valid_from and valid_to dates)
     bool isAlertValid(const Alert &alert);
 
-    // Ensure Alert channel exists (create if needed)
-    ChannelIndex ensureAlertChannel();
+    // Find Alert channel by name, returns -1 if not found
+    int8_t findAlertChannel();
 
     // Send alert to mesh network
     bool sendAlertToMesh(const Alert &alert);
