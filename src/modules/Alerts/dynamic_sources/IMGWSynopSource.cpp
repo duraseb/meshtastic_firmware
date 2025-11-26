@@ -71,7 +71,7 @@ String IMGWSynopSource::fetchAndFormat(
     // "Pogoda: 📍Poznań, 2025-11-25 23:00, 🌡️temp.: 0.5°C, suma opadów: 0.1mm, ciśnienie: 1009.2hPa, 💨wiatr: N 4m/s"
     String message = "Pogoda: \xF0\x9F\x93\x8D"; // UTF-8 for 📍 (PIN emoji)
     message += station;
-    message += ", ";
+    message += " | ";
 
     // Temperature with thermometer icon
     message += "\xF0\x9F\x8C\xA1"; // UTF-8 for 🌡️ (thermometer)
@@ -80,17 +80,17 @@ String IMGWSynopSource::fetchAndFormat(
     message += "\xC2\xB0" "C"; // UTF-8 for ° (degree symbol)
 
     // Precipitation
-    message += ", suma opad\xC3\xB3w: "; // opadów with ó
+    message += " | suma opad\xC3\xB3w: "; // opadów with ó
     message += precip;
     message += "mm";
 
     // Pressure
-    message += ", ci\xC5\x9Bnienie: "; // ciśnienie with ś
+    message += " | ci\xC5\x9Bnienie: "; // ciśnienie with ś
     message += pressure;
     message += " hPa";
 
     // Wind with wind icon
-    message += ", \xF0\x9F\x92\xA8wiatr: "; // UTF-8 for 💨 (wind)
+    message += " | \xF0\x9F\x92\xA8wiatr: "; // UTF-8 for 💨 (wind)
     message += windCompass;
     message += " ";
     message += windSpeed;
@@ -107,7 +107,7 @@ String IMGWSynopSource::fetchAndFormat(
     message += date;
     message += " ";
     message += hour;
-    message += ":00): ";
+    message += ":00)";
 
     LOG_INFO("IMGWSynopSource: Formatted weather: %s", message.c_str());
 

@@ -44,6 +44,12 @@ AlertsModule::AlertsModule() : OSThread("AlertsModule")
 {
     LOG_INFO("[AlertsModule] Initializing Multi-Source Alert System");
 
+#ifdef ALERT_CHANNEL_NAME
+    alertChannelName = ALERT_CHANNEL_NAME;
+#else
+    alertChannelName = "Alert";
+#endif
+
     currentState = ModuleState::INIT;
     initializationDone = false;
     lastCleanupTime = 0;
@@ -156,8 +162,6 @@ AlertsModule::AlertsModule() : OSThread("AlertsModule")
     } else {
         LOG_INFO("[AlertsModule] %d AI provider(s) available", configuredCount);
     }
-
-    alertChannelName = "Alert";
 
     alertsModule = this;
 

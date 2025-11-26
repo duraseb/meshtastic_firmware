@@ -70,8 +70,8 @@ class AlertsModule : public concurrency::OSThread {
 
     // Time synchronization settings
     static constexpr uint32_t MIN_VALID_EPOCH = 1577836800UL; // 2020-01-01 00:00:00 UTC
-    static constexpr unsigned long TIME_SYNC_WAIT_MS = 60000;
-    static constexpr unsigned long WIFI_UNAVAILABLE_WAIT_MS = 60000;
+    static constexpr unsigned long TIME_SYNC_WAIT_MS = 30000;
+    static constexpr unsigned long WIFI_UNAVAILABLE_WAIT_MS = 30000;
     static constexpr unsigned long FETCH_FAIL_WAIT_MS = 60000;
 
     // Message settings
@@ -80,7 +80,7 @@ class AlertsModule : public concurrency::OSThread {
     static constexpr int MAX_LOCATION_CHARS = 30;
 
     // Severity-based send intervals
-    static constexpr unsigned long SEVERITY_0_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes for critical (severity 0)
+    static constexpr unsigned long SEVERITY_0_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes for critical (severity 0)
     static constexpr unsigned long SEVERITY_10_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours for least important (severity 10)
     static constexpr uint8_t DEFAULT_SOURCE_SEVERITY = 3;
 
