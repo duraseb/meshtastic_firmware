@@ -3,6 +3,7 @@
 #include "AlertsModule.h"
 #include "sources/RCBAlertSource.h"
 #include "sources/IMGWAlertSource.h"
+#include "dynamic_sources/IMGWSynopSource.h"
 #include "mesh/wifi/WiFiAPClient.h"
 #include "FSCommon.h"
 #include "main.h"
@@ -74,7 +75,22 @@ AlertsModule::AlertsModule() : OSThread("AlertsModule")
              sources[numSources]->getFetchIntervalMs() / 60000);
     numSources++;
 
-    LOG_INFO("[AlertsModule] Total sources registered: %d", numSources);
+    LOG_INFO("[AlertsModule] Total alert sources registered: %d", numSources);
+
+    // Register dynamic sources (periodic data, no AI, no persistence)
+    numDynamicSources = 0;
+    currentDynamicSourceIndex = 0;
+
+    // Register IMGW SYNOP weather source
+    dynamicSources[numDynamicSources] = new IMGWSynopSource();
+    dynamicSourceLastFetchTime[numDynamicSources] = 0;
+    LOG_INFO("[AlertsModule] Registered dynamic source: %s (fetch every %lu min)",
+             dynamicSources[numDynamicSources]->getSourceId().c_str(),
+             dynamicSources[numDynamicSources]->getFetchIntervalMs() / 60000);
+    numDynamicSources++;
+
+    LOG_INFO("[AlertsModule] Total dynamic sources registered: %d", numDynamicSources);
+
     // AI provider fallback chain (Gemini → Perplexity → Mistral → Groq)
     aiProviders[0].name = "Gemini-2.5";
     aiProviders[0].endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
@@ -722,7 +738,27 @@ int32_t AlertsModule::runOnce()
                 }
             }
             
-            // Priority 4: Run cleanup if needed
+            // Priority 4: Check dynamic sources for fetching (periodic data like weather)
+            for (int i = 0; i < numDynamicSources; i++) {
+                unsigned long lastFetch = dynamicSourceLastFetchTime[i];
+                unsigned long fetchInterval = dynamicSources[i]->getFetchIntervalMs();
+
+                // On first run (lastFetch == 0), fetch immediately when WiFi is ready
+                if (lastFetch == 0 || (currentMillis - lastFetch) >= fetchInterval) {
+                    currentDynamicSourceIndex = i;
+                    if (lastFetch == 0) {
+                        LOG_INFO("Initial fetch for dynamic source %s",
+                                 dynamicSources[i]->getSourceId().c_str());
+                    } else {
+                        LOG_INFO("Fetch interval elapsed for dynamic source %s (%lu min)",
+                                 dynamicSources[i]->getSourceId().c_str(), fetchInterval / 60000);
+                    }
+                    currentState = ModuleState::FETCHING_DYNAMIC;
+                    return ALERT_PROCESSING_YIELD_MS;
+                }
+            }
+
+            // Priority 5: Run cleanup if needed
             if (lastCleanupTime == 0 || (currentMillis - lastCleanupTime) > CLEANUP_INTERVAL_MS) {
                 LOG_DEBUG("Running cleanup");
                 cleanupOldAlerts();
@@ -1009,7 +1045,42 @@ int32_t AlertsModule::runOnce()
             currentState = ModuleState::IDLE;
             return ALERT_PROCESSING_YIELD_MS; // Quick return to process next alert
         }
-        
+
+        case ModuleState::FETCHING_DYNAMIC: {
+            DynamicSource* source = dynamicSources[currentDynamicSourceIndex];
+            LOG_INFO("Fetching data from dynamic source [%s]...", source->getSourceId().c_str());
+
+            // Create HTTP GET callback for the source to use
+            auto httpGetCallback = [this](const char* url, int& httpCode) -> String {
+                return httpGet(url, httpCode);
+            };
+
+            // Fetch and format data - returns ready-to-send message
+            String message = source->fetchAndFormat(httpGetCallback);
+            feedWatchdog();
+
+            // Update last fetch time for this source
+            dynamicSourceLastFetchTime[currentDynamicSourceIndex] = currentMillis;
+
+            if (message.length() == 0) {
+                LOG_WARN("No data from dynamic source %s", source->getSourceId().c_str());
+                currentState = ModuleState::IDLE;
+                return ALERT_PROCESSING_YIELD_MS;
+            }
+
+            // Send immediately to mesh (no storage, no resending)
+            if (sendMessageToMesh(message)) {
+                LOG_INFO("Sent dynamic data from [%s]: %s",
+                         source->getSourceId().c_str(), message.c_str());
+            } else {
+                LOG_WARN("Failed to send dynamic data from [%s]",
+                         source->getSourceId().c_str());
+            }
+
+            currentState = ModuleState::IDLE;
+            return ALERT_PROCESSING_YIELD_MS;
+        }
+
         default:
             LOG_ERROR("Invalid state %d", (int)currentState);
             currentState = ModuleState::IDLE;
@@ -1633,6 +1704,49 @@ bool AlertsModule::sendAlertToMesh(const Alert &alert)
     }
 
     return true;
+}
+
+bool AlertsModule::sendMessageToMesh(const String &message)
+{
+    LOG_DEBUG("Sending message to mesh: %s", message.c_str());
+
+    const int maxPayload = meshtastic_Constants_DATA_PAYLOAD_LEN;
+    size_t msgBytes = utf8ByteLength(message);
+
+    if (msgBytes > maxPayload) {
+        LOG_WARN("Message too long (%d bytes, max %d), truncating", msgBytes, maxPayload);
+        // Simple truncation - not ideal for UTF-8 but acceptable for now
+        msgBytes = maxPayload;
+    }
+
+    // Allocate and prepare mesh packet
+    meshtastic_MeshPacket *p = router->allocForSending();
+    p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+    p->to = 0xffffffff; // Broadcast
+
+    int8_t alertChannelIndex = findAlertChannel();
+    if (alertChannelIndex < 0) {
+        packetPool.release(p);
+        return false;
+    }
+    p->channel = alertChannelIndex;
+    p->want_ack = true;
+    p->priority = meshtastic_MeshPacket_Priority_RELIABLE;
+
+    p->decoded.payload.size = msgBytes;
+    memcpy(p->decoded.payload.bytes, message.c_str(), msgBytes);
+
+    LOG_INFO("Sending message to mesh - channel: %d, size: %d", alertChannelIndex, p->decoded.payload.size);
+
+    if (service) {
+        p->from = nodeDB->getNodeNum();
+        service->sendToMesh(p, RX_SRC_USER, true);
+        LOG_DEBUG("Message sent to mesh network");
+        return true;
+    }
+
+    LOG_ERROR("MeshService not available");
+    return false;
 }
 
 int8_t AlertsModule::findAlertChannel()

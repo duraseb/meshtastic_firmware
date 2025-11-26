@@ -6,6 +6,7 @@
 #include "configuration.h"
 #include "mesh/Channels.h"
 #include "AlertSource.h"
+#include "DynamicSource.h"
 #include <Arduino.h>
 #include <vector>
 
@@ -36,12 +37,18 @@ class AlertsModule : public concurrency::OSThread {
     // ===== Configuration Variables =====
     // These can be easily changed and later moved to config files
 
-    // Alert sources (pluggable architecture)
+    // Alert sources (pluggable architecture) - persistent alerts with AI processing
     static constexpr int MAX_ALERT_SOURCES = 5;
     AlertSource* sources[MAX_ALERT_SOURCES];
     int numSources;
     int currentSourceIndex;
     unsigned long sourceLastFetchTime[MAX_ALERT_SOURCES];
+
+    // Dynamic sources (pluggable architecture) - periodic data, no persistence, no AI
+    static constexpr int MAX_DYNAMIC_SOURCES = 5;
+    DynamicSource* dynamicSources[MAX_DYNAMIC_SOURCES];
+    int numDynamicSources;
+    unsigned long dynamicSourceLastFetchTime[MAX_DYNAMIC_SOURCES];
 
     // AI provider configuration (primary and fallbacks)
     struct AIProvider {
@@ -135,6 +142,7 @@ class AlertsModule : public concurrency::OSThread {
         CALLING_AI,
         SAVING_ALERT,
         SENDING_ALERT,
+        FETCHING_DYNAMIC,  // Fetching from a dynamic source (weather, etc.)
         CLEANUP
     };
 
@@ -167,6 +175,9 @@ class AlertsModule : public concurrency::OSThread {
     // Memory management
     unsigned long lastMemoryCheckTime;
     size_t lastReportedMemoryUsage;
+
+    // Dynamic source processing state
+    int currentDynamicSourceIndex;
 
     // ===== Core Module Functions =====
     bool loadConfig();
@@ -231,6 +242,9 @@ class AlertsModule : public concurrency::OSThread {
 
     // Send alert to mesh network
     bool sendAlertToMesh(const Alert &alert);
+
+    // Send a simple message to mesh network (for dynamic sources)
+    bool sendMessageToMesh(const String &message);
 
     // ===== Utility Functions =====
     // Calculate UTF-8 byte length of a string
