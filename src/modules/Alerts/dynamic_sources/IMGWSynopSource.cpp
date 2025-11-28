@@ -12,7 +12,7 @@ String IMGWSynopSource::getFetchUrl() const
 
 unsigned long IMGWSynopSource::getFetchIntervalMs() const
 {
-    return 60 * 60 * 1000; // 1 hour
+    return 4 * 60 * 60 * 1000; // 4 hours
 }
 
 String IMGWSynopSource::fetchAndFormat(

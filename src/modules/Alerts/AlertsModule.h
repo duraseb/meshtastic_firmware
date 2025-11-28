@@ -80,8 +80,8 @@ class AlertsModule : public concurrency::OSThread {
     static constexpr int MAX_LOCATION_CHARS = 30;
 
     // Severity-based send intervals
-    static constexpr unsigned long SEVERITY_0_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes for critical (severity 0)
-    static constexpr unsigned long SEVERITY_10_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours for least important (severity 10)
+    static constexpr unsigned long SEVERITY_0_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes for critical (severity 0)
+    static constexpr unsigned long SEVERITY_10_INTERVAL_MS = 1 * 60 * 60 * 1000; // 1 hour for least important (severity 10)
     static constexpr uint8_t DEFAULT_SOURCE_SEVERITY = 3;
 
     // New alert send delay
