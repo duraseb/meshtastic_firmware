@@ -1792,10 +1792,8 @@ int8_t AlertsModule::findAlertChannel()
 
 unsigned long AlertsModule::getSendInterval(uint8_t severity)
 {
-    // Severity 0 = configured interval, severity 10 = configured max interval
-    // Linear interpolation: interval = baseInterval + (severity * (maxInterval - baseInterval) / 10)
-    unsigned long baseIntervalMs = SEVERITY_0_INTERVAL_MS;
-    unsigned long maxIntervalMs = SEVERITY_10_INTERVAL_MS;
+    unsigned long baseIntervalMs = SEVERITY_MIN_INTERVAL_MS;
+    unsigned long maxIntervalMs = SEVERITY_MAX_INTERVAL_MS;
     unsigned long rangeMs = maxIntervalMs - baseIntervalMs;
 
     // Calculate proportional interval
