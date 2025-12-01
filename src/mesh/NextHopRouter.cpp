@@ -8,7 +8,6 @@
 #include "modules/TrafficManagementModule.h"
 #endif
 #include "NodeDB.h"
-#include "SignalRoutingModule.h"
 
 NextHopRouter::NextHopRouter() {}
 
@@ -146,23 +145,15 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                     meshtastic_MeshPacket *tosend = packetPool.allocCopy(*p); // keep a copy because we will be sending it
                     LOG_INFO("Rebroadcast received message coming from %x", p->relay_node);
 
-                    // Signal-based routing: do NOT decrement hop_limit
-                    if (signalRoutingModule && signalRoutingModule->shouldUseSignalBasedRouting(p)) {
-                        // Leave hop_limit untouched for signal-based routing
-                        LOG_DEBUG("Signal-based routing: preserving hop_limit for packet 0x%08x", p->id);
-                    }
                     // If exhausting hops, force hop_limit = 0 regardless of other logic
-		    else if (exhaustHops) {
+		    if (exhaustHops) {
                         tosend->hop_limit = 0;
                         LOG_INFO("Traffic management: exhausting hops for 0x%08x, setting hop_limit=0", getFrom(p));
                     } else if (shouldDecrementHopLimit(p)) {
                         // Use shared logic to determine if hop_limit should be decremented
                         tosend->hop_limit--; // bump down the hop count
                     } else {
-                        // Classic flood path: decrement hop_limit
-                        if (p->hop_limit > 0) {
-                            tosend->hop_limit--; // bump down the hop count
-                        }
+                        LOG_INFO("favorite-ROUTER/CLIENT_BASE-to-ROUTER/CLIENT_BASE rebroadcast: preserving hop_limit");
                     }
 #if USERPREFS_EVENT_MODE
                     if (tosend->hop_limit > 2) {
