@@ -143,6 +143,10 @@ typedef enum _meshtastic_PortNum {
     /* LoraWAN Payload Transport
  ENCODING: compact binary LoRaWAN uplink (10-byte RF metadata + PHY payload) - see LoRaWANBridgeModule */
     meshtastic_PortNum_LORAWAN_BRIDGE = 75,
+    /* Signal-based routing protocol for community mesh networks.
+ Exchanges neighbor link quality information for intelligent route selection.
+ ENCODING: Protobuf (SignalRoutingInfo) */
+    meshtastic_PortNum_SIGNAL_ROUTING_APP = 75,
     /* Reticulum Network Stack Tunnel App
  ENCODING: Fragmented RNS Packet. Handled by Meshtastic RNS interface */
     meshtastic_PortNum_RETICULUM_TUNNEL_APP = 76,
