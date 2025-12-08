@@ -14,10 +14,6 @@
 #include <pb_decode.h>
 #include <pb_encode.h>
 
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_BLUETOOTH
-extern void setBluetoothEnable(bool enable);
-#endif
-
 static bool isUserGeneratedPacket(const meshtastic_MeshPacket *txp)
 {
     if (!txp)
@@ -194,19 +190,10 @@ void RadioLibInterface::setAirplaneMode(bool enabled)
         if (enabled) {
             instance->disabled = true;
             instance->setStandby();
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_BLUETOOTH
-            instance->airplaneBtWasEnabled = config.bluetooth.enabled;
-            instance->airplaneBtStateValid = true;
-            setBluetoothEnable(false);
-#endif
         } else {
             instance->disabled = false;
             instance->startReceive();
             instance->flushAirplaneQueue();
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_BLUETOOTH
-            if (instance->airplaneBtStateValid)
-                setBluetoothEnable(instance->airplaneBtWasEnabled);
-#endif
         }
     }
     LOG_INFO("Airplane mode %s", enabled ? "ENABLED" : "DISABLED");

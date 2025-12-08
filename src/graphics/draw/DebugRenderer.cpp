@@ -451,6 +451,13 @@ void drawLoRaFocused(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x,
     nameX = (SCREEN_WIDTH - textWidth) / 2;
     display->drawString(nameX, getTextPositions(display)[line++], frequencyslot);
 
+    // === Fifth Row: Airplane Mode Status ===
+    char airplaneStr[25];
+    snprintf(airplaneStr, sizeof(airplaneStr), "Airplane: %s", RadioLibInterface::isAirplaneMode() ? "ON" : "OFF");
+    textWidth = display->getStringWidth(airplaneStr);
+    nameX = (SCREEN_WIDTH - textWidth) / 2;
+    display->drawString(nameX, getTextPositions(display)[line++], airplaneStr);
+
 #if !defined(M5STACK_UNITC6L)
     // === Fifth Row: Channel Utilization ===
     const char *chUtil = "ChUtil:";

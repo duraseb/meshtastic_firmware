@@ -207,8 +207,6 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     static bool airplaneMode;
     static constexpr size_t AIRPLANE_QUEUE_MAX = 8;
     std::deque<meshtastic_MeshPacket *> airplaneQueue;
-    bool airplaneBtWasEnabled = false;
-    bool airplaneBtStateValid = false;
 
     uint8_t bumpAttempts(const meshtastic_MeshPacket *txp);
     void enqueueAirplanePacket(meshtastic_MeshPacket *txp);
