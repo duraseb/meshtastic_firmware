@@ -415,6 +415,13 @@ esp_sleep_wakeup_cause_t doLightSleep(uint64_t sleepMsec) // FIXME, use a more r
     // assert(uart_set_wakeup_threshold(UART_NUM_0, 3) == ESP_OK);
     // assert(esp_sleep_enable_uart_wakeup(0) == ESP_OK);
 #endif
+#if defined(T_WATCH_S3_POWER_OPT)
+    // Limit wake sources to touch and radio IRQ for the watch
+#if defined(WAKE_ON_TOUCH)
+    gpio_wakeup_enable((gpio_num_t)SCREEN_TOUCH_INT, GPIO_INTR_LOW_LEVEL);
+#endif
+    enableLoraInterrupt();
+#else
 #ifdef ROTARY_PRESS
     // The enableLoraInterrupt() method is using ext0_wakeup, so we are forced to use GPIO wakeup
     gpio_wakeup_enable((gpio_num_t)ROTARY_PRESS, GPIO_INTR_LOW_LEVEL);
@@ -438,6 +445,7 @@ esp_sleep_wakeup_cause_t doLightSleep(uint64_t sleepMsec) // FIXME, use a more r
     if (pmu_found)
         gpio_wakeup_enable((gpio_num_t)PMU_IRQ, GPIO_INTR_LOW_LEVEL); // pmu irq
 #endif
+#endif
 
     auto res = esp_sleep_enable_gpio_wakeup();
     if (res != ESP_OK) {
@@ -458,6 +466,21 @@ esp_sleep_wakeup_cause_t doLightSleep(uint64_t sleepMsec) // FIXME, use a more r
     // commented out because it's not that crucial;
     // if it sporadically happens the node will go into light sleep during the next round
     // assert(res == ESP_OK);
+#if defined(T_WATCH_S3_POWER_OPT)
+#if defined(WAKE_ON_TOUCH)
+    gpio_wakeup_disable((gpio_num_t)SCREEN_TOUCH_INT);
+#endif
+#if !defined(SOC_PM_SUPPORT_EXT_WAKEUP) && defined(LORA_DIO1) && (LORA_DIO1 != RADIOLIB_NC)
+    if (radioType != RF95_RADIO) {
+        gpio_wakeup_disable((gpio_num_t)LORA_DIO1);
+    }
+#endif
+#if defined(RF95_IRQ) && (RF95_IRQ != RADIOLIB_NC)
+    if (radioType == RF95_RADIO) {
+        gpio_wakeup_disable((gpio_num_t)RF95_IRQ);
+    }
+#endif
+#else
 #ifdef ROTARY_PRESS
     gpio_wakeup_disable((gpio_num_t)ROTARY_PRESS);
 #endif
@@ -483,6 +506,7 @@ esp_sleep_wakeup_cause_t doLightSleep(uint64_t sleepMsec) // FIXME, use a more r
     if (radioType == RF95_RADIO) {
         gpio_wakeup_disable((gpio_num_t)RF95_IRQ);
     }
+#endif
 #endif
 
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
