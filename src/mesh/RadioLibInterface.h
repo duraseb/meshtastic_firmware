@@ -191,11 +191,21 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     meshtastic_QueueStatus getQueueStatus();
 
   protected:
+    struct AttemptEntry {
+        NodeNum from = 0;
+        PacketId id = 0;
+        uint8_t attempts = 0;
+    };
+    static constexpr size_t MAX_ATTEMPT_TRACK = 12;
+    AttemptEntry attemptTable[MAX_ATTEMPT_TRACK];
+
+    uint8_t bumpAttempts(const meshtastic_MeshPacket *txp);
+
     uint32_t activeReceiveStart = 0;
 
     bool receiveDetected(uint16_t irq, ulong syncWordHeaderValidFlag, ulong preambleDetectedFlag);
 
-    int8_t selectTxPowerForPacket(const meshtastic_MeshPacket *txp);
+    int8_t selectTxPowerForPacket(const meshtastic_MeshPacket *txp, uint8_t attempts);
 
     /** Apply a per-packet TX power override (default: update member only) */
     virtual void applyOutputPower(int8_t newPower);

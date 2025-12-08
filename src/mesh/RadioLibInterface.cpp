@@ -81,8 +81,27 @@ static int8_t snrToDelta(float snr)
 }
 
 #include "power.h" // for PowerStatus
+#include <cstdint>
 
-int8_t RadioLibInterface::selectTxPowerForPacket(const meshtastic_MeshPacket *txp)
+uint8_t RadioLibInterface::bumpAttempts(const meshtastic_MeshPacket *txp)
+{
+    if (!txp)
+        return 0;
+    for (auto &e : attemptTable) {
+        if (e.from == txp->from && e.id == txp->id) {
+            if (e.attempts < 255)
+                e.attempts++;
+            return e.attempts;
+        }
+    }
+    // Insert into first slot (lightweight LRU not needed for small table)
+    attemptTable[0].from = txp->from;
+    attemptTable[0].id = txp->id;
+    attemptTable[0].attempts = 0;
+    return 0;
+}
+
+int8_t RadioLibInterface::selectTxPowerForPacket(const meshtastic_MeshPacket *txp, uint8_t attempts)
 {
     // Start from configured/region-limited power
     int8_t configured = config.lora.tx_power ? config.lora.tx_power : power;
@@ -108,6 +127,12 @@ int8_t RadioLibInterface::selectTxPowerForPacket(const meshtastic_MeshPacket *tx
                 target = floorPower;
         }
     }
+
+    // Step-up on retries: +2 dB for 1st retry, +4 dB for 2+ (still capped)
+    if (attempts == 1)
+        target = clampPowerValue(target + 2, -9, maxAllowed);
+    else if (attempts >= 2)
+        target = clampPowerValue(target + 4, -9, maxAllowed);
 
     (void)hasNeighborSnr;
     return target;
@@ -605,7 +630,8 @@ bool RadioLibInterface::startSend(meshtastic_MeshPacket *txp)
         packetPool.release(txp);
         return false;
     } else {
-        int8_t perPacketPower = selectTxPowerForPacket(txp);
+        uint8_t attempts = bumpAttempts(txp);
+        int8_t perPacketPower = selectTxPowerForPacket(txp, attempts);
         if (perPacketPower != power) {
             applyOutputPower(perPacketPower);
         }
