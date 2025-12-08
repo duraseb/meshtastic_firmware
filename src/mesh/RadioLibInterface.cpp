@@ -323,6 +323,19 @@ bool RadioLibInterface::receiveDetected(uint16_t irq, ulong syncWordHeaderValidF
 ErrorCode RadioLibInterface::send(meshtastic_MeshPacket *p)
 {
 
+    // In airplane mode: queue only user-generated messages, drop the rest.
+    if (airplaneMode) {
+        if (isUserGeneratedPacket(p)) {
+            enqueueAirplanePacket(p);
+            LOG_INFO("Queued TX while airplane mode active (size %u)", (unsigned)airplaneQueue.size());
+            return ERRNO_OK;
+        } else {
+            LOG_WARN("Drop non-user packet because airplane mode is active");
+            packetPool.release(p);
+            return ERRNO_DISABLED;
+        }
+    }
+
 #ifndef DISABLE_WELCOME_UNSET
 
     if (config.lora.region != meshtastic_Config_LoRaConfig_RegionCode_UNSET) {
