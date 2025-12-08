@@ -96,9 +96,9 @@ meshtastic_Telemetry DeviceTelemetryModule::getDeviceTelemetry()
     t.variant.device_metrics.has_uptime_seconds = true;
 
     t.variant.device_metrics.air_util_tx = airTime->utilizationTXPercent();
-    t.variant.device_metrics.battery_level = (!powerStatus->getHasBattery() || powerStatus->getIsCharging())
-                                                 ? MAGIC_USB_BATTERY_LEVEL
-                                                 : powerStatus->getBatteryChargePercent();
+    // Report real SoC; avoid MAGIC_USB sentinel so other nodes/apps see correct % even while charging/USB
+    t.variant.device_metrics.battery_level =
+        powerStatus->getHasBattery() ? powerStatus->getBatteryChargePercent() : MAGIC_USB_BATTERY_LEVEL;
     t.variant.device_metrics.channel_utilization = airTime->channelUtilizationPercent();
     t.variant.device_metrics.voltage = powerStatus->getBatteryVoltageMv() / 1000.0;
     t.variant.device_metrics.uptime_seconds = getUptimeSeconds();

@@ -382,6 +382,11 @@ void PowerFSM_setup()
                                       Default::getConfiguredOrDefaultMs(config.power.min_wake_secs, default_min_wake_secs), NULL,
                                       "Min wake timeout");
 
+#if defined(T_WATCH_S3)
+        // For watch: after an extended LS period, fall to super-deep-sleep to cut idle current
+        powerFSM.add_timed_transition(&stateLS, &stateSDS, 10 * 60 * 1000, NULL, "Extended idle deep sleep");
+#endif
+
         // If ESP32 and using power-saving, timer mover from DARK to light-sleep
         // Also serves purpose of the old DARK to DARK transition(?) See https://github.com/meshtastic/firmware/issues/3517
         powerFSM.add_timed_transition(
