@@ -970,6 +970,15 @@ int32_t Power::runOnce()
 #endif
 #endif
 
+    // Graceful shutdown when SoC critically low
+    if (!powerStatus->getHasUSB()) {
+        int socCritical = powerStatus->getBatteryChargePercent();
+        if (socCritical >= 0 && socCritical <= 1) {
+            LOG_WARN("Battery critically low (%d%%), scheduling shutdown", socCritical);
+            shutdownAtMsec = millis();
+        }
+    }
+
 #ifdef HAS_PMU
     // WE no longer use the IRQ line to wake the CPU (due to false wakes from sleep), but we do poll
     // the IRQ status by reading the registers over I2C
