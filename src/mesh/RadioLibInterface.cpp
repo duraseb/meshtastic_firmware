@@ -218,11 +218,23 @@ void RadioLibInterface::enqueueAirplanePacket(meshtastic_MeshPacket *txp)
 
 void RadioLibInterface::flushAirplaneQueue()
 {
+    bool scheduled = false;
     while (!airplaneQueue.empty()) {
         auto *p = airplaneQueue.front();
         airplaneQueue.pop_front();
-        LOG_INFO("Sending queued packet after airplane mode disabled (remaining %u)", (unsigned)airplaneQueue.size());
-        startSend(p);
+        bool dropped = false;
+        if (txQueue.enqueue(p, &dropped)) {
+            scheduled = true;
+            LOG_INFO("Requeued TX from airplane mode (remaining %u, txFree %u)", (unsigned)airplaneQueue.size(),
+                     (unsigned)txQueue.getFree());
+        } else {
+            LOG_WARN("Dropping queued TX from airplane mode (remaining %u, txFree %u)", (unsigned)airplaneQueue.size(),
+                     (unsigned)txQueue.getFree());
+            packetPool.release(p);
+        }
+    }
+    if (scheduled) {
+        startTransmitTimer(false); // send as soon as possible
     }
 }
 
