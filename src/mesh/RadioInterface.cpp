@@ -597,6 +597,11 @@ void RadioInterface::applyModemConfig()
     saveChannelNum(channel_num);
     saveFreq(freq + loraConfig.frequency_offset);
 
+    // Increase preamble for longer duty-cycled RX on low-power watch
+#ifdef T_WATCH_S3
+    preambleLength = 32;
+#endif
+
     slotTimeMsec = computeSlotTimeMsec();
     preambleTimeMsec = preambleLength * (pow_of_2(sf) / bw);
 

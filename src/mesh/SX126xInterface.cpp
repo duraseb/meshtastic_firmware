@@ -298,8 +298,12 @@ template <typename T> void SX126xInterface<T>::startReceive()
     setTransmitEnable(false);
     setStandby();
 
-    // We use a 16 bit preamble so this should save some power by letting radio sit in standby mostly.
-    int err = lora.startReceiveDutyCycleAuto(preambleLength, 8, MESHTASTIC_RADIOLIB_IRQ_RX_FLAGS);
+    uint8_t sleepSymbols = 8;
+#ifdef T_WATCH_S3
+    // More aggressive duty-cycle: longer sleep to cut idle RX current
+    sleepSymbols = 16;
+#endif
+    int err = lora.startReceiveDutyCycleAuto(preambleLength, sleepSymbols, MESHTASTIC_RADIOLIB_IRQ_RX_FLAGS);
     if (err != RADIOLIB_ERR_NONE)
         LOG_ERROR("SX126X startReceiveDutyCycleAuto %s%d", radioLibErr, err);
     assert(err == RADIOLIB_ERR_NONE);
