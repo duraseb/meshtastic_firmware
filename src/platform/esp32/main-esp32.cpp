@@ -7,6 +7,7 @@
 #if !defined(CONFIG_IDF_TARGET_ESP32S2) && !MESHTASTIC_EXCLUDE_BLUETOOTH
 #include "BleOta.h"
 #include "nimble/NimbleBluetooth.h"
+#include <NimBLEDevice.h>
 #endif
 
 #include <WiFiOTA.h>
@@ -40,13 +41,20 @@ void setBluetoothEnable(bool enable)
         if (!nimbleBluetooth) {
             nimbleBluetooth = new NimbleBluetooth();
         }
-        if (enable && !nimbleBluetooth->isActive()) {
-            powerMon->setState(meshtastic_PowerMon_State_BT_On);
-            nimbleBluetooth->setup();
+        if (enable) {
+            if (nimbleBluetooth->isDeInit) {
+                nimbleBluetooth->isDeInit = false;
+            }
+            if (!nimbleBluetooth->isActive()) {
+                powerMon->setState(meshtastic_PowerMon_State_BT_On);
+                nimbleBluetooth->setup();
+            }
+        } else {
+            if (nimbleBluetooth->isActive()) {
+                NimBLEDevice::stopAdvertising();
+                nimbleBluetooth->deinit();
+            }
         }
-        // For ESP32, no way to recover from bluetooth shutdown without reboot
-        // BLE advertising automatically stops when MCU enters light-sleep(?)
-        // For deep-sleep, shutdown hardware with nimbleBluetooth->deinit(). Requires reboot to reverse
     }
 }
 #else

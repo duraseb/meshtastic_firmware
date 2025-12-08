@@ -132,6 +132,7 @@ int8_t RadioLibInterface::selectTxPowerForPacket(const meshtastic_MeshPacket *tx
     // Default to configured power for broadcast/unknown
     int8_t target = maxAllowed;
     if (txp) {
+        bool appliedSnr = false;
         // Unicast: bias to direct neighbor SNR if we have it
         if (txp->to && txp->to != NODENUM_BROADCAST && txp->to != NODENUM_BROADCAST_NO_LORA) {
             const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(txp->to);
@@ -140,9 +141,12 @@ int8_t RadioLibInterface::selectTxPowerForPacket(const meshtastic_MeshPacket *tx
                 int8_t floorPower = maxAllowed - 4;
                 if (target < floorPower)
                     target = floorPower;
+                appliedSnr = true;
             }
-        } else {
-            // Broadcast: bias to strongest directly heard neighbor so they can retransmit
+        }
+
+        // Broadcast or unicast without SNR: use strongest heard neighbor as fallback
+        if (!appliedSnr) {
             float bestSnr = 0.0f;
             size_t total = nodeDB->getNumMeshNodes();
             for (size_t i = 0; i < total; i++) {

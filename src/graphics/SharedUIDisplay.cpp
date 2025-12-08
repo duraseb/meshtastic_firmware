@@ -8,6 +8,7 @@
 #include "graphics/draw/UIRenderer.h"
 #include "main.h"
 #include "meshtastic/config.pb.h"
+#include "mesh/RadioLibInterface.h"
 #include "power.h"
 #include <OLEDDisplay.h>
 #include <graphics/images.h>
@@ -231,10 +232,25 @@ void drawCommonHeader(OLEDDisplay *display, int16_t x, int16_t y, const char *ti
         } else {
             timeStrWidth = display->getStringWidth(timeStr);
         }
-        timeX = screenW - xOffset - timeStrWidth + 3;
 
-        // === Show Mail or Mute Icon to the Left of Time ===
+        // Reserve space for airplane indicator to the left of time when active
+        int apW = 0;
+        if (RadioLibInterface::isAirplaneMode())
+            apW = display->getStringWidth("AP") + 4;
+
+        timeX = screenW - xOffset - timeStrWidth - apW + 3;
+
+        // === Show Mail/Mute/AP Icons to the Left of Time ===
         int iconRightEdge = timeX - 2;
+
+        // Airplane indicator sits immediately left of time (or date)
+        if (RadioLibInterface::isAirplaneMode()) {
+            const char *apStr = "AP";
+            int apW = display->getStringWidth(apStr);
+            int apX = iconRightEdge - apW;
+            display->drawString(apX, textY, apStr);
+            iconRightEdge = apX - 3;
+        }
 
         bool showMail = false;
 
