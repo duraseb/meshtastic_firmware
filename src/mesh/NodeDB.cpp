@@ -731,7 +731,7 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
     config.display.wake_on_tap_or_motion = true;
 #endif
 #if defined(T_WATCH_S3) || defined(SENSECAP_INDICATOR)
-    config.display.screen_on_secs = 30;
+    config.display.screen_on_secs = 10;
     config.display.wake_on_tap_or_motion = true;
 #endif
 #ifdef COMPASS_ORIENTATION
@@ -775,6 +775,13 @@ void NodeDB::initConfigIntervals()
     config.power.is_power_saving = true;
     config.display.screen_on_secs = 30;
     config.power.wait_bluetooth_secs = 30;
+#endif
+
+#if defined(T_WATCH_S3)
+    // Favour longer low-power windows and short wake pulses for the watch
+    config.power.ls_secs = 15 * 60;      // stay in light sleep up to 15 minutes
+    config.power.min_wake_secs = 5;      // resume work briefly before sleeping again
+    config.power.wait_bluetooth_secs = 30; // drop BLE quickly when idle
 #endif
 }
 

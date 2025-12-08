@@ -195,6 +195,11 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
 
     bool receiveDetected(uint16_t irq, ulong syncWordHeaderValidFlag, ulong preambleDetectedFlag);
 
+    int8_t selectTxPowerForPacket(const meshtastic_MeshPacket *txp);
+
+    /** Apply a per-packet TX power override (default: update member only) */
+    virtual void applyOutputPower(int8_t newPower);
+
     /** Do any hardware setup needed on entry into send configuration for the radio.
      * Subclasses can customize, but must also call this base method */
     virtual void configHardwareForSend();

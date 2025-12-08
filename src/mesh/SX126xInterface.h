@@ -65,6 +65,8 @@ template <class T> class SX126xInterface : public RadioLibInterface
      */
     virtual void configHardwareForSend() override;
 
+    virtual void applyOutputPower(int8_t newPower) override;
+
     /**
      * Add SNR data to received messages
      */

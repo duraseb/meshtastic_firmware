@@ -16,6 +16,7 @@
 #endif
 
 #include "esp_mac.h"
+#include "esp_pm.h"
 #include "meshUtils.h"
 #include "sleep.h"
 #include "soc/rtc.h"
@@ -181,6 +182,19 @@ void esp32Setup()
 #endif
     res = esp_task_wdt_add(NULL);
     assert(res == ESP_OK);
+
+#if defined(CONFIG_PM_ENABLE) && defined(T_WATCH_S3)
+    // Keep the CPU at a lower ceiling on battery while allowing light sleep
+    esp_pm_config_t pm_config = {
+        .max_freq_mhz = 80,
+        .min_freq_mhz = 10,
+        .light_sleep_enable = true,
+    };
+    auto pm_res = esp_pm_configure(&pm_config);
+    if (pm_res != ESP_OK) {
+        LOG_WARN("Power management configuration failed: %d", pm_res);
+    }
+#endif
 
 #if HAS_32768HZ
     enableSlowCLK();

@@ -8,6 +8,7 @@
 #include "error.h"
 #include "main.h"
 #include "mesh-pb-constants.h"
+#include <algorithm>
 #include <pb_decode.h>
 #include <pb_encode.h>
 
@@ -52,6 +53,60 @@ RadioLibInterface::RadioLibInterface(LockingArduinoHal *hal, RADIOLIB_PIN_TYPE c
 #else
 #define YIELD_FROM_ISR(x) portYIELD_FROM_ISR(x)
 #endif
+
+static int8_t clampPowerValue(int8_t value, int8_t minValue, int8_t maxValue)
+{
+    if (value < minValue)
+        return minValue;
+    if (value > maxValue)
+        return maxValue;
+    return value;
+}
+
+static int8_t snrToDelta(float snr)
+{
+    if (snr >= 15.0f)
+        return -8;
+    if (snr >= 10.0f)
+        return -6;
+    if (snr >= 6.0f)
+        return -4;
+    if (snr >= 3.0f)
+        return -2;
+    if (snr <= -7.0f)
+        return 4;
+    if (snr <= -3.0f)
+        return 2;
+    return 0;
+}
+
+int8_t RadioLibInterface::selectTxPowerForPacket(const meshtastic_MeshPacket *txp)
+{
+    // Start from configured/region-limited power
+    int8_t configured = config.lora.tx_power ? config.lora.tx_power : power;
+    int8_t regionCap = myRegion->powerLimit ? myRegion->powerLimit : configured;
+    if (configured == 0)
+        configured = regionCap ? regionCap : power;
+
+    int8_t maxAllowed = configured;
+    if (!devicestate.owner.is_licensed && regionCap > 0)
+        maxAllowed = std::min<int8_t>(configured, regionCap);
+
+    // Default to configured power for broadcast/unknown
+    int8_t target = maxAllowed;
+    if (txp && txp->to && txp->to != NODENUM_BROADCAST && txp->to != NODENUM_BROADCAST_NO_LORA) {
+        const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(txp->to);
+        if (node && node->snr != 0.0f) {
+            target = clampPowerValue(maxAllowed + snrToDelta(node->snr), -9, maxAllowed);
+        }
+    }
+    return target;
+}
+
+void RadioLibInterface::applyOutputPower(int8_t newPower)
+{
+    power = newPower;
+}
 
 void INTERRUPT_ATTR RadioLibInterface::isrLevel0Common(PendingISR cause)
 {
@@ -540,6 +595,10 @@ bool RadioLibInterface::startSend(meshtastic_MeshPacket *txp)
         packetPool.release(txp);
         return false;
     } else {
+        int8_t perPacketPower = selectTxPowerForPacket(txp);
+        if (perPacketPower != power) {
+            applyOutputPower(perPacketPower);
+        }
         configHardwareForSend(); // must be after setStandby
 
         size_t numbytes = beginSending(txp);

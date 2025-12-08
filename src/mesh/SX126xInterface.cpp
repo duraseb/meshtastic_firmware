@@ -277,6 +277,15 @@ template <typename T> void SX126xInterface<T>::configHardwareForSend()
     RadioLibInterface::configHardwareForSend();
 }
 
+template <typename T> void SX126xInterface<T>::applyOutputPower(int8_t newPower)
+{
+    power = newPower;
+    limitPower(SX126X_MAX_POWER);
+    int err = lora.setOutputPower(power);
+    if (err != RADIOLIB_ERR_NONE)
+        LOG_ERROR("SX126X setOutputPower %s%d", radioLibErr, err);
+}
+
 // For power draw measurements, helpful to force radio to stay sleeping
 // #define SLEEP_ONLY
 
