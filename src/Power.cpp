@@ -822,13 +822,16 @@ void Power::readPowerStatus()
         isChargingNow = batteryLevel->isCharging() ? OptTrue : OptFalse;
         if (hasBattery) {
             batteryVoltageMv = batteryLevel->getBattVoltage();
-            // If the AXP192 returns a valid battery percentage, use it
-            if (batteryLevel->getBatteryPercent() >= 0) {
-                batteryChargePercent = batteryLevel->getBatteryPercent();
-            } else {
-                // If the AXP192 returns a percentage less than 0, the feature is either not supported or there is an error
-                // In that case, we compute an estimate of the charge percent based on open circuit voltage table defined
-                // in power.h
+            int pmuPct = batteryLevel->getBatteryPercent();
+            // Some AXP2101 boards return 0 or -1 when SoC is unknown; treat <=0 as unknown and estimate
+#ifdef T_WATCH_S3
+            hasBattery = OptTrue; // the watch always has a cell connected
+            if (usbPowered == OptUnknown && batteryVoltageMv > 0)
+                usbPowered = batteryLevel->isVbusIn() ? OptTrue : OptFalse;
+#endif
+            if (pmuPct > 0) {
+                batteryChargePercent = pmuPct;
+            } else if (batteryVoltageMv > 0) {
                 batteryChargePercent = clamp((int)(((batteryVoltageMv - (OCV[NUM_OCV_POINTS - 1] * NUM_CELLS)) * 1e2) /
                                                    ((OCV[0] * NUM_CELLS) - (OCV[NUM_OCV_POINTS - 1] * NUM_CELLS))),
                                              0, 100);
