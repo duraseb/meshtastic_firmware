@@ -382,7 +382,7 @@ void PowerFSM_setup()
                                       Default::getConfiguredOrDefaultMs(config.power.min_wake_secs, default_min_wake_secs), NULL,
                                       "Min wake timeout");
 
-#if defined(T_WATCH_S3)
+#if defined(T_WATCH_S3_POWER_OPT)
         // For watch: after an extended LS period, fall to super-deep-sleep to cut idle current
         powerFSM.add_timed_transition(&stateLS, &stateSDS, 10 * 60 * 1000, NULL, "Extended idle deep sleep");
 #endif

@@ -183,7 +183,7 @@ void esp32Setup()
     res = esp_task_wdt_add(NULL);
     assert(res == ESP_OK);
 
-#if defined(CONFIG_PM_ENABLE) && defined(T_WATCH_S3)
+#if defined(CONFIG_PM_ENABLE) && defined(T_WATCH_S3_POWER_OPT)
     // Keep the CPU at a lower ceiling on battery while allowing light sleep
     esp_pm_config_t pm_config = {
         .max_freq_mhz = 80,

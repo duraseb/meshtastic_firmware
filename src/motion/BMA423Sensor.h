@@ -21,6 +21,9 @@ class BMA423Sensor : public MotionSensor
     virtual int32_t runOnce() override;
 };
 
+// Last time (millis) motion/tilt/tap was seen
+extern volatile uint32_t lastMotionMillis;
+
 #endif
 
 #endif

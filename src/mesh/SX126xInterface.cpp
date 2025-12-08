@@ -299,7 +299,7 @@ template <typename T> void SX126xInterface<T>::startReceive()
     setStandby();
 
     uint8_t sleepSymbols = 8;
-#ifdef T_WATCH_S3
+#ifdef T_WATCH_S3_POWER_OPT
     // More aggressive duty-cycle: longer sleep to cut idle RX current
     sleepSymbols = 16;
 #endif

@@ -96,9 +96,16 @@ meshtastic_Telemetry DeviceTelemetryModule::getDeviceTelemetry()
     t.variant.device_metrics.has_uptime_seconds = true;
 
     t.variant.device_metrics.air_util_tx = airTime->utilizationTXPercent();
-    // Report real SoC; avoid MAGIC_USB sentinel so other nodes/apps see correct % even while charging/USB
+#if defined(T_WATCH_S3_POWER_OPT)
+    // For T-Watch power optimizations, report real SoC even when charging/USB
     t.variant.device_metrics.battery_level =
         powerStatus->getHasBattery() ? powerStatus->getBatteryChargePercent() : MAGIC_USB_BATTERY_LEVEL;
+#else
+    // Default behavior: show MAGIC_USB when charging/USB present
+    t.variant.device_metrics.battery_level = (!powerStatus->getHasBattery() || powerStatus->getIsCharging())
+                                                 ? MAGIC_USB_BATTERY_LEVEL
+                                                 : powerStatus->getBatteryChargePercent();
+#endif
     t.variant.device_metrics.channel_utilization = airTime->channelUtilizationPercent();
     t.variant.device_metrics.voltage = powerStatus->getBatteryVoltageMv() / 1000.0;
     t.variant.device_metrics.uptime_seconds = getUptimeSeconds();

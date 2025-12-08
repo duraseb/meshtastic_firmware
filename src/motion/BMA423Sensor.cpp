@@ -4,11 +4,14 @@
 
 using namespace MotionSensorI2C;
 
+volatile uint32_t lastMotionMillis = 0;
+
 BMA423Sensor::BMA423Sensor(ScanI2C::FoundDevice foundDevice) : MotionSensor::MotionSensor(foundDevice) {}
 
 bool BMA423Sensor::init()
 {
     if (sensor.begin(deviceAddress(), &MotionSensorI2C::readRegister, &MotionSensorI2C::writeRegister)) {
+        lastMotionMillis = millis();
         sensor.configAccelerometer(sensor.RANGE_2G, sensor.ODR_100HZ, sensor.BW_NORMAL_AVG4, sensor.PERF_CONTINUOUS_MODE);
         sensor.enableAccelerometer();
         sensor.configInterrupt(BMA4_LEVEL_TRIGGER, BMA4_ACTIVE_HIGH, BMA4_PUSH_PULL, BMA4_OUTPUT_ENABLE, BMA4_INPUT_DISABLE);
@@ -52,6 +55,7 @@ int32_t BMA423Sensor::runOnce()
 {
     if (sensor.readIrqStatus() != DEV_WIRE_NONE) {
         if (sensor.isTilt() || sensor.isDoubleTap()) {
+            lastMotionMillis = millis();
             wakeScreen();
             return 500;
         }

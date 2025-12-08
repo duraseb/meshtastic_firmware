@@ -19,6 +19,9 @@
 #include "main.h"
 #include "meshUtils.h"
 #include "sleep.h"
+#if defined(T_WATCH_S3_POWER_OPT) && defined(HAS_BMA423)
+#include "motion/BMA423Sensor.h"
+#endif
 
 #if defined(ARCH_PORTDUINO)
 #include "api/WiFiServerAPI.h"
@@ -940,7 +943,7 @@ int32_t Power::runOnce()
 {
     readPowerStatus();
 
-#ifdef T_WATCH_S3
+#ifdef T_WATCH_S3_POWER_OPT
     // Adaptive light-sleep length and wake cadence based on state of charge while on battery
     const int soc = powerStatus->getBatteryChargePercent();
     if (!powerStatus->getHasUSB() && soc > 0) {
@@ -954,6 +957,17 @@ int32_t Power::runOnce()
         config.power.min_wake_secs = 5;
         config.power.wait_bluetooth_secs = 30;
     }
+#if defined(HAS_BMA423)
+    // Motion-aware duty cycling: if inactive for >15 min, stretch light-sleep
+    static uint32_t lastMotionSeen = 0;
+    if (lastMotionMillis)
+        lastMotionSeen = lastMotionMillis;
+    uint32_t now = millis();
+    bool inactive = lastMotionSeen && (now - lastMotionSeen > 15 * 60 * 1000UL);
+    if (inactive) {
+        config.power.ls_secs = max<uint32_t>(config.power.ls_secs, 45 * 60);
+    }
+#endif
 #endif
 
 #ifdef HAS_PMU
