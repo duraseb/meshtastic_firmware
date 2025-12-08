@@ -103,28 +103,43 @@ uint8_t RadioLibInterface::bumpAttempts(const meshtastic_MeshPacket *txp)
 
 int8_t RadioLibInterface::selectTxPowerForPacket(const meshtastic_MeshPacket *txp, uint8_t attempts)
 {
-    // Start from configured/region-limited power
-    int8_t configured = config.lora.tx_power ? config.lora.tx_power : power;
-    int8_t regionCap = myRegion->powerLimit ? myRegion->powerLimit : configured;
-    if (configured == 0)
-        configured = regionCap ? regionCap : power;
+    // Use configured TX power as ceiling; if unset, fall back to region cap
+    int8_t regionCap = myRegion->powerLimit;
+    int8_t maxAllowed = config.lora.tx_power ? config.lora.tx_power : (regionCap ? regionCap : power);
 
-    int8_t maxAllowed = configured;
+    // Always honor regional cap when not licensed
     if (!devicestate.owner.is_licensed && regionCap > 0)
-        maxAllowed = std::min<int8_t>(configured, regionCap);
+        maxAllowed = std::min<int8_t>(maxAllowed, regionCap);
 
     // Default to configured power for broadcast/unknown
     int8_t target = maxAllowed;
-    bool hasNeighborSnr = false;
-    if (txp && txp->to && txp->to != NODENUM_BROADCAST && txp->to != NODENUM_BROADCAST_NO_LORA) {
-        const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(txp->to);
-        if (node && node->snr != 0.0f) {
-            hasNeighborSnr = true;
-            target = clampPowerValue(maxAllowed + snrToDelta(node->snr), -9, maxAllowed);
-            // Keep some margin: never drop more than 4 dB from maxAllowed
-            int8_t floorPower = maxAllowed - 4;
-            if (target < floorPower)
-                target = floorPower;
+    if (txp) {
+        // Unicast: bias to direct neighbor SNR if we have it
+        if (txp->to && txp->to != NODENUM_BROADCAST && txp->to != NODENUM_BROADCAST_NO_LORA) {
+            const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(txp->to);
+            if (node && node->snr != 0.0f) {
+                target = clampPowerValue(maxAllowed + snrToDelta(node->snr), -9, maxAllowed);
+                int8_t floorPower = maxAllowed - 4;
+                if (target < floorPower)
+                    target = floorPower;
+            }
+        } else {
+            // Broadcast: bias to strongest directly heard neighbor so they can retransmit
+            float bestSnr = 0.0f;
+            size_t total = nodeDB->getNumMeshNodes();
+            for (size_t i = 0; i < total; i++) {
+                const meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
+                if (!n || n->num == nodeDB->getNodeNum())
+                    continue;
+                if (n->snr != 0.0f && n->snr > bestSnr)
+                    bestSnr = n->snr;
+            }
+            if (bestSnr != 0.0f) {
+                target = clampPowerValue(maxAllowed + snrToDelta(bestSnr), -9, maxAllowed);
+                int8_t floorPower = maxAllowed - 4;
+                if (target < floorPower)
+                    target = floorPower;
+            }
         }
     }
 
@@ -134,13 +149,20 @@ int8_t RadioLibInterface::selectTxPowerForPacket(const meshtastic_MeshPacket *tx
     else if (attempts >= 2)
         target = clampPowerValue(target + 4, -9, maxAllowed);
 
-    (void)hasNeighborSnr;
     return target;
 }
 
 void RadioLibInterface::applyOutputPower(int8_t newPower)
 {
     power = newPower;
+    lastTxPowerApplied = newPower;
+}
+
+int8_t RadioLibInterface::getLastTxPowerApplied()
+{
+    if (instance && instance->lastTxPowerApplied != 0)
+        return instance->lastTxPowerApplied;
+    return 0;
 }
 
 void INTERRUPT_ATTR RadioLibInterface::isrLevel0Common(PendingISR cause)

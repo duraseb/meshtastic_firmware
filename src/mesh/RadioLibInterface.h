@@ -102,6 +102,8 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
      */
     static RadioLibInterface *instance;
 
+    static int8_t getLastTxPowerApplied();
+
     /**
      * Glue functions called from ISR land
      */
@@ -198,6 +200,7 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     };
     static constexpr size_t MAX_ATTEMPT_TRACK = 12;
     AttemptEntry attemptTable[MAX_ATTEMPT_TRACK];
+    int8_t lastTxPowerApplied = 0;
 
     uint8_t bumpAttempts(const meshtastic_MeshPacket *txp);
 

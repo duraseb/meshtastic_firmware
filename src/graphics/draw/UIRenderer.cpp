@@ -14,6 +14,8 @@
 #include "graphics/TimeFormatters.h"
 #include "graphics/images.h"
 #include "main.h"
+#include "mesh/MeshRadio.h"
+#include "mesh/RadioLibInterface.h"
 #include "target_specific.h"
 #include <OLEDDisplay.h>
 #include <RTC.h>
@@ -638,6 +640,20 @@ void UIRenderer::drawDeviceFocused(OLEDDisplay *display, OLEDDisplayUiState *sta
     } else {
         display->drawString(x + SCREEN_WIDTH - display->getStringWidth("USB"), getTextPositions(display)[line++], "USB");
     }
+#if defined(T_WATCH_S3_POWER_OPT)
+    {
+        char txStr[16];
+        int8_t txp = RadioLibInterface::getLastTxPowerApplied();
+        if (txp == 0)
+            txp = config.lora.tx_power;
+        if (txp == 0 && myRegion && myRegion->powerLimit)
+            txp = myRegion->powerLimit;
+        if (txp == 0)
+            txp = 17;
+        snprintf(txStr, sizeof(txStr), "TX %ddBm", txp);
+        display->drawString(x + SCREEN_WIDTH - display->getStringWidth(txStr), getTextPositions(display)[line++], txStr);
+    }
+#endif
 
     config.display.heading_bold = origBold;
 
