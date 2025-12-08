@@ -1635,6 +1635,14 @@ int Screen::handleInputEvent(const InputEvent *event)
         return 0;
     }
 
+    if (event->inputEvent == INPUT_BROKER_AIRPLANE_TOGGLE) {
+        bool now = !RadioLibInterface::isAirplaneMode();
+        RadioLibInterface::setAirplaneMode(now);
+        const char *msg = now ? "Airplane mode ON" : "Airplane mode OFF";
+        showSimpleBanner(msg, 2000);
+        return 0;
+    }
+
     // Use left or right input from a keyboard to move between frames,
     // so long as a mesh module isn't using these events for some other purpose
     if (showingNormalScreen) {

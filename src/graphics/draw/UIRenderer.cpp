@@ -636,9 +636,22 @@ void UIRenderer::drawDeviceFocused(OLEDDisplay *display, OLEDDisplayUiState *sta
         int batV = powerStatus->getBatteryVoltageMv() / 1000;
         int batCv = (powerStatus->getBatteryVoltageMv() % 1000) / 10;
         snprintf(batStr, sizeof(batStr), "%01d.%02dV", batV, batCv);
-        display->drawString(x + SCREEN_WIDTH - display->getStringWidth(batStr), getTextPositions(display)[line++], batStr);
+        int batX = x + SCREEN_WIDTH - display->getStringWidth(batStr);
+        if (RadioLibInterface::isAirplaneMode()) {
+            const char *apStr = "AP";
+            int apW = display->getStringWidth(apStr);
+            display->drawString(batX - apW - 6, getTextPositions(display)[line], apStr);
+        }
+        display->drawString(batX, getTextPositions(display)[line++], batStr);
     } else {
-        display->drawString(x + SCREEN_WIDTH - display->getStringWidth("USB"), getTextPositions(display)[line++], "USB");
+        const char *usbStr = "USB";
+        int usbX = x + SCREEN_WIDTH - display->getStringWidth(usbStr);
+        if (RadioLibInterface::isAirplaneMode()) {
+            const char *apStr = "AP";
+            int apW = display->getStringWidth(apStr);
+            display->drawString(usbX - apW - 6, getTextPositions(display)[line], apStr);
+        }
+        display->drawString(usbX, getTextPositions(display)[line++], usbStr);
     }
 #if defined(T_WATCH_S3_POWER_OPT)
     {

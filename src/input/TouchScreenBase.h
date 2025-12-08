@@ -28,7 +28,8 @@ class TouchScreenBase : public Observable<const InputEvent *>, public concurrenc
         TOUCH_ACTION_LEFT,
         TOUCH_ACTION_RIGHT,
         TOUCH_ACTION_TAP,
-        TOUCH_ACTION_LONG_PRESS
+        TOUCH_ACTION_LONG_PRESS,
+        TOUCH_ACTION_SUPER_LONG_PRESS
     };
 
     virtual int32_t runOnce() override;
@@ -50,6 +51,7 @@ class TouchScreenBase : public Observable<const InputEvent *>, public concurrenc
     int16_t _first_y, _last_y; // vertical swipe direction
     time_t _start;             // for LONG_PRESS
     bool _tapped;              // for DOUBLE_TAP
+    bool _longFired = false;
 
     const char *_originName;
 };

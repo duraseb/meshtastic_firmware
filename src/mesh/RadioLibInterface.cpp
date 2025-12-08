@@ -8,9 +8,24 @@
 #include "error.h"
 #include "main.h"
 #include "mesh-pb-constants.h"
+#include "power.h"
+#include <deque>
 #include <algorithm>
 #include <pb_decode.h>
 #include <pb_encode.h>
+
+#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_BLUETOOTH
+extern void setBluetoothEnable(bool enable);
+#endif
+
+static bool isUserGeneratedPacket(const meshtastic_MeshPacket *txp)
+{
+    if (!txp)
+        return false;
+    if (txp->which_payload_variant != meshtastic_MeshPacket_decoded_tag)
+        return false;
+    return txp->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP;
+}
 
 #if ARCH_PORTDUINO
 #include "PortduinoGlue.h"
@@ -35,6 +50,9 @@ void LockingArduinoHal::spiTransfer(uint8_t *out, size_t len, uint8_t *in)
     spi->transfer(out, in, len);
 }
 #endif
+
+RadioLibInterface *RadioLibInterface::instance;
+bool RadioLibInterface::airplaneMode = false;
 
 RadioLibInterface::RadioLibInterface(LockingArduinoHal *hal, RADIOLIB_PIN_TYPE cs, RADIOLIB_PIN_TYPE irq, RADIOLIB_PIN_TYPE rst,
                                      RADIOLIB_PIN_TYPE busy, PhysicalLayer *_iface)
@@ -165,6 +183,58 @@ int8_t RadioLibInterface::getLastTxPowerApplied()
     return 0;
 }
 
+void RadioLibInterface::setAirplaneMode(bool enabled)
+{
+    airplaneMode = enabled;
+    if (instance) {
+        if (enabled) {
+            instance->disabled = true;
+            instance->setStandby();
+#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_BLUETOOTH
+            instance->airplaneBtWasEnabled = config.bluetooth.enabled;
+            instance->airplaneBtStateValid = true;
+            setBluetoothEnable(false);
+#endif
+        } else {
+            instance->disabled = false;
+            instance->startReceive();
+            instance->flushAirplaneQueue();
+#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_BLUETOOTH
+            if (instance->airplaneBtStateValid)
+                setBluetoothEnable(instance->airplaneBtWasEnabled);
+#endif
+        }
+    }
+    LOG_INFO("Airplane mode %s", enabled ? "ENABLED" : "DISABLED");
+}
+
+bool RadioLibInterface::isAirplaneMode()
+{
+    return airplaneMode;
+}
+
+void RadioLibInterface::enqueueAirplanePacket(meshtastic_MeshPacket *txp)
+{
+    if (airplaneQueue.size() >= AIRPLANE_QUEUE_MAX) {
+        auto *old = airplaneQueue.front();
+        airplaneQueue.pop_front();
+        LOG_WARN("Airplane queue full, dropping oldest pending TX");
+        packetPool.release(old);
+    }
+    airplaneQueue.push_back(txp);
+    LOG_INFO("Queued TX while airplane mode active (queue size %u)", (unsigned)airplaneQueue.size());
+}
+
+void RadioLibInterface::flushAirplaneQueue()
+{
+    while (!airplaneQueue.empty()) {
+        auto *p = airplaneQueue.front();
+        airplaneQueue.pop_front();
+        LOG_INFO("Sending queued packet after airplane mode disabled (remaining %u)", (unsigned)airplaneQueue.size());
+        startSend(p);
+    }
+}
+
 void INTERRUPT_ATTR RadioLibInterface::isrLevel0Common(PendingISR cause)
 {
     instance->disableInterrupt();
@@ -187,10 +257,6 @@ void INTERRUPT_ATTR RadioLibInterface::isrTxLevel0()
 {
     isrLevel0Common(ISR_TX);
 }
-
-/** Our ISR code currently needs this to find our active instance
- */
-RadioLibInterface *RadioLibInterface::instance;
 
 /** Could we send right now (i.e. either not actively receiving or transmitting)? */
 bool RadioLibInterface::canSendImmediately()
@@ -626,6 +692,10 @@ void RadioLibInterface::handleReceiveInterrupt()
 
 void RadioLibInterface::startReceive()
 {
+    if (airplaneMode) {
+        setStandby();
+        return;
+    }
     isReceiving = true;
     powerMon->setState(meshtastic_PowerMon_State_Lora_RXOn);
 }
@@ -645,6 +715,15 @@ void RadioLibInterface::setStandby()
 /** start an immediate transmit */
 bool RadioLibInterface::startSend(meshtastic_MeshPacket *txp)
 {
+    if (airplaneMode) {
+        if (isUserGeneratedPacket(txp)) {
+            enqueueAirplanePacket(txp);
+        } else {
+            LOG_WARN("Drop Tx packet because airplane mode is active (non-user packet)");
+            packetPool.release(txp);
+        }
+        return false;
+    }
     /* NOTE: Minimize the actions before startTransmit() to keep the time between
              channel scan and actual transmit as low as possible to avoid collisions. */
     if (disabled || !config.lora.tx_enabled) {

@@ -74,6 +74,10 @@ void TouchScreenImpl1::onEvent(const TouchEvent &event)
         e.inputEvent = INPUT_BROKER_SELECT;
         break;
     }
+    case TOUCH_ACTION_SUPER_LONG_PRESS: {
+        e.inputEvent = INPUT_BROKER_AIRPLANE_TOGGLE;
+        break;
+    }
     case TOUCH_ACTION_TAP: {
         e.inputEvent = INPUT_BROKER_USER_PRESS;
         break;

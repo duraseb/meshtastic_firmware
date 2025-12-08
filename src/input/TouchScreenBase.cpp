@@ -9,6 +9,10 @@
 #define TIME_LONG_PRESS 400
 #endif
 
+#ifndef TIME_SUPER_LONG_PRESS
+#define TIME_SUPER_LONG_PRESS 5000
+#endif
+
 // move a minimum distance over the screen to detect a "swipe"
 #ifndef TOUCH_THRESHOLD_X
 #define TOUCH_THRESHOLD_X 30
@@ -57,6 +61,7 @@ int32_t TouchScreenBase::runOnce()
             _start = millis();
             _first_x = x;
             _first_y = y;
+            _longFired = false;
         } else {
             _state = TOUCH_EVENT_CLEARED;
             time_t duration = millis() - _start;
@@ -102,6 +107,18 @@ int32_t TouchScreenBase::runOnce()
                     _tapped = false;
                 }
             }
+            // Emit only one press event (long or super-long) on release
+            if (e.touchEvent == static_cast<char>(TOUCH_ACTION_NONE)) {
+                if (duration >= TIME_SUPER_LONG_PRESS) {
+                    _tapped = false;
+                    e.touchEvent = static_cast<char>(TOUCH_ACTION_SUPER_LONG_PRESS);
+                    LOG_DEBUG("action SUPER LONG PRESS(%d/%d)", _last_x, _last_y);
+                } else if (duration >= TIME_LONG_PRESS) {
+                    _tapped = false;
+                    e.touchEvent = static_cast<char>(TOUCH_ACTION_LONG_PRESS);
+                    LOG_DEBUG("action LONG PRESS(%d/%d)", _last_x, _last_y);
+                }
+            }
         }
     }
     _touchedOld = touched;
@@ -131,13 +148,7 @@ int32_t TouchScreenBase::runOnce()
     }
 #endif
 
-    // fire LONG_PRESS event without the need for release
-    if (touched && (time_t(millis()) - _start) > TIME_LONG_PRESS) {
-        // tricky: prevent reoccurring events and another touch event when releasing
-        _start = millis() + 30000;
-        e.touchEvent = static_cast<char>(TOUCH_ACTION_LONG_PRESS);
-        LOG_DEBUG("action LONG PRESS(%d/%d)", _last_x, _last_y);
-    }
+    // Release-based long/super-long handled above; no additional hold-based events.
 
     if (e.touchEvent != TOUCH_ACTION_NONE) {
         e.source = this->_originName;

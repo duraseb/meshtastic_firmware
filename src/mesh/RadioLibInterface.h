@@ -6,6 +6,7 @@
 
 #include <RadioLib.h>
 #include <sys/types.h>
+#include <deque>
 
 // ESP32 has special rules about ISR code
 #ifdef ARDUINO_ARCH_ESP32
@@ -102,6 +103,8 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
      */
     static RadioLibInterface *instance;
 
+    static void setAirplaneMode(bool enabled);
+    static bool isAirplaneMode();
     static int8_t getLastTxPowerApplied();
 
     /**
@@ -201,8 +204,15 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     static constexpr size_t MAX_ATTEMPT_TRACK = 12;
     AttemptEntry attemptTable[MAX_ATTEMPT_TRACK];
     int8_t lastTxPowerApplied = 0;
+    static bool airplaneMode;
+    static constexpr size_t AIRPLANE_QUEUE_MAX = 8;
+    std::deque<meshtastic_MeshPacket *> airplaneQueue;
+    bool airplaneBtWasEnabled = false;
+    bool airplaneBtStateValid = false;
 
     uint8_t bumpAttempts(const meshtastic_MeshPacket *txp);
+    void enqueueAirplanePacket(meshtastic_MeshPacket *txp);
+    void flushAirplaneQueue();
 
     uint32_t activeReceiveStart = 0;
 
