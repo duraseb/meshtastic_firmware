@@ -9,6 +9,7 @@
 #include "MeshRadio.h"
 #include "MeshService.h"
 #include "NodeDB.h"
+#include "PowerStatus.h"
 #include "PowerMon.h"
 #include "detect/LoRaRadioType.h"
 #include "error.h"
@@ -177,6 +178,9 @@ void initDeepSleep()
 
 bool doPreflightSleep()
 {
+    // Stay awake while charging to keep UI/USB responsive
+    if (powerStatus && powerStatus->getIsCharging())
+        return false;
     if (preflightSleep.notifyObservers(NULL) != 0)
         return false; // vetoed
     else
@@ -416,11 +420,20 @@ esp_sleep_wakeup_cause_t doLightSleep(uint64_t sleepMsec) // FIXME, use a more r
     // assert(esp_sleep_enable_uart_wakeup(0) == ESP_OK);
 #endif
 #if defined(T_WATCH_S3_POWER_OPT)
-    // Limit wake sources to touch and radio IRQ for the watch
+    // Limit wake sources to touch and radio IRQ for the watch; allow PMU/USB while charging
+#if defined(PMU_IRQ)
+    bool wantPmuWake = pmu_found && powerStatus && (powerStatus->getHasUSB() || powerStatus->getIsCharging());
+#else
+    bool wantPmuWake = false;
+#endif
 #if defined(WAKE_ON_TOUCH)
     gpio_wakeup_enable((gpio_num_t)SCREEN_TOUCH_INT, GPIO_INTR_LOW_LEVEL);
 #endif
     enableLoraInterrupt();
+#if defined(PMU_IRQ)
+    if (wantPmuWake)
+        gpio_wakeup_enable((gpio_num_t)PMU_IRQ, GPIO_INTR_LOW_LEVEL);
+#endif
 #else
 #ifdef ROTARY_PRESS
     // The enableLoraInterrupt() method is using ext0_wakeup, so we are forced to use GPIO wakeup
@@ -479,6 +492,10 @@ esp_sleep_wakeup_cause_t doLightSleep(uint64_t sleepMsec) // FIXME, use a more r
     if (radioType == RF95_RADIO) {
         gpio_wakeup_disable((gpio_num_t)RF95_IRQ);
     }
+#endif
+#if defined(PMU_IRQ)
+    if (wantPmuWake)
+        gpio_wakeup_disable((gpio_num_t)PMU_IRQ);
 #endif
 #else
 #ifdef ROTARY_PRESS

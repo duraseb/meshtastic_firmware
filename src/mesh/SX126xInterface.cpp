@@ -281,6 +281,8 @@ template <typename T> void SX126xInterface<T>::applyOutputPower(int8_t newPower)
 {
     power = newPower;
     limitPower(SX126X_MAX_POWER);
+    // Track the final applied power for UI/telemetry and hardware
+    RadioLibInterface::applyOutputPower(power);
     int err = lora.setOutputPower(power);
     if (err != RADIOLIB_ERR_NONE)
         LOG_ERROR("SX126X setOutputPower %s%d", radioLibErr, err);

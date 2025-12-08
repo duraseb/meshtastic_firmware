@@ -79,14 +79,19 @@ static int8_t clampPowerValue(int8_t value, int8_t minValue, int8_t maxValue)
 
 static int8_t snrToDelta(float snr)
 {
+    // Push hard on strong links; preserve boosts for weak ones
+    if (snr >= 20.0f)
+        return -12;
     if (snr >= 15.0f)
-        return -6;
-    if (snr >= 10.0f)
-        return -4;
+        return -11;
+    if (snr >= 12.0f)
+        return -10;
+    if (snr >= 9.0f)
+        return -8;
     if (snr >= 6.0f)
-        return -2;
+        return -6;
     if (snr >= 3.0f)
-        return -1;
+        return -3;
     if (snr <= -7.0f)
         return 4;
     if (snr <= -3.0f)
@@ -128,13 +133,17 @@ int8_t RadioLibInterface::selectTxPowerForPacket(const meshtastic_MeshPacket *tx
     // Default to configured power for broadcast/unknown
     int8_t target = maxAllowed;
     if (txp) {
+        auto calcFloor = [maxAllowed]() {
+            // Allow dropping up to 18 dB below configured cap, but never below -9 dBm
+            return std::max<int8_t>(maxAllowed - 18, -9);
+        };
         bool appliedSnr = false;
         // Unicast: bias to direct neighbor SNR if we have it
         if (txp->to && txp->to != NODENUM_BROADCAST && txp->to != NODENUM_BROADCAST_NO_LORA) {
             const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(txp->to);
             if (node && node->snr != 0.0f) {
                 target = clampPowerValue(maxAllowed + snrToDelta(node->snr), -9, maxAllowed);
-                int8_t floorPower = maxAllowed - 4;
+                int8_t floorPower = calcFloor();
                 if (target < floorPower)
                     target = floorPower;
                 appliedSnr = true;
@@ -143,7 +152,7 @@ int8_t RadioLibInterface::selectTxPowerForPacket(const meshtastic_MeshPacket *tx
 
         // Broadcast or unicast without SNR: use strongest heard neighbor as fallback
         if (!appliedSnr) {
-            float bestSnr = 0.0f;
+            float bestSnr = -20.0f;
             size_t total = nodeDB->getNumMeshNodes();
             for (size_t i = 0; i < total; i++) {
                 const meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
@@ -154,7 +163,7 @@ int8_t RadioLibInterface::selectTxPowerForPacket(const meshtastic_MeshPacket *tx
             }
             if (bestSnr != 0.0f) {
                 target = clampPowerValue(maxAllowed + snrToDelta(bestSnr), -9, maxAllowed);
-                int8_t floorPower = maxAllowed - 4;
+                int8_t floorPower = calcFloor();
                 if (target < floorPower)
                     target = floorPower;
             }
@@ -749,9 +758,8 @@ bool RadioLibInterface::startSend(meshtastic_MeshPacket *txp)
     } else {
         uint8_t attempts = bumpAttempts(txp);
         int8_t perPacketPower = selectTxPowerForPacket(txp, attempts);
-        if (perPacketPower != power) {
-            applyOutputPower(perPacketPower);
-        }
+        // Always record the applied power so UI/telemetry can show the real value
+        applyOutputPower(perPacketPower);
         configHardwareForSend(); // must be after setStandby
 
         size_t numbytes = beginSending(txp);
