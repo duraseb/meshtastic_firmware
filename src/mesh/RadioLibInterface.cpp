@@ -66,19 +66,21 @@ static int8_t clampPowerValue(int8_t value, int8_t minValue, int8_t maxValue)
 static int8_t snrToDelta(float snr)
 {
     if (snr >= 15.0f)
-        return -8;
-    if (snr >= 10.0f)
         return -6;
-    if (snr >= 6.0f)
+    if (snr >= 10.0f)
         return -4;
-    if (snr >= 3.0f)
+    if (snr >= 6.0f)
         return -2;
+    if (snr >= 3.0f)
+        return -1;
     if (snr <= -7.0f)
         return 4;
     if (snr <= -3.0f)
         return 2;
     return 0;
 }
+
+#include "power.h" // for PowerStatus
 
 int8_t RadioLibInterface::selectTxPowerForPacket(const meshtastic_MeshPacket *txp)
 {
@@ -94,12 +96,20 @@ int8_t RadioLibInterface::selectTxPowerForPacket(const meshtastic_MeshPacket *tx
 
     // Default to configured power for broadcast/unknown
     int8_t target = maxAllowed;
+    bool hasNeighborSnr = false;
     if (txp && txp->to && txp->to != NODENUM_BROADCAST && txp->to != NODENUM_BROADCAST_NO_LORA) {
         const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(txp->to);
         if (node && node->snr != 0.0f) {
+            hasNeighborSnr = true;
             target = clampPowerValue(maxAllowed + snrToDelta(node->snr), -9, maxAllowed);
+            // Keep some margin: never drop more than 4 dB from maxAllowed
+            int8_t floorPower = maxAllowed - 4;
+            if (target < floorPower)
+                target = floorPower;
         }
     }
+
+    (void)hasNeighborSnr;
     return target;
 }
 

@@ -937,6 +937,22 @@ int32_t Power::runOnce()
 {
     readPowerStatus();
 
+#ifdef T_WATCH_S3
+    // Adaptive light-sleep length and wake cadence based on state of charge while on battery
+    const int soc = powerStatus->getBatteryChargePercent();
+    if (!powerStatus->getHasUSB() && soc > 0) {
+        uint32_t target_ls = 15 * 60; // baseline 15 minutes
+        if (soc < 25)
+            target_ls = 45 * 60;
+        else if (soc < 50)
+            target_ls = 30 * 60;
+
+        config.power.ls_secs = target_ls;
+        config.power.min_wake_secs = 5;
+        config.power.wait_bluetooth_secs = 30;
+    }
+#endif
+
 #ifdef HAS_PMU
     // WE no longer use the IRQ line to wake the CPU (due to false wakes from sleep), but we do poll
     // the IRQ status by reading the registers over I2C
