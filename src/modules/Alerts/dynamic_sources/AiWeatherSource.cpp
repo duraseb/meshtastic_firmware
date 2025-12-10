@@ -141,17 +141,14 @@ String AiWeatherSource::buildWeatherPrompt() const
            "1. Znajdź sławną, bardzo rozpoznawalną w Polsce osobę (żyjącą lub nie), która urodziła się dokładnie dnia " + tomorrowDate + " (dowolnego roku). Najlepsze źródła:  \n" +
            "   - pl.wikipedia.org/wiki/Kategoria:Urodzeni_[dzień]_[miesiąca]  \n" +
            "   - en.wikipedia.org/wiki/[Miesiąc]_[dzień]  \n" +
-           "   Wybierz jedną najbardziej ikoniczną postać dla Polaków.\n" +
-           "2. Pobierz rzeczywistą prognozę pogody dla Poznania (Polska) dokładnie na dzień " + tomorrowDate + ", korzystając wyłącznie z wiarygodnych bezpłatnych źródeł (wybierz najlepsze dostępne w danej chwili):  \n" +
-           "   - weather.com -> wyszukaj \"Poznań\" - \"10 Day\" lub \"Hourly\"\n" +
-           "   - accuweather.com → /pl/pl/poznan/274480/daily-weather-forecast/274480?day=2\n" +
-           "   - meteoblue.com/pl/pogoda/tydzień/poznań_polska_3088171\n" +
-           "   - imgw.pl (Instytut Meteorologii i Gospodarki Wodnej)\n" +
+           "   Wytypuj 1-10 najbardziej znanych postaci dla Polaków, a których sposób wypowiedzi lub sposób bycia jest lub był charakterystyczny i rozpoznawalny.Preferuj pisarzy, poetów, piosenkarzy, polityków, sportowców, naukowców, etc. Z tych wytypowanych osób wybierz jedną losowo.\n" +
+           "2. Pobierz rzeczywistą prognozę pogody dla Poznania (Polska) dokładnie na dzień " + tomorrowDate + ", korzystając wyłącznie z poniższego URL (format JSON):  \n" +
+           "https://api.open-meteo.com/v1/forecast?latitude=52.4069&longitude=16.9299&hourly=temperature_2m,relative_humidity_2m,precipitation_probability,precipitation,surface_pressure,cloud_cover,visibility,wind_speed_10m,wind_direction_10m,soil_temperature_0cm&timezone=Europe%2FBerlin&forecast_days=1&forecast_hours=24&temporal_resolution=hourly_6&format=json&timeformat=unixtime\n\n" +
            "   Podaj prawdziwe wartości: temperatura dzienna/nocna, opady, wiatr, zachmurzenie.\n" +
-           "3. Przetłumacz tę prognozę na charakterystyczny język/manierę mówienia wybranej postaci (używaj jej typowych zwrotów, akcentu gwarowego, stylu piosenek lub cytatów).\n" +
+           "3. Przetłumacz tę prognozę na charakterystyczny język/manierę mówienia wybranej postaci (używaj jej typowych zwrotów, akcentu gwarowego, stylu piosenek lub cytatów). Przedstaw tę wypowiedź jako prognozę pogody na jutro. Jeśli imię lub imiona tej osoby są długie, użyj inicjałów, aby zachować więcej miejsca na prognozę.\n" +
            "4. Odpowiedz WYŁĄCZNIE jednym krótkim zdaniem w formacie:\n" +
-           "   \"{Imię i nazwisko postaci} prognozuje: {prognoza w jej stylu}\"\n" +
-           "   Całość (wraz z imieniem i \"prognozuje: \") maksymalnie 180 znaków ze spacjami włącznie.\n\n" +
+           "   \"{Imię i nazwisko postaci}: {prognoza w jej stylu}\"\n" +
+           "   Całość maksymalnie 180 znaków ze spacjami włącznie.\n\n" +
            "Nie dodawaj żadnych wyjaśnień, wstępów ani podpisów - tylko tę jedną linijkę.";
 }
 
@@ -170,9 +167,9 @@ bool AiWeatherSource::validateMessage(const String& message) const
         return false;
     }
 
-    // Check for required format: "{Name} prognozuje: {forecast}"
-    if (message.indexOf(" prognozuje: ") < 0) {
-        LOG_ERROR("[AiWeatherSource] Message doesn't contain required 'prognozuje:' format");
+    // Check for required format: "{Name}: {forecast}"
+    if (message.indexOf(": ") < 0) {
+        LOG_ERROR("[AiWeatherSource] Message doesn't contain required colon format");
         return false;
     }
 
