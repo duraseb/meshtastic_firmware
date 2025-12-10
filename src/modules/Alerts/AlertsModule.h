@@ -50,23 +50,11 @@ class AlertsModule : public concurrency::OSThread {
     int numDynamicSources;
     unsigned long dynamicSourceLastFetchTime[MAX_DYNAMIC_SOURCES];
 
-    // AI provider configuration (primary and fallbacks)
-    struct AIProvider {
-        String name;
-        String endpoint;
-        String apiKey;
-        String requestFormat; // "gemini", "groq", or "mistral"
-        String model;         // Model name for providers that need it (Groq, Mistral)
-    };
-    static constexpr int MAX_AI_PROVIDERS = 4;
-    AIProvider aiProviders[MAX_AI_PROVIDERS];
-    int currentAIProviderIndex;
 
     unsigned long intervalMs;
     
     // HTTP/Network settings
     static constexpr unsigned long HTTP_TIMEOUT_MS = 10000;
-    static constexpr unsigned long AI_TIMEOUT_MS = 15000;
 
     // Time synchronization settings
     static constexpr uint32_t MIN_VALID_EPOCH = 1577836800UL; // 2020-01-01 00:00:00 UTC
@@ -214,16 +202,6 @@ class AlertsModule : public concurrency::OSThread {
                            String &outMessage, String &outStart, String &outEnd,
                            String &outWhere, uint8_t &outSeverity);
 
-    // Provider-specific AI calls
-    bool callGeminiAPI(const AIProvider &provider, const String &prompt,
-                     String &outMessage, String &outStart, String &outEnd,
-                     String &outWhere, uint8_t &outSeverity);
-    bool callMistralAPI(const AIProvider &provider, const String &prompt,
-                       String &outMessage, String &outStart, String &outEnd,
-                       String &outWhere, uint8_t &outSeverity);
-    bool callGroqAPI(const AIProvider &provider, const String &prompt,
-                   String &outMessage, String &outStart, String &outEnd,
-                   String &outWhere, uint8_t &outSeverity);
 
     // Parse AI response
     bool parseAIResponse(const String &response, String &outMessage, String &outStart,

@@ -1,9 +1,11 @@
 #if defined(HAS_ALERTING) && HAS_ALERTING
 
 #include "AlertsModule.h"
+#include "AIService.h"
 #include "sources/RCBAlertSource.h"
 #include "sources/IMGWAlertSource.h"
 #include "dynamic_sources/IMGWSynopSource.h"
+#include "dynamic_sources/AiWeatherSource.h"
 #include "mesh/wifi/WiFiAPClient.h"
 #include "FSCommon.h"
 #include "main.h"
@@ -83,6 +85,11 @@ AlertsModule::AlertsModule() : OSThread("AlertsModule")
 
     LOG_INFO("[AlertsModule] Total alert sources registered: %d", numSources);
 
+    // Initialize AI service
+    if (aiService == nullptr) {
+        aiService = new AIService();
+    }
+
     // Register dynamic sources (periodic data, no AI, no persistence)
     numDynamicSources = 0;
     currentDynamicSourceIndex = 0;
@@ -95,72 +102,35 @@ AlertsModule::AlertsModule() : OSThread("AlertsModule")
              dynamicSources[numDynamicSources]->getFetchIntervalMs() / 60000);
     numDynamicSources++;
 
+    // Register AI Weather source
+    dynamicSources[numDynamicSources] = new AiWeatherSource();
+    dynamicSourceLastFetchTime[numDynamicSources] = 0;
+    LOG_INFO("[AlertsModule] Registered dynamic source: %s (fetch every %lu hours, after %02d:00)",
+             dynamicSources[numDynamicSources]->getSourceId().c_str(),
+             dynamicSources[numDynamicSources]->getFetchIntervalMs() / (60 * 60 * 1000),
+             20); // MIN_HOUR_OF_DAY from AiWeatherSource
+    numDynamicSources++;
+
     LOG_INFO("[AlertsModule] Total dynamic sources registered: %d", numDynamicSources);
 
-    // AI provider fallback chain (Gemini → Perplexity → Mistral → Groq)
-    aiProviders[0].name = "Gemini-2.5";
-    aiProviders[0].endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
-    #ifdef GEMINI_API_KEY
-    aiProviders[0].apiKey = GEMINI_API_KEY;
-    #else
-    aiProviders[0].apiKey = "";
-    #endif
-    aiProviders[0].requestFormat = "gemini";
-
-    aiProviders[1].name = "Perplexity-Sonar";
-    aiProviders[1].endpoint = "https://api.perplexity.ai/chat/completions";
-    aiProviders[1].model = "sonar";
-    #ifdef PERPLEXITY_API_KEY
-    aiProviders[1].apiKey = PERPLEXITY_API_KEY;
-    #else
-    aiProviders[1].apiKey = "";
-    #endif
-    aiProviders[1].requestFormat = "perplexity";
-
-    aiProviders[2].name = "Mistral-7B";
-    aiProviders[2].endpoint = "https://api.mistral.ai/v1/chat/completions";
-    aiProviders[2].model = "open-mistral-7b";
-    #ifdef MISTRAL_API_KEY
-    aiProviders[2].apiKey = MISTRAL_API_KEY;
-    #else
-    aiProviders[2].apiKey = "";
-    #endif
-    aiProviders[2].requestFormat = "mistral";
-
-    aiProviders[3].name = "Groq";
-    aiProviders[3].endpoint = "https://api.groq.com/openai/v1/chat/completions";
-    aiProviders[3].model = "llama-3.3-70b-versatile";
-    #ifdef GROQ_API_KEY
-    aiProviders[3].apiKey = GROQ_API_KEY;
-    #else
-    aiProviders[3].apiKey = "";
-    #endif
-    aiProviders[3].requestFormat = "groq";
-    
-    currentAIProviderIndex = 0; // Start with first provider
-    
-    // Log which providers are configured and validate at least one is available
-    int configuredCount = 0;
-    for (int i = 0; i < MAX_AI_PROVIDERS; i++) {
-        if (aiProviders[i].apiKey.length() > 0) {
-            LOG_INFO("[AlertsModule] AI provider configured: %s", aiProviders[i].name.c_str());
-            configuredCount++;
+    // Log AI service status
+    if (aiService != nullptr) {
+        int configuredCount = aiService->getConfiguredProviderCount();
+        if (configuredCount == 0) {
+            LOG_ERROR("[AlertsModule] ==============================================================================");
+            LOG_ERROR("[AlertsModule] FATAL - No AI providers configured!");
+            LOG_ERROR("[AlertsModule] At least one API key must be set in .env file:");
+            LOG_ERROR("[AlertsModule] GEMINI_API_KEY (free tier: 1500 req/day, recommended)");
+            LOG_ERROR("[AlertsModule] PERPLEXITY_API_KEY (Pro: $5/month credit)");
+            LOG_ERROR("[AlertsModule] MISTRAL_API_KEY (free tier, good for Polish)");
+            LOG_ERROR("[AlertsModule] GROQ_API_KEY (free tier: 14,400 req/day, fallback)");
+            LOG_ERROR("[AlertsModule] See src/modules/Alerts/ALERTING_SETUP.md for setup instructions");
+            LOG_ERROR("[AlertsModule] ==============================================================================");
+        } else {
+            LOG_INFO("[AlertsModule] %d AI provider(s) available via AIService", configuredCount);
         }
-    }
-
-    if (configuredCount == 0) {
-        LOG_ERROR("[AlertsModule] ==============================================================================");
-        LOG_ERROR("[AlertsModule] FATAL - No AI providers configured!");
-        LOG_ERROR("[AlertsModule] At least one API key must be set in .env file:");
-        LOG_ERROR("[AlertsModule]  - GEMINI_API_KEY (free tier: 1500 req/day, recommended)");
-        LOG_ERROR("[AlertsModule]  - PERPLEXITY_API_KEY (Pro: $5/month credit)");
-        LOG_ERROR("[AlertsModule]  - MISTRAL_API_KEY (free tier, good for Polish)");
-        LOG_ERROR("[AlertsModule]  - GROQ_API_KEY (free tier: 14,400 req/day, fallback)");
-        LOG_ERROR("[AlertsModule] See src/modules/Alerts/ALERTING_SETUP.md for setup instructions");
-        LOG_ERROR("[AlertsModule] ==============================================================================");
-        // Module will still initialize but AI extraction will always fail
     } else {
-        LOG_INFO("[AlertsModule] %d AI provider(s) available", configuredCount);
+        LOG_ERROR("[AlertsModule] AIService initialization failed");
     }
 
     alertsModule = this;
@@ -1096,130 +1066,74 @@ bool AlertsModule::callAIForExtraction(AlertSource* source, const AlertSource::R
                                        String &outMessage, String &outStart, String &outEnd, String &outWhere, uint8_t &outSeverity)
 {
     LOG_DEBUG("Calling AI for extraction (source: %s)", source->getSourceId().c_str());
-    
+
+    // Check if AIService is available
+    if (aiService == nullptr || !aiService->hasConfiguredProviders()) {
+        LOG_ERROR("AIService not available or no providers configured");
+        return false;
+    }
+
     // Calculate source prefix dynamically
     String sourcePrefixStr = "[" + source->getSourceId() + "] ";
     size_t sourcePrefixBytes = utf8ByteLength(sourcePrefixStr);
-    
+
     // Calculate available bytes for message
     const int maxPayload = meshtastic_Constants_DATA_PAYLOAD_LEN;
     const int maxLocationBytes = 35; // Approximate max for " [location]"
     const int safetyMargin = 10; // Safety buffer
     int maxMessageBytes = maxPayload - sourcePrefixBytes - maxLocationBytes - safetyMargin;
-    
+
     // Max location chars (in chars, not bytes - AI should respect this)
     int maxLocationChars = 30;
-    
+
     // Get source-specific prompt
     String prompt = source->buildAIPrompt(rawAlert, maxMessageBytes, maxLocationChars);
-    
+
     LOG_DEBUG("AI prompt built (%d bytes)", prompt.length());
-    
-    // Try each configured AI provider until one succeeds
-    for (int providerIdx = 0; providerIdx < MAX_AI_PROVIDERS; providerIdx++) {
-        AIProvider &provider = aiProviders[providerIdx];
-        
+
+    // Try each AI provider until one succeeds (both HTTP call AND parsing)
+    for (int providerIdx = 0; providerIdx < aiService->getMaxProviders(); providerIdx++) {
+        AIService::AIProvider& provider = aiService->getProviders()[providerIdx];
+
         // Skip if provider not configured
         if (provider.endpoint.length() == 0 || provider.apiKey.length() == 0) {
             LOG_DEBUG("Skipping provider %s (not configured)", provider.name.c_str());
             continue;
         }
-        
+
         LOG_INFO("Attempting AI extraction with [%s]...", provider.name.c_str());
-        
-        bool success = false;
-        if (provider.requestFormat == "gemini") {
-            success = callGeminiAPI(provider, prompt, outMessage, outStart, outEnd, outWhere, outSeverity);
-        } else if (provider.requestFormat == "perplexity") {
-            success = callMistralAPI(provider, prompt, outMessage, outStart, outEnd, outWhere, outSeverity); // Reuse Mistral (OpenAI-compatible)
-        } else if (provider.requestFormat == "mistral") {
-            success = callMistralAPI(provider, prompt, outMessage, outStart, outEnd, outWhere, outSeverity);
-        } else if (provider.requestFormat == "groq") {
-            success = callGroqAPI(provider, prompt, outMessage, outStart, outEnd, outWhere, outSeverity);
+
+        String aiResponse;
+        bool httpSuccess = false;
+
+        // Call the specific provider directly
+        httpSuccess = aiService->callProvider(providerIdx, prompt, aiResponse);
+
+        if (!httpSuccess) {
+            LOG_WARN("HTTP call failed for [%s], trying next provider...", provider.name.c_str());
+            continue;
         }
-        
-        if (success) {
-            LOG_INFO("AI extraction successful with [%s]", provider.name.c_str());
-            currentAIProviderIndex = providerIdx; // Remember successful provider for next time
+
+        LOG_DEBUG("AI response received from [%s] (%d bytes)", provider.name.c_str(), aiResponse.length());
+
+        // Try to parse the response
+        bool parseSuccess = parseAIResponse(aiResponse, outMessage, outStart, outEnd, outWhere, outSeverity);
+
+        if (parseSuccess) {
+            LOG_INFO("AI extraction successful with [%s] - severity: %d, location: %s",
+                    provider.name.c_str(), outSeverity, outWhere.c_str());
+            // Remember successful provider for future calls
+            aiService->setCurrentProviderIndex(providerIdx);
             return true;
         } else {
-            LOG_WARN("Provider [%s] failed, trying next fallback...", provider.name.c_str());
+            LOG_WARN("Failed to parse AI response from [%s], trying next provider...", provider.name.c_str());
         }
     }
-    
-    LOG_ERROR("All AI providers failed");
+
+    LOG_ERROR("All AI providers failed (either HTTP error or parsing error)");
     return false;
 }
 
-bool AlertsModule::callGeminiAPI(const AIProvider &provider, const String &prompt, String &outMessage, String &outStart, 
-                                 String &outEnd, String &outWhere, uint8_t &outSeverity)
-{
-    // Call AI endpoint with POST
-    HTTPClient http;
-    WiFiClientSecure client;
-    client.setInsecure();
-
-    // Add API key to URL as query parameter for Gemini API
-    String url = provider.endpoint;
-    if (provider.apiKey.length() > 0) {
-        url += "?key=" + provider.apiKey;
-    }
-    http.begin(client, url.c_str());
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(AI_TIMEOUT_MS); // AI service timeout
-
-    // Build Gemini API request format
-    String body = "{\"contents\":[{\"parts\":[{\"text\":\"";
-
-    // Escape prompt for JSON
-    for (int i = 0; i < prompt.length(); i++) {
-        char c = prompt.charAt(i);
-        if (c == '"') {
-            body += "\\\"";
-        } else if (c == '\\') {
-            body += "\\\\";
-        } else if (c == '\n') {
-            body += "\\n";
-        } else if (c == '\r') {
-            body += "\\r";
-        } else {
-            body += c;
-        }
-    }
-    body += "\"}]}]}";
-
-    LOG_DEBUG("Sending AI request to %s (prompt length: %d)", provider.name.c_str(), prompt.length());
-    int httpCode = http.POST(body);
-
-    // Reset watchdog after potentially long AI API call
-    feedWatchdog();
-
-    bool success = false;
-
-    if (httpCode == HTTP_CODE_OK) {
-        String response = http.getString();
-        LOG_DEBUG("AI response received from %s (%d bytes)", provider.name.c_str(), response.length());
-        success = parseAIResponse(response, outMessage, outStart, outEnd, outWhere, outSeverity);
-        if (success) {
-            LOG_INFO("AI extraction successful - severity: %d, location: %s", outSeverity, outWhere.c_str());
-        } else {
-            // Log truncated response for debugging (first 500 chars)
-            String truncatedResponse = response;
-            if (truncatedResponse.length() > 500) {
-                truncatedResponse = truncatedResponse.substring(0, 500) + "...";
-            }
-            LOG_ERROR("Failed to parse AI response from %s. Response (first 500 chars): %s", 
-                     provider.name.c_str(), truncatedResponse.c_str());
-        }
-    } else {
-        String errorResponse = http.getString();
-        LOG_ERROR("AI request to %s failed with HTTP code %d. Response: %s", 
-                 provider.name.c_str(), httpCode, errorResponse.c_str());
-    }
-    http.end();
-
-    return success;
-}
 
 // Helper function to decode Unicode escape sequences (\uXXXX) to UTF-8
 String decodeUnicodeEscapes(const String &input) {
@@ -1256,340 +1170,275 @@ String decodeUnicodeEscapes(const String &input) {
     return output;
 }
 
-bool AlertsModule::callMistralAPI(const AIProvider &provider, const String &prompt, String &outMessage, String &outStart,
-                                   String &outEnd, String &outWhere, uint8_t &outSeverity)
-{
-    HTTPClient http;
-    WiFiClientSecure client;
-    client.setInsecure();
-
-    http.begin(client, provider.endpoint.c_str());
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("Authorization", "Bearer " + provider.apiKey);
-    http.setTimeout(AI_TIMEOUT_MS);
-
-    // Build Mistral API request format (OpenAI-compatible)
-    String body = "{\"model\":\"" + provider.model + "\",\"messages\":[{\"role\":\"user\",\"content\":\"";
-
-    // Escape prompt for JSON
-    for (int i = 0; i < prompt.length(); i++) {
-        char c = prompt.charAt(i);
-        if (c == '"') {
-            body += "\\\"";
-        } else if (c == '\\') {
-            body += "\\\\";
-        } else if (c == '\n') {
-            body += "\\n";
-        } else if (c == '\r') {
-            body += "\\r";
-        } else {
-            body += c;
-        }
-    }
-    body += "\"}],\"temperature\":0.1,\"max_tokens\":500}";
-
-    LOG_DEBUG("Sending AI request to %s (prompt length: %d)", provider.name.c_str(), prompt.length());
-    int httpCode = http.POST(body);
-
-    // Reset watchdog after potentially long AI API call
-    feedWatchdog();
-
-    bool success = false;
-
-    if (httpCode == HTTP_CODE_OK) {
-        String response = http.getString();
-        LOG_DEBUG("AI response received from %s (%d bytes)", provider.name.c_str(), response.length());
-
-        // Parse Mistral/OpenAI response format: {"choices":[{"message":{"content":"..."}}]}
-        int contentPos = response.indexOf("\"content\"");
-        if (contentPos < 0) {
-            LOG_ERROR("'content' field not found in Mistral response");
-            http.end();
-            return false;
-        }
-        
-        int colonPos = response.indexOf(':', contentPos);
-        int textStart = colonPos + 1;
-        while (textStart < response.length() && (response.charAt(textStart) == ' ' || response.charAt(textStart) == '"')) {
-            textStart++;
-        }
-        
-        // Find the closing quote, handling escaped quotes
-        int textEnd = textStart;
-        bool escaped = false;
-        while (textEnd < response.length()) {
-            char c = response.charAt(textEnd);
-            if (escaped) {
-                escaped = false;
-            } else if (c == '\\') {
-                escaped = true;
-            } else if (c == '"') {
-                break;
-            }
-            textEnd++;
-        }
-        
-        if (textEnd >= response.length()) {
-            LOG_ERROR("Could not parse Mistral response");
-            http.end();
-            return false;
-        }
-        
-        String extractedText = response.substring(textStart, textEnd);
-        
-        // Decode Unicode escape sequences (\uXXXX) that Mistral/Perplexity return for Polish characters
-        extractedText = decodeUnicodeEscapes(extractedText);
-        
-        // Then handle standard JSON escapes
-        extractedText.replace("\\n", "\n");
-        extractedText.replace("\\\"", "\"");
-        extractedText.replace("\\\\", "\\");
-        
-        // Create a fake Gemini-style response for the existing parser
-        String geminiStyleResponse = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"" + extractedText + "\"}]}}]}";
-        success = parseAIResponse(geminiStyleResponse, outMessage, outStart, outEnd, outWhere, outSeverity);
-    } else {
-        String errorResponse = http.getString();
-        LOG_ERROR("AI request to %s failed with HTTP code %d. Response: %s",
-                 provider.name.c_str(), httpCode, errorResponse.c_str());
-    }
-    http.end();
-
-    return success;
-}
-
-bool AlertsModule::callGroqAPI(const AIProvider &provider, const String &prompt, String &outMessage, String &outStart,
-                                 String &outEnd, String &outWhere, uint8_t &outSeverity)
-{
-    HTTPClient http;
-    WiFiClientSecure client;
-    client.setInsecure();
-
-    http.begin(client, provider.endpoint.c_str());
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("Authorization", "Bearer " + provider.apiKey);
-    http.setTimeout(AI_TIMEOUT_MS);
-
-    // Build Groq API request format (OpenAI-compatible)
-    String body = "{\"model\":\"" + provider.model + "\",\"messages\":[{\"role\":\"user\",\"content\":\"";
-
-    // Escape prompt for JSON
-    for (int i = 0; i < prompt.length(); i++) {
-        char c = prompt.charAt(i);
-        if (c == '"') {
-            body += "\\\"";
-        } else if (c == '\\') {
-            body += "\\\\";
-        } else if (c == '\n') {
-            body += "\\n";
-        } else if (c == '\r') {
-            body += "\\r";
-        } else {
-            body += c;
-        }
-    }
-    body += "\"}],\"temperature\":0.1,\"max_tokens\":500}";
-
-    LOG_DEBUG("Sending AI request to %s (prompt length: %d)", provider.name.c_str(), prompt.length());
-    int httpCode = http.POST(body);
-
-    // Reset watchdog after potentially long AI API call
-    feedWatchdog();
-
-    bool success = false;
-
-    if (httpCode == HTTP_CODE_OK) {
-        String response = http.getString();
-        LOG_DEBUG("AI response received from %s (%d bytes)", provider.name.c_str(), response.length());
-
-        // Parse Groq/OpenAI response format: {"choices":[{"message":{"content":"..."}}]}
-        int contentPos = response.indexOf("\"content\"");
-        if (contentPos < 0) {
-            LOG_ERROR("'content' field not found in Groq response");
-            http.end();
-            return false;
-        }
-        
-        int colonPos = response.indexOf(':', contentPos);
-        int textStart = colonPos + 1;
-        while (textStart < response.length() && (response.charAt(textStart) == ' ' || response.charAt(textStart) == '"')) {
-            textStart++;
-        }
-        
-        // Find the closing quote, handling escaped quotes
-        int textEnd = textStart;
-        bool escaped = false;
-        while (textEnd < response.length()) {
-            char c = response.charAt(textEnd);
-            if (escaped) {
-                escaped = false;
-            } else if (c == '\\') {
-                escaped = true;
-            } else if (c == '"') {
-                break;
-            }
-            textEnd++;
-        }
-        
-        if (textEnd >= response.length()) {
-            LOG_ERROR("Could not parse Groq response");
-            http.end();
-            return false;
-        }
-        
-        String extractedText = response.substring(textStart, textEnd);
-        extractedText.replace("\\n", "\n");
-        extractedText.replace("\\\"", "\"");
-        extractedText.replace("\\\\", "\\");
-        
-        // Create a fake Gemini-style response for the existing parser
-        String geminiStyleResponse = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"" + extractedText + "\"}]}}]}";
-        success = parseAIResponse(geminiStyleResponse, outMessage, outStart, outEnd, outWhere, outSeverity);
-        
-        if (success) {
-            LOG_INFO("AI extraction successful - severity: %d, location: %s", outSeverity, outWhere.c_str());
-        }
-    } else {
-        String errorResponse = http.getString();
-        LOG_ERROR("AI request to %s failed with HTTP code %d. Response: %s",
-                 provider.name.c_str(), httpCode, errorResponse.c_str());
-    }
-    http.end();
-
-    return success;
-}
 
 bool AlertsModule::parseAIResponse(const String &response, String &outMessage, String &outStart, String &outEnd, String &outWhere, uint8_t &outSeverity)
 {
-    // Gemini API response format: {"candidates":[{"content":{"parts":[{"text":"message|||___|||start|||___|||end|||___|||where|||___|||severity"}]}}]}
-    // We need to extract the text field, then parse the delimited format
+    String extractedText;
 
-    // Find "text" field - handle whitespace variations
-    int textKeyPos = response.indexOf("\"text\"");
-    if (textKeyPos < 0) {
-        LOG_WARN("'text' field not found in AI response");
-        return false;
-    }
-    
-    // Find the colon after "text"
-    int colonPos = response.indexOf(':', textKeyPos);
-    if (colonPos < 0) {
-        LOG_WARN("Colon not found after 'text' field");
-        return false;
-    }
-    
-    // Find the opening quote of the text value (skip whitespace)
-    int textStart = colonPos + 1;
-    while (textStart < response.length() && (response.charAt(textStart) == ' ' || response.charAt(textStart) == '\t' || response.charAt(textStart) == '\n' || response.charAt(textStart) == '\r')) {
-        textStart++;
-    }
-    
-    if (textStart >= response.length() || response.charAt(textStart) != '"') {
-        LOG_WARN("Opening quote not found for 'text' value");
-        return false;
-    }
-    textStart++; // Move past the opening quote
+    LOG_DEBUG("[parseAIResponse] Starting parsing (response length: %d)", response.length());
 
-    // Find the end of the text string by tracking escaped quotes
-    int textEnd = textStart;
-    bool escaped = false;
-    while (textEnd < response.length()) {
-        char c = response.charAt(textEnd);
-        if (escaped) {
-            escaped = false;
-        } else if (c == '\\') {
-            escaped = true;
-        } else if (c == '"') {
-            // Check if this is the closing quote (not escaped)
-            // Look ahead to see if we're at the end of the text field
-            int nextChar = textEnd + 1;
-            while (nextChar < response.length() && (response.charAt(nextChar) == ' ' || response.charAt(nextChar) == '\t' || response.charAt(nextChar) == '\n' || response.charAt(nextChar) == '\r')) {
-                nextChar++;
-            }
-            if (nextChar < response.length() && (response.charAt(nextChar) == '}' || response.charAt(nextChar) == ']' || response.charAt(nextChar) == ',')) {
-                // This looks like the end of the text field
-                break;
+    // Check if response looks like valid JSON
+    if (!response.startsWith("{")) {
+        LOG_WARN("[parseAIResponse] Response doesn't start with '{' - might be HTML error or malformed (first 100 chars): %s",
+                 response.length() > 100 ? response.substring(0, 100).c_str() : response.c_str());
+        return false;
+    }
+
+    // Log response type detection
+    bool hasCandidates = response.indexOf("\"candidates\"") >= 0;
+    bool hasChoices = response.indexOf("\"choices\"") >= 0;
+
+    LOG_DEBUG("[parseAIResponse] Response contains: candidates=%s, choices=%s",
+              hasCandidates ? "YES" : "NO", hasChoices ? "YES" : "NO");
+
+    // Prioritize OpenAI format first (Perplexity, Mistral, Groq), then Gemini
+    if (hasChoices) {
+        LOG_DEBUG("[parseAIResponse] Detected OpenAI format response");
+
+        // OpenAI-compatible format (Perplexity, Mistral, Groq)
+        // Format: {"choices":[{"message":{"content":"message|||___|||start|||___|||end|||___|||where|||___|||severity"}}]}
+
+        int contentPos = response.indexOf("\"content\"");
+        if (contentPos < 0) {
+            // Sometimes it's just "content" without quotes, or different structure
+            contentPos = response.indexOf("content");
+            if (contentPos >= 0) {
+                LOG_DEBUG("[parseAIResponse] Found unquoted 'content' field");
             }
         }
-        textEnd++;
-    }
 
-    if (textEnd >= response.length()) {
-        LOG_WARN("Could not find end of 'text' field (reached end of response)");
-        return false;
-    }
+        if (contentPos < 0) {
+            LOG_WARN("[parseAIResponse] 'content' field not found in OpenAI AI response (response length: %d)", response.length());
+            // Log first 300 chars for debugging
+            if (response.length() > 300) {
+                LOG_DEBUG("[parseAIResponse] Response start: %s...", response.substring(0, 300).c_str());
+            } else {
+                LOG_DEBUG("[parseAIResponse] Full response: %s", response.c_str());
+            }
+            return false;
+        }
 
-    String delimitedData = response.substring(textStart, textEnd);
-    
-    // Unescape the string (handle escaped quotes and newlines from JSON)
-    delimitedData.replace("\\\"", "\"");   // Replace \"
-    delimitedData.replace("\\n", "\n");    // Replace \n
-    delimitedData.replace("\\r", "\r");    // Replace \r
-    delimitedData.replace("\\t", "\t");    // Replace \t
-    delimitedData.replace("\\\\", "\\");   // Replace \\
-    
-    // Log the extracted data for debugging (truncate if too long)
-    if (delimitedData.length() > 200) {
-        LOG_DEBUG("Extracted data (first 200 chars): %s...", delimitedData.substring(0, 200).c_str());
+        // Find the colon after "content"
+        int colonPos = response.indexOf(':', contentPos);
+        if (colonPos < 0) {
+            LOG_WARN("[parseAIResponse] Colon not found after 'content' field");
+            return false;
+        }
+
+        // Find the opening quote of the content value (skip whitespace)
+        int textStart = colonPos + 1;
+        while (textStart < response.length() && (response.charAt(textStart) == ' ' || response.charAt(textStart) == '\t' || response.charAt(textStart) == '\n' || response.charAt(textStart) == '\r')) {
+            textStart++;
+        }
+
+        if (textStart >= response.length() || response.charAt(textStart) != '"') {
+            LOG_WARN("[parseAIResponse] Opening quote not found for 'content' value");
+            return false;
+        }
+
+        textStart++; // Skip the opening quote
+
+        // Find the closing quote (handle escaped quotes)
+        int textEnd = textStart;
+        bool escaped = false;
+        while (textEnd < response.length()) {
+            char c = response.charAt(textEnd);
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                break;
+            }
+            textEnd++;
+        }
+
+        if (textEnd >= response.length()) {
+            LOG_WARN("[parseAIResponse] Closing quote not found for 'content' value");
+            return false;
+        }
+
+        extractedText = response.substring(textStart, textEnd);
+
+        // Decode Unicode escape sequences
+        extractedText = decodeUnicodeEscapes(extractedText);
+
+        // Handle JSON escapes
+        extractedText.replace("\\n", "\n");
+        extractedText.replace("\\\"", "\"");
+        extractedText.replace("\\\\", "\\");
+
+        LOG_DEBUG("[parseAIResponse] Successfully extracted text from OpenAI response");
+
+    } else if (hasCandidates) {
+        LOG_DEBUG("[parseAIResponse] Detected Gemini format response");
+
+        // Try multiple ways to extract text from Gemini response
+        // Format 1: {"candidates":[{"content":{"parts":[{"text":"..."}]}}]}
+        // Format 2: {"candidates":[{"content":{"text":"..."}}]}
+        // Format 3: {"candidates":[{"text":"..."}]}
+
+        int textKeyPos = -1;
+        bool foundText = false;
+
+        // Try Format 1 first (nested parts)
+        if (response.indexOf("\"parts\"") >= 0) {
+            textKeyPos = response.indexOf("\"text\"", response.indexOf("\"parts\""));
+            if (textKeyPos >= 0) {
+                foundText = true;
+                LOG_DEBUG("[parseAIResponse] Using Gemini format 1 (parts)");
+            }
+        }
+
+        // Try Format 2 (direct content.text)
+        if (!foundText && response.indexOf("\"content\"") >= 0) {
+            textKeyPos = response.indexOf("\"text\"", response.indexOf("\"content\""));
+            if (textKeyPos >= 0) {
+                foundText = true;
+                LOG_DEBUG("[parseAIResponse] Using Gemini format 2 (content.text)");
+            }
+        }
+
+        // Try Format 3 (direct candidates.text)
+        if (!foundText) {
+            textKeyPos = response.indexOf("\"text\"", response.indexOf("\"candidates\""));
+            if (textKeyPos >= 0) {
+                foundText = true;
+                LOG_DEBUG("[parseAIResponse] Using Gemini format 3 (candidates.text)");
+            }
+        }
+
+        if (!foundText) {
+            LOG_WARN("[parseAIResponse] No supported 'text' field found in Gemini AI response (response length: %d)", response.length());
+            // Log first 300 chars for debugging
+            if (response.length() > 300) {
+                LOG_DEBUG("[parseAIResponse] Response start: %s...", response.substring(0, 300).c_str());
+            } else {
+                LOG_DEBUG("[parseAIResponse] Full response: %s", response.c_str());
+            }
+            return false;
+        }
+
+        // Parse the text value (same logic for all formats)
+        int colonPos = response.indexOf(':', textKeyPos);
+        if (colonPos < 0) {
+            LOG_WARN("[parseAIResponse] Colon not found after 'text' field");
+            return false;
+        }
+
+        // Find the opening quote of the text value (skip whitespace)
+        int textStart = colonPos + 1;
+        while (textStart < response.length() && (response.charAt(textStart) == ' ' || response.charAt(textStart) == '\t' || response.charAt(textStart) == '\n' || response.charAt(textStart) == '\r')) {
+            textStart++;
+        }
+
+        if (textStart >= response.length() || response.charAt(textStart) != '"') {
+            LOG_WARN("[parseAIResponse] Opening quote not found for 'text' value");
+            return false;
+        }
+
+        textStart++; // Skip the opening quote
+
+        // Find the closing quote (handle escaped quotes)
+        int textEnd = textStart;
+        bool escaped = false;
+        while (textEnd < response.length()) {
+            char c = response.charAt(textEnd);
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                break;
+            }
+            textEnd++;
+        }
+
+        if (textEnd >= response.length()) {
+            LOG_WARN("[parseAIResponse] Closing quote not found for 'text' value");
+            return false;
+        }
+
+        extractedText = response.substring(textStart, textEnd);
+
+        // Decode Unicode escape sequences
+        extractedText = decodeUnicodeEscapes(extractedText);
+
+        // Handle JSON escapes
+        extractedText.replace("\\n", "\n");
+        extractedText.replace("\\\"", "\"");
+        extractedText.replace("\\\\", "\\");
+
+        LOG_DEBUG("[parseAIResponse] Successfully extracted text from Gemini response");
+
     } else {
-        LOG_DEBUG("Extracted data: %s", delimitedData.c_str());
-    }
-    
-    // Parse delimited format: message|||___|||start|||___|||end|||___|||where|||___|||severity
-    const char *delimiter = "|||___|||";
-    const int delimiterLen = 9; // Length of "|||___|||"
-    
-    int pos = 0;
-    int field = 0;
-    
-    while (pos < delimitedData.length() && field < 5) {
-        int nextDelim = delimitedData.indexOf(delimiter, pos);
-        if (nextDelim < 0) {
-            // Last field - take everything remaining
-            nextDelim = delimitedData.length();
+        LOG_WARN("[parseAIResponse] Unknown AI response format - neither Gemini nor OpenAI format detected (response length: %d)", response.length());
+        // Log first 300 chars for debugging unknown formats
+        if (response.length() > 300) {
+            LOG_DEBUG("[parseAIResponse] Unknown response start: %s...", response.substring(0, 300).c_str());
+        } else {
+            LOG_DEBUG("[parseAIResponse] Unknown full response: %s", response.c_str());
         }
-        
-        String value = delimitedData.substring(pos, nextDelim);
-        value.trim();
-        
-        switch (field) {
-            case 0:
-                outMessage = value;
-                break;
-            case 1:
-                outStart = value;
-                break;
-            case 2:
-                outEnd = value;
-                break;
-            case 3:
-                outWhere = value;
-                break;
-            case 4:
-                outSeverity = value.toInt();
-                // Validate severity range
-                if (outSeverity > 10) {
-                    LOG_WARN("Severity out of range (%d), using default 3", outSeverity);
-                    outSeverity = 3;
-                }
-                break;
-        }
-        
-        pos = nextDelim + delimiterLen; // Move past delimiter
-        field++;
+        return false;
     }
-    
-    // Validate that we extracted all required fields
-    bool valid = (field == 5 && outMessage.length() > 0 && outStart.length() > 0 && outEnd.length() > 0 && outWhere.length() > 0);
-    
-    if (!valid) {
-        LOG_WARN("Missing required fields in parsed data - fields found: %d, message: %d, start: %d, end: %d, where: %d", 
-                 field, outMessage.length(), outStart.length(), outEnd.length(), outWhere.length());
-        LOG_DEBUG("Parsed values - message: '%s', start: '%s', end: '%s', where: '%s', severity: %d", 
-                  outMessage.c_str(), outStart.c_str(), outEnd.c_str(), outWhere.c_str(), outSeverity);
+
+    // Now parse the delimited format from the extracted text
+    // Format: message|||___|||start|||___|||end|||___|||where|||___|||severity
+
+    String delimiter = "|||___|||";
+    int firstDelim = extractedText.indexOf(delimiter);
+    if (firstDelim < 0) {
+        LOG_WARN("Delimiter not found in AI response");
+        return false;
     }
-    
-    return valid;
+
+    outMessage = extractedText.substring(0, firstDelim);
+    outMessage.trim();
+
+    String remaining = extractedText.substring(firstDelim + delimiter.length());
+    int secondDelim = remaining.indexOf(delimiter);
+    if (secondDelim < 0) {
+        LOG_WARN("Second delimiter not found in AI response");
+        return false;
+    }
+
+    outStart = remaining.substring(0, secondDelim);
+    outStart.trim();
+
+    remaining = remaining.substring(secondDelim + delimiter.length());
+    int thirdDelim = remaining.indexOf(delimiter);
+    if (thirdDelim < 0) {
+        LOG_WARN("Third delimiter not found in AI response");
+        return false;
+    }
+
+    outEnd = remaining.substring(0, thirdDelim);
+    outEnd.trim();
+
+    remaining = remaining.substring(thirdDelim + delimiter.length());
+    int fourthDelim = remaining.indexOf(delimiter);
+    if (fourthDelim < 0) {
+        LOG_WARN("Fourth delimiter not found in AI response");
+        return false;
+    }
+
+    outWhere = remaining.substring(0, fourthDelim);
+    outWhere.trim();
+
+    String severityStr = remaining.substring(fourthDelim + delimiter.length());
+    severityStr.trim();
+
+    // Parse severity (0-10)
+    outSeverity = severityStr.toInt();
+    if (outSeverity > 10) {
+        LOG_WARN("Invalid severity value: %d (expected 0-10)", outSeverity);
+        outSeverity = DEFAULT_SOURCE_SEVERITY; // Use default if invalid
+    }
+
+    LOG_DEBUG("Parsed AI response - message: '%s', start: '%s', end: '%s', where: '%s', severity: %d",
+              outMessage.c_str(), outStart.c_str(), outEnd.c_str(), outWhere.c_str(), outSeverity);
+
+    return true;
 }
 
 
