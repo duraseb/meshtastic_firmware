@@ -28,8 +28,8 @@ std::vector<AlertSource::RawAlert> IMGWAlertSource::fetchAndParseAlerts(
         return alerts;
     }
     
-    // Parse JSON using ArduinoJson
-    StaticJsonDocument<16384> doc; // Large document for weather alert data
+    // Parse JSON using ArduinoJson (use heap allocation to avoid stack overflow)
+    DynamicJsonDocument doc(16384); // Large document for weather alert data
 
     DeserializationError error = deserializeJson(doc, payload);
     if (error) {

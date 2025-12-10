@@ -8,6 +8,7 @@
 
 #ifdef ARCH_ESP32
 #include "esp_task_wdt.h"
+#include <esp_heap_caps.h>
 #endif
 
 // Helper to reset watchdog timer (architecture-aware)
@@ -367,14 +368,25 @@ bool AIService::extractTextFromAIResponse(const String& response, String& outTex
 {
     LOG_DEBUG("[AIService::extractTextFromAIResponse] Starting extraction (response length: %d)", response.length());
 
-    // Use ArduinoJson to parse the response
-    StaticJsonDocument<8192> doc;
+    // Use ArduinoJson to parse the response (use heap allocation to avoid stack overflow)
+    // Typical AI responses are 2-6KB, allocate 8KB on heap for safety
+    DynamicJsonDocument doc(8192);
+
+    LOG_DEBUG("[AIService::extractTextFromAIResponse] Allocating %d bytes for JSON parsing", 8192);
+#ifdef ARCH_ESP32
+    size_t free_heap_before = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    LOG_DEBUG("[AIService::extractTextFromAIResponse] Free heap before parsing: %d bytes", free_heap_before);
+#endif
 
     // Parse the JSON response
     DeserializationError error = deserializeJson(doc, response);
 
     if (error) {
         LOG_ERROR("[AIService::extractTextFromAIResponse] JSON parsing failed: %s", error.c_str());
+#ifdef ARCH_ESP32
+        size_t free_heap_after = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+        LOG_DEBUG("[AIService::extractTextFromAIResponse] Free heap after failed parsing: %d bytes (used: %d)", free_heap_after, free_heap_before - free_heap_after);
+#endif
         // Log first 200 chars for debugging
         if (response.length() > 200) {
             LOG_DEBUG("[AIService::extractTextFromAIResponse] Response start: %s...", response.substring(0, 200).c_str());
@@ -385,6 +397,10 @@ bool AIService::extractTextFromAIResponse(const String& response, String& outTex
     }
 
     LOG_DEBUG("[AIService::extractTextFromAIResponse] JSON parsed successfully");
+#ifdef ARCH_ESP32
+    size_t free_heap_after = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    LOG_DEBUG("[AIService::extractTextFromAIResponse] Free heap after parsing: %d bytes (used: %d)", free_heap_after, free_heap_before - free_heap_after);
+#endif
 
     // Try to extract text content from different AI provider formats
     const char* text = nullptr;
