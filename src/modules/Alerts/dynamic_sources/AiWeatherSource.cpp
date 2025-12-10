@@ -82,6 +82,9 @@ String AiWeatherSource::fetchAndFormat(
             LOG_INFO("[AiWeatherSource] AI extraction successful with [%s]", provider.name.c_str());
             aiService->setCurrentProviderIndex(providerIdx); // Remember successful provider
 
+            // Log the AI response (split into up to 5 lines of 180 chars each)
+            logAIResponse(message);
+
             // Validate message format and length
             if (!validateMessage(message)) {
                 LOG_ERROR("[AiWeatherSource] AI response failed validation");
@@ -146,9 +149,9 @@ String AiWeatherSource::buildWeatherPrompt() const
            "https://api.open-meteo.com/v1/forecast?latitude=52.4069&longitude=16.9299&hourly=temperature_2m,relative_humidity_2m,precipitation_probability,precipitation,surface_pressure,cloud_cover,visibility,wind_speed_10m,wind_direction_10m,soil_temperature_0cm&timezone=Europe%2FBerlin&forecast_days=1&forecast_hours=24&temporal_resolution=hourly_6&format=json&timeformat=unixtime\n\n" +
            "   Podaj prawdziwe wartości: temperatura dzienna/nocna, opady, wiatr, zachmurzenie.\n" +
            "3. Przetłumacz tę prognozę na charakterystyczny język/manierę mówienia wybranej postaci (używaj jej typowych zwrotów, akcentu gwarowego, stylu piosenek lub cytatów). Przedstaw tę wypowiedź jako prognozę pogody na jutro. Jeśli imię lub imiona tej osoby są długie, użyj inicjałów, aby zachować więcej miejsca na prognozę.\n" +
-           "4. Odpowiedz WYŁĄCZNIE jednym krótkim zdaniem w formacie:\n" +
+           "4. Odpowiedz WYŁĄCZNIE jednym zdaniem w formacie:\n" +
            "   \"{Imię i nazwisko postaci}: {prognoza w jej stylu}\"\n" +
-           "   Całość maksymalnie 180 znaków ze spacjami włącznie.\n\n" +
+           "   Całość jak najdłuższa, ale maksymalnie " + String(MAX_MESSAGE_BYTES) + " bajtów.\n\n" +
            "Nie dodawaj żadnych wyjaśnień, wstępów ani podpisów - tylko tę jedną linijkę.";
 }
 
@@ -161,9 +164,9 @@ bool AiWeatherSource::validateMessage(const String& message) const
         return false;
     }
 
-    // Check maximum length (180 characters as specified in prompt)
-    if (message.length() > 180) {
-        LOG_ERROR("[AiWeatherSource] Message too long: %d > 180 chars", message.length());
+    // Check maximum length (same as alert sources - reasonable limit to prevent issues)
+    if (message.length() > MAX_MESSAGE_BYTES) {
+        LOG_ERROR("[AiWeatherSource] Message too long: %d > %d bytes", message.length(), MAX_MESSAGE_BYTES);
         return false;
     }
 
@@ -188,4 +191,42 @@ bool AiWeatherSource::validateMessage(const String& message) const
 
     LOG_INFO("[AiWeatherSource] Message validation passed: %d chars", message.length());
     return true;
+}
+
+void AiWeatherSource::logAIResponse(const String& response) const
+{
+    const int MAX_LINE_LENGTH = 180;
+    const int MAX_LINES = 5;
+
+    LOG_INFO("[AiWeatherSource] AI Response (%d chars):", response.length());
+
+    int remainingLength = response.length();
+    int startPos = 0;
+
+    for (int lineNum = 0; lineNum < MAX_LINES && startPos < response.length(); lineNum++) {
+        int lineLength = min(MAX_LINE_LENGTH, remainingLength);
+        String line = response.substring(startPos, startPos + lineLength);
+
+        // If we're not at the end and this line ends mid-word, try to break at word boundary
+        if (startPos + lineLength < response.length() && lineLength == MAX_LINE_LENGTH) {
+            int lastSpace = line.lastIndexOf(' ');
+            if (lastSpace > MAX_LINE_LENGTH / 2) { // Only break at space if it's not too early in line
+                line = line.substring(0, lastSpace);
+                lineLength = lastSpace + 1; // Include the space
+            }
+        }
+
+        LOG_INFO("[AiWeatherSource]   [%d] %s", lineNum + 1, line.c_str());
+
+        startPos += lineLength;
+        remainingLength -= lineLength;
+
+        if (remainingLength <= 0) {
+            break;
+        }
+    }
+
+    if (startPos < response.length()) {
+        LOG_INFO("[AiWeatherSource]   ... (%d more chars truncated)", response.length() - startPos);
+    }
 }

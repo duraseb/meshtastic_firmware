@@ -28,8 +28,8 @@ private:
     static constexpr unsigned long DEFAULT_FETCH_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
     static constexpr int MIN_HOUR_OF_DAY = 20; // Don't fetch before 20:00
 
-    // Message length limits (same as other modules)
-    static constexpr int MAX_MESSAGE_BYTES = 200; // Leave room for formatting
+    // Message length limits (same as alert sources - let system handle payload sizing)
+    static constexpr int MAX_MESSAGE_BYTES = 200; // Same as alert sources
     static constexpr int MAX_TOTAL_BYTES = 233;   // Meshtastic payload limit
 
     /**
@@ -51,4 +51,10 @@ private:
      * @return true if valid, false otherwise
      */
     bool validateMessage(const String& message) const;
+
+    /**
+     * Log AI response by splitting into up to 5 lines (180 chars each)
+     * @param response The AI-generated response to log
+     */
+    void logAIResponse(const String& response) const;
 };

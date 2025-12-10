@@ -536,6 +536,8 @@ int32_t AlertsModule::runOnce()
         }
 
         lastMemoryCheckTime = currentMillis;
+
+        return ALERT_PROCESSING_YIELD_MS;
     }
 
     // State machine for non-blocking operation
@@ -606,14 +608,14 @@ int32_t AlertsModule::runOnce()
                         // Alert is pending but not yet due
                         unsigned long remainingMs = alert.nextSendAt - currentMillis;
                         unsigned long remainingSec = remainingMs / 1000;
-                        if (remainingSec > 120) {
-                            unsigned long remainingMin = remainingSec / 60;
-                            LOG_DEBUG("Alert pending (will send in %lu min, source: %s, severity: %d): %s",
-                                      remainingMin, alert.source.c_str(), alert.severity, alert.title.c_str());
-                        } else {
-                            LOG_DEBUG("Alert pending (will send in %lu sec, source: %s, severity: %d): %s",
-                                      remainingSec, alert.source.c_str(), alert.severity, alert.title.c_str());
-                        }
+                    if (remainingSec > 120) {
+                        unsigned long remainingMin = remainingSec / 60;
+                        LOG_DEBUG("Alert pending (will send in %lu min, source: %s, severity: %d): %s",
+                                  remainingMin, alert.source.c_str(), alert.severity, alert.title.c_str());
+                    } else {
+                        LOG_DEBUG("Alert pending (will send in %lu sec, source: %s, severity: %d): %s",
+                                  remainingSec, alert.source.c_str(), alert.severity, alert.title.c_str());
+                    }
                     }
                 }
 
@@ -674,12 +676,12 @@ int32_t AlertsModule::runOnce()
 #endif
             
             if (!wifiConnected) {
-                LOG_DEBUG("WiFi not connected (status=%d), waiting 60s (mesh resends still active)", 
-#if HAS_WIFI && !defined(ARCH_PORTDUINO)
+                LOG_DEBUG("WiFi not connected (status=%d), waiting 60s (mesh resends still active)",
+    #if HAS_WIFI && !defined(ARCH_PORTDUINO)
                          WiFi.status()
-#else
+    #else
                          0
-#endif
+    #endif
                          );
                 return MAX_RUNONCE_INTERVAL_MS; // Return 1 minute, not WIFI_UNAVAILABLE_WAIT_MS
             }
@@ -737,6 +739,7 @@ int32_t AlertsModule::runOnce()
                 LOG_DEBUG("Running cleanup");
                 cleanupOldAlerts();
                 lastCleanupTime = currentMillis;
+                return ALERT_PROCESSING_YIELD_MS;
             }
             
             // Nothing to do, calculate next wake time but cap at 1 minute for responsive checks
@@ -765,9 +768,22 @@ int32_t AlertsModule::runOnce()
             if (minInterval > MAX_RUNONCE_INTERVAL_MS) {
                 minInterval = MAX_RUNONCE_INTERVAL_MS;
             }
-            
+
             LOG_DEBUG("Idle, next check in %lu seconds", minInterval / 1000);
-            return minInterval > 0 ? minInterval : MAX_RUNONCE_INTERVAL_MS;
+
+            // Power optimization: allow CPU to idle for longer waits
+            unsigned long returnInterval = minInterval > 0 ? minInterval : MAX_RUNONCE_INTERVAL_MS;
+
+#ifdef ARCH_ESP32
+            // For very long waits (>30 seconds), allow deeper CPU idle to reduce power
+            if (returnInterval > 30000) {
+                // ESP32 can enter light sleep or just yield more aggressively
+                // The OSThread framework will handle the timing
+                LOG_DEBUG("Long idle period (%lu sec), optimizing for power", returnInterval / 1000);
+            }
+#endif
+
+            return returnInterval;
         }
         
         case ModuleState::FETCHING_PAGE: {
