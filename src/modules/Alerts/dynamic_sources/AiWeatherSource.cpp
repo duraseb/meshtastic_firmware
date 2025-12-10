@@ -44,14 +44,63 @@ String AiWeatherSource::fetchAndFormat(
         return "";
     }
 
-    // Build the AI prompt
-    String prompt = buildWeatherPrompt();
+    // Fetch real weather data from Open-Meteo API
+    String weatherApiUrl = "https://api.open-meteo.com/v1/forecast?latitude=52.4069&longitude=16.9299&hourly=temperature_2m,relative_humidity_2m,precipitation_probability,precipitation,surface_pressure,cloud_cover,visibility,wind_speed_10m,wind_direction_10m,soil_temperature_0cm&timezone=Europe%2FBerlin&forecast_days=1&forecast_hours=24&temporal_resolution=hourly_6&format=json&timeformat=unixtime";
+
+    int httpCode = 0;
+    String weatherJson = httpGetCallback(weatherApiUrl.c_str(), httpCode);
+
+    if (httpCode != 200 || weatherJson.length() == 0) {
+        LOG_ERROR("[AiWeatherSource] Failed to fetch weather data (HTTP %d)", httpCode);
+        return "";
+    }
+
+    LOG_DEBUG("[AiWeatherSource] Fetched weather JSON (%d bytes)", weatherJson.length());
+
+    // Calculate tomorrow's date for Wikipedia lookup and prompt
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) {
+        LOG_WARN("[AiWeatherSource] Failed to get local time for date calculation");
+        return ""; // Can't proceed without time
+    }
+
+    // Calculate tomorrow's date
+    timeinfo.tm_mday += 1;
+    mktime(&timeinfo); // Normalize the date
+
+    // Polish month names for Wikipedia URL and date formatting
+    const char* months[] = {
+        "stycznia", "lutego", "marca", "kwietnia", "maja", "czerwca",
+        "lipca", "sierpnia", "września", "października", "listopada", "grudnia"
+    };
+
+    // Format date as "DD miesiąc YYYY" (Polish format)
+    String tomorrowDate = String(timeinfo.tm_mday) + " " +
+                         String(months[timeinfo.tm_mon]) + " " +
+                         String(timeinfo.tm_year + 1900);
+
+    LOG_DEBUG("[AiWeatherSource] Using tomorrow's date: %s", tomorrowDate.c_str());
+
+    // Fetch Wikipedia page content for people born on this date
+    String wikiUrl = "https://api.wikimedia.org/core/v1/wikipedia/pl/page/" + String(timeinfo.tm_mday) + "_" + String(months[timeinfo.tm_mon]);
+
+    String wikiContent = httpGetCallback(wikiUrl.c_str(), httpCode);
+
+    if (httpCode != 200 || wikiContent.length() == 0) {
+        LOG_WARN("[AiWeatherSource] Failed to fetch Wikipedia data (HTTP %d), proceeding without it", httpCode);
+        wikiContent = ""; // Continue without Wikipedia data
+    } else {
+        LOG_DEBUG("[AiWeatherSource] Fetched Wikipedia content (%d bytes)", wikiContent.length());
+    }
+
+    // Build the AI prompt with real weather data, Wikipedia content, and formatted date
+    String prompt = buildWeatherPrompt(weatherJson, wikiContent, tomorrowDate);
     if (prompt.length() == 0) {
         LOG_ERROR("[AiWeatherSource] Failed to build AI prompt");
         return "";
     }
 
-    LOG_DEBUG("[AiWeatherSource] Built prompt (%d bytes)", prompt.length());
+    LOG_DEBUG("[AiWeatherSource] Built prompt with weather data and wiki content (%d bytes)", prompt.length());
 
     // Try each AI provider until one succeeds (both HTTP call AND parsing)
     for (int providerIdx = 0; providerIdx < aiService->getMaxProviders(); providerIdx++) {
@@ -74,28 +123,30 @@ String AiWeatherSource::fetchAndFormat(
 
         LOG_DEBUG("[AiWeatherSource] AI response received from [%s] (%d bytes)", provider.name.c_str(), aiResponse.length());
 
-        // Try to parse the response
-        String message;
-        bool parseSuccess = aiService->extractTextFromAIResponse(aiResponse, message);
-
-        if (parseSuccess) {
-            LOG_INFO("[AiWeatherSource] AI extraction successful with [%s]", provider.name.c_str());
-            aiService->setCurrentProviderIndex(providerIdx); // Remember successful provider
-
-            // Log the AI response (split into up to 5 lines of 180 chars each)
-            logAIResponse(message);
-
-            // Validate message format and length
-            if (!validateMessage(message)) {
-                LOG_ERROR("[AiWeatherSource] AI response failed validation");
-                return "";
-            }
-
-            LOG_INFO("[AiWeatherSource] Successfully generated weather forecast: %s", message.c_str());
-            return message;
-        } else {
-            LOG_WARN("[AiWeatherSource] Failed to parse AI response from [%s], trying next provider...", provider.name.c_str());
+        // Extract raw text from AI response
+        String rawText;
+        if (!aiService->extractTextFromAIResponse(aiResponse, rawText)) {
+            LOG_WARN("[AiWeatherSource] Failed to extract text from AI response from [%s], trying next provider...", provider.name.c_str());
+            continue;
         }
+
+        // Parse the raw text to extract the weather forecast in expected format
+        String message = extractWeatherForecast(rawText);
+
+        // Validate the extracted result
+        if (message.length() == 0) {
+            LOG_WARN("[AiWeatherSource] No weather forecast extracted from [%s] response, trying next provider...", provider.name.c_str());
+            continue;
+        }
+
+        if (message.length() > MAX_MESSAGE_BYTES) {
+            LOG_WARN("[AiWeatherSource] Weather forecast from [%s] too long (%d > %d bytes), trying next provider...", provider.name.c_str(), message.length(), MAX_MESSAGE_BYTES);
+            continue;
+        }
+
+        LOG_INFO("[AiWeatherSource] Successfully generated weather forecast with [%s]: %s", provider.name.c_str(), message.c_str());
+        aiService->setCurrentProviderIndex(providerIdx); // Remember successful provider
+        return message;
     }
 
     LOG_ERROR("[AiWeatherSource] All AI providers failed (either HTTP error or parsing error)");
@@ -115,118 +166,97 @@ bool AiWeatherSource::isWithinFetchWindow() const
     return currentHour >= MIN_HOUR_OF_DAY;
 }
 
-String AiWeatherSource::buildWeatherPrompt() const
+String AiWeatherSource::buildWeatherPrompt(const String& weatherJson, const String& wikiContent, const String& tomorrowDate) const
 {
-    // Calculate tomorrow's date
-    struct tm timeinfo;
-    if (!getLocalTime(&timeinfo)) {
-        LOG_ERROR("[AiWeatherSource] Cannot build prompt: time not available");
-        return "";
+    String wikiSection = "";
+    if (wikiContent.length() > 0) {
+        wikiSection = "\n\nPoniżej znajduje się zawartość strony Wikipedia o osobach urodzonych " + tomorrowDate + ":\n\n" + wikiContent + "\n\n";
     }
 
-    // Add one day to get tomorrow
-    timeinfo.tm_mday += 1;
-    mktime(&timeinfo); // Normalize the date
-
-    // Format date as "DD miesiąc YYYY" (Polish format)
-    const char* months[] = {
-        "stycznia", "lutego", "marca", "kwietnia", "maja", "czerwca",
-        "lipca", "sierpnia", "września", "października", "listopada", "grudnia"
-    };
-
-    String tomorrowDate = String(timeinfo.tm_mday) + " " +
-                         String(months[timeinfo.tm_mon]) + " " +
-                         String(timeinfo.tm_year + 1900);
-
-    LOG_DEBUG("[AiWeatherSource] Using tomorrow's date: %s", tomorrowDate.c_str());
-
-    return String("Jesteś precyzyjnym asystentem z dostępem do internetu. Wykonaj dokładnie poniższe kroki i nie wymyślaj żadnych danych.\n\n") +
-           "1. Znajdź sławną, bardzo rozpoznawalną w Polsce osobę (żyjącą lub nie), która urodziła się dokładnie dnia " + tomorrowDate + " (dowolnego roku). Najlepsze źródła:  \n" +
-           "   - pl.wikipedia.org/wiki/Kategoria:Urodzeni_[dzień]_[miesiąca]  \n" +
-           "   - en.wikipedia.org/wiki/[Miesiąc]_[dzień]  \n" +
-           "   Wytypuj 1-10 najbardziej znanych postaci dla Polaków, a których sposób wypowiedzi lub sposób bycia jest lub był charakterystyczny i rozpoznawalny.Preferuj pisarzy, poetów, piosenkarzy, polityków, sportowców, naukowców, etc. Z tych wytypowanych osób wybierz jedną losowo.\n" +
-           "2. Pobierz rzeczywistą prognozę pogody dla Poznania (Polska) dokładnie na dzień " + tomorrowDate + ", korzystając wyłącznie z poniższego URL (format JSON):  \n" +
-           "https://api.open-meteo.com/v1/forecast?latitude=52.4069&longitude=16.9299&hourly=temperature_2m,relative_humidity_2m,precipitation_probability,precipitation,surface_pressure,cloud_cover,visibility,wind_speed_10m,wind_direction_10m,soil_temperature_0cm&timezone=Europe%2FBerlin&forecast_days=1&forecast_hours=24&temporal_resolution=hourly_6&format=json&timeformat=unixtime\n\n" +
-           "   Podaj prawdziwe wartości: temperatura dzienna/nocna, opady, wiatr, zachmurzenie.\n" +
-           "3. Przetłumacz tę prognozę na charakterystyczny język/manierę mówienia wybranej postaci (używaj jej typowych zwrotów, akcentu gwarowego, stylu piosenek lub cytatów). Przedstaw tę wypowiedź jako prognozę pogody na jutro. Jeśli imię lub imiona tej osoby są długie, użyj inicjałów, aby zachować więcej miejsca na prognozę.\n" +
-           "4. Odpowiedz WYŁĄCZNIE jednym zdaniem w formacie:\n" +
-           "   \"{Imię i nazwisko postaci}: {prognoza w jej stylu}\"\n" +
-           "   Całość jak najdłuższa, ale maksymalnie " + String(MAX_MESSAGE_BYTES) + " bajtów.\n\n" +
-           "Nie dodawaj żadnych wyjaśnień, wstępów ani podpisów - tylko tę jedną linijkę.";
+    return String("Jesteś kreatywnym asystentem AI specjalizującym się w tworzeniu polskich prognoz pogody w stylu historycznych postaci.\n\n") +
+           "Wykonaj dokładnie te kroki:\n\n" +
+           "1. Wybierz losowo jedną sławną postać historyczną z poniższej listy osób urodzonych " + tomorrowDate + ". Osoba może pochodzić z dowolnego kraju, ale musi być rozpoznawalna i znana Polakom. Wybierz kogoś o charakterystycznym stylu wyrażania się - może to być styl pisania, mówienia, tworzenia muzyki, malowania, czy inne formy artystycznego wyrazu." + wikiSection +
+           "Przeszukaj listę i wybierz jedną osobę, która jest znana i ma charakterystyczny styl. Jeśli strona Wikipedia jest niedostępna lub nie zawiera odpowiednich osób, możesz wybrać inną znaną postać historyczną urodzoną w tym dniu.\n\n" +
+           "2. Przeanalizuj poniższe rzeczywiste dane pogodowe dla Poznania na jutro (" + tomorrowDate + ") z Open-Meteo API:\n\n" +
+           weatherJson + "\n\n" +
+           "Dane zawierają:\n" +
+           "- hourly.temperature_2m: temperatura na różnych godzinach (°C)\n" +
+           "- hourly.precipitation_probability: prawdopodobieństwo opadów (%)\n" +
+           "- hourly.precipitation: ilość opadów (mm)\n" +
+           "- hourly.wind_speed_10m: prędkość wiatru (km/h)\n" +
+           "- hourly.wind_direction_10m: kierunek wiatru (°)\n" +
+           "- hourly.cloud_cover: zachmurzenie (%)\n\n" +
+           "Na podstawie tych danych stwórz podsumowanie pogody na jutro, uwzględniając:\n" +
+           "- Średnią temperaturę w dzień (godziny 6:00-18:00) i w nocy (godziny 18:00-6:00)\n" +
+           "- Maksymalne prawdopodobieństwo opadów i ich ilość\n" +
+           "- Średnią prędkość wiatru i dominujący kierunek\n" +
+           "- Średnie zachmurzenie\n\n" +
+           "3. Przepisz tę prognozę w charakterystycznym stylu wybranej postaci - użyj jej znanych powiedzeń, stylu językowego, gwary, idiomów, czy innych form artystycznego wyrazu. Spraw, aby prognoza brzmiała tak, jakby została napisana lub wypowiedziana przez tę osobę.\n\n" +
+           "4. Odpowiedz WYŁĄCZNIE w tym formacie (nic więcej):\n" +
+           "   {Imię i nazwisko postaci}: {prognoza w jej stylu}\n\n" +
+           "Przykład: Adam Mickiewicz: Jutro w Poznaniu będzie pochmurno z temperaturą około 15 stopni w dzień i 8 stopni w nocy. Lekki wiatr z zachodu przyniesie kilka kropel deszczu.\n\n" +
+           "Maksymalnie " + String(MAX_MESSAGE_BYTES) + " znaków.";
 }
 
-
-bool AiWeatherSource::validateMessage(const String& message) const
+String AiWeatherSource::extractWeatherForecast(const String& fullResponse) const
 {
-    // Check if message is empty
-    if (message.length() == 0) {
-        LOG_ERROR("[AiWeatherSource] Message is empty");
-        return false;
-    }
+    // Look for the specific format expected for weather forecasts: "{Name}: {weather forecast}"
 
-    // Check maximum length (same as alert sources - reasonable limit to prevent issues)
-    if (message.length() > MAX_MESSAGE_BYTES) {
-        LOG_ERROR("[AiWeatherSource] Message too long: %d > %d bytes", message.length(), MAX_MESSAGE_BYTES);
-        return false;
-    }
+    // First, try to find a line that exactly matches the expected format
+    int start = 0;
+    while (start < fullResponse.length()) {
+        int end = fullResponse.indexOf('\n', start);
+        if (end == -1) end = fullResponse.length();
 
-    // Check for required format: "{Name}: {forecast}"
-    if (message.indexOf(": ") < 0) {
-        LOG_ERROR("[AiWeatherSource] Message doesn't contain required colon format");
-        return false;
-    }
+        String line = fullResponse.substring(start, end);
+        line.trim();
 
-    // Check for reasonable content (should have weather-related terms)
-    bool hasWeatherTerms = message.indexOf("pogoda") >= 0 ||
-                          message.indexOf("temperatura") >= 0 ||
-                          message.indexOf("deszcz") >= 0 ||
-                          message.indexOf("śnieg") >= 0 ||
-                          message.indexOf("wiatr") >= 0 ||
-                          message.indexOf("stopni") >= 0;
+        // Check if this line matches the expected weather forecast format
+        int colonPos = line.indexOf(": ");
+        if (colonPos > 0 && colonPos < line.length() - 5) {  // Has colon with content after
+            String namePart = line.substring(0, colonPos);
+            String forecastPart = line.substring(colonPos + 2);
 
-    if (!hasWeatherTerms) {
-        LOG_WARN("[AiWeatherSource] Message may not contain weather information");
-        // Don't fail validation for this, as the AI might use creative language
-    }
+            // Validate the format:
+            // 1. Name part should be reasonable length (person's name)
+            // 2. Forecast part should be reasonable length for weather content
+            if (namePart.length() >= 3 && namePart.length() <= 50 &&
+                forecastPart.length() >= 10 && forecastPart.length() <= MAX_MESSAGE_BYTES) {
 
-    LOG_INFO("[AiWeatherSource] Message validation passed: %d chars", message.length());
-    return true;
-}
-
-void AiWeatherSource::logAIResponse(const String& response) const
-{
-    const int MAX_LINE_LENGTH = 180;
-    const int MAX_LINES = 5;
-
-    LOG_INFO("[AiWeatherSource] AI Response (%d chars):", response.length());
-
-    int remainingLength = response.length();
-    int startPos = 0;
-
-    for (int lineNum = 0; lineNum < MAX_LINES && startPos < response.length(); lineNum++) {
-        int lineLength = min(MAX_LINE_LENGTH, remainingLength);
-        String line = response.substring(startPos, startPos + lineLength);
-
-        // If we're not at the end and this line ends mid-word, try to break at word boundary
-        if (startPos + lineLength < response.length() && lineLength == MAX_LINE_LENGTH) {
-            int lastSpace = line.lastIndexOf(' ');
-            if (lastSpace > MAX_LINE_LENGTH / 2) { // Only break at space if it's not too early in line
-                line = line.substring(0, lastSpace);
-                lineLength = lastSpace + 1; // Include the space
+                // Trust the AI to provide weather-related content when prompted
+                // The format validation and length checks are sufficient
+                LOG_DEBUG("[AiWeatherSource::extractWeatherForecast] Found weather forecast: %s", line.c_str());
+                return line;
             }
         }
 
-        LOG_INFO("[AiWeatherSource]   [%d] %s", lineNum + 1, line.c_str());
+        start = end + 1;
+    }
 
-        startPos += lineLength;
-        remainingLength -= lineLength;
+    // If no perfect match found, try to extract the last reasonable line with weather content
+    // This handles cases where the AI puts the result at the end
+    start = fullResponse.length() - 300;  // Check last 300 chars
+    if (start < 0) start = 0;
 
-        if (remainingLength <= 0) {
-            break;
+    while (start < fullResponse.length()) {
+        int end = fullResponse.indexOf('\n', start);
+        if (end == -1) end = fullResponse.length();
+
+        String line = fullResponse.substring(start, end);
+        line.trim();
+
+        if (line.indexOf(": ") > 0 && line.length() > 15 && line.length() < MAX_MESSAGE_BYTES) {
+            // Accept any reasonable line with colon as potential weather forecast
+            // Trust the AI prompt to produce weather-related content
+            LOG_DEBUG("[AiWeatherSource::extractWeatherForecast] Using fallback line: %s", line.c_str());
+            return line;
         }
+
+        start = end + 1;
     }
 
-    if (startPos < response.length()) {
-        LOG_INFO("[AiWeatherSource]   ... (%d more chars truncated)", response.length() - startPos);
-    }
+    LOG_DEBUG("[AiWeatherSource::extractWeatherForecast] No weather forecast found in response");
+    return "";
 }
+
+

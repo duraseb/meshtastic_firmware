@@ -40,21 +40,19 @@ private:
 
     /**
      * Build the AI prompt for weather forecast generation
+     * @param weatherJson Real weather data JSON from Open-Meteo API
+     * @param wikiContent Wikipedia page content for people born on this date
+     * @param tomorrowDate Formatted date string for tomorrow (Polish format)
      * @return Complete prompt string
      */
-    String buildWeatherPrompt() const;
-
-
-    /**
-     * Validate message length and format
-     * @param message Message to validate
-     * @return true if valid, false otherwise
-     */
-    bool validateMessage(const String& message) const;
+    String buildWeatherPrompt(const String& weatherJson, const String& wikiContent, const String& tomorrowDate) const;
 
     /**
-     * Log AI response by splitting into up to 5 lines (180 chars each)
-     * @param response The AI-generated response to log
+     * Extract weather forecast from AI response text
+     * Expected format: "{Name}: {weather forecast}"
+     * @param fullResponse Complete AI response text
+     * @return Extracted weather forecast or empty string if not found
      */
-    void logAIResponse(const String& response) const;
+    String extractWeatherForecast(const String& fullResponse) const;
+
 };

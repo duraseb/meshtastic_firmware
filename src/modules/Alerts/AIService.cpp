@@ -455,15 +455,16 @@ bool AIService::extractTextFromAIResponse(const String& response, String& outTex
         return false;
     }
 
-    // Convert to Arduino String and validate
-    outText = String(text);
-    outText.trim();
+    // Convert to Arduino String - return raw text as-is
+    // Individual sources will specify how to parse their expected formats
+    String extractedText = String(text);
 
-    if (outText.length() == 0) {
+    if (extractedText.length() == 0) {
         LOG_ERROR("[AIService::extractTextFromAIResponse] Extracted text is empty");
         return false;
     }
 
+    outText = extractedText;
     LOG_DEBUG("[AIService::extractTextFromAIResponse] Successfully extracted text (length: %d)", outText.length());
     return true;
 }
