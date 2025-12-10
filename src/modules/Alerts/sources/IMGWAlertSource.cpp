@@ -1,5 +1,6 @@
 #include "IMGWAlertSource.h"
 #include "configuration.h"
+#include <ArduinoJson.h>
 
 IMGWAlertSource::IMGWAlertSource() {
     // Constructor
@@ -27,76 +28,81 @@ std::vector<AlertSource::RawAlert> IMGWAlertSource::fetchAndParseAlerts(
         return alerts;
     }
     
-    // Parse JSON manually (to avoid heavy JSON library)
-    // Find "warnings" array
-    int warningsStart = payload.indexOf("\"warnings\":");
-    if (warningsStart < 0) {
+    // Parse JSON using ArduinoJson
+    StaticJsonDocument<16384> doc; // Large document for weather alert data
+
+    DeserializationError error = deserializeJson(doc, payload);
+    if (error) {
+        LOG_ERROR("IMGWAlertSource: JSON parsing failed: %s", error.c_str());
+        return alerts;
+    }
+
+    // Check if we have warnings array
+    if (!doc.containsKey("warnings") || !doc["warnings"].is<JsonArray>()) {
         LOG_WARN("IMGWAlertSource: No warnings array found in response");
         return alerts;
     }
-    
-    // Find first alert object
-    int alertStart = payload.indexOf("{\"alert\":", warningsStart);
-    
-    while (alertStart >= 0 && alerts.size() < 10) { // Limit to 10 most recent alerts
-        // Find the end of this alert object (look for next alert or end of array)
-        int nextAlert = payload.indexOf("{\"alert\":", alertStart + 1);
-        int alertEnd = nextAlert > 0 ? nextAlert : payload.indexOf("]}", alertStart);
-        
-        if (alertEnd < 0) {
-            break;
-        }
-        
-        String alertJson = payload.substring(alertStart, alertEnd);
-        
-        // Extract identifier (unique ID)
-        String identifier = findJsonValue(alertJson, "\"identifier\":");
-        
-        // Look for Polish language info block
-        int infoArrayStart = alertJson.indexOf("\"info\":");
-        if (infoArrayStart < 0) {
-            alertStart = nextAlert;
+
+    JsonArray warnings = doc["warnings"];
+
+    // Process up to 10 most recent alerts
+    for (size_t i = 0; i < warnings.size() && alerts.size() < 10; i++) {
+        JsonVariant warning = warnings[i];
+
+        if (!warning.containsKey("alert")) {
             continue;
         }
-        
-        // Look for pl-PL language in the entire alert JSON
-        // Don't try to extract info blocks individually - just search the whole thing
+
+        JsonVariant alert = warning["alert"];
+
+        // Extract identifier (unique ID)
+        String identifier = alert.containsKey("identifier") ? String(alert["identifier"].as<const char*>()) : "";
+
+        // Check if this alert has Polish language info
+        bool foundPolish = false;
         String headline, description, instruction, areaDesc, onset, expires;
         String severity, certainty, urgency;
-        bool foundPolish = false;
-        
-        // Simple check: does this alert contain Polish language info?
-        if (alertJson.indexOf("\"language\":\"pl-PL\"") >= 0) {
-            foundPolish = true;
-            
-            // Extract fields directly from alert JSON (they should be in the pl-PL info block)
-            // Since we're looking in the whole alert, we'll get the first occurrence which should be pl-PL
-            headline = findJsonValue(alertJson, "\"headline\":");
-            description = findJsonValue(alertJson, "\"description\":");
-            instruction = findJsonValue(alertJson, "\"instruction\":");
-            onset = findJsonValue(alertJson, "\"onset\":");
-            expires = findJsonValue(alertJson, "\"expires\":");
-            severity = findJsonValue(alertJson, "\"severity\":");
-            certainty = findJsonValue(alertJson, "\"certainty\":");
-            urgency = findJsonValue(alertJson, "\"urgency\":");
-            
-            // Extract all area descriptions
-            int areaDescPos = 0;
-            while (true) {
-                String desc = findJsonValue(alertJson, "\"areaDesc\":", areaDescPos);
-                if (desc.length() == 0) break;
-                
-                if (areaDesc.length() > 0) {
-                    areaDesc += ", ";
+
+        if (alert.containsKey("info") && alert["info"].is<JsonArray>()) {
+            JsonArray infoArray = alert["info"];
+
+            // Look for Polish language info block
+            for (size_t j = 0; j < infoArray.size(); j++) {
+                JsonVariant info = infoArray[j];
+
+                if (info.containsKey("language") && strcmp(info["language"], "pl-PL") == 0) {
+                    foundPolish = true;
+
+                    // Extract fields from this info block
+                    if (info.containsKey("headline")) headline = String(info["headline"].as<const char*>());
+                    if (info.containsKey("description")) description = String(info["description"].as<const char*>());
+                    if (info.containsKey("instruction")) instruction = String(info["instruction"].as<const char*>());
+                    if (info.containsKey("onset")) onset = String(info["onset"].as<const char*>());
+                    if (info.containsKey("expires")) expires = String(info["expires"].as<const char*>());
+                    if (info.containsKey("severity")) severity = String(info["severity"].as<const char*>());
+                    if (info.containsKey("certainty")) certainty = String(info["certainty"].as<const char*>());
+                    if (info.containsKey("urgency")) urgency = String(info["urgency"].as<const char*>());
+
+                    // Extract area descriptions
+                    if (info.containsKey("area") && info["area"].is<JsonArray>()) {
+                        JsonArray areas = info["area"];
+                        for (size_t k = 0; k < areas.size(); k++) {
+                            JsonVariant area = areas[k];
+                            if (area.containsKey("areaDesc")) {
+                                if (areaDesc.length() > 0) areaDesc += ", ";
+                                areaDesc += String(area["areaDesc"].as<const char*>());
+
+                                // Limit to avoid too long strings
+                                if (areaDesc.length() > 200) {
+                                    areaDesc = areaDesc.substring(0, 200) + "...";
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    break; // Found Polish info, no need to check other info blocks
                 }
-                areaDesc += desc;
-                
-                // Find next areaDesc occurrence
-                areaDescPos = alertJson.indexOf("\"areaDesc\":", areaDescPos + 10);
-                if (areaDescPos < 0) break;
-                
-                // Limit to avoid too long strings
-                if (areaDesc.length() > 200) break;
             }
         }
         
@@ -108,7 +114,7 @@ std::vector<AlertSource::RawAlert> IMGWAlertSource::fetchAndParseAlerts(
             rawAlert.dateStr = onset; // Use onset time as publication date
             rawAlert.intro = description;
             rawAlert.id = hashString(identifier); // Hash of IMGW identifier (unique alert ID)
-            
+
             // IMGW has structured dates - convert from ISO8601 to our format
             if (onset.length() >= 19) {
                 rawAlert.structuredStartDate = onset.substring(0, 10) + " " + onset.substring(11, 19);
@@ -116,23 +122,20 @@ std::vector<AlertSource::RawAlert> IMGWAlertSource::fetchAndParseAlerts(
             if (expires.length() >= 19) {
                 rawAlert.structuredEndDate = expires.substring(0, 10) + " " + expires.substring(11, 19);
             }
-            
+
             // Store additional metadata in context (area, severity, instructions)
-            rawAlert.context = "AREA:" + areaDesc + "|SEVERITY:" + severity + 
+            rawAlert.context = "AREA:" + areaDesc + "|SEVERITY:" + severity +
                                "|CERTAINTY:" + certainty + "|URGENCY:" + urgency;
             if (instruction.length() > 0) {
                 rawAlert.context += "|INSTRUCTION:" + instruction;
             }
-            
+
             alerts.push_back(rawAlert);
-            
-            LOG_DEBUG("IMGWAlertSource: Found alert: %s (valid: %s to %s)", 
-                     headline.c_str(), rawAlert.structuredStartDate.c_str(), 
+
+            LOG_DEBUG("IMGWAlertSource: Found alert: %s (valid: %s to %s)",
+                     headline.c_str(), rawAlert.structuredStartDate.c_str(),
                      rawAlert.structuredEndDate.c_str());
         }
-        
-        // Move to next alert
-        alertStart = nextAlert;
     }
     
     LOG_INFO("IMGWAlertSource: Found %d Polish language alerts", alerts.size());
@@ -208,41 +211,6 @@ String IMGWAlertSource::buildAIPrompt(const RawAlert &rawAlert,
     return prompt;
 }
 
-String IMGWAlertSource::findJsonValue(const String &json, const char *key, size_t startPos)
-{
-    int keyPos = json.indexOf(key, startPos);
-    if (keyPos < 0) return "";
-    
-    // Find the value start (after : and possible whitespace/quotes)
-    int valueStart = json.indexOf(":", keyPos);
-    if (valueStart < 0) return "";
-    valueStart++;
-    
-    // Skip whitespace
-    while (valueStart < json.length() && (json.charAt(valueStart) == ' ' || json.charAt(valueStart) == '\t')) {
-        valueStart++;
-    }
-    
-    // Check if it's a quoted string
-    if (json.charAt(valueStart) == '"') {
-        valueStart++;
-        int valueEnd = json.indexOf("\"", valueStart);
-        if (valueEnd < 0) return "";
-        return json.substring(valueStart, valueEnd);
-    }
-    
-    // Otherwise, find end (comma, brace, or bracket)
-    int valueEnd = valueStart;
-    while (valueEnd < json.length()) {
-        char c = json.charAt(valueEnd);
-        if (c == ',' || c == '}' || c == ']' || c == '\n') break;
-        valueEnd++;
-    }
-    
-    String value = json.substring(valueStart, valueEnd);
-    value.trim();
-    return value;
-}
 
 uint8_t IMGWAlertSource::calculateSeverity(const String &severity, const String &certainty, const String &urgency) const
 {

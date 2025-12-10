@@ -30,14 +30,8 @@ public:
                         int maxLocationChars) const override;
     
 private:
-    // JSON parsing helpers
-    String extractJsonString(const String &json, const char *key, size_t startPos = 0);
-    String extractJsonArrayFirstString(const String &json, const char *arrayKey, const char *itemKey);
     uint8_t calculateSeverity(const String &severity, const String &certainty, const String &urgency) const;
     String convertISO8601ToMeshtastic(const String &iso8601) const;
     uint32_t hashString(const String &str);
-    
-    // Simple JSON extraction (we avoid full JSON library to save memory)
-    String findJsonValue(const String &json, const char *key, size_t startPos = 0);
 };
 
