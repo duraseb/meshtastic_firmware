@@ -76,7 +76,7 @@ String AiWeatherSource::fetchAndFormat(
 
         // Try to parse the response
         String message;
-        bool parseSuccess = aiService->parseAIResponse(aiResponse, message);
+        bool parseSuccess = aiService->extractTextFromAIResponse(aiResponse, message);
 
         if (parseSuccess) {
             LOG_INFO("[AiWeatherSource] AI extraction successful with [%s]", provider.name.c_str());

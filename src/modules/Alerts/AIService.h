@@ -59,12 +59,12 @@ public:
     bool callProvider(int providerIdx, const String& prompt, String& outResponse);
 
     /**
-     * Parse AI response and extract weather forecast information
-     * @param response Raw AI response string
-     * @param outMessage Extracted message text
-     * @return true if parsing successful
+     * Extract text content from AI JSON response
+     * @param response Raw AI response string (JSON)
+     * @param outText Extracted text content
+     * @return true if extraction successful
      */
-    bool parseAIResponse(const String& response, String& outMessage);
+    bool extractTextFromAIResponse(const String& response, String& outText);
 
     /**
      * Set the current AI provider index (for remembering successful providers)

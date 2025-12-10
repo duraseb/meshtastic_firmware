@@ -1173,214 +1173,16 @@ String decodeUnicodeEscapes(const String &input) {
 
 bool AlertsModule::parseAIResponse(const String &response, String &outMessage, String &outStart, String &outEnd, String &outWhere, uint8_t &outSeverity)
 {
-    String extractedText;
-
     LOG_DEBUG("[parseAIResponse] Starting parsing (response length: %d)", response.length());
 
-    // Check if response looks like valid JSON
-    if (!response.startsWith("{")) {
-        LOG_WARN("[parseAIResponse] Response doesn't start with '{' - might be HTML error or malformed (first 100 chars): %s",
-                 response.length() > 100 ? response.substring(0, 100).c_str() : response.c_str());
+    // Use AIService to extract text content from JSON response
+    String extractedText;
+    if (!aiService->extractTextFromAIResponse(response, extractedText)) {
+        LOG_ERROR("[parseAIResponse] Failed to extract text from AI response");
         return false;
     }
 
-    // Log response type detection
-    bool hasCandidates = response.indexOf("\"candidates\"") >= 0;
-    bool hasChoices = response.indexOf("\"choices\"") >= 0;
-
-    LOG_DEBUG("[parseAIResponse] Response contains: candidates=%s, choices=%s",
-              hasCandidates ? "YES" : "NO", hasChoices ? "YES" : "NO");
-
-    // Prioritize OpenAI format first (Perplexity, Mistral, Groq), then Gemini
-    if (hasChoices) {
-        LOG_DEBUG("[parseAIResponse] Detected OpenAI format response");
-
-        // OpenAI-compatible format (Perplexity, Mistral, Groq)
-        // Format: {"choices":[{"message":{"content":"message|||___|||start|||___|||end|||___|||where|||___|||severity"}}]}
-
-        int contentPos = response.indexOf("\"content\"");
-        if (contentPos < 0) {
-            // Sometimes it's just "content" without quotes, or different structure
-            contentPos = response.indexOf("content");
-            if (contentPos >= 0) {
-                LOG_DEBUG("[parseAIResponse] Found unquoted 'content' field");
-            }
-        }
-
-        if (contentPos < 0) {
-            LOG_WARN("[parseAIResponse] 'content' field not found in OpenAI AI response (response length: %d)", response.length());
-            // Log first 300 chars for debugging
-            if (response.length() > 300) {
-                LOG_DEBUG("[parseAIResponse] Response start: %s...", response.substring(0, 300).c_str());
-            } else {
-                LOG_DEBUG("[parseAIResponse] Full response: %s", response.c_str());
-            }
-            return false;
-        }
-
-        // Find the colon after "content"
-        int colonPos = response.indexOf(':', contentPos);
-        if (colonPos < 0) {
-            LOG_WARN("[parseAIResponse] Colon not found after 'content' field");
-            return false;
-        }
-
-        // Find the opening quote of the content value (skip whitespace)
-        int textStart = colonPos + 1;
-        while (textStart < response.length() && (response.charAt(textStart) == ' ' || response.charAt(textStart) == '\t' || response.charAt(textStart) == '\n' || response.charAt(textStart) == '\r')) {
-            textStart++;
-        }
-
-        if (textStart >= response.length() || response.charAt(textStart) != '"') {
-            LOG_WARN("[parseAIResponse] Opening quote not found for 'content' value");
-            return false;
-        }
-
-        textStart++; // Skip the opening quote
-
-        // Find the closing quote (handle escaped quotes)
-        int textEnd = textStart;
-        bool escaped = false;
-        while (textEnd < response.length()) {
-            char c = response.charAt(textEnd);
-            if (escaped) {
-                escaped = false;
-            } else if (c == '\\') {
-                escaped = true;
-            } else if (c == '"') {
-                break;
-            }
-            textEnd++;
-        }
-
-        if (textEnd >= response.length()) {
-            LOG_WARN("[parseAIResponse] Closing quote not found for 'content' value");
-            return false;
-        }
-
-        extractedText = response.substring(textStart, textEnd);
-
-        // Decode Unicode escape sequences
-        extractedText = decodeUnicodeEscapes(extractedText);
-
-        // Handle JSON escapes
-        extractedText.replace("\\n", "\n");
-        extractedText.replace("\\\"", "\"");
-        extractedText.replace("\\\\", "\\");
-
-        LOG_DEBUG("[parseAIResponse] Successfully extracted text from OpenAI response");
-
-    } else if (hasCandidates) {
-        LOG_DEBUG("[parseAIResponse] Detected Gemini format response");
-
-        // Try multiple ways to extract text from Gemini response
-        // Format 1: {"candidates":[{"content":{"parts":[{"text":"..."}]}}]}
-        // Format 2: {"candidates":[{"content":{"text":"..."}}]}
-        // Format 3: {"candidates":[{"text":"..."}]}
-
-        int textKeyPos = -1;
-        bool foundText = false;
-
-        // Try Format 1 first (nested parts)
-        if (response.indexOf("\"parts\"") >= 0) {
-            textKeyPos = response.indexOf("\"text\"", response.indexOf("\"parts\""));
-            if (textKeyPos >= 0) {
-                foundText = true;
-                LOG_DEBUG("[parseAIResponse] Using Gemini format 1 (parts)");
-            }
-        }
-
-        // Try Format 2 (direct content.text)
-        if (!foundText && response.indexOf("\"content\"") >= 0) {
-            textKeyPos = response.indexOf("\"text\"", response.indexOf("\"content\""));
-            if (textKeyPos >= 0) {
-                foundText = true;
-                LOG_DEBUG("[parseAIResponse] Using Gemini format 2 (content.text)");
-            }
-        }
-
-        // Try Format 3 (direct candidates.text)
-        if (!foundText) {
-            textKeyPos = response.indexOf("\"text\"", response.indexOf("\"candidates\""));
-            if (textKeyPos >= 0) {
-                foundText = true;
-                LOG_DEBUG("[parseAIResponse] Using Gemini format 3 (candidates.text)");
-            }
-        }
-
-        if (!foundText) {
-            LOG_WARN("[parseAIResponse] No supported 'text' field found in Gemini AI response (response length: %d)", response.length());
-            // Log first 300 chars for debugging
-            if (response.length() > 300) {
-                LOG_DEBUG("[parseAIResponse] Response start: %s...", response.substring(0, 300).c_str());
-            } else {
-                LOG_DEBUG("[parseAIResponse] Full response: %s", response.c_str());
-            }
-            return false;
-        }
-
-        // Parse the text value (same logic for all formats)
-        int colonPos = response.indexOf(':', textKeyPos);
-        if (colonPos < 0) {
-            LOG_WARN("[parseAIResponse] Colon not found after 'text' field");
-            return false;
-        }
-
-        // Find the opening quote of the text value (skip whitespace)
-        int textStart = colonPos + 1;
-        while (textStart < response.length() && (response.charAt(textStart) == ' ' || response.charAt(textStart) == '\t' || response.charAt(textStart) == '\n' || response.charAt(textStart) == '\r')) {
-            textStart++;
-        }
-
-        if (textStart >= response.length() || response.charAt(textStart) != '"') {
-            LOG_WARN("[parseAIResponse] Opening quote not found for 'text' value");
-            return false;
-        }
-
-        textStart++; // Skip the opening quote
-
-        // Find the closing quote (handle escaped quotes)
-        int textEnd = textStart;
-        bool escaped = false;
-        while (textEnd < response.length()) {
-            char c = response.charAt(textEnd);
-            if (escaped) {
-                escaped = false;
-            } else if (c == '\\') {
-                escaped = true;
-            } else if (c == '"') {
-                break;
-            }
-            textEnd++;
-        }
-
-        if (textEnd >= response.length()) {
-            LOG_WARN("[parseAIResponse] Closing quote not found for 'text' value");
-            return false;
-        }
-
-        extractedText = response.substring(textStart, textEnd);
-
-        // Decode Unicode escape sequences
-        extractedText = decodeUnicodeEscapes(extractedText);
-
-        // Handle JSON escapes
-        extractedText.replace("\\n", "\n");
-        extractedText.replace("\\\"", "\"");
-        extractedText.replace("\\\\", "\\");
-
-        LOG_DEBUG("[parseAIResponse] Successfully extracted text from Gemini response");
-
-    } else {
-        LOG_WARN("[parseAIResponse] Unknown AI response format - neither Gemini nor OpenAI format detected (response length: %d)", response.length());
-        // Log first 300 chars for debugging unknown formats
-        if (response.length() > 300) {
-            LOG_DEBUG("[parseAIResponse] Unknown response start: %s...", response.substring(0, 300).c_str());
-        } else {
-            LOG_DEBUG("[parseAIResponse] Unknown full response: %s", response.c_str());
-        }
-        return false;
-    }
+    LOG_DEBUG("[parseAIResponse] Extracted text content (length: %d)", extractedText.length());
 
     // Now parse the delimited format from the extracted text
     // Format: message|||___|||start|||___|||end|||___|||where|||___|||severity
@@ -1388,7 +1190,7 @@ bool AlertsModule::parseAIResponse(const String &response, String &outMessage, S
     String delimiter = "|||___|||";
     int firstDelim = extractedText.indexOf(delimiter);
     if (firstDelim < 0) {
-        LOG_WARN("Delimiter not found in AI response");
+        LOG_WARN("[parseAIResponse] Delimiter not found in AI response");
         return false;
     }
 
@@ -1398,7 +1200,7 @@ bool AlertsModule::parseAIResponse(const String &response, String &outMessage, S
     String remaining = extractedText.substring(firstDelim + delimiter.length());
     int secondDelim = remaining.indexOf(delimiter);
     if (secondDelim < 0) {
-        LOG_WARN("Second delimiter not found in AI response");
+        LOG_WARN("[parseAIResponse] Second delimiter not found in AI response");
         return false;
     }
 
@@ -1408,7 +1210,7 @@ bool AlertsModule::parseAIResponse(const String &response, String &outMessage, S
     remaining = remaining.substring(secondDelim + delimiter.length());
     int thirdDelim = remaining.indexOf(delimiter);
     if (thirdDelim < 0) {
-        LOG_WARN("Third delimiter not found in AI response");
+        LOG_WARN("[parseAIResponse] Third delimiter not found in AI response");
         return false;
     }
 
@@ -1418,7 +1220,7 @@ bool AlertsModule::parseAIResponse(const String &response, String &outMessage, S
     remaining = remaining.substring(thirdDelim + delimiter.length());
     int fourthDelim = remaining.indexOf(delimiter);
     if (fourthDelim < 0) {
-        LOG_WARN("Fourth delimiter not found in AI response");
+        LOG_WARN("[parseAIResponse] Fourth delimiter not found in AI response");
         return false;
     }
 
@@ -1428,14 +1230,13 @@ bool AlertsModule::parseAIResponse(const String &response, String &outMessage, S
     String severityStr = remaining.substring(fourthDelim + delimiter.length());
     severityStr.trim();
 
-    // Parse severity (0-10)
     outSeverity = severityStr.toInt();
     if (outSeverity > 10) {
-        LOG_WARN("Invalid severity value: %d (expected 0-10)", outSeverity);
-        outSeverity = DEFAULT_SOURCE_SEVERITY; // Use default if invalid
+        LOG_WARN("[parseAIResponse] Invalid severity value: %d (expected 0-10)", outSeverity);
+        outSeverity = DEFAULT_SOURCE_SEVERITY;
     }
 
-    LOG_DEBUG("Parsed AI response - message: '%s', start: '%s', end: '%s', where: '%s', severity: %d",
+    LOG_INFO("[parseAIResponse] Successfully parsed AI response: msg='%s', start='%s', end='%s', where='%s', severity=%d",
               outMessage.c_str(), outStart.c_str(), outEnd.c_str(), outWhere.c_str(), outSeverity);
 
     return true;

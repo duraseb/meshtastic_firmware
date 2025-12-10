@@ -44,12 +44,6 @@ private:
      */
     String buildWeatherPrompt() const;
 
-    /**
-     * Extract the message from AI response
-     * @param aiResponse Raw AI response
-     * @return Cleaned message or empty string on failure
-     */
-    String extractMessageFromResponse(const String& aiResponse) const;
 
     /**
      * Validate message length and format
