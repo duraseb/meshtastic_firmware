@@ -29,7 +29,7 @@ private:
     static constexpr int MIN_HOUR_OF_DAY = 20; // Don't fetch before 20:00
 
     // Message length limits (same as alert sources - let system handle payload sizing)
-    static constexpr int MAX_MESSAGE_BYTES = 200; // Same as alert sources
+    static constexpr int MAX_MESSAGE_BYTES = 210; // Slightly increased buffer for AI-generated content
     static constexpr int MAX_TOTAL_BYTES = 233;   // Meshtastic payload limit
 
     /**

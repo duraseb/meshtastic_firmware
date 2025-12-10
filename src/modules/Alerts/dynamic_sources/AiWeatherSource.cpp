@@ -195,7 +195,7 @@ String AiWeatherSource::buildWeatherPrompt(const String& weatherJson, const Stri
            "4. Odpowiedz WYŁĄCZNIE w tym formacie (nic więcej):\n" +
            "   {Imię i nazwisko postaci}: {prognoza w jej stylu}\n\n" +
            "Przykład: Adam Mickiewicz: Jutro w Poznaniu będzie pochmurno z temperaturą około 15 stopni w dzień i 8 stopni w nocy. Lekki wiatr z zachodu przyniesie kilka kropel deszczu.\n\n" +
-           "Maksymalnie " + String(MAX_MESSAGE_BYTES) + " znaków.";
+           "WAŻNE: Całkowita długość odpowiedzi nie może przekroczyć " + String(MAX_MESSAGE_BYTES - 5) + " znaków. Bądź zwięzły i konkretny w opisie pogody.";
 }
 
 String AiWeatherSource::extractWeatherForecast(const String& fullResponse) const
