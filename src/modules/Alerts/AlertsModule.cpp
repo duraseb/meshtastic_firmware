@@ -1012,7 +1012,7 @@ int32_t AlertsModule::runOnce()
 
                     if (startTime > 0) {
                         // Add default expiration period based on source
-                        if (processingCtx.rawAlert.source == "RCB") {
+                        if (processingCtx.source->getSourceId() == "RCB") {
                             // RCB alerts are typically short-term emergency notifications
                             // Expire after 24 hours
                             startTime += (24 * 60 * 60);
@@ -1023,14 +1023,21 @@ int32_t AlertsModule::runOnce()
 
                         // Convert back to string format
                         struct tm *expireTm = gmtime(&startTime);
-                        char expireStr[20];
-                        snprintf(expireStr, sizeof(expireStr), "%04d-%02d-%02d %02d:%02d:%02d",
-                                expireTm->tm_year + 1900, expireTm->tm_mon + 1, expireTm->tm_mday,
-                                expireTm->tm_hour, expireTm->tm_min, expireTm->tm_sec);
-                        processingCtx.alert.valid_to = String(expireStr);
+                        if (expireTm) {
+                            char expireStr[20];
+                            snprintf(expireStr, sizeof(expireStr), "%04d-%02d-%02d %02d:%02d:%02d",
+                                    expireTm->tm_year + 1900, expireTm->tm_mon + 1, expireTm->tm_mday,
+                                    expireTm->tm_hour, expireTm->tm_min, expireTm->tm_sec);
+                            processingCtx.alert.valid_to = String(expireStr);
 
-                        LOG_DEBUG("Set default expiration for %s alert: %s",
-                                 processingCtx.rawAlert.source.c_str(), expireStr);
+                            LOG_DEBUG("Set default expiration for %s alert: %s",
+                                     processingCtx.source->getSourceId().c_str(), expireStr);
+                        } else {
+                            // Fallback if gmtime fails
+                            processingCtx.alert.valid_to = String((unsigned long)startTime);
+                            LOG_DEBUG("Set default expiration for %s alert (fallback): %lu",
+                                     processingCtx.source->getSourceId().c_str(), (unsigned long)startTime);
+                        }
                     } else {
                         // Fallback - use publish date (will expire immediately, but better than never)
                         processingCtx.alert.valid_to = processingCtx.rawAlert.dateStr;

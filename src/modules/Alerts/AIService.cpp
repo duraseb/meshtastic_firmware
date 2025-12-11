@@ -164,7 +164,7 @@ bool AIService::callGeminiAPI(const AIProvider& provider, const String& prompt, 
     http.setTimeout(AI_TIMEOUT_MS);
 
     // Build Gemini API request using ArduinoJson
-    DynamicJsonDocument doc(131072); // 128KB buffer for large prompts with Wikipedia content
+    DynamicJsonDocument doc(65536); // 64KB buffer for large prompts with Wikipedia content
 
     JsonArray contents = doc.createNestedArray("contents");
     JsonObject contentObj = contents.createNestedObject();
@@ -211,7 +211,7 @@ bool AIService::callMistralAPI(const AIProvider& provider, const String& prompt,
     http.setTimeout(AI_TIMEOUT_MS);
 
     // Build Mistral API request using ArduinoJson
-    DynamicJsonDocument doc(131072); // 128KB buffer for large prompts with Wikipedia content
+    DynamicJsonDocument doc(65536); // 64KB buffer for large prompts with Wikipedia content
 
     doc["model"] = provider.model;
 
@@ -260,7 +260,7 @@ bool AIService::callGroqAPI(const AIProvider& provider, const String& prompt, St
     http.setTimeout(AI_TIMEOUT_MS);
 
     // Build Groq API request using ArduinoJson
-    DynamicJsonDocument doc(131072); // 128KB buffer for large prompts with Wikipedia content
+    DynamicJsonDocument doc(65536); // 64KB buffer for large prompts with Wikipedia content
 
     doc["model"] = provider.model;
 
