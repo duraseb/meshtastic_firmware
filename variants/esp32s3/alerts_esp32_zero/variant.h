@@ -1,7 +1,10 @@
-#define I2C_SDA 11 // I2C pins for this board
-#define I2C_SCL 10
+#define I2C_SDA 1 // I2C pins for this board
+#define I2C_SCL 2
 
-#define LED_PIN 21
+#define HAS_NEOPIXEL                         // Enable the use of neopixels
+#define NEOPIXEL_COUNT 1                     // How many neopixels are connected
+#define NEOPIXEL_DATA 21                     // gpio pin used to send data to the neopixels
+#define NEOPIXEL_TYPE (NEO_GRB + NEO_KHZ800) // type of neopixels in use
 
 #define BUTTON_PIN 0 // If defined, this will be used for user button presses
 #define BUTTON_NEED_PULLUP
