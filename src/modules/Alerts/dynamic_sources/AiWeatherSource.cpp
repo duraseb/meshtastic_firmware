@@ -74,33 +74,33 @@ String AiWeatherSource::fetchAndFormat(
         "lipca", "sierpnia", "września", "października", "listopada", "grudnia"
     };
 
-    // Format date as "DD miesiąc YYYY" (Polish format)
+    // Format date as "DD miesiąc YYYY" (Polish format for display)
     String tomorrowDate = String(timeinfo.tm_mday) + " " +
                          String(months[timeinfo.tm_mon]) + " " +
                          String(timeinfo.tm_year + 1900);
 
-    LOG_DEBUG("[AiWeatherSource] Using tomorrow's date: %s", tomorrowDate.c_str());
+    // Format date for API URL as "DD_miesiąca" (without year)
+    String apiDate = String(timeinfo.tm_mday) + "_" + String(months[timeinfo.tm_mon]);
 
-    // Fetch Wikipedia page content for people born on this date
-    String wikiUrl = "https://api.wikimedia.org/core/v1/wikipedia/pl/page/" + String(timeinfo.tm_mday) + "_" + String(months[timeinfo.tm_mon]);
+    LOG_DEBUG("[AiWeatherSource] Using tomorrow's date: %s (API format: %s)", tomorrowDate.c_str(), apiDate.c_str());
 
-    String wikiContent = httpGetCallback(wikiUrl.c_str(), httpCode);
+    // Don't fetch Wikipedia content - let AI handle it
+    String wikiContent = ""; // Not used anymore
 
-    if (httpCode != 200 || wikiContent.length() == 0) {
-        LOG_WARN("[AiWeatherSource] Failed to fetch Wikipedia data (HTTP %d), proceeding without it", httpCode);
-        wikiContent = ""; // Continue without Wikipedia data
-    } else {
-        LOG_DEBUG("[AiWeatherSource] Fetched Wikipedia content (%d bytes)", wikiContent.length());
-    }
-
-    // Build the AI prompt with real weather data, Wikipedia content, and formatted date
-    String prompt = buildWeatherPrompt(weatherJson, wikiContent, tomorrowDate);
+    // Build the AI prompt with real weather data and formatted date
+    String prompt = buildWeatherPrompt(weatherJson, tomorrowDate, apiDate);
     if (prompt.length() == 0) {
         LOG_ERROR("[AiWeatherSource] Failed to build AI prompt");
         return "";
     }
 
-    LOG_DEBUG("[AiWeatherSource] Built prompt with weather data and wiki content (%d bytes)", prompt.length());
+    LOG_DEBUG("[AiWeatherSource] Built prompt with weather data (%d bytes)", prompt.length());
+    if (prompt.length() > 50000) {
+        LOG_WARN("[AiWeatherSource] Prompt size is very large (%d bytes) - may cause API issues", prompt.length());
+    }
+
+    // Clear large strings to free memory after prompt is built
+    weatherJson = String();
 
     // Try each AI provider until one succeeds (both HTTP call AND parsing)
     for (int providerIdx = 0; providerIdx < aiService->getMaxProviders(); providerIdx++) {
@@ -166,17 +166,14 @@ bool AiWeatherSource::isWithinFetchWindow() const
     return currentHour >= MIN_HOUR_OF_DAY;
 }
 
-String AiWeatherSource::buildWeatherPrompt(const String& weatherJson, const String& wikiContent, const String& tomorrowDate) const
+String AiWeatherSource::buildWeatherPrompt(const String& weatherJson, const String& tomorrowDate, const String& apiDate) const
 {
-    String wikiSection = "";
-    if (wikiContent.length() > 0) {
-        wikiSection = "\n\nPoniżej znajduje się zawartość strony Wikipedia o osobach urodzonych " + tomorrowDate + ":\n\n" + wikiContent + "\n\n";
-    }
 
     return String("Jesteś kreatywnym asystentem AI specjalizującym się w tworzeniu polskich prognoz pogody w stylu historycznych postaci.\n\n") +
            "Wykonaj dokładnie te kroki:\n\n" +
-           "1. Wybierz losowo jedną sławną postać historyczną z poniższej listy osób urodzonych " + tomorrowDate + ". Osoba może pochodzić z dowolnego kraju, ale musi być rozpoznawalna i znana Polakom. Wybierz kogoś o charakterystycznym stylu wyrażania się - może to być styl pisania, mówienia, tworzenia muzyki, malowania, czy inne formy artystycznego wyrazu." + wikiSection +
-           "Przeszukaj listę i wybierz jedną osobę, która jest znana i ma charakterystyczny styl. Jeśli strona Wikipedia jest niedostępna lub nie zawiera odpowiednich osób, możesz wybrać inną znaną postać historyczną urodzoną w tym dniu.\n\n" +
+           "1. Wybierz losowo jedną sławną postać historyczną urodzoną " + tomorrowDate + ". Osoba może pochodzić z dowolnego kraju, ale musi być rozpoznawalna i znana Polakom. Wybierz kogoś o charakterystycznym stylu wyrażania się - może to być styl pisania, mówienia, tworzenia muzyki, malowania, czy inne formy artystycznego wyrazu.\n\n" +
+           "Sprawdź listę osób urodzonych tego dnia używając API: https://api.wikimedia.org/core/v1/wikipedia/pl/page/" + apiDate + "\n\n" +
+           "API zwraca JSON z polem 'content' zawierającym wikitext. Przeszukaj sekcję '== Urodzili się ==' i wybierz jedną osobę, która jest znana i ma charakterystyczny styl. Jeśli strona nie istnieje lub nie zawiera odpowiednich osób, możesz wybrać inną znaną postać historyczną.\n\n" +
            "2. Przeanalizuj poniższe rzeczywiste dane pogodowe dla Poznania na jutro (" + tomorrowDate + ") z Open-Meteo API:\n\n" +
            weatherJson + "\n\n" +
            "Dane zawierają:\n" +
@@ -258,5 +255,4 @@ String AiWeatherSource::extractWeatherForecast(const String& fullResponse) const
     LOG_DEBUG("[AiWeatherSource::extractWeatherForecast] No weather forecast found in response");
     return "";
 }
-
 

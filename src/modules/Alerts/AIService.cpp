@@ -163,27 +163,21 @@ bool AIService::callGeminiAPI(const AIProvider& provider, const String& prompt, 
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(AI_TIMEOUT_MS);
 
-    // Build Gemini API request format
-    String body = "{\"contents\":[{\"parts\":[{\"text\":\"";
+    // Build Gemini API request using ArduinoJson
+    DynamicJsonDocument doc(131072); // 128KB buffer for large prompts with Wikipedia content
 
-    // Escape prompt for JSON
-    for (int i = 0; i < prompt.length(); i++) {
-        char c = prompt.charAt(i);
-        if (c == '"') {
-            body += "\\\"";
-        } else if (c == '\\') {
-            body += "\\\\";
-        } else if (c == '\n') {
-            body += "\\n";
-        } else if (c == '\r') {
-            body += "\\r";
-        } else {
-            body += c;
-        }
-    }
-    body += "\"}]}]}";
+    JsonArray contents = doc.createNestedArray("contents");
+    JsonObject contentObj = contents.createNestedObject();
+    JsonArray parts = contentObj.createNestedArray("parts");
+    JsonObject partObj = parts.createNestedObject();
 
-    LOG_DEBUG("[AIService] Sending Gemini request (prompt length: %d)", prompt.length());
+    // ArduinoJson handles escaping automatically
+    partObj["text"] = prompt;
+
+    String body;
+    serializeJson(doc, body);
+
+    LOG_DEBUG("[AIService] Sending Gemini request (prompt length: %d, body length: %d)", prompt.length(), body.length());
     int httpCode = http.POST(body);
 
     // Reset watchdog after potentially long AI API call
@@ -216,27 +210,23 @@ bool AIService::callMistralAPI(const AIProvider& provider, const String& prompt,
     http.addHeader("Authorization", "Bearer " + provider.apiKey);
     http.setTimeout(AI_TIMEOUT_MS);
 
-    // Build Mistral API request format (OpenAI-compatible)
-    String body = "{\"model\":\"" + provider.model + "\",\"messages\":[{\"role\":\"user\",\"content\":\"";
+    // Build Mistral API request using ArduinoJson
+    DynamicJsonDocument doc(131072); // 128KB buffer for large prompts with Wikipedia content
 
-    // Escape prompt for JSON
-    for (int i = 0; i < prompt.length(); i++) {
-        char c = prompt.charAt(i);
-        if (c == '"') {
-            body += "\\\"";
-        } else if (c == '\\') {
-            body += "\\\\";
-        } else if (c == '\n') {
-            body += "\\n";
-        } else if (c == '\r') {
-            body += "\\r";
-        } else {
-            body += c;
-        }
-    }
-    body += "\"}],\"temperature\":0.1,\"max_tokens\":500}";
+    doc["model"] = provider.model;
 
-    LOG_DEBUG("[AIService] Sending Mistral request to %s (prompt length: %d)", provider.name.c_str(), prompt.length());
+    JsonArray messages = doc.createNestedArray("messages");
+    JsonObject messageObj = messages.createNestedObject();
+    messageObj["role"] = "user";
+    messageObj["content"] = prompt; // ArduinoJson handles escaping automatically
+
+    doc["temperature"] = 0.1;
+    doc["max_tokens"] = 500;
+
+    String body;
+    serializeJson(doc, body);
+
+    LOG_DEBUG("[AIService] Sending Mistral request to %s (prompt length: %d, body length: %d)", provider.name.c_str(), prompt.length(), body.length());
     int httpCode = http.POST(body);
 
     // Reset watchdog after potentially long AI API call
@@ -269,27 +259,23 @@ bool AIService::callGroqAPI(const AIProvider& provider, const String& prompt, St
     http.addHeader("Authorization", "Bearer " + provider.apiKey);
     http.setTimeout(AI_TIMEOUT_MS);
 
-    // Build Groq API request format (OpenAI-compatible)
-    String body = "{\"model\":\"" + provider.model + "\",\"messages\":[{\"role\":\"user\",\"content\":\"";
+    // Build Groq API request using ArduinoJson
+    DynamicJsonDocument doc(131072); // 128KB buffer for large prompts with Wikipedia content
 
-    // Escape prompt for JSON
-    for (int i = 0; i < prompt.length(); i++) {
-        char c = prompt.charAt(i);
-        if (c == '"') {
-            body += "\\\"";
-        } else if (c == '\\') {
-            body += "\\\\";
-        } else if (c == '\n') {
-            body += "\\n";
-        } else if (c == '\r') {
-            body += "\\r";
-        } else {
-            body += c;
-        }
-    }
-    body += "\"}],\"temperature\":0.1,\"max_tokens\":500}";
+    doc["model"] = provider.model;
 
-    LOG_DEBUG("[AIService] Sending Groq request to %s (prompt length: %d)", provider.name.c_str(), prompt.length());
+    JsonArray messages = doc.createNestedArray("messages");
+    JsonObject messageObj = messages.createNestedObject();
+    messageObj["role"] = "user";
+    messageObj["content"] = prompt; // ArduinoJson handles escaping automatically
+
+    doc["temperature"] = 0.1;
+    doc["max_tokens"] = 500;
+
+    String body;
+    serializeJson(doc, body);
+
+    LOG_DEBUG("[AIService] Sending Groq request to %s (prompt length: %d, body length: %d)", provider.name.c_str(), prompt.length(), body.length());
     int httpCode = http.POST(body);
 
     // Reset watchdog after potentially long AI API call

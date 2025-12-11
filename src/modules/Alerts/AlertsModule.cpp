@@ -13,6 +13,7 @@
 #include "mesh/Router.h"
 #include "mesh/MeshService.h"
 #include "mesh/Channels.h"
+#include "memGet.h"
 #include "mesh/NodeDB.h"
 #include "SPILock.h"
 #include "RTC.h"
@@ -188,13 +189,55 @@ String AlertsModule::httpGet(const char *url, int &httpCode)
 
     if (httpCode > 0) {
         if (httpCode == HTTP_CODE_OK) {
+            // Monitor memory usage for large HTTP responses
+            size_t heapBefore = memGet.getFreeHeap();
+
+            // Use getString() but validate the response
             payload = http->getString();
-            LOG_DEBUG("HTTP GET successful, received %d bytes", payload.length());
+
+            // Validate that we actually got data and it's not corrupted
+            if (payload.length() == 0) {
+                LOG_ERROR("HTTP response received but payload is empty");
+                return "";
+            }
+
+            size_t heapAfter = memGet.getFreeHeap();
+            size_t memoryUsed = (heapBefore > heapAfter) ? (heapBefore - heapAfter) / 1024 : 0;
+            LOG_DEBUG("HTTP GET successful, received %d bytes (heap used: %d KB, free: %d KB)",
+                     payload.length(), memoryUsed, heapAfter/1024);
+
+            // Basic validation - check if response looks like valid data
+            bool hasValidChars = false;
+            const char* buffer = payload.c_str();
+            for (int i = 0; i < min(100, (int)payload.length()); i++) {
+                if (buffer[i] >= 32 || buffer[i] == '\n' || buffer[i] == '\r' || buffer[i] == '\t') {
+                    hasValidChars = true;
+                    break;
+                }
+            }
+
+            if (!hasValidChars) {
+                LOG_WARN("HTTP response appears to contain only control characters, possible corruption");
+            }
+
+            // Check for unexpected null characters (we shouldn't be getting any)
+            int nullCharCount = 0;
+            const char* payloadBuffer = payload.c_str();
+            for (size_t i = 0; i < payload.length(); i++) {
+                if (payloadBuffer[i] == '\x00') {
+                    nullCharCount++;
+                }
+            }
+
+            if (nullCharCount > 0) {
+                LOG_ERROR("HTTP response contains %d unexpected null characters - possible data corruption", nullCharCount);
+                // Don't filter, but log the issue for debugging
+            }
 
             // Sanity check payload size (prevent memory exhaustion)
-            if (payload.length() > 50000) { // 50KB limit
+            if (payload.length() > 200000) { // 200KB limit
                 LOG_WARN("Response too large (%d bytes), truncating", payload.length());
-                payload = payload.substring(0, 50000);
+                payload = payload.substring(0, 200000);
             }
         } else {
             LOG_WARN("HTTP GET returned code %d", httpCode);
@@ -763,7 +806,22 @@ int32_t AlertsModule::runOnce()
                 }
                 checked++;
             }
-            
+
+            // Priority 5: Clean up any expired alerts from memory (more responsive than hourly cleanup)
+            int expiredRemoved = 0;
+            for (auto it = alerts.begin(); it != alerts.end();) {
+                if (!isAlertValid(*it)) {
+                    LOG_DEBUG("Removing expired alert during idle check: %s", it->title.c_str());
+                    it = alerts.erase(it);
+                    expiredRemoved++;
+                } else {
+                    ++it;
+                }
+            }
+            if (expiredRemoved > 0) {
+                LOG_INFO("Removed %d expired alerts during idle check", expiredRemoved);
+            }
+
             // Cap at 1 minute for responsive operation
             if (minInterval > MAX_RUNONCE_INTERVAL_MS) {
                 minInterval = MAX_RUNONCE_INTERVAL_MS;
@@ -940,13 +998,44 @@ int32_t AlertsModule::runOnce()
                              processingCtx.rawAlert.dateStr.c_str());
                 }
                 
-                // For end date, use AI result, or start date, or publish date
+                // For end date, use AI result, or calculate reasonable expiration
                 if (aiEnd.length() > 0) {
                     processingCtx.alert.valid_to = aiEnd;
-                } else if (aiStart.length() > 0) {
-                    processingCtx.alert.valid_to = aiStart;
                 } else {
-                    processingCtx.alert.valid_to = processingCtx.rawAlert.dateStr;
+                    // No explicit end date - set reasonable expiration based on source type
+                    time_t startTime = 0;
+                    if (aiStart.length() > 0) {
+                        startTime = parseDateString(aiStart);
+                    } else {
+                        startTime = parseDateString(processingCtx.rawAlert.dateStr);
+                    }
+
+                    if (startTime > 0) {
+                        // Add default expiration period based on source
+                        if (processingCtx.rawAlert.source == "RCB") {
+                            // RCB alerts are typically short-term emergency notifications
+                            // Expire after 24 hours
+                            startTime += (24 * 60 * 60);
+                        } else {
+                            // Other sources - expire after 7 days
+                            startTime += (7 * 24 * 60 * 60);
+                        }
+
+                        // Convert back to string format
+                        struct tm *expireTm = gmtime(&startTime);
+                        char expireStr[20];
+                        snprintf(expireStr, sizeof(expireStr), "%04d-%02d-%02d %02d:%02d:%02d",
+                                expireTm->tm_year + 1900, expireTm->tm_mon + 1, expireTm->tm_mday,
+                                expireTm->tm_hour, expireTm->tm_min, expireTm->tm_sec);
+                        processingCtx.alert.valid_to = String(expireStr);
+
+                        LOG_DEBUG("Set default expiration for %s alert: %s",
+                                 processingCtx.rawAlert.source.c_str(), expireStr);
+                    } else {
+                        // Fallback - use publish date (will expire immediately, but better than never)
+                        processingCtx.alert.valid_to = processingCtx.rawAlert.dateStr;
+                        LOG_WARN("Could not calculate expiration for alert, using publish date");
+                    }
                 }
             }
             

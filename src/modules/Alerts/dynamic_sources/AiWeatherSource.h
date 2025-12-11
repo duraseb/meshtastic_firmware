@@ -26,7 +26,7 @@ public:
 private:
     // Configuration constants
     static constexpr unsigned long DEFAULT_FETCH_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
-    static constexpr int MIN_HOUR_OF_DAY = 20; // Don't fetch before 20:00
+    static constexpr int MIN_HOUR_OF_DAY = 0; // Don't fetch before 20:00
 
     // Message length limits (same as alert sources - let system handle payload sizing)
     static constexpr int MAX_MESSAGE_BYTES = 210; // Slightly increased buffer for AI-generated content
@@ -41,11 +41,11 @@ private:
     /**
      * Build the AI prompt for weather forecast generation
      * @param weatherJson Real weather data JSON from Open-Meteo API
-     * @param wikiContent Wikipedia page content for people born on this date
      * @param tomorrowDate Formatted date string for tomorrow (Polish format)
+     * @param apiDate Date string formatted for API URL (day_month)
      * @return Complete prompt string
      */
-    String buildWeatherPrompt(const String& weatherJson, const String& wikiContent, const String& tomorrowDate) const;
+    String buildWeatherPrompt(const String& weatherJson, const String& tomorrowDate, const String& apiDate) const;
 
     /**
      * Extract weather forecast from AI response text
