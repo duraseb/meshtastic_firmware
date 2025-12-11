@@ -27,9 +27,9 @@ String AiWeatherSource::fetchAndFormat(
 {
     LOG_INFO("[AiWeatherSource] Starting AI weather forecast generation");
 
-    // Check if we're within the allowed fetch window (after 20:00)
+    // Check if we're within the allowed fetch window
     if (!isWithinFetchWindow()) {
-        LOG_INFO("[AiWeatherSource] Too early in day (before %02d:00), skipping fetch", MIN_HOUR_OF_DAY);
+        LOG_INFO("[AiWeatherSource] Too early in day (before %02d:00), skipping fetch", getMinHourOfDay());
         return "";
     }
 
@@ -163,7 +163,7 @@ bool AiWeatherSource::isWithinFetchWindow() const
     }
 
     int currentHour = timeinfo.tm_hour;
-    return currentHour >= MIN_HOUR_OF_DAY;
+    return currentHour >= getMinHourOfDay();
 }
 
 String AiWeatherSource::buildWeatherPrompt(const String& weatherJson, const String& tomorrowDate, const String& apiDate) const
@@ -254,5 +254,19 @@ String AiWeatherSource::extractWeatherForecast(const String& fullResponse) const
 
     LOG_DEBUG("[AiWeatherSource::extractWeatherForecast] No weather forecast found in response");
     return "";
+}
+
+int AiWeatherSource::getMinHourOfDay()
+{
+    // ALERT_MIN_HOUR_OF_DAY is defined as a string from environment variable
+    String hourStr = ALERT_MIN_HOUR_OF_DAY;
+    if (hourStr.length() > 0) {
+        int hour = hourStr.toInt();
+        if (hour >= 0 && hour <= 23) {
+            return hour;
+        }
+    }
+    // Use default if not set or invalid
+    return DEFAULT_MIN_HOUR_OF_DAY;
 }
 
