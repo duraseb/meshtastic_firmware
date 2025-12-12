@@ -97,6 +97,7 @@ class AlertsModule : public concurrency::OSThread {
     // Memory management settings
     // No longer limited - we only keep valid (non-expired) alerts in memory
     static constexpr int MAX_ALERTS_IN_MEMORY = 200; // Reasonable upper limit for edge cases
+    static constexpr int MAX_PENDING_ALERTS = 50; // Limit pending alerts queue
     static constexpr unsigned long MEMORY_CHECK_INTERVAL_MS = 60000;
 
     // Debugging settings

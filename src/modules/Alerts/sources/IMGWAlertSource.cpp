@@ -38,8 +38,9 @@ std::vector<AlertSource::RawAlert> IMGWAlertSource::fetchAndParseAlerts(
             return false;
         }
 
-        // Use streaming JSON parsing with minimal buffer (8KB instead of 180KB)
-        DynamicJsonDocument doc(8192);
+    // Use larger buffer for parsing the 458KB JSON response (256KB should be sufficient)
+    {
+        DynamicJsonDocument doc(256 * 1024);
 
         // Monitor memory usage
         size_t heapBefore = ESP.getFreeHeap();
@@ -57,7 +58,8 @@ std::vector<AlertSource::RawAlert> IMGWAlertSource::fetchAndParseAlerts(
 
         // Process the parsed JSON (rest of the original logic)
         return processParsedJson(doc, alerts);
-    };
+    }
+};
 
     // Call the streaming HTTP method from AlertsModule
     if (!alertsModule->httpGetStream(getFetchUrl().c_str(), jsonProcessor)) {

@@ -143,7 +143,20 @@ AlertsModule::~AlertsModule() {
     // Clean up sources
     for (int i = 0; i < numSources; i++) {
         delete sources[i];
+        sources[i] = nullptr;
     }
+
+    // Clean up dynamic sources
+    for (int i = 0; i < numDynamicSources; i++) {
+        delete dynamicSources[i];
+        dynamicSources[i] = nullptr;
+    }
+
+    // Clear vectors to free memory
+    pendingAlerts.clear();
+    alerts.clear();
+
+    // Note: aiService is a global managed elsewhere, not cleaned up here
 }
 
 bool AlertsModule::loadConfig()
@@ -265,7 +278,7 @@ bool AlertsModule::httpGetStream(const char *url, std::function<bool(WiFiClient*
         return false;
     }
 
-    LOG_DEBUG("[AlertsModule] Streaming URL: %s", url);
+    // URL logging handled by caller for cleaner output
 
     // Use unique_ptr for automatic cleanup
     std::unique_ptr<HTTPClient> http(new HTTPClient());
@@ -296,16 +309,8 @@ bool AlertsModule::httpGetStream(const char *url, std::function<bool(WiFiClient*
             WiFiClient* stream = http->getStreamPtr();
 
             if (stream) {
-                // Monitor memory usage
-                size_t heapBefore = memGet.getFreeHeap();
-                LOG_DEBUG("[AlertsModule] Starting stream processing (heap: %d KB)", heapBefore/1024);
-
                 // Call the processor callback with the stream
                 success = jsonProcessor(stream);
-
-                size_t heapAfter = memGet.getFreeHeap();
-                LOG_DEBUG("[AlertsModule] Stream processing completed (heap used: %d KB, free: %d KB)",
-                         (heapBefore > heapAfter) ? (heapBefore - heapAfter)/1024 : 0, heapAfter/1024);
             } else {
                 LOG_ERROR("[AlertsModule] Failed to get HTTP stream pointer");
             }
@@ -984,6 +989,13 @@ int32_t AlertsModule::runOnce()
                     }
 
                     // Queue alert for full content fetching - don't fetch here to avoid watchdog
+                    // Check bounds to prevent memory exhaustion
+                    if (pendingAlerts.size() >= MAX_PENDING_ALERTS) {
+                        LOG_WARN("Pending alerts queue at limit (%d), skipping alert: %s",
+                                MAX_PENDING_ALERTS, rawAlert.title.c_str());
+                        continue;
+                    }
+
                     PendingAlert pending;
                     pending.source = sources[currentSourceIndex];
                     pending.rawAlert = rawAlert;  // Store raw alert, will fetch full content later
