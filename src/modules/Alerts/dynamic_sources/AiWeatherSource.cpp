@@ -1,6 +1,7 @@
 #include "AiWeatherSource.h"
 #include <time.h>
 #include <RTC.h>
+#include <ctype.h>
 
 // Initialize AIService if not already done
 extern AIService* aiService;
@@ -190,6 +191,43 @@ String AiWeatherSource::buildWeatherPrompt(const String& weatherJson, const Stri
            "WAŻNE: Całkowita długość odpowiedzi nie może przekroczyć " + String(MAX_MESSAGE_BYTES - 5) + " znaków. Postaraj się, aby wypowiedź była jak najbardziej naturalna i prawdopodobna i jak najdłuższa w granicy " + String(MAX_MESSAGE_BYTES - 5) + " znaków.";
 }
 
+String AiWeatherSource::cleanFootnotes(const String& input) const
+{
+    String result = input;
+
+    // Remove footnote markers like [1], [2], etc.
+    // These are often added by AI models when referencing sources
+    int bracketStart;
+    while ((bracketStart = result.indexOf('[')) >= 0) {
+        int bracketEnd = result.indexOf(']', bracketStart);
+        if (bracketEnd > bracketStart) {
+            // Check if content between brackets is numeric (footnote marker)
+            bool isFootnote = true;
+            for (int i = bracketStart + 1; i < bracketEnd; i++) {
+                if (!isdigit(result.charAt(i))) {
+                    isFootnote = false;
+                    break;
+                }
+            }
+
+            if (isFootnote) {
+                // Remove the footnote marker including brackets
+                result = result.substring(0, bracketStart) + result.substring(bracketEnd + 1);
+            } else {
+                // Not a footnote, skip this bracket pair
+                break;
+            }
+        } else {
+            // No closing bracket, stop processing
+            break;
+        }
+    }
+
+    // Trim any trailing whitespace that might be left
+    result.trim();
+    return result;
+}
+
 String AiWeatherSource::extractWeatherForecast(const String& fullResponse) const
 {
     // Look for the specific format expected for weather forecasts: "{Name}: {weather forecast}"
@@ -217,8 +255,9 @@ String AiWeatherSource::extractWeatherForecast(const String& fullResponse) const
 
                 // Trust the AI to provide weather-related content when prompted
                 // The format validation and length checks are sufficient
-                LOG_DEBUG("[AiWeatherSource::extractWeatherForecast] Found weather forecast: %s", line.c_str());
-                return line;
+                String cleanedLine = cleanFootnotes(line);
+                LOG_DEBUG("[AiWeatherSource::extractWeatherForecast] Found weather forecast: %s", cleanedLine.c_str());
+                return cleanedLine;
             }
         }
 
@@ -238,10 +277,13 @@ String AiWeatherSource::extractWeatherForecast(const String& fullResponse) const
         line.trim();
 
         if (line.indexOf(": ") > 0 && line.length() > 15 && line.length() < MAX_MESSAGE_BYTES) {
+            // Clean up footnote/reference markers that AI models sometimes add
+            String cleanedLine = cleanFootnotes(line);
+
             // Accept any reasonable line with colon as potential weather forecast
             // Trust the AI prompt to produce weather-related content
-            LOG_DEBUG("[AiWeatherSource::extractWeatherForecast] Using fallback line: %s", line.c_str());
-            return line;
+            LOG_DEBUG("[AiWeatherSource::extractWeatherForecast] Using fallback line: %s", cleanedLine.c_str());
+            return cleanedLine;
         }
 
         start = end + 1;
