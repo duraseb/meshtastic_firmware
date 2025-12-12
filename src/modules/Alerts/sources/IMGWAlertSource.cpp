@@ -1,6 +1,15 @@
 #include "IMGWAlertSource.h"
+#include "../AlertsModule.h"
 #include "configuration.h"
 #include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+
+// Forward declaration for alertsModule
+extern AlertsModule *alertsModule;
+
+// HTTP timeout constant (matches AlertsModule)
+static constexpr unsigned long HTTP_TIMEOUT_MS = 10000;
 
 IMGWAlertSource::IMGWAlertSource() {
     // Constructor
@@ -18,130 +27,45 @@ std::vector<AlertSource::RawAlert> IMGWAlertSource::fetchAndParseAlerts(
     std::function<String(const char*, int&)> httpGetCallback)
 {
     std::vector<RawAlert> alerts;
-    
-    // Fetch JSON data
-    int httpCode = 0;
-    String payload = httpGetCallback(getFetchUrl().c_str(), httpCode);
-    
-    if (httpCode != 200 || payload.length() == 0) {
-        LOG_WARN("IMGWAlertSource: Failed to fetch alerts (HTTP code: %d)", httpCode);
-        return alerts;
-    }
-    
-    // Parse JSON using ArduinoJson (use heap allocation to avoid stack overflow)
-    DynamicJsonDocument doc(180 * 1024); // Large document for weather alert data
 
-    DeserializationError error = deserializeJson(doc, payload);
-    if (error) {
-        LOG_ERROR("IMGWAlertSource: JSON parsing failed: %s", error.c_str());
-        return alerts;
-    }
+    // Use streaming JSON parsing with direct HTTP piping for memory efficiency
+    LOG_DEBUG("IMGWAlertSource: Starting streaming JSON parse from %s", getFetchUrl().c_str());
 
-    LOG_DEBUG("IMGWAlertSource: JSON parsed successfully");
-
-    // Check if we have warnings array
-    if (!doc.containsKey("warnings") || !doc["warnings"].is<JsonArray>()) {
-        LOG_WARN("IMGWAlertSource: No warnings array found in response");
-        return alerts;
-    }
-
-    JsonArray warnings = doc["warnings"];
-
-    // Process up to 10 most recent alerts
-    for (size_t i = 0; i < warnings.size() && alerts.size() < 10; i++) {
-        JsonVariant warning = warnings[i];
-
-        if (!warning.containsKey("alert")) {
-            continue;
+    // Use AlertsModule's streaming HTTP utility
+    auto jsonProcessor = [&](WiFiClient* stream) -> bool {
+        if (!stream) {
+            LOG_ERROR("IMGWAlertSource: Stream is null");
+            return false;
         }
 
-        JsonVariant alert = warning["alert"];
+        // Use streaming JSON parsing with minimal buffer (8KB instead of 180KB)
+        DynamicJsonDocument doc(8192);
 
-        // Extract identifier (unique ID)
-        String identifier = alert.containsKey("identifier") ? String(alert["identifier"].as<const char*>()) : "";
+        // Monitor memory usage
+        size_t heapBefore = ESP.getFreeHeap();
+        LOG_DEBUG("IMGWAlertSource: Starting stream parse (heap: %d KB)", heapBefore/1024);
 
-        // Check if this alert has Polish language info
-        bool foundPolish = false;
-        String headline, description, instruction, areaDesc, onset, expires;
-        String severity, certainty, urgency;
-
-        if (alert.containsKey("info") && alert["info"].is<JsonArray>()) {
-            JsonArray infoArray = alert["info"];
-
-            // Look for Polish language info block
-            for (size_t j = 0; j < infoArray.size(); j++) {
-                JsonVariant info = infoArray[j];
-
-                if (info.containsKey("language") && strcmp(info["language"], "pl-PL") == 0) {
-                    foundPolish = true;
-
-                    // Extract fields from this info block
-                    if (info.containsKey("headline")) headline = String(info["headline"].as<const char*>());
-                    if (info.containsKey("description")) description = String(info["description"].as<const char*>());
-                    if (info.containsKey("instruction")) instruction = String(info["instruction"].as<const char*>());
-                    if (info.containsKey("onset")) onset = String(info["onset"].as<const char*>());
-                    if (info.containsKey("expires")) expires = String(info["expires"].as<const char*>());
-                    if (info.containsKey("severity")) severity = String(info["severity"].as<const char*>());
-                    if (info.containsKey("certainty")) certainty = String(info["certainty"].as<const char*>());
-                    if (info.containsKey("urgency")) urgency = String(info["urgency"].as<const char*>());
-
-                    // Extract area descriptions
-                    if (info.containsKey("area") && info["area"].is<JsonArray>()) {
-                        JsonArray areas = info["area"];
-                        for (size_t k = 0; k < areas.size(); k++) {
-                            JsonVariant area = areas[k];
-                            if (area.containsKey("areaDesc")) {
-                                if (areaDesc.length() > 0) areaDesc += ", ";
-                                areaDesc += String(area["areaDesc"].as<const char*>());
-
-                                // Limit to avoid too long strings
-                                if (areaDesc.length() > 200) {
-                                    areaDesc = areaDesc.substring(0, 200) + "...";
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    break; // Found Polish info, no need to check other info blocks
-                }
-            }
+        DeserializationError error = deserializeJson(doc, *stream);
+        if (error) {
+            LOG_ERROR("IMGWAlertSource: Streaming JSON parsing failed: %s", error.c_str());
+            return false;
         }
-        
-        // Only process Polish language alerts
-        if (foundPolish && headline.length() > 0) {
-            RawAlert rawAlert;
-            rawAlert.link = identifier; // Use identifier as unique link
-            rawAlert.title = headline;
-            rawAlert.dateStr = onset; // Use onset time as publication date
-            rawAlert.intro = description;
-            rawAlert.id = hashString(identifier); // Hash of IMGW identifier (unique alert ID)
 
-            // IMGW has structured dates - convert from ISO8601 to our format
-            if (onset.length() >= 19) {
-                rawAlert.structuredStartDate = onset.substring(0, 10) + " " + onset.substring(11, 19);
-            }
-            if (expires.length() >= 19) {
-                rawAlert.structuredEndDate = expires.substring(0, 10) + " " + expires.substring(11, 19);
-            }
+        size_t heapAfter = ESP.getFreeHeap();
+        LOG_DEBUG("IMGWAlertSource: JSON parsed successfully (heap used: %d KB, free: %d KB)",
+                  (heapBefore > heapAfter) ? (heapBefore - heapAfter)/1024 : 0, heapAfter/1024);
 
-            // Store additional metadata in context (area, severity, instructions)
-            rawAlert.context = "AREA:" + areaDesc + "|SEVERITY:" + severity +
-                               "|CERTAINTY:" + certainty + "|URGENCY:" + urgency;
-            if (instruction.length() > 0) {
-                rawAlert.context += "|INSTRUCTION:" + instruction;
-            }
+        // Process the parsed JSON (rest of the original logic)
+        return processParsedJson(doc, alerts);
+    };
 
-            alerts.push_back(rawAlert);
-
-            LOG_DEBUG("IMGWAlertSource: Found alert: %s (valid: %s to %s)",
-                     headline.c_str(), rawAlert.structuredStartDate.c_str(),
-                     rawAlert.structuredEndDate.c_str());
-        }
+    // Call the streaming HTTP method from AlertsModule
+    if (!alertsModule->httpGetStream(getFetchUrl().c_str(), jsonProcessor)) {
+        LOG_ERROR("IMGWAlertSource: Streaming HTTP request failed");
+        return alerts;
     }
-    
-    LOG_INFO("IMGWAlertSource: Found %d Polish language alerts", alerts.size());
-    
+
+    // The JSON processing is now handled by processParsedJson callback
     return alerts;
 }
 
@@ -273,5 +197,112 @@ uint32_t IMGWAlertSource::hashString(const String &str)
         hash = ((hash << 5) + hash) + str.charAt(i);
     }
     return hash;
+}
+
+bool IMGWAlertSource::processParsedJson(DynamicJsonDocument &doc, std::vector<RawAlert> &alerts)
+{
+    // Check if we have warnings array
+    if (!doc.containsKey("warnings") || !doc["warnings"].is<JsonArray>()) {
+        LOG_WARN("IMGWAlertSource: No warnings array found in response");
+        return false;
+    }
+
+    JsonArray warnings = doc["warnings"];
+
+    // Process up to 10 most recent alerts
+    for (size_t i = 0; i < warnings.size() && alerts.size() < 10; i++) {
+        JsonVariant warning = warnings[i];
+
+        if (!warning.containsKey("alert")) {
+            continue;
+        }
+
+        JsonVariant alert = warning["alert"];
+
+        // Extract identifier (unique ID)
+        String identifier = alert.containsKey("identifier") ? String(alert["identifier"].as<const char*>()) : "";
+
+        // Check if this alert has Polish language info
+        bool foundPolish = false;
+        String headline, description, instruction, areaDesc, onset, expires;
+        String severity, certainty, urgency;
+
+        if (alert.containsKey("info") && alert["info"].is<JsonArray>()) {
+            JsonArray infoArray = alert["info"];
+
+            // Look for Polish language info block
+            for (size_t j = 0; j < infoArray.size(); j++) {
+                JsonVariant info = infoArray[j];
+
+                if (info.containsKey("language") && strcmp(info["language"], "pl-PL") == 0) {
+                    foundPolish = true;
+
+                    // Extract fields from this info block
+                    if (info.containsKey("headline")) headline = String(info["headline"].as<const char*>());
+                    if (info.containsKey("description")) description = String(info["description"].as<const char*>());
+                    if (info.containsKey("instruction")) instruction = String(info["instruction"].as<const char*>());
+                    if (info.containsKey("onset")) onset = String(info["onset"].as<const char*>());
+                    if (info.containsKey("expires")) expires = String(info["expires"].as<const char*>());
+                    if (info.containsKey("severity")) severity = String(info["severity"].as<const char*>());
+                    if (info.containsKey("certainty")) certainty = String(info["certainty"].as<const char*>());
+                    if (info.containsKey("urgency")) urgency = String(info["urgency"].as<const char*>());
+
+                    // Extract area descriptions
+                    if (info.containsKey("area") && info["area"].is<JsonArray>()) {
+                        JsonArray areas = info["area"];
+                        for (size_t k = 0; k < areas.size(); k++) {
+                            JsonVariant area = areas[k];
+                            if (area.containsKey("areaDesc")) {
+                                if (areaDesc.length() > 0) areaDesc += ", ";
+                                areaDesc += String(area["areaDesc"].as<const char*>());
+
+                                // Limit to avoid too long strings
+                                if (areaDesc.length() > 200) {
+                                    areaDesc = areaDesc.substring(0, 200) + "...";
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    break; // Found Polish info, no need to check other info blocks
+                }
+            }
+        }
+
+        // Only process Polish language alerts
+        if (foundPolish && headline.length() > 0) {
+            RawAlert rawAlert;
+            rawAlert.link = identifier; // Use identifier as unique link
+            rawAlert.title = headline;
+            rawAlert.dateStr = onset; // Use onset time as publication date
+            rawAlert.intro = description;
+            rawAlert.id = hashString(identifier); // Hash of IMGW identifier (unique alert ID)
+
+            // IMGW has structured dates - convert from ISO8601 to our format
+            if (onset.length() >= 19) {
+                rawAlert.structuredStartDate = onset.substring(0, 10) + " " + onset.substring(11, 19);
+            }
+            if (expires.length() >= 19) {
+                rawAlert.structuredEndDate = expires.substring(0, 10) + " " + expires.substring(11, 19);
+            }
+
+            // Store additional metadata in context (area, severity, instructions)
+            rawAlert.context = "AREA:" + areaDesc + "|SEVERITY:" + severity +
+                               "|CERTAINTY:" + certainty + "|URGENCY:" + urgency;
+            if (instruction.length() > 0) {
+                rawAlert.context += "|INSTRUCTION:" + instruction;
+            }
+
+            alerts.push_back(rawAlert);
+
+            LOG_DEBUG("IMGWAlertSource: Found alert: %s (valid: %s to %s)",
+                     headline.c_str(), rawAlert.structuredStartDate.c_str(),
+                     rawAlert.structuredEndDate.c_str());
+        }
+    }
+
+    LOG_INFO("IMGWAlertSource: Found %d Polish language alerts", alerts.size());
+    return true;
 }
 

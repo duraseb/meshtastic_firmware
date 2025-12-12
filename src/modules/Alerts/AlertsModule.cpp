@@ -252,6 +252,76 @@ String AlertsModule::httpGet(const char *url, int &httpCode)
     return payload;
 }
 
+/**
+ * Stream HTTP response directly to JSON parser for memory-efficient parsing of large responses
+ * @param url The URL to fetch
+ * @param jsonProcessor Callback function that receives the stream and processes JSON
+ * @return true if streaming completed successfully
+ */
+bool AlertsModule::httpGetStream(const char *url, std::function<bool(WiFiClient* stream)> jsonProcessor)
+{
+    if (!isWifiAvailable()) {
+        LOG_DEBUG("[AlertsModule] WiFi not available for streaming HTTP request");
+        return false;
+    }
+
+    LOG_DEBUG("[AlertsModule] Streaming URL: %s", url);
+
+    // Use unique_ptr for automatic cleanup
+    std::unique_ptr<HTTPClient> http(new HTTPClient());
+    std::unique_ptr<WiFiClientSecure> client(new WiFiClientSecure());
+
+    if (!http || !client) {
+        LOG_ERROR("[AlertsModule] Failed to allocate HTTP client resources for streaming");
+        return false;
+    }
+
+    client->setInsecure();
+    http->begin(*client, url);
+    http->setTimeout(HTTP_TIMEOUT_MS);
+
+    // Add headers to reduce server load and identify ourselves
+    http->addHeader("User-Agent", "Meshtastic-Alerts/1.0");
+    http->addHeader("Accept", "application/json");
+
+    int httpCode = http->GET();
+
+    // Reset watchdog after potentially long HTTP operation
+    feedWatchdog();
+
+    bool success = false;
+    if (httpCode > 0) {
+        if (httpCode == HTTP_CODE_OK) {
+            // Get direct stream access
+            WiFiClient* stream = http->getStreamPtr();
+
+            if (stream) {
+                // Monitor memory usage
+                size_t heapBefore = memGet.getFreeHeap();
+                LOG_DEBUG("[AlertsModule] Starting stream processing (heap: %d KB)", heapBefore/1024);
+
+                // Call the processor callback with the stream
+                success = jsonProcessor(stream);
+
+                size_t heapAfter = memGet.getFreeHeap();
+                LOG_DEBUG("[AlertsModule] Stream processing completed (heap used: %d KB, free: %d KB)",
+                         (heapBefore > heapAfter) ? (heapBefore - heapAfter)/1024 : 0, heapAfter/1024);
+            } else {
+                LOG_ERROR("[AlertsModule] Failed to get HTTP stream pointer");
+            }
+        } else {
+            LOG_WARN("[AlertsModule] HTTP GET returned code %d", httpCode);
+        }
+    } else {
+        LOG_ERROR("[AlertsModule] HTTP GET failed with code %d", httpCode);
+    }
+
+    // Explicit cleanup (unique_ptr will handle it, but be explicit)
+    http->end();
+
+    return success;
+}
+
 
 bool AlertsModule::alertExists(uint32_t id)
 {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../AlertSource.h"
+#include <ArduinoJson.h>
 
 /**
  * IMGW (Instytut Meteorologii i Gospodarki Wodnej) Alert Source
@@ -24,7 +25,10 @@ public:
     
     std::vector<RawAlert> fetchAndParseAlerts(
         std::function<String(const char*, int&)> httpGetCallback) override;
-    
+
+    // Process already parsed JSON document
+    bool processParsedJson(DynamicJsonDocument &doc, std::vector<RawAlert> &alerts);
+
     String buildAIPrompt(const RawAlert &rawAlert,
                         int maxMessageBytes,
                         int maxLocationChars) const override;

@@ -167,11 +167,15 @@ class AlertsModule : public concurrency::OSThread {
     // Dynamic source processing state
     int currentDynamicSourceIndex;
 
+  public:
     // ===== Core Module Functions =====
     bool loadConfig();
 
     // HTTP helper (used by sources via callback)
     String httpGet(const char *url, int &httpCode);
+
+    // Streaming HTTP helper for memory-efficient JSON parsing
+    bool httpGetStream(const char *url, std::function<bool(WiFiClient* stream)> jsonProcessor);
 
     // ===== Alert Storage and Management =====
     // Persist alerts to disk and load them (using individual files)
