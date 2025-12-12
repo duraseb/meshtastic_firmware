@@ -55,8 +55,6 @@ String AiWeatherSource::fetchAndFormat(
         return "";
     }
 
-    LOG_DEBUG("[AiWeatherSource] Fetched weather JSON (%d bytes)", weatherJson.length());
-
     // Calculate tomorrow's date for Wikipedia lookup and prompt
     struct tm timeinfo;
     if (!getLocalTime(&timeinfo)) {
@@ -94,7 +92,6 @@ String AiWeatherSource::fetchAndFormat(
         return "";
     }
 
-    LOG_DEBUG("[AiWeatherSource] Built prompt with weather data (%d bytes)", prompt.length());
     if (prompt.length() > 50000) {
         LOG_WARN("[AiWeatherSource] Prompt size is very large (%d bytes) - may cause API issues", prompt.length());
     }
@@ -120,8 +117,6 @@ String AiWeatherSource::fetchAndFormat(
             LOG_WARN("[AiWeatherSource] HTTP call failed for [%s], trying next provider...", provider.name.c_str());
             continue;
         }
-
-        LOG_DEBUG("[AiWeatherSource] AI response received from [%s] (%d bytes)", provider.name.c_str(), aiResponse.length());
 
         // Extract raw text from AI response
         String rawText;
@@ -173,7 +168,7 @@ String AiWeatherSource::buildWeatherPrompt(const String& weatherJson, const Stri
            "Wykonaj dokładnie te kroki:\n\n" +
            "1. Wybierz losowo jedną sławną postać historyczną urodzoną " + tomorrowDate + ". Osoba może pochodzić z dowolnego kraju, ale musi być rozpoznawalna i znana Polakom. Wybierz kogoś o charakterystycznym stylu wyrażania się - może to być styl pisania, mówienia, tworzenia muzyki, malowania, czy inne formy artystycznego wyrazu.\n\n" +
            "Sprawdź listę osób urodzonych tego dnia używając API: https://api.wikimedia.org/core/v1/wikipedia/pl/page/" + apiDate + "\n\n" +
-           "API zwraca JSON z polem 'content' zawierającym wikitext. Przeszukaj sekcję '== Urodzili się ==' i wybierz jedną osobę, która jest znana i ma charakterystyczny styl. Jeśli strona nie istnieje lub nie zawiera odpowiednich osób, możesz wybrać inną znaną postać historyczną.\n\n" +
+           "API zwraca JSON z polem 'content' zawierającym wikitext. Przeszukaj sekcję '== Urodzili się ==' i wybierz jedną osobę, która jest znana i ma charakterystyczny styl. Jeśli strona nie istnieje lub nie zawiera odpowiednich osób, możesz wybrać inną znaną postać historyczną. MUSISZ wybrać osobę urodzoną DOKŁADNIE " + tomorrowDate + ".\n\n" +
            "2. Przeanalizuj poniższe rzeczywiste dane pogodowe dla Poznania na jutro (" + tomorrowDate + ") z Open-Meteo API:\n\n" +
            weatherJson + "\n\n" +
            "Dane zawierają:\n" +
@@ -190,9 +185,9 @@ String AiWeatherSource::buildWeatherPrompt(const String& weatherJson, const Stri
            "- Średnie zachmurzenie\n\n" +
            "3. Przepisz tę prognozę w charakterystycznym stylu wybranej postaci - użyj jej znanych powiedzeń, stylu językowego, gwary, idiomów, czy innych form artystycznego wyrazu. Spraw, aby prognoza brzmiała tak, jakby została napisana lub wypowiedziana przez tę osobę.\n\n" +
            "4. Odpowiedz WYŁĄCZNIE w tym formacie (nic więcej):\n" +
-           "   {Imię i nazwisko postaci}: {prognoza w jej stylu}\n\n" +
+           "{Imię i nazwisko postaci}: {prognoza w jej stylu}\n\n" +
            "Przykład: Adam Mickiewicz: Jutro w Poznaniu będzie pochmurno z temperaturą około 15 stopni w dzień i 8 stopni w nocy. Lekki wiatr z zachodu przyniesie kilka kropel deszczu.\n\n" +
-           "WAŻNE: Całkowita długość odpowiedzi nie może przekroczyć " + String(MAX_MESSAGE_BYTES - 5) + " znaków. Bądź zwięzły i konkretny w opisie pogody.";
+           "WAŻNE: Całkowita długość odpowiedzi nie może przekroczyć " + String(MAX_MESSAGE_BYTES - 5) + " znaków. Postaraj się, aby wypowiedź była jak najbardziej naturalna i prawdopodobna i jak najdłuższa w granicy " + String(MAX_MESSAGE_BYTES - 5) + " znaków.";
 }
 
 String AiWeatherSource::extractWeatherForecast(const String& fullResponse) const

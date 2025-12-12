@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <functional>
+#include <HTTPClient.h>
 
 /**
  * Shared AI service for interacting with various AI providers.
@@ -77,6 +78,9 @@ private:
 
     AIProvider aiProviders[MAX_AI_PROVIDERS];
     int currentAIProviderIndex;
+
+    // Common HTTP response processing helper
+    bool processHttpResponse(HTTPClient& http, int httpCode, const String& providerName, String& outResponse);
 
     // Provider-specific implementations
     bool callGeminiAPI(const AIProvider& provider, const String& prompt, String& outResponse);

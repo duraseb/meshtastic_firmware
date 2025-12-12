@@ -147,6 +147,29 @@ int AIService::getConfiguredProviderCount() const
     return configuredCount;
 }
 
+bool AIService::processHttpResponse(HTTPClient& http, int httpCode, const String& providerName, String& outResponse)
+{
+    bool success = false;
+
+    if (httpCode == HTTP_CODE_OK) {
+        outResponse = http.getString();
+        LOG_DEBUG("[AIService] %s response received (%d bytes)", providerName.c_str(), outResponse.length());
+        success = true;
+    } else {
+        String errorResponse = http.getString();
+        if (errorResponse.length() > 0) {
+            LOG_ERROR("[AIService] %s request failed with HTTP code %d. Response: %s",
+                     providerName.c_str(), httpCode, errorResponse.c_str());
+        } else {
+            LOG_ERROR("[AIService] %s request failed with HTTP code %d (no response body)",
+                     providerName.c_str(), httpCode);
+        }
+    }
+    http.end();
+
+    return success;
+}
+
 bool AIService::callGeminiAPI(const AIProvider& provider, const String& prompt, String& outResponse)
 {
     // Call AI endpoint with POST
@@ -183,20 +206,7 @@ bool AIService::callGeminiAPI(const AIProvider& provider, const String& prompt, 
     // Reset watchdog after potentially long AI API call
     feedWatchdog();
 
-    bool success = false;
-
-    if (httpCode == HTTP_CODE_OK) {
-        outResponse = http.getString();
-        LOG_DEBUG("[AIService] Gemini response received (%d bytes)", outResponse.length());
-        success = true;
-    } else {
-        String errorResponse = http.getString();
-        LOG_ERROR("[AIService] Gemini request failed with HTTP code %d. Response: %s",
-                 httpCode, errorResponse.c_str());
-    }
-    http.end();
-
-    return success;
+    return processHttpResponse(http, httpCode, "Gemini", outResponse);
 }
 
 bool AIService::callMistralAPI(const AIProvider& provider, const String& prompt, String& outResponse)
@@ -232,20 +242,7 @@ bool AIService::callMistralAPI(const AIProvider& provider, const String& prompt,
     // Reset watchdog after potentially long AI API call
     feedWatchdog();
 
-    bool success = false;
-
-    if (httpCode == HTTP_CODE_OK) {
-        outResponse = http.getString();
-        LOG_DEBUG("[AIService] Mistral response received (%d bytes)", outResponse.length());
-        success = true;
-    } else {
-        String errorResponse = http.getString();
-        LOG_ERROR("[AIService] Mistral request to %s failed with HTTP code %d. Response: %s",
-                 provider.name.c_str(), httpCode, errorResponse.c_str());
-    }
-    http.end();
-
-    return success;
+    return processHttpResponse(http, httpCode, provider.name, outResponse);
 }
 
 bool AIService::callGroqAPI(const AIProvider& provider, const String& prompt, String& outResponse)
@@ -281,20 +278,7 @@ bool AIService::callGroqAPI(const AIProvider& provider, const String& prompt, St
     // Reset watchdog after potentially long AI API call
     feedWatchdog();
 
-    bool success = false;
-
-    if (httpCode == HTTP_CODE_OK) {
-        outResponse = http.getString();
-        LOG_DEBUG("[AIService] Groq response received (%d bytes)", outResponse.length());
-        success = true;
-    } else {
-        String errorResponse = http.getString();
-        LOG_ERROR("[AIService] Groq request to %s failed with HTTP code %d. Response: %s",
-                 provider.name.c_str(), httpCode, errorResponse.c_str());
-    }
-    http.end();
-
-    return success;
+    return processHttpResponse(http, httpCode, provider.name, outResponse);
 }
 
 String AIService::httpPost(const char* url, const String& payload, const String& authHeader)
@@ -352,55 +336,30 @@ bool AIService::callProvider(int providerIdx, const String& prompt, String& outR
 
 bool AIService::extractTextFromAIResponse(const String& response, String& outText)
 {
-    LOG_DEBUG("[AIService::extractTextFromAIResponse] Starting extraction (response length: %d)", response.length());
-
     // Use ArduinoJson to parse the response (use heap allocation to avoid stack overflow)
     // Typical AI responses are 2-6KB, allocate 8KB on heap for safety
     DynamicJsonDocument doc(8192);
-
-    LOG_DEBUG("[AIService::extractTextFromAIResponse] Allocating %d bytes for JSON parsing", 8192);
-#ifdef ARCH_ESP32
-    size_t free_heap_before = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-    LOG_DEBUG("[AIService::extractTextFromAIResponse] Free heap before parsing: %d bytes", free_heap_before);
-#endif
 
     // Parse the JSON response
     DeserializationError error = deserializeJson(doc, response);
 
     if (error) {
         LOG_ERROR("[AIService::extractTextFromAIResponse] JSON parsing failed: %s", error.c_str());
-#ifdef ARCH_ESP32
-        size_t free_heap_after = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-        LOG_DEBUG("[AIService::extractTextFromAIResponse] Free heap after failed parsing: %d bytes (used: %d)", free_heap_after, free_heap_before - free_heap_after);
-#endif
-        // Log first 200 chars for debugging
-        if (response.length() > 200) {
-            LOG_DEBUG("[AIService::extractTextFromAIResponse] Response start: %s...", response.substring(0, 200).c_str());
-        } else {
-            LOG_DEBUG("[AIService::extractTextFromAIResponse] Full response: %s", response.c_str());
-        }
         return false;
     }
 
-    LOG_DEBUG("[AIService::extractTextFromAIResponse] JSON parsed successfully");
-#ifdef ARCH_ESP32
-    size_t free_heap_after = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-    LOG_DEBUG("[AIService::extractTextFromAIResponse] Free heap after parsing: %d bytes (used: %d)", free_heap_after, free_heap_before - free_heap_after);
-#endif
+    // JSON parsing successful
 
     // Try to extract text content from different AI provider formats
     const char* text = nullptr;
 
     // Check for OpenAI-compatible format (Perplexity, Mistral, Groq)
     if (doc.containsKey("choices") && doc["choices"].is<JsonArray>() && doc["choices"].size() > 0) {
-        LOG_DEBUG("[AIService::extractTextFromAIResponse] Detected OpenAI-compatible format");
-
         JsonVariant choice = doc["choices"][0];
         if (choice.containsKey("message")) {
             JsonVariant message = choice["message"];
             if (message.containsKey("content")) {
                 text = message["content"];
-                LOG_DEBUG("[AIService::extractTextFromAIResponse] Extracted content from choices[0].message.content");
             }
         }
     }
