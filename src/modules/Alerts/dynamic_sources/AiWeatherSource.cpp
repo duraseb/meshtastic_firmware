@@ -185,10 +185,12 @@ String AiWeatherSource::buildWeatherPrompt(const String& weatherJson, const Stri
            "- Średnią prędkość wiatru i dominujący kierunek\n" +
            "- Średnie zachmurzenie\n\n" +
            "3. Przepisz tę prognozę w charakterystycznym stylu wybranej postaci - użyj jej znanych powiedzeń, stylu językowego, gwary, idiomów, czy innych form artystycznego wyrazu. Spraw, aby prognoza brzmiała tak, jakby została napisana lub wypowiedziana przez tę osobę.\n\n" +
-           "4. Odpowiedz WYŁĄCZNIE w tym formacie (nic więcej):\n" +
+           "4. Odpowiedz WYŁĄCZNIE w tym formacie (nic więcej, bez markdown):\n" +
            "{Imię i nazwisko postaci}: {prognoza w jej stylu}\n\n" +
-           "Przykład: Adam Mickiewicz: Jutro w Poznaniu będzie pochmurno z temperaturą około 15 stopni w dzień i 8 stopni w nocy. Lekki wiatr z zachodu przyniesie kilka kropel deszczu.\n\n" +
-           "WAŻNE: Całkowita długość odpowiedzi nie może przekroczyć " + String(MAX_MESSAGE_BYTES - 5) + " znaków. Postaraj się, aby wypowiedź była jak najbardziej naturalna i prawdopodobna i jak najdłuższa w granicy " + String(MAX_MESSAGE_BYTES - 5) + " znaków.";
+           "FORMAT PRZYKŁADU (tylko dla pokazania formatu - NIE KOPIUJ treści):\n" +
+           "Maria Skłodowska-Curie: Dzisiaj będzie słonecznie z temperaturą 15-18°C w dzień i 8-10°C w nocy.\n\n" +
+           "UWAGA: NIE KOPIUJ przykładu dosłownie! Użyj prawdziwych danych pogodowych z JSON powyżej. Przeanalizuj liczby i stwórz oryginalną prognozę.\n\n" +
+           "WAŻNE: Całkowita długość odpowiedzi musi być bliska, ale nie może przekroczyć " + String(MAX_MESSAGE_BYTES - 5) + " znaków. Odpowiedź musi zawierać analizę prawdziwych danych pogodowych, nie kopię przykładu.";
 }
 
 String AiWeatherSource::cleanFootnotes(const String& input) const

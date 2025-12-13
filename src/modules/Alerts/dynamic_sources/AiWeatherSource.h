@@ -42,7 +42,7 @@ private:
     String cleanFootnotes(const String& input) const;
 
     // Message length limits (same as alert sources - let system handle payload sizing)
-    static constexpr int MAX_MESSAGE_BYTES = 210; // Slightly increased buffer for AI-generated content
+    static constexpr int MAX_MESSAGE_BYTES = 218; // Slightly increased buffer for AI-generated content
     static constexpr int MAX_TOTAL_BYTES = 233;   // Meshtastic payload limit
 
     /**
