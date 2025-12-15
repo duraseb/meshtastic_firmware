@@ -20,7 +20,7 @@ String IMGWAlertSource::getFetchUrl() const {
 }
 
 unsigned long IMGWAlertSource::getFetchIntervalMs() const {
-    return 15 * 60 * 1000; // 15 minutes (weather alerts update less frequently)
+    return 60 * 60 * 1000;
 }
 
 std::vector<AlertSource::RawAlert> IMGWAlertSource::fetchAndParseAlerts(
@@ -38,17 +38,24 @@ std::vector<AlertSource::RawAlert> IMGWAlertSource::fetchAndParseAlerts(
             return false;
         }
 
-    // Use larger buffer for parsing the 458KB JSON response (256KB should be sufficient)
+    // Use 32KB buffer - compromise between memory usage and parsing capability
+    // The 233KB response needs significant buffer space for ArduinoJson parsing
     {
-        DynamicJsonDocument doc(256 * 1024);
+        DynamicJsonDocument doc(32768);  // 32KB buffer
 
         // Monitor memory usage
         size_t heapBefore = ESP.getFreeHeap();
-        LOG_DEBUG("IMGWAlertSource: Starting stream parse (heap: %d KB)", heapBefore/1024);
+        LOG_INFO("IMGWAlertSource: Starting stream parse (heap: %d KB, buffer: 32KB, response: ~233KB)", heapBefore/1024);
+
+        // Check if we have enough heap for the buffer
+        if (heapBefore < 32768 + 8192) {  // 32KB buffer + 8KB safety margin
+            LOG_ERROR("IMGWAlertSource: Insufficient heap (%d KB) for JSON parsing (need ~40KB)", heapBefore/1024);
+            return false;
+        }
 
         DeserializationError error = deserializeJson(doc, *stream);
         if (error) {
-            LOG_ERROR("IMGWAlertSource: Streaming JSON parsing failed: %s", error.c_str());
+            LOG_ERROR("IMGWAlertSource: JSON parsing failed: %s (heap: %d KB, buffer: 32KB)", error.c_str(), ESP.getFreeHeap()/1024);
             return false;
         }
 
