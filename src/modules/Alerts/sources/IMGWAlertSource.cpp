@@ -5,14 +5,250 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 
+// Custom streaming JSON parser for IMGW alerts
+// Since we can't fit the entire 233KB JSON in memory, we parse in chunks
+// and only extract Polish alerts
+bool IMGWAlertSource::parseIMGWStream(WiFiClient* stream, std::vector<AlertSource::RawAlert>& alerts) {
+    LOG_INFO("IMGWAlertSource: Starting chunked streaming parsing with PSRAM buffers...");
+
+    // Check if buffers are allocated
+    if (!chunkBuffer || !jsonBuffer) {
+        LOG_ERROR("IMGWAlertSource: Buffers not allocated - cannot parse");
+        return false;
+    }
+
+    bool inWarningsArray = false;
+    int braceDepth = 0;
+    int bracketDepth = 0;
+    bool inWarningObject = false;
+    AlertSource::RawAlert currentAlert;
+
+    // Reset buffer position for new parsing session
+    jsonBufferPos = 0;
+
+    while (stream->available() || stream->connected()) {
+        size_t bytesRead = stream->readBytes(chunkBuffer, CHUNK_SIZE);
+        if (bytesRead == 0) {
+            delay(10);  // Wait for more data
+            continue;
+        }
+
+        // Add chunk to our buffer (with bounds checking)
+        if (jsonBufferPos + bytesRead < JSON_BUFFER_SIZE) {
+            memcpy(&jsonBuffer[jsonBufferPos], chunkBuffer, bytesRead);
+            jsonBufferPos += bytesRead;
+        } else {
+            // Buffer full, shift data to make room (keep last part)
+            size_t shiftAmount = jsonBufferPos - (JSON_BUFFER_SIZE - bytesRead - 1);
+            memmove(jsonBuffer, &jsonBuffer[shiftAmount], jsonBufferPos - shiftAmount);
+            jsonBufferPos -= shiftAmount;
+            memcpy(&jsonBuffer[jsonBufferPos], chunkBuffer, bytesRead);
+            jsonBufferPos += bytesRead;
+        }
+
+        // Process the buffer character by character
+        size_t pos = 0;
+        while (pos < jsonBufferPos) {
+            char c = jsonBuffer[pos];
+
+            if (c == '{') {
+                braceDepth++;
+            if (braceDepth == 2 && inWarningsArray && !inWarningObject) {
+                // Starting a new warning object
+                inWarningObject = true;
+                currentAlert = AlertSource::RawAlert();
+                currentAlert.id = 0; // Initialize
+                currentAlert.link = "";
+                currentAlert.title = "";
+                currentAlert.dateStr = "";
+                currentAlert.intro = "";
+                currentAlert.context = "";
+                LOG_DEBUG("IMGWAlertSource: Found warning object");
+            }
+            } else if (c == '}') {
+                braceDepth--;
+                if (braceDepth == 1 && inWarningObject) {
+                    // End of warning object
+                    inWarningObject = false;
+                    // Check if this alert is for Poland and has content
+                    if (!currentAlert.context.isEmpty() &&
+                        (!currentAlert.title.isEmpty() || !currentAlert.intro.isEmpty())) {
+                        alerts.push_back(currentAlert);
+                        LOG_INFO("IMGWAlertSource: Captured Polish alert: %s", currentAlert.title.c_str());
+                    }
+                }
+            } else if (c == '[') {
+                bracketDepth++;
+                if (bracketDepth == 1 && strstr(jsonBuffer, "\"warnings\"") != nullptr && (char*)strstr(jsonBuffer, "\"warnings\"") < &jsonBuffer[pos]) {
+                    inWarningsArray = true;
+                    LOG_DEBUG("IMGWAlertSource: Found warnings array");
+                }
+            } else if (c == ']') {
+                bracketDepth--;
+                if (bracketDepth == 0 && inWarningsArray) {
+                    inWarningsArray = false;
+                    LOG_INFO("IMGWAlertSource: Finished processing warnings array, total Polish alerts: %d", alerts.size());
+                }
+            } else if (inWarningObject && c == '"') {
+                // Parse string values
+                size_t startPos = pos;
+                pos++; // Skip opening quote
+
+                String key = "";
+                String value = "";
+
+                // Find key
+                while (pos < jsonBufferPos && jsonBuffer[pos] != '"') {
+                    key += jsonBuffer[pos];
+                    pos++;
+                }
+                if (pos >= jsonBufferPos) break;
+                pos++; // Skip closing quote
+
+                // Skip colon and whitespace
+                while (pos < jsonBufferPos && (jsonBuffer[pos] == ':' || jsonBuffer[pos] == ' ' || jsonBuffer[pos] == '\t' || jsonBuffer[pos] == '\n' || jsonBuffer[pos] == '\r')) {
+                    pos++;
+                }
+
+                if (pos < jsonBufferPos && jsonBuffer[pos] == '"') {
+                    // String value
+                    pos++; // Skip opening quote
+                    while (pos < jsonBufferPos && jsonBuffer[pos] != '"') {
+                        if (jsonBuffer[pos] == '\\') {
+                            pos++; // Skip escape character
+                            if (pos < jsonBufferPos) {
+                                value += jsonBuffer[pos];
+                            }
+                        } else {
+                            value += jsonBuffer[pos];
+                        }
+                        pos++;
+                    }
+
+                    // Store the value if it's a key we're interested in
+                    if (strcmp(key.c_str(), "headline") == 0) {
+                        currentAlert.title = value;
+                    } else if (strcmp(key.c_str(), "description") == 0) {
+                        currentAlert.intro = value;
+                    } else if (strcmp(key.c_str(), "area") == 0) {
+                        // Check if it's for Poland - store in context field
+                        if (strstr(value.c_str(), "Polska") != nullptr || strstr(value.c_str(), "Poland") != nullptr) {
+                            currentAlert.context = value;
+                        }
+                    } else if (strcmp(key.c_str(), "identifier") == 0) {
+                        // Use identifier as unique ID (simple hash)
+                        uint32_t hash = 0;
+                        for (size_t i = 0; i < value.length(); i++) {
+                            hash = hash * 31 + value[i];
+                        }
+                        currentAlert.id = hash;
+                        currentAlert.link = value;
+                    }
+                }
+            }
+
+            pos++;
+        }
+
+        // Shift buffer to keep recent data for context (simplified approach)
+        // In a full implementation, we'd track processed position more carefully
+        if (jsonBufferPos > CHUNK_SIZE) {
+            size_t keepAmount = min((size_t)CHUNK_SIZE, jsonBufferPos);
+            memmove(jsonBuffer, &jsonBuffer[jsonBufferPos - keepAmount], keepAmount);
+            jsonBufferPos = keepAmount;
+        }
+    }
+
+    LOG_INFO("IMGWAlertSource: Streaming parsing completed, captured %d Polish alerts", alerts.size());
+    return true;
+}
+
 // Forward declaration for alertsModule
 extern AlertsModule *alertsModule;
 
 // HTTP timeout constant (matches AlertsModule)
 static constexpr unsigned long HTTP_TIMEOUT_MS = 10000;
 
-IMGWAlertSource::IMGWAlertSource() {
-    // Constructor
+// PSRAM buffer allocation/deallocation
+void IMGWAlertSource::allocatePsramBuffers() {
+    #ifdef BOARD_HAS_PSRAM
+    if (ESP.getPsramSize() > 0) {
+        LOG_INFO("IMGWAlertSource: Allocating %d KB chunk buffer in PSRAM", CHUNK_SIZE/1024);
+        chunkBuffer = static_cast<char*>(ps_malloc(CHUNK_SIZE));
+        if (!chunkBuffer) {
+            LOG_ERROR("IMGWAlertSource: Failed to allocate chunk buffer in PSRAM");
+        }
+
+        LOG_INFO("IMGWAlertSource: Allocating %d KB JSON buffer in PSRAM", JSON_BUFFER_SIZE/1024);
+        jsonBuffer = static_cast<char*>(ps_malloc(JSON_BUFFER_SIZE));
+        if (!jsonBuffer) {
+            LOG_ERROR("IMGWAlertSource: Failed to allocate JSON buffer in PSRAM");
+            // Try to free chunk buffer if JSON buffer failed
+            if (chunkBuffer) {
+                free(chunkBuffer);
+                chunkBuffer = nullptr;
+            }
+        }
+    } else {
+        LOG_WARN("IMGWAlertSource: PSRAM not available, falling back to heap allocation");
+    }
+    #endif
+
+    // Fallback to heap allocation if PSRAM not available or allocation failed
+    if (!chunkBuffer) {
+        LOG_INFO("IMGWAlertSource: Using heap allocation for chunk buffer");
+        chunkBuffer = static_cast<char*>(malloc(CHUNK_SIZE));
+    }
+    if (!jsonBuffer) {
+        LOG_INFO("IMGWAlertSource: Using heap allocation for JSON buffer");
+        jsonBuffer = static_cast<char*>(malloc(JSON_BUFFER_SIZE));
+    }
+
+    if (!chunkBuffer || !jsonBuffer) {
+        LOG_ERROR("IMGWAlertSource: Failed to allocate buffers - parsing will not work");
+    }
+}
+
+void IMGWAlertSource::freePsramBuffers() {
+    if (chunkBuffer) {
+        #ifdef BOARD_HAS_PSRAM
+        if (ESP.getPsramSize() > 0) {
+            free(chunkBuffer);  // ps_free() is just free() for PSRAM
+        } else {
+            free(chunkBuffer);
+        }
+        #else
+        free(chunkBuffer);
+        #endif
+        chunkBuffer = nullptr;
+    }
+
+    if (jsonBuffer) {
+        #ifdef BOARD_HAS_PSRAM
+        if (ESP.getPsramSize() > 0) {
+            free(jsonBuffer);
+        } else {
+            free(jsonBuffer);
+        }
+        #else
+        free(jsonBuffer);
+        #endif
+        jsonBuffer = nullptr;
+    }
+
+    jsonBufferPos = 0;
+}
+
+// Note: PSRAM is available on ESP32-S3 but we'll use heap for now
+// Future optimization could use PSRAM for very large JSON documents
+
+IMGWAlertSource::IMGWAlertSource() :
+    chunkBuffer(nullptr),
+    jsonBuffer(nullptr),
+    jsonBufferPos(0)
+{
+    // Allocate PSRAM buffers
+    allocatePsramBuffers();
 }
 
 String IMGWAlertSource::getFetchUrl() const {
@@ -38,35 +274,21 @@ std::vector<AlertSource::RawAlert> IMGWAlertSource::fetchAndParseAlerts(
             return false;
         }
 
-    // Use 32KB buffer - compromise between memory usage and parsing capability
-    // The 233KB response needs significant buffer space for ArduinoJson parsing
-    {
-        DynamicJsonDocument doc(32768);  // 32KB buffer
+        LOG_INFO("IMGWAlertSource: Starting true streaming JSON parsing...");
 
-        // Monitor memory usage
-        size_t heapBefore = ESP.getFreeHeap();
-        LOG_INFO("IMGWAlertSource: Starting stream parse (heap: %d KB, buffer: 32KB, response: ~233KB)", heapBefore/1024);
+        // Use our custom streaming parser that processes JSON in chunks
+        // and only extracts Polish alerts without loading the entire 233KB response
+        bool success = this->parseIMGWStream(stream, alerts);
 
-        // Check if we have enough heap for the buffer
-        if (heapBefore < 32768 + 8192) {  // 32KB buffer + 8KB safety margin
-            LOG_ERROR("IMGWAlertSource: Insufficient heap (%d KB) for JSON parsing (need ~40KB)", heapBefore/1024);
+        if (!success) {
+            LOG_ERROR("IMGWAlertSource: Streaming JSON parsing failed");
             return false;
         }
 
-        DeserializationError error = deserializeJson(doc, *stream);
-        if (error) {
-            LOG_ERROR("IMGWAlertSource: JSON parsing failed: %s (heap: %d KB, buffer: 32KB)", error.c_str(), ESP.getFreeHeap()/1024);
-            return false;
-        }
+        LOG_INFO("IMGWAlertSource: Streaming JSON parsing completed successfully");
 
-        size_t heapAfter = ESP.getFreeHeap();
-        LOG_DEBUG("IMGWAlertSource: JSON parsed successfully (heap used: %d KB, free: %d KB)",
-                  (heapBefore > heapAfter) ? (heapBefore - heapAfter)/1024 : 0, heapAfter/1024);
-
-        // Process the parsed JSON (rest of the original logic)
-        return processParsedJson(doc, alerts);
-    }
-};
+        return true;
+    };
 
     // Call the streaming HTTP method from AlertsModule
     if (!alertsModule->httpGetStream(getFetchUrl().c_str(), jsonProcessor)) {
@@ -208,15 +430,20 @@ uint32_t IMGWAlertSource::hashString(const String &str)
     return hash;
 }
 
-bool IMGWAlertSource::processParsedJson(DynamicJsonDocument &doc, std::vector<RawAlert> &alerts)
+template<typename T>
+bool IMGWAlertSource::processParsedJson(T &doc, std::vector<RawAlert> &alerts)
 {
     // Check if we have warnings array
-    if (!doc.containsKey("warnings") || !doc["warnings"].is<JsonArray>()) {
-        LOG_WARN("IMGWAlertSource: No warnings array found in response");
+    if (!doc.containsKey("warnings")) {
+        LOG_WARN("IMGWAlertSource: No warnings key found in response");
         return false;
     }
 
     JsonArray warnings = doc["warnings"];
+    if (warnings.isNull()) {
+        LOG_WARN("IMGWAlertSource: Warnings is not an array");
+        return false;
+    }
 
     // Process up to 10 most recent alerts
     for (size_t i = 0; i < warnings.size() && alerts.size() < 10; i++) {

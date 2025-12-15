@@ -296,6 +296,7 @@ bool AlertsModule::httpGetStream(const char *url, std::function<bool(WiFiClient*
     // Add headers to reduce server load and identify ourselves
     http->addHeader("User-Agent", "Meshtastic-Alerts/1.0");
     http->addHeader("Accept", "application/json");
+    http->addHeader("Accept-Encoding", "identity");  // Disable compression to reduce buffering
 
     int httpCode = http->GET();
 
