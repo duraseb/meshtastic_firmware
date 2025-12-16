@@ -608,12 +608,18 @@ bool AlertsModule::loadAlertsFromDisk()
                 a.id = binAlert.id;
                 a.alert_type = a.title;
 
-                // Millis()-based timestamps don't persist across reboots since millis() resets to 0
-                // Set lastSent to 0 and nextSendAt to 0 so alerts are checked immediately
-                // after time sync, but the resend logic will skip alerts with lastSent=0
-                // to prevent immediate sending after reboot
+                // lastSent is set to 0 to prevent immediate sending after reboot
+                // nextSendAt is now stored as absolute Unix timestamp, so preserve it from disk
+                // Handle backward compatibility: old alerts stored nextSendAt as seconds from boot
                 a.lastSent = 0;
-                a.nextSendAt = 0;
+                if (binAlert.nextSendAt >= MIN_VALID_EPOCH) {
+                    // New format: absolute Unix timestamp
+                    a.nextSendAt = binAlert.nextSendAt;
+                } else {
+                    // Old format: seconds from boot, treat as expired and reschedule
+                    LOG_DEBUG("Detected old-format nextSendAt (%lu), will reschedule after time sync", binAlert.nextSendAt);
+                    a.nextSendAt = 0;
+                }
 
                 if (isAlertValid(a)) {
                     alerts.push_back(a);
@@ -643,6 +649,7 @@ bool AlertsModule::loadAlertsFromDisk()
 int32_t AlertsModule::runOnce()
 {
     unsigned long currentMillis = millis();
+    uint32_t currentTime = getTime(false);
 
     // Periodic memory usage monitoring
     if (currentMillis - lastMemoryCheckTime > MEMORY_CHECK_INTERVAL_MS) {
@@ -691,13 +698,12 @@ int32_t AlertsModule::runOnce()
             
             // Priority 1: Check for alerts that need re-sending (works without WiFi)
             // Only send if time is synced (to check dates) and radio is available
-            uint32_t currentTime = getTime(false);
             if (currentTime > 0 && currentTime >= MIN_VALID_EPOCH) {
                 // Time is synced, we can check and resend existing alerts
                 // Limit processing to avoid blocking - only check a few alerts per cycle
                 static size_t lastCheckedIndex = 0;
                 size_t alertsCheckedThisCycle = 0;
-                const size_t MAX_CHECKS_PER_CYCLE = 5; // Check max 5 alerts per runOnce call
+                const size_t MAX_CHECKS_PER_CYCLE = 1;
 
                 for (size_t i = 0; i < alerts.size() && alertsCheckedThisCycle < MAX_CHECKS_PER_CYCLE; i++) {
                     size_t checkIndex = (lastCheckedIndex + i) % alerts.size();
@@ -710,27 +716,39 @@ int32_t AlertsModule::runOnce()
                     alertsCheckedThisCycle++;
 
                     // Check if it's time to send based on pre-calculated nextSendAt
-                    if (currentMillis >= alert.nextSendAt) {
+                    // nextSendAt is now stored as absolute Unix timestamp
+                    if (currentTime >= alert.nextSendAt) {
                         // Time to re-send this alert (mesh only, no WiFi needed)
                         if (sendAlertToMesh(alert)) {
                             alert.lastSent = currentMillis;
                             // Calculate next send time based on severity
                             unsigned long interval = getSendInterval(alert.severity);
-                            alert.nextSendAt = currentMillis + interval;
+                            // Store absolute time instead of relative time from boot
+                            if (currentTime > 0) {
+                                alert.nextSendAt = currentTime + interval;
+                            } else {
+                                // Fallback if time not synced (shouldn't happen in resend logic)
+                                alert.nextSendAt = currentTime + interval;
+                            }
                             saveAlertToDisk(alert);
                             LOG_INFO("Re-sent alert [%s, sev:%d]: %s (next in %lu min)",
-                                     alert.source.c_str(), alert.severity, alert.title.c_str(), interval / 60000);
+                                     alert.source.c_str(), alert.severity, alert.title.c_str(), interval / 60);
                         } else {
                             // Failed to send - set retry delay to avoid tight loop
-                            alert.nextSendAt = currentMillis + 60000; // Retry in 1 minute
+                            // Store absolute time instead of relative time from boot
+                            if (currentTime > 0) {
+                                alert.nextSendAt = currentTime + 60; // Retry in 1 minute
+                            } else {
+                                alert.nextSendAt = currentTime + 60; // Retry in 1 minute
+                            }
                         }
                         // Only resend one alert per cycle to avoid blocking
                         lastCheckedIndex = (checkIndex + 1) % alerts.size(); // Resume after this alert
                         return RESEND_CHECK_YIELD_MS;
                     } else {
                         // Alert is pending but not yet due
-                        unsigned long remainingMs = alert.nextSendAt - currentMillis;
-                        unsigned long remainingSec = remainingMs / 1000;
+                        // nextSendAt is now absolute Unix timestamp
+                        unsigned long remainingSec = alert.nextSendAt - currentTime;
                     if (remainingSec > 120) {
                         unsigned long remainingMin = remainingSec / 60;
                         LOG_DEBUG("Alert pending (will send in %lu min, source: %s, severity: %d): %s",
@@ -800,11 +818,11 @@ int32_t AlertsModule::runOnce()
             
             if (!wifiConnected) {
                 LOG_DEBUG("WiFi not connected (status=%d), waiting 60s (mesh resends still active)",
-    #if HAS_WIFI && !defined(ARCH_PORTDUINO)
+#if HAS_WIFI && !defined(ARCH_PORTDUINO)
                          WiFi.status()
-    #else
+#else
                          0
-    #endif
+#endif
                          );
                 return MAX_RUNONCE_INTERVAL_MS; // Return 1 minute, not WIFI_UNAVAILABLE_WAIT_MS
             }
@@ -877,8 +895,8 @@ int32_t AlertsModule::runOnce()
                 if (isAlertValid(alert) && alert.lastSent > 0) {
                     unsigned long alertInterval = getSendInterval(alert.severity);
                     unsigned long elapsed = currentMillis - alert.lastSent;
-                    if (elapsed < alertInterval) {
-                        unsigned long timeUntilNext = alertInterval - elapsed;
+                    if (elapsed < alertInterval * 1000) {  // Convert alertInterval from seconds to milliseconds for comparison
+                        unsigned long timeUntilNext = (alertInterval * 1000) - elapsed;
                         if (timeUntilNext < minInterval) {
                             minInterval = timeUntilNext;
                         }
@@ -1034,8 +1052,7 @@ int32_t AlertsModule::runOnce()
             processingCtx.alert.source = processingCtx.source->getSourceId();
             processingCtx.alert.severity = processingCtx.source->getDefaultSeverity();
             processingCtx.alert.lastSent = 0;
-            
-            uint32_t currentTime = getTime(false);
+
             if (currentTime > 0) {
                 processingCtx.alert.addedAt = currentTime;
             } else {
@@ -1233,14 +1250,24 @@ int32_t AlertsModule::runOnce()
                     processingCtx.alert.lastSent = currentMillis;
                     // Calculate next send time based on severity
                     unsigned long interval = getSendInterval(processingCtx.alert.severity);
-                    processingCtx.alert.nextSendAt = currentMillis + interval;
+                    // Store absolute time instead of relative time from boot
+                    if (currentTime > 0) {
+                        processingCtx.alert.nextSendAt = currentTime + interval;
+                    } else {
+                        processingCtx.alert.nextSendAt = currentTime + interval;
+                    }
                     saveAlertToFile(processingCtx.alert, id, processingCtx.alert.valid_from);
                     LOG_INFO("Sent NEW alert [%s, sev:%d]: %s (next in %lu min)",
                              processingCtx.alert.source.c_str(), processingCtx.alert.severity,
-                             processingCtx.alert.title.c_str(), interval / 60000);
+                             processingCtx.alert.title.c_str(), interval / 60);
                 } else {
                     // Failed to send - set retry delay to avoid tight loop
-                    processingCtx.alert.nextSendAt = currentMillis + 60000; // Retry in 1 minute
+                    // Store absolute time instead of relative time from boot
+                    if (currentTime > 0) {
+                        processingCtx.alert.nextSendAt = currentTime + 60; // Retry in 1 minute
+                    } else {
+                        processingCtx.alert.nextSendAt = currentTime + 60; // Retry in 1 minute
+                    }
                     saveAlertToFile(processingCtx.alert, id, processingCtx.alert.valid_from);
                     LOG_WARN("Failed to send new alert, will retry in 1 min [%s, sev:%d]: %s",
                              processingCtx.alert.source.c_str(), processingCtx.alert.severity,
@@ -1681,14 +1708,14 @@ int8_t AlertsModule::findAlertChannel()
 
 unsigned long AlertsModule::getSendInterval(uint8_t severity)
 {
-    unsigned long baseIntervalMs = SEVERITY_MIN_INTERVAL_MS;
-    unsigned long maxIntervalMs = SEVERITY_MAX_INTERVAL_MS;
-    unsigned long rangeMs = maxIntervalMs - baseIntervalMs;
+    unsigned long baseIntervalSec = SEVERITY_MIN_INTERVAL_SEC;
+    unsigned long maxIntervalSec = SEVERITY_MAX_INTERVAL_SEC;
+    unsigned long rangeSec = maxIntervalSec - baseIntervalSec;
 
-    // Calculate proportional interval
-    unsigned long intervalMs = baseIntervalMs + (severity * rangeMs / 10);
+    // Calculate proportional interval in seconds
+    unsigned long intervalSec = baseIntervalSec + (severity * rangeSec / 10);
 
-    return intervalMs;
+    return intervalSec;
 }
 
 time_t AlertsModule::parseDateString(const String &dateStr)
