@@ -77,7 +77,7 @@ class AlertsModule : public concurrency::OSThread {
 
     // Storage and cleanup settings
     static constexpr unsigned long CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
-    static constexpr unsigned long ALERT_RETENTION_DAYS = 30; // Keep processed markers for duplicate detection
+    static constexpr unsigned long ALERT_RETENTION_DAYS = 5; // Keep processed markers for duplicate detection
 
     // Channel settings
     String alertChannelName; // Channel name (empty string = use default/primary channel)

@@ -575,6 +575,8 @@ bool AlertsModule::loadAlertsFromDisk()
                   return a.second > b.second;
               });
 
+    LOG_INFO("Found %d valid alert files, loading up to %d", alertFiles.size(), MAX_ALERTS_IN_MEMORY);
+
     int loadedCount = 0;
     for (const auto& fileInfo : alertFiles) {
         if (loadedCount >= MAX_ALERTS_IN_MEMORY) {
@@ -606,9 +608,10 @@ bool AlertsModule::loadAlertsFromDisk()
                 a.id = binAlert.id;
                 a.alert_type = a.title;
 
-                // Reset millis()-based timestamps on load since they don't persist across reboots
+                // Millis()-based timestamps don't persist across reboots since millis() resets to 0
                 // Set lastSent to 0 and nextSendAt to 0 so alerts are checked immediately
-                // after time sync, proper intervals will be applied after first resend
+                // after time sync, but the resend logic will skip alerts with lastSent=0
+                // to prevent immediate sending after reboot
                 a.lastSent = 0;
                 a.nextSendAt = 0;
 
@@ -628,6 +631,7 @@ bool AlertsModule::loadAlertsFromDisk()
     }
 
     LOG_INFO("Loaded %d valid (non-expired) alerts from disk (of %d total files)", loadedCount, alertFiles.size());
+    LOG_INFO("Alert loading complete");
     return loadedCount > 0;
 }
 
@@ -1074,11 +1078,33 @@ int32_t AlertsModule::runOnce()
                 // No structured dates - use AI extraction with fallbacks
                 if (aiStart.length() > 0) {
                     processingCtx.alert.valid_from = aiStart;
-                } else {
+                } else if (processingCtx.rawAlert.dateStr.length() > 0) {
                     // Fallback to source's publish date
                     processingCtx.alert.valid_from = processingCtx.rawAlert.dateStr;
-                    LOG_DEBUG("No start date from AI, using publish date: %s", 
+                    LOG_DEBUG("No start date from AI, using publish date: %s",
                              processingCtx.rawAlert.dateStr.c_str());
+                } else {
+                    // No date from AI or source - fallback to current time
+                    time_t now = time(nullptr);
+                    if (now >= MIN_VALID_EPOCH) {
+                        struct tm *nowTm = gmtime(&now);
+                        if (nowTm) {
+                            char currentTimeStr[20];
+                            snprintf(currentTimeStr, sizeof(currentTimeStr), "%04d-%02d-%02d %02d:%02d:%02d",
+                                    nowTm->tm_year + 1900, nowTm->tm_mon + 1, nowTm->tm_mday,
+                                    nowTm->tm_hour, nowTm->tm_min, nowTm->tm_sec);
+                            processingCtx.alert.valid_from = String(currentTimeStr);
+                            LOG_DEBUG("No date from source or AI, using current time: %s", currentTimeStr);
+                        } else {
+                            // gmtime failed - set to empty string, will be handled later
+                            processingCtx.alert.valid_from = "";
+                            LOG_WARN("Could not get current time for alert start date");
+                        }
+                    } else {
+                        // Time not synced - set to empty string, will be handled later
+                        processingCtx.alert.valid_from = "";
+                        LOG_WARN("Time not synced, cannot set alert start date");
+                    }
                 }
                 
                 // For end date, use AI result, or calculate reasonable expiration
@@ -1122,9 +1148,27 @@ int32_t AlertsModule::runOnce()
                                      processingCtx.source->getSourceId().c_str(), (unsigned long)startTime);
                         }
                     } else {
-                        // Fallback - use publish date (will expire immediately, but better than never)
-                        processingCtx.alert.valid_to = processingCtx.rawAlert.dateStr;
-                        LOG_WARN("Could not calculate expiration for alert, using publish date");
+                        // No valid start time from AI or source - fallback to end of current day
+                        time_t now = time(nullptr);
+                        if (now >= MIN_VALID_EPOCH) {
+                            // Set end date to end of current day (23:59:59)
+                            struct tm *nowTm = gmtime(&now);
+                            if (nowTm) {
+                                char endOfDayStr[20];
+                                snprintf(endOfDayStr, sizeof(endOfDayStr), "%04d-%02d-%02d 23:59:59",
+                                        nowTm->tm_year + 1900, nowTm->tm_mon + 1, nowTm->tm_mday);
+                                processingCtx.alert.valid_to = String(endOfDayStr);
+                                LOG_DEBUG("No valid date from source or AI, using end of current day: %s", endOfDayStr);
+                            } else {
+                                // gmtime failed - use publish date as last resort
+                                processingCtx.alert.valid_to = processingCtx.rawAlert.dateStr;
+                                LOG_WARN("Could not calculate end of day, using publish date");
+                            }
+                        } else {
+                            // Time not synced - use publish date as last resort
+                            processingCtx.alert.valid_to = processingCtx.rawAlert.dateStr;
+                            LOG_WARN("Time not synced, using publish date for expiration");
+                        }
                     }
                 }
             }
@@ -1658,6 +1702,11 @@ time_t AlertsModule::parseDateString(const String &dateStr)
 
     // Try YYYY-MM-DD hh:mm:ss format first (from AI)
     if (sscanf(dateStr.c_str(), "%d-%d-%d %d:%d:%d", &year, &month, &day, &hour, &minute, &second) >= 3) {
+        // Validate ranges
+        if (year < 2020 || year > 2030 || month < 1 || month > 12 || day < 1 || day > 31 ||
+            hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
+            return 0; // Invalid date
+        }
         tm.tm_mday = day;
         tm.tm_mon = month - 1; // tm_mon is 0-11
         tm.tm_year = year - 1900; // tm_year is years since 1900
@@ -1672,6 +1721,11 @@ time_t AlertsModule::parseDateString(const String &dateStr)
     // Try DD.MM.YYYY or DD.MM.YYYY HH:MM format (from HTML parsing)
     if (sscanf(dateStr.c_str(), "%d.%d.%d %d:%d", &day, &month, &year, &hour, &minute) >= 3 ||
         sscanf(dateStr.c_str(), "%d.%d.%d", &day, &month, &year) >= 3) {
+        // Validate ranges
+        if (year < 2020 || month < 1 || month > 12 || day < 1 || day > 31 ||
+            hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+            return 0; // Invalid date
+        }
         tm.tm_mday = day;
         tm.tm_mon = month - 1; // tm_mon is 0-11
         tm.tm_year = year - 1900; // tm_year is years since 1900
