@@ -479,8 +479,8 @@ bool AlertsModule::saveAlertToFile(const Alert &alert, uint32_t id, const String
 
     binAlert.severity = alert.severity;
     binAlert.addedAt = alert.addedAt;
-    binAlert.lastSent = alert.lastSent / 1000;
-    binAlert.nextSendAt = alert.nextSendAt / 1000;
+    binAlert.lastSent = alert.lastSent / 1000;  // Keep lastSent in seconds for compatibility
+    binAlert.nextSendAt = alert.nextSendAt;     // nextSendAt is now stored as Unix timestamp in seconds
     binAlert.id = alert.id;
 
     // Atomic write with temp file
