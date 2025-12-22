@@ -190,7 +190,8 @@ String AiWeatherSource::buildWeatherPrompt(const String& weatherJson, const Stri
            "FORMAT PRZYKŁADU (tylko dla pokazania formatu - NIE KOPIUJ treści):\n" +
            "Maria Skłodowska-Curie: Dzisiaj będzie słonecznie z temperaturą 15-18°C w dzień i 8-10°C w nocy.\n\n" +
            "UWAGA: NIE KOPIUJ przykładu dosłownie! Użyj prawdziwych danych pogodowych z JSON powyżej. Przeanalizuj liczby i stwórz oryginalną prognozę.\n\n" +
-           "WAŻNE: Całkowita długość odpowiedzi musi być bliska, ale nie może przekroczyć " + String(MAX_MESSAGE_BYTES - 5) + " znaków. Odpowiedź musi zawierać analizę prawdziwych danych pogodowych, nie kopię przykładu.";
+           "WAŻNE: Całkowita długość odpowiedzi musi być bliska, ale nie może przekroczyć " + String(MAX_MESSAGE_BYTES - 5) + " znaków. Odpowiedź musi zawierać analizę prawdziwych danych pogodowych, nie kopię przykładu.\n\n" +
+           "BEZWZGLĘDNIE ZAKAZANE: NIE DODAWAJ żadnych meta-informacji do odpowiedzi! NIE podawaj liczby znaków, słów, bajtów. NIE dodawaj komentarzy w nawiasach typu '(X znaków)', '(X słów)'. NIE wyjaśniaj formatu. Zwróć TYLKO prognozę pogody w wymaganym formacie, nic więcej.";
 }
 
 String AiWeatherSource::cleanFootnotes(const String& input) const
