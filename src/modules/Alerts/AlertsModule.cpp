@@ -1450,56 +1450,78 @@ bool AlertsModule::parseAIResponse(const String &response, String &outMessage, S
 
     LOG_DEBUG("[parseAIResponse] Extracted text content (length: %d)", extractedText.length());
 
-    // Now parse the delimited format from the extracted text
-    // Format: message|||___|||start|||___|||end|||___|||where|||___|||severity
+    // Parse named field format: field:value|||___|||field:value|||___|||...
+    // Fields can be in any order and some may be missing
 
     String delimiter = "|||___|||";
-    int firstDelim = extractedText.indexOf(delimiter);
-    if (firstDelim < 0) {
-        LOG_WARN("[parseAIResponse] Delimiter not found in AI response");
+
+    // Initialize outputs with defaults
+    outMessage = "";
+    outStart = "";
+    outEnd = "";
+    outWhere = "";
+    outSeverity = DEFAULT_SOURCE_SEVERITY;
+
+    // Split response by delimiter
+    int startPos = 0;
+    while (startPos < extractedText.length()) {
+        int delimPos = extractedText.indexOf(delimiter, startPos);
+        String fieldStr;
+
+        if (delimPos >= 0) {
+            fieldStr = extractedText.substring(startPos, delimPos);
+            startPos = delimPos + delimiter.length();
+        } else {
+            // Last field
+            fieldStr = extractedText.substring(startPos);
+            startPos = extractedText.length();
+        }
+
+        fieldStr.trim();
+
+        // Parse field name and value (format: "fieldname:value")
+        // The AI replaces {fieldname} with actual content, so we get "fieldname:actual_value"
+        int colonPos = fieldStr.indexOf(':');
+        if (colonPos <= 0) {
+            LOG_WARN("[parseAIResponse] Invalid field format: '%s'", fieldStr.c_str());
+            continue;
+        }
+
+        String fieldName = fieldStr.substring(0, colonPos);
+        String fieldValue = fieldStr.substring(colonPos + 1);
+
+        fieldName.trim();
+        fieldValue.trim();
+
+        // Map field to output variable
+        if (fieldName == "message") {
+            outMessage = fieldValue;
+        } else if (fieldName == "where") {
+            outWhere = fieldValue;
+        } else if (fieldName == "severity") {
+            outSeverity = fieldValue.toInt();
+            if (outSeverity > 10) {
+                LOG_WARN("[parseAIResponse] Invalid severity value: %d (expected 0-10)", outSeverity);
+                outSeverity = DEFAULT_SOURCE_SEVERITY;
+            }
+        } else if (fieldName == "start") {
+            outStart = fieldValue;
+        } else if (fieldName == "end") {
+            outEnd = fieldValue;
+        } else {
+            LOG_WARN("[parseAIResponse] Unknown field: '%s'", fieldName.c_str());
+        }
+    }
+
+    // Validate required fields
+    if (outMessage.length() == 0) {
+        LOG_WARN("[parseAIResponse] Message field not found or empty");
         return false;
     }
 
-    outMessage = extractedText.substring(0, firstDelim);
-    outMessage.trim();
-
-    String remaining = extractedText.substring(firstDelim + delimiter.length());
-    int secondDelim = remaining.indexOf(delimiter);
-    if (secondDelim < 0) {
-        LOG_WARN("[parseAIResponse] Second delimiter not found in AI response");
+    if (outWhere.length() == 0) {
+        LOG_WARN("[parseAIResponse] Where field not found or empty");
         return false;
-    }
-
-    outStart = remaining.substring(0, secondDelim);
-    outStart.trim();
-
-    remaining = remaining.substring(secondDelim + delimiter.length());
-    int thirdDelim = remaining.indexOf(delimiter);
-    if (thirdDelim < 0) {
-        LOG_WARN("[parseAIResponse] Third delimiter not found in AI response");
-        return false;
-    }
-
-    outEnd = remaining.substring(0, thirdDelim);
-    outEnd.trim();
-
-    remaining = remaining.substring(thirdDelim + delimiter.length());
-    int fourthDelim = remaining.indexOf(delimiter);
-    if (fourthDelim < 0) {
-        LOG_WARN("[parseAIResponse] Fourth delimiter not found in AI response");
-        return false;
-    }
-
-    outWhere = remaining.substring(0, fourthDelim);
-    outWhere.trim();
-
-    String severityStr = remaining.substring(fourthDelim + delimiter.length());
-    severityStr.trim();
-
-    outSeverity = severityStr.toInt();
-    if (outSeverity > 10) {
-        LOG_WARN("[parseAIResponse] Invalid severity value: %d (expected 0-10)", outSeverity);
-        outSeverity = DEFAULT_SOURCE_SEVERITY;
     }
 
     LOG_INFO("[parseAIResponse] Successfully parsed AI response: msg='%s', start='%s', end='%s', where='%s', severity=%d",
@@ -1507,9 +1529,6 @@ bool AlertsModule::parseAIResponse(const String &response, String &outMessage, S
 
     return true;
 }
-
-
-
 
 
 // ========== Utility Functions ==========

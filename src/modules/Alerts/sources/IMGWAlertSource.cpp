@@ -253,19 +253,17 @@ String IMGWAlertSource::buildAIPrompt(const RawAlert &rawAlert,
     
     // For IMGW, structured dates come from RawAlert, but GPT still evaluates severity
     String prompt = "Jesteś parserem alertów pogodowych IMGW. Zwróć TYLKO ten format (bez dodatkowego tekstu):\n\n"
-                    "message|||___|||IGNORE|||___|||IGNORE|||___|||where|||___|||severity\n\n"
-                    "UWAGA: Daty są już ustalone (wpisz IGNORE). Oceń severity na podstawie treści.\n\n"
+                    "message:{message}|||___|||where:{where}|||___|||severity:{severity}\n\n"
                     "ZASADY:\n\n"
-                    "message: Max " + String(maxMessageBytes) + " bajtów UTF-8\n"
+                    "{message}: Max " + String(maxMessageBytes) + " bajtów UTF-8\n"
                     "- Z HEADLINE i DESCRIPTION (dodaj INSTRUCTION jeśli się zmieści)\n"
                     "- Zachowaj kluczowe fakty: zjawisko, intensywność, skutki\n"
                     "- Skróty: woj., pow., gm., godz.\n"
-                    "- NIE WYMYŚLAJ nic\n"
-                    "- NIE używaj: |||___|||\n\n"
-                    "where: Max " + String(maxLocationChars) + " znaków\n"
+                    "- NIE WYMYŚLAJ nic\n\n"
+                    "{where}: Max " + String(maxLocationChars) + " znaków\n"
                     "- Z AREA (PRZEPISZ dokładnie, skróć jeśli za długa)\n"
                     "- Wiele powiatów: wypisz lub użyj 'woj. [nazwa]'\n\n"
-                    "severity: Liczba 0-10 - oceń całościowo\n"
+                    "{severity}: Liczba 0-10 - oceń całościowo\n"
                     "- Weź pod uwagę SOURCE SEVERITY: " + severity + "\n"
                     "- Weź pod uwagę SOURCE CERTAINTY: " + certainty + "\n"
                     "- Weź pod uwagę SOURCE URGENCY: " + urgency + "\n"
@@ -274,19 +272,19 @@ String IMGWAlertSource::buildAIPrompt(const RawAlert &rawAlert,
                     "- Uwzględnij rzeczywiste zagrożenie opisane w tekście\n"
                     "- Ostateczna wartość to Twoja ocena na podstawie WSZYSTKICH powyższych\n\n"
                     "PRZYKŁAD:\n"
-                    "Opady śniegu 21.11, umiarkowane, pokrywa do 15 cm. Utrudnienia na drogach.|||___|||IGNORE|||___|||IGNORE|||___|||" + 
-                    area + "|||___|||" + String(calculatedSeverity) + "\n\n"
+                    "message:Opady śniegu 21.11, umiarkowane, pokrywa do 15 cm. Utrudnienia na drogach.|||___|||where:" +
+                    area + "|||___|||severity:" + String(calculatedSeverity) + "\n\n"
+                    "\n"
                     "AREA: " + area + "\n"
                     "HEADLINE: " + rawAlert.title + "\n"
                     "DESCRIPTION: " + rawAlert.intro;
     
-    if (instruction.length() > 0 && instruction.length() < 200) {
+    if (instruction.length() > 0 && instruction.length() < 300) {
         prompt += "\nINSTRUCTION: " + instruction;
     }
     
     return prompt;
 }
-
 
 uint8_t IMGWAlertSource::calculateSeverity(const String &severity, const String &certainty, const String &urgency) const
 {
@@ -294,29 +292,29 @@ uint8_t IMGWAlertSource::calculateSeverity(const String &severity, const String 
     // CAP certainty: Observed, Likely, Possible, Unlikely
     // CAP urgency: Immediate, Expected, Future, Past
     //
-    // Our scale: 0=info, 3=minor, 5=moderate, 8=severe, 10=extreme
-    
-    int base = 5; // Default moderate
-    
-    // Base severity mapping
-    if (severity.indexOf("Minor") >= 0) base = 3;
+    // Our scale: 0=critical (extreme), 10=informational
+
+    int base = 10; // Default to informational
+
+    // Base severity mapping (lower = more critical)
+    if (severity.indexOf("Extreme") >= 0) base = 0;
+    else if (severity.indexOf("Severe") >= 0) base = 2;
     else if (severity.indexOf("Moderate") >= 0) base = 5;
-    else if (severity.indexOf("Severe") >= 0) base = 8;
-    else if (severity.indexOf("Extreme") >= 0) base = 10;
+    else if (severity.indexOf("Minor") >= 0) base = 8;
     
-    // Certainty modifier
+    // Certainty modifier (higher certainty = lower severity number = more critical)
     float certMod = 0;
-    if (certainty.indexOf("Observed") >= 0) certMod = 1.0;
-    else if (certainty.indexOf("Likely") >= 0) certMod = 0.5;
-    else if (certainty.indexOf("Possible") >= 0) certMod = 0;
-    else if (certainty.indexOf("Unlikely") >= 0) certMod = -1.0;
-    
-    // Urgency modifier
+    if (certainty.indexOf("Observed") >= 0) certMod = -2.0;  // High certainty = more critical
+    else if (certainty.indexOf("Likely") >= 0) certMod = -0.6; // Medium certainty
+    else if (certainty.indexOf("Possible") >= 0) certMod = 0;   // Low certainty
+    else if (certainty.indexOf("Unlikely") >= 0) certMod = 1.0; // Very low certainty = less critical
+
+    // Urgency modifier (higher urgency = lower severity number = more critical)
     float urgMod = 0;
-    if (urgency.indexOf("Immediate") >= 0) urgMod = 1.0;
-    else if (urgency.indexOf("Expected") >= 0) urgMod = 0.5;
-    else if (urgency.indexOf("Future") >= 0) urgMod = 0;
-    else if (urgency.indexOf("Past") >= 0) urgMod = -2.0;
+    if (urgency.indexOf("Immediate") >= 0) urgMod = -2.0; // High urgency = more critical
+    else if (urgency.indexOf("Expected") >= 0) urgMod = -0.6; // Medium urgency
+    else if (urgency.indexOf("Future") >= 0) urgMod = 0;     // Future urgency
+    else if (urgency.indexOf("Past") >= 0) urgMod = 2.0;     // Past urgency = less critical
     
     // Calculate final severity
     int final = base + (int)(certMod + urgMod);
