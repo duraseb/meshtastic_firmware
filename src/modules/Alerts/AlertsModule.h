@@ -9,6 +9,7 @@
 #include "DynamicSource.h"
 #include <Arduino.h>
 #include <vector>
+#include <unordered_set>
 
 // Alert structure - shared between AlertsModule and AlertSource
 struct Alert {
@@ -92,6 +93,7 @@ class AlertsModule : public concurrency::OSThread {
     static constexpr unsigned long ALERT_PROCESSING_YIELD_MS = 100;
     static constexpr unsigned long RESEND_CHECK_YIELD_MS = 50;
     static constexpr unsigned long MAX_RUNONCE_INTERVAL_MS = 15000;
+    static constexpr unsigned long ALERT_PROCESSING_THROTTLE_MS = 1000; // Minimum 1 second between alert processing starts
     static constexpr int MAX_ALERTS_PER_CYCLE = 1;
 
     // Memory management settings
@@ -160,6 +162,9 @@ class AlertsModule : public concurrency::OSThread {
 
     // Stored alerts
     std::vector<Alert> alerts;
+
+    // Cache of processed alert IDs for fast duplicate checking (prevents slow filesystem scans)
+    std::unordered_set<uint32_t> processedAlertIds;
 
     // Memory management
     unsigned long lastMemoryCheckTime;

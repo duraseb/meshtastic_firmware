@@ -23,6 +23,7 @@
 #include <ctype.h>
 #include <vector>
 #include <sstream>
+#include <ArduinoJson.h>
 
 #ifdef ARCH_ESP32
 #include "esp_task_wdt.h"
@@ -152,9 +153,10 @@ AlertsModule::~AlertsModule() {
         dynamicSources[i] = nullptr;
     }
 
-    // Clear vectors to free memory
+    // Clear vectors and cache to free memory
     pendingAlerts.clear();
     alerts.clear();
+    processedAlertIds.clear();
 
     // Note: aiService is a global managed elsewhere, not cleaned up here
 }
@@ -411,6 +413,12 @@ String AlertsModule::extractDateFromFilename(const String &filename)
 
 bool AlertsModule::isAlertProcessed(uint32_t id)
 {
+    // First check the fast in-memory cache
+    if (processedAlertIds.find(id) != processedAlertIds.end()) {
+        return true;
+    }
+
+    // Fallback to filesystem check (for alerts not yet in cache)
     concurrency::LockGuard g(spiLock);
     String hashStr = String(id, HEX);
 
@@ -428,6 +436,8 @@ bool AlertsModule::isAlertProcessed(uint32_t id)
             if (filename.endsWith(".bin") && filename.indexOf("_" + hashStr + ".bin") >= 0) {
                 file.close();
                 root.close();
+                // Add to cache for future fast lookups
+                processedAlertIds.insert(id);
                 return true;
             }
         }
@@ -513,6 +523,10 @@ bool AlertsModule::saveAlertToFile(const Alert &alert, uint32_t id, const String
     }
 
     LOG_DEBUG("Saved binary alert file: %s (%d bytes)", filename.c_str(), written);
+
+    // Add to processed IDs cache for fast duplicate checking
+    processedAlertIds.insert(id);
+
     return true;
 }
 
@@ -520,6 +534,7 @@ bool AlertsModule::loadAlertsFromDisk()
 {
     LOG_DEBUG("Loading alerts from disk (memory limited)");
     alerts.clear();
+    processedAlertIds.clear(); // Clear the processed IDs cache
 
     concurrency::LockGuard g(spiLock);
 
@@ -627,6 +642,9 @@ bool AlertsModule::loadAlertsFromDisk()
                 } else {
                     LOG_DEBUG("Skipping expired alert during load: %s", a.title.c_str());
                 }
+
+                // Add to processed IDs cache for fast duplicate checking
+                processedAlertIds.insert(a.id);
             }
         }
 
@@ -766,13 +784,25 @@ int32_t AlertsModule::runOnce()
                 }
             }
             
-            // Priority 2: Fetch full content for pending alerts (one at a time to avoid watchdog)
+            // Priority 2: Process ONE alert at a time (fetch content + AI processing) to prevent watchdog timeout
             if (!pendingAlerts.empty() && !processingCtx.active) {
+                // Only process one alert per runOnce cycle to stay within watchdog timeout
+                static uint32_t lastAlertProcessingTime = 0;
+
+                // Check if we processed an alert recently (throttle to prevent overwhelming the system)
+                if (currentMillis - lastAlertProcessingTime < ALERT_PROCESSING_THROTTLE_MS) {
+                    // Too soon since last processing, skip for now
+                    return ALERT_PROCESSING_YIELD_MS;
+                }
+
                 // Find first alert that needs full content fetch
                 for (auto& pending : pendingAlerts) {
                     if (pending.needsFullFetch) {
                         LOG_INFO("Fetching full content for alert: %s (queue: %d)",
                                  pending.rawAlert.title.c_str(), pendingAlerts.size());
+
+                        // Reset watchdog before starting HTTP operation
+                        feedWatchdog();
 
                         // Create HTTP GET callback
                         auto httpGetCallback = [this](const char* url, int& httpCode) -> String {
@@ -787,12 +817,19 @@ int32_t AlertsModule::runOnce()
 
                         LOG_DEBUG("Full content fetched for: %s", fullAlert.title.c_str());
 
-                        // Return to main loop to reset watchdog before processing next alert
+                        // Reset watchdog after HTTP operation
+                        feedWatchdog();
+
+                        // Update processing timestamp
+                        lastAlertProcessingTime = currentMillis;
+
+                        // Return to main loop immediately after content fetch
+                        // This ensures we don't start AI processing in the same cycle
                         return ALERT_PROCESSING_YIELD_MS;
                     }
                 }
 
-                // All content fetched, start AI processing for first alert
+                // All content fetched for first pending alert, start AI processing for it
                 PendingAlert pending = pendingAlerts.front();
                 pendingAlerts.erase(pendingAlerts.begin());
 
@@ -801,8 +838,11 @@ int32_t AlertsModule::runOnce()
                 processingCtx.rawAlert = pending.rawAlert;
                 processingCtx.stateStartTime = currentMillis;
 
-                LOG_INFO("Processing alert from [%s]: %s (queue: %d remaining)",
+                LOG_INFO("Starting AI processing for alert from [%s]: %s (queue: %d remaining)",
                          pending.source->getSourceId().c_str(), pending.rawAlert.title.c_str(), pendingAlerts.size());
+
+                // Update processing timestamp
+                lastAlertProcessingTime = currentMillis;
 
                 // Proceed to AI extraction
                 currentState = ModuleState::CALLING_AI;
@@ -1074,17 +1114,23 @@ int32_t AlertsModule::runOnce()
             String message, aiStart, aiEnd, where;
             uint8_t aiSeverity = processingCtx.source->getDefaultSeverity();
             
-            LOG_DEBUG("Calling AI for extraction (source: %s)", 
+            // Reset watchdog before starting AI processing (which can take up to 60 seconds with fallbacks)
+            feedWatchdog();
+
+            LOG_DEBUG("Calling AI for extraction (source: %s)",
                      processingCtx.source->getSourceId().c_str());
-            
-            if (!callAIForExtraction(processingCtx.source, processingCtx.rawAlert, 
+
+            if (!callAIForExtraction(processingCtx.source, processingCtx.rawAlert,
                                     message, aiStart, aiEnd, where, aiSeverity)) {
-                LOG_ERROR("AI extraction failed for alert: %s", 
+                LOG_ERROR("AI extraction failed for alert: %s",
                          processingCtx.alert.title.c_str());
                 processingCtx.active = false;
                 currentState = ModuleState::IDLE;
                 return ALERT_PROCESSING_YIELD_MS;
             }
+
+            // Reset watchdog after AI processing completes
+            feedWatchdog();
             
             // Use structured dates if available, otherwise use AI-extracted or fallback
             if (hasStructuredDates) {
@@ -1360,6 +1406,9 @@ bool AlertsModule::callAIForExtraction(AlertSource* source, const AlertSource::R
     // Try each AI provider until one succeeds (both HTTP call AND parsing)
     for (int providerIdx = 0; providerIdx < aiService->getMaxProviders(); providerIdx++) {
         AIService::AIProvider& provider = aiService->getProviders()[providerIdx];
+
+        // Reset watchdog before trying each provider (AI calls can take 15+ seconds each)
+        feedWatchdog();
 
         // Skip if provider not configured
         if (provider.endpoint.length() == 0 || provider.apiKey.length() == 0) {
@@ -1994,8 +2043,9 @@ void AlertsModule::purgeAllAlerts()
     }
     root.close();
     
-    // Clear the in-memory alerts vector
+    // Clear the in-memory alerts vector and processed IDs cache
     alerts.clear();
+    processedAlertIds.clear();
     LOG_INFO("Purged %d alert files and cleared in-memory cache", deletedCount);
 }
 
