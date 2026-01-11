@@ -22,6 +22,7 @@
 #include <ctime>
 #include <ctype.h>
 #include <vector>
+#include <algorithm>
 #include <sstream>
 #include <ArduinoJson.h>
 
@@ -413,39 +414,8 @@ String AlertsModule::extractDateFromFilename(const String &filename)
 
 bool AlertsModule::isAlertProcessed(uint32_t id)
 {
-    // First check the fast in-memory cache
-    if (processedAlertIds.find(id) != processedAlertIds.end()) {
-        return true;
-    }
-
-    // Fallback to filesystem check (for alerts not yet in cache)
-    concurrency::LockGuard g(spiLock);
-    String hashStr = String(id, HEX);
-
-    FSCom.mkdir(ALERTS_DIR);
-    File root = FSCom.open(ALERTS_DIR, FILE_O_READ);
-    if (!root || !root.isDirectory()) {
-        if (root) root.close();
-        return false;
-    }
-
-    File file = root.openNextFile();
-    while (file) {
-        if (!file.isDirectory()) {
-            String filename = file.name();
-            if (filename.endsWith(".bin") && filename.indexOf("_" + hashStr + ".bin") >= 0) {
-                file.close();
-                root.close();
-                // Add to cache for future fast lookups
-                processedAlertIds.insert(id);
-                return true;
-            }
-        }
-        file.close();
-        file = root.openNextFile();
-    }
-    root.close();
-    return false;
+    // Use the in-memory cache only - it's populated at startup from loadAlertsFromDisk()
+    return processedAlertIds.find(id) != processedAlertIds.end();
 }
 
 
@@ -454,8 +424,137 @@ bool AlertsModule::saveAlertToDisk(const Alert &alert)
     return saveAlertToFile(alert, alert.id);
 }
 
+bool AlertsModule::hasEnoughFreeSpace()
+{
+    // Check filesystem free space
+    size_t totalBytes = 0;
+    size_t usedBytes = 0;
+
+#ifdef FSCom
+    totalBytes = FSCom.totalBytes();
+    usedBytes = FSCom.usedBytes();
+#endif
+
+    if (totalBytes == 0) {
+        // Can't determine, assume OK
+        return true;
+    }
+
+    size_t freeBytes = (totalBytes > usedBytes) ? (totalBytes - usedBytes) : 0;
+    bool hasSpace = freeBytes >= MIN_FREE_SPACE_BYTES;
+
+    if (!hasSpace) {
+        LOG_WARN("Low filesystem space: %d/%d bytes used, need %d free",
+                 usedBytes, totalBytes, MIN_FREE_SPACE_BYTES);
+    }
+
+    return hasSpace;
+}
+
+void AlertsModule::enforceFileLimits()
+{
+    // Collect all filenames, sort by name (oldest first since format is YYYYMMDD_id.bin),
+    // then delete oldest until under limit.
+    concurrency::LockGuard g(spiLock);
+
+    FSCom.mkdir(ALERTS_DIR);
+    File root = FSCom.open(ALERTS_DIR, FILE_O_READ);
+    if (!root || !root.isDirectory()) {
+        if (root) root.close();
+        return;
+    }
+
+    // Collect all .bin filenames (format YYYYMMDD_id.bin sorts correctly)
+    std::vector<String> filenames;
+    filenames.reserve(MAX_FILES_ON_DISK + 100);  // Reserve reasonable capacity
+
+    int filesScanned = 0;
+    File file = root.openNextFile();
+    while (file) {
+        filesScanned++;
+        if (filesScanned % 20 == 0) {
+            feedWatchdog();
+        }
+
+        if (!file.isDirectory()) {
+            String filename = file.name();
+            if (filename.endsWith(".bin") && !filename.endsWith(".tmp")) {
+                filenames.push_back(filename);
+            }
+        }
+        file.close();
+        file = root.openNextFile();
+    }
+    root.close();
+
+    if ((int)filenames.size() <= MAX_FILES_ON_DISK) {
+        return;  // Under limit, nothing to do
+    }
+
+    LOG_WARN("Too many alert files on disk (%d > %d), enforcing limits", 
+             filenames.size(), MAX_FILES_ON_DISK);
+
+    // Sort by filename (oldest first - YYYYMMDD format sorts correctly)
+    std::sort(filenames.begin(), filenames.end());
+    feedWatchdog();
+
+    // Delete oldest files until under limit
+    int targetDeletes = filenames.size() - MAX_FILES_ON_DISK;
+    int deletedCount = 0;
+
+    for (int i = 0; i < targetDeletes && i < (int)filenames.size(); i++) {
+        if (i % 5 == 0) {
+            feedWatchdog();
+        }
+
+        const String &filename = filenames[i];
+        String fullPath = String(ALERTS_DIR) + "/" + filename;
+
+        // Extract ID for cache cleanup
+        int underscorePos = filename.indexOf('_');
+        int dotPos = filename.lastIndexOf('.');
+        if (underscorePos >= 0 && dotPos > underscorePos) {
+            String idHex = filename.substring(underscorePos + 1, dotPos);
+            uint32_t id = strtoul(idHex.c_str(), nullptr, 16);
+            if (id > 0) {
+                processedAlertIds.erase(id);
+                // Remove from memory if present
+                for (auto it = alerts.begin(); it != alerts.end(); ++it) {
+                    if (it->id == id) {
+                        alerts.erase(it);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (FSCom.remove(fullPath.c_str())) {
+            deletedCount++;
+        }
+    }
+
+    feedWatchdog();
+
+    if (deletedCount > 0) {
+        LOG_INFO("Enforced file limit: deleted %d oldest files (now %d files)", 
+                 deletedCount, (int)filenames.size() - deletedCount);
+    }
+}
+
 bool AlertsModule::saveAlertToFile(const Alert &alert, uint32_t id, const String &dateStr)
 {
+    // Check filesystem space before attempting to save
+    if (!hasEnoughFreeSpace()) {
+        LOG_WARN("Insufficient filesystem space, running cleanup before save");
+        enforceFileLimits();
+
+        // Check again after cleanup
+        if (!hasEnoughFreeSpace()) {
+            LOG_ERROR("Cannot save alert: filesystem still full after cleanup");
+            return false;
+        }
+    }
+
     concurrency::LockGuard g(spiLock);
 
     if (id == 0) {
@@ -524,17 +623,19 @@ bool AlertsModule::saveAlertToFile(const Alert &alert, uint32_t id, const String
 
     LOG_DEBUG("Saved binary alert file: %s (%d bytes)", filename.c_str(), written);
 
-    // Add to processed IDs cache for fast duplicate checking
-    processedAlertIds.insert(id);
+    // Add to processed IDs cache for fast duplicate checking (only if cache not full)
+    if (processedAlertIds.size() < MAX_PROCESSED_IDS_CACHE) {
+        processedAlertIds.insert(id);
+    }
 
     return true;
 }
 
 bool AlertsModule::loadAlertsFromDisk()
 {
-    LOG_DEBUG("Loading alerts from disk (memory limited)");
+    LOG_DEBUG("Loading alerts from disk (memory-optimized)");
     alerts.clear();
-    processedAlertIds.clear(); // Clear the processed IDs cache
+    processedAlertIds.clear();
 
     concurrency::LockGuard g(spiLock);
 
@@ -547,34 +648,36 @@ bool AlertsModule::loadAlertsFromDisk()
         return false;
     }
 
-    std::vector<std::pair<String, uint32_t>> alertFiles;
-    int filesScanned = 0;
+    // First pass: count files, clean up .tmp files, and enforce limits
+    // Use minimal memory - don't store filenames in a vector
+    int totalFiles = 0;
+    int tmpFilesDeleted = 0;
+    int invalidFilesDeleted = 0;
 
     File file = root.openNextFile();
     while (file) {
         if (!file.isDirectory()) {
             String filename = file.name();
-            if (filename.endsWith(".bin")) {
-                AlertBinary binAlert;
-                size_t bytesRead = file.read((uint8_t*)&binAlert, sizeof(AlertBinary));
-                file.close();
 
-                if (bytesRead == sizeof(AlertBinary) && binAlert.id > 0) {
-                    alertFiles.push_back(std::make_pair(filename, binAlert.addedAt));
-                } else {
-                    LOG_WARN("Invalid binary alert file: %s (%d bytes, expected %d)",
-                             filename.c_str(), bytesRead, sizeof(AlertBinary));
+            // Clean up leftover .tmp files immediately
+            if (filename.endsWith(".tmp")) {
+                file.close();
+                String fullPath = String(ALERTS_DIR) + "/" + filename;
+                if (FSCom.remove(fullPath.c_str())) {
+                    tmpFilesDeleted++;
                 }
-            } else {
-                file.close();
+                file = root.openNextFile();
+                continue;
             }
-        } else {
-            file.close();
-        }
 
-        // Reset watchdog periodically during file scanning
-        filesScanned++;
-        if (filesScanned % 10 == 0) {
+            if (filename.endsWith(".bin")) {
+                totalFiles++;
+            }
+        }
+        file.close();
+
+        // Reset watchdog periodically
+        if (totalFiles % 20 == 0) {
             feedWatchdog();
         }
 
@@ -582,80 +685,109 @@ bool AlertsModule::loadAlertsFromDisk()
     }
     root.close();
 
-    // Reset watchdog after scanning
-    feedWatchdog();
-
-    std::sort(alertFiles.begin(), alertFiles.end(),
-              [](const std::pair<String, uint32_t>& a, const std::pair<String, uint32_t>& b) {
-                  return a.second > b.second;
-              });
-
-    LOG_INFO("Found %d valid alert files, loading up to %d", alertFiles.size(), MAX_ALERTS_IN_MEMORY);
-
-    int loadedCount = 0;
-    for (const auto& fileInfo : alertFiles) {
-        if (loadedCount >= MAX_ALERTS_IN_MEMORY) {
-            LOG_INFO("Memory limit reached (%d alerts), skipping older alerts. Total available: %d",
-                     MAX_ALERTS_IN_MEMORY, alertFiles.size());
-            break;
-        }
-
-        String filename = fileInfo.first;
-        String fullPath = String(ALERTS_DIR) + "/" + filename;
-
-        File alertFile = FSCom.open(fullPath.c_str(), FILE_O_READ);
-        if (alertFile) {
-            AlertBinary binAlert;
-            size_t bytesRead = alertFile.read((uint8_t*)&binAlert, sizeof(AlertBinary));
-            alertFile.close();
-
-            if (bytesRead == sizeof(AlertBinary)) {
-                Alert a;
-                a.title = String(binAlert.title);
-                a.link = "";
-                a.valid_from = String(binAlert.valid_from);
-                a.valid_to = String(binAlert.valid_to);
-                a.location = String(binAlert.location);
-                a.message = String(binAlert.message);
-                a.source = String(binAlert.source);
-                a.severity = binAlert.severity;
-                a.addedAt = binAlert.addedAt;
-                a.id = binAlert.id;
-                a.alert_type = a.title;
-
-                // lastSent is set to 0 to prevent immediate sending after reboot
-                // nextSendAt is now stored as absolute Unix timestamp, so preserve it from disk
-                // Handle backward compatibility: old alerts stored nextSendAt as seconds from boot
-                a.lastSent = 0;
-                if (binAlert.nextSendAt >= MIN_VALID_EPOCH) {
-                    // New format: absolute Unix timestamp
-                    a.nextSendAt = binAlert.nextSendAt;
-                } else {
-                    // Old format: seconds from boot, treat as expired and reschedule
-                    LOG_DEBUG("Detected old-format nextSendAt (%lu), will reschedule after time sync", binAlert.nextSendAt);
-                    a.nextSendAt = 0;
-                }
-
-                if (isAlertValid(a)) {
-                    alerts.push_back(a);
-                    loadedCount++;
-                } else {
-                    LOG_DEBUG("Skipping expired alert during load: %s", a.title.c_str());
-                }
-
-                // Add to processed IDs cache for fast duplicate checking
-                processedAlertIds.insert(a.id);
-            }
-        }
-
-        // Reset watchdog periodically during loading
-        if (loadedCount % 10 == 0) {
-            feedWatchdog();
-        }
+    if (tmpFilesDeleted > 0) {
+        LOG_INFO("Cleaned up %d leftover .tmp files during boot", tmpFilesDeleted);
     }
 
-    LOG_INFO("Loaded %d valid (non-expired) alerts from disk (of %d total files)", loadedCount, alertFiles.size());
-    LOG_INFO("Alert loading complete");
+    feedWatchdog();
+
+    // If too many files, enforce limits before loading
+    if (totalFiles > MAX_FILES_ON_DISK) {
+        // Release lock temporarily for enforceFileLimits (it has its own lock)
+        g.~LockGuard();
+        enforceFileLimits();  // This function logs the warning
+        // Re-acquire lock
+        new (&g) concurrency::LockGuard(spiLock);
+    }
+
+    // Second pass: load valid alerts directly without storing all filenames
+    // Load files in filesystem order (no sorting to save memory)
+    // Valid alerts will be loaded, expired ones skipped
+    root = FSCom.open(ALERTS_DIR, FILE_O_READ);
+    if (!root || !root.isDirectory()) {
+        if (root) root.close();
+        return false;
+    }
+
+    int loadedCount = 0;
+    int skippedExpired = 0;
+    int filesProcessed = 0;
+
+    file = root.openNextFile();
+    while (file) {
+        if (!file.isDirectory()) {
+            String filename = file.name();
+
+            if (filename.endsWith(".bin") && !filename.endsWith(".tmp")) {
+                AlertBinary binAlert;
+                size_t bytesRead = file.read((uint8_t*)&binAlert, sizeof(AlertBinary));
+                file.close();
+
+                if (bytesRead == sizeof(AlertBinary) && binAlert.id > 0) {
+                    Alert a;
+                    a.id = binAlert.id;
+                    a.title = String(binAlert.title);
+                    a.link = "";
+                    a.valid_from = String(binAlert.valid_from);
+                    a.valid_to = String(binAlert.valid_to);
+                    a.location = String(binAlert.location);
+                    a.message = String(binAlert.message);
+                    a.source = String(binAlert.source);
+                    a.severity = binAlert.severity;
+                    a.addedAt = binAlert.addedAt;
+                    a.alert_type = a.title;
+                    a.lastSent = 0;
+
+                    // Handle nextSendAt format
+                    if (binAlert.nextSendAt >= MIN_VALID_EPOCH) {
+                        a.nextSendAt = binAlert.nextSendAt;
+                    } else {
+                        a.nextSendAt = 0;
+                    }
+
+                    // Add to processed IDs cache (always, for duplicate detection)
+                    // Limit cache size to prevent unbounded growth
+                    if (processedAlertIds.size() < MAX_PROCESSED_IDS_CACHE) {
+                        processedAlertIds.insert(a.id);
+                    }
+
+                    // Only load valid (non-expired) alerts into memory
+                    if (isAlertValid(a)) {
+                        if (loadedCount < MAX_ALERTS_IN_MEMORY) {
+                            alerts.push_back(a);
+                            loadedCount++;
+                        }
+                    } else {
+                        skippedExpired++;
+                    }
+                } else {
+                    // Invalid file, delete it
+                    String fullPath = String(ALERTS_DIR) + "/" + filename;
+                    if (FSCom.remove(fullPath.c_str())) {
+                        invalidFilesDeleted++;
+                        LOG_DEBUG("Deleted invalid alert file: %s", fullPath.c_str());
+                    }
+                }
+
+                filesProcessed++;
+            } else {
+                file.close();
+            }
+        } else {
+            file.close();
+        }
+
+        // Reset watchdog periodically
+        if (filesProcessed % 10 == 0) {
+            feedWatchdog();
+        }
+
+        file = root.openNextFile();
+    }
+    root.close();
+
+    LOG_INFO("Loaded %d valid alerts from disk (skipped %d expired, deleted %d invalid)",
+             loadedCount, skippedExpired, invalidFilesDeleted);
     return loadedCount > 0;
 }
 
@@ -1880,14 +2012,37 @@ void AlertsModule::cleanupOldAlerts()
         return;
     }
 
-    // Collect IDs of expired alerts (don't delete files - keep as processed markers)
-    std::vector<uint32_t> idsToRemoveFromMemory;
-
+    // Collect files to delete and IDs to remove from memory
+    // Use small fixed-size buffers to avoid memory exhaustion with many files
+    // Process in batches if needed
+    int filesDeleted = 0;
+    int tmpFilesDeleted = 0;
     int filesScanned = 0;
+
     File file = root.openNextFile();
     while (file) {
         if (!file.isDirectory()) {
             String filename = file.name();
+
+            // Clean up .tmp files (leftover from failed atomic writes)
+            if (filename.endsWith(".tmp")) {
+                file.close();
+
+                String fullPath = String(ALERTS_DIR) + "/" + filename;
+                if (FSCom.remove(fullPath.c_str())) {
+                    tmpFilesDeleted++;
+                    LOG_DEBUG("Deleted leftover temp file: %s", fullPath.c_str());
+                }
+
+                // Reset watchdog and continue
+                filesScanned++;
+                if (filesScanned % 10 == 0) {
+                    feedWatchdog();
+                }
+                file = root.openNextFile();
+                continue;
+            }
+
             // Only process .bin files with date prefix format: {YYYYMMDD}_{alertId}.bin
             if (filename.endsWith(".bin") && filename.indexOf('_') >= 0) {
                 // Extract date from filename
@@ -1896,19 +2051,48 @@ void AlertsModule::cleanupOldAlerts()
                 if (fileDate.length() == 8) {
                     // Check if this file is for an expired alert
                     if (fileDate < cutoffDate) {
-                        LOG_DEBUG("Found expired alert file (keeping as processed marker): %s (date: %s)",
-                                 filename.c_str(), fileDate.c_str());
+                        // Close file before deleting
+                        file.close();
 
-                        // Extract ID from filename for memory cleanup
+                        // Build full path and delete the file
+                        String fullPath = String(ALERTS_DIR) + "/" + filename;
+
+                        // Extract ID from filename for cache cleanup
                         int underscorePos = filename.indexOf('_');
                         int dotPos = filename.lastIndexOf('.');
                         if (underscorePos >= 0 && dotPos > underscorePos) {
                             String idHex = filename.substring(underscorePos + 1, dotPos);
                             uint32_t id = strtoul(idHex.c_str(), nullptr, 16);
                             if (id > 0) {
-                                idsToRemoveFromMemory.push_back(id);
+                                // Remove from processed IDs cache
+                                processedAlertIds.erase(id);
+
+                                // Remove from memory if present
+                                for (auto it = alerts.begin(); it != alerts.end(); ++it) {
+                                    if (it->id == id) {
+                                        LOG_DEBUG("Removing expired alert from memory: %s", it->title.c_str());
+                                        alerts.erase(it);
+                                        break;
+                                    }
+                                }
                             }
                         }
+
+                        // Delete the file
+                        if (FSCom.remove(fullPath.c_str())) {
+                            filesDeleted++;
+                            LOG_DEBUG("Deleted expired alert file: %s", fullPath.c_str());
+                        } else {
+                            LOG_WARN("Failed to delete expired file: %s", fullPath.c_str());
+                        }
+
+                        // Reset watchdog and continue (file already closed)
+                        filesScanned++;
+                        if (filesScanned % 10 == 0) {
+                            feedWatchdog();
+                        }
+                        file = root.openNextFile();
+                        continue;
                     }
                 } else {
                     // Invalid date format, skip (might be legacy file without date prefix)
@@ -1928,21 +2112,6 @@ void AlertsModule::cleanupOldAlerts()
     }
     root.close();
 
-    // Remove from memory (after file operations to avoid issues)
-    int memoryRemoved = 0;
-    for (uint32_t id : idsToRemoveFromMemory) {
-        for (auto it = alerts.begin(); it != alerts.end();) {
-            if (it->id == id) {
-                LOG_DEBUG("Removing expired alert from memory: %s", it->title.c_str());
-                it = alerts.erase(it);
-                memoryRemoved++;
-                break; // Only one alert per ID
-            } else {
-                ++it;
-            }
-        }
-    }
-
     // Also check for any alerts in memory that are expired (defensive programming)
     int expiredInMemory = 0;
     for (auto it = alerts.begin(); it != alerts.end();) {
@@ -1955,11 +2124,11 @@ void AlertsModule::cleanupOldAlerts()
         }
     }
 
-    if (memoryRemoved > 0 || expiredInMemory > 0) {
-        LOG_INFO("Cleanup completed - kept %d expired files as processed markers, removed %d from memory, found %d extra expired in memory",
-                 (int)idsToRemoveFromMemory.size(), memoryRemoved, expiredInMemory);
+    if (filesDeleted > 0 || tmpFilesDeleted > 0 || expiredInMemory > 0) {
+        LOG_INFO("Cleanup completed - deleted %d expired files, %d temp files, removed %d expired from memory",
+                 filesDeleted, tmpFilesDeleted, expiredInMemory);
     } else {
-        LOG_DEBUG("Cleanup completed - no expired alerts in memory to remove");
+        LOG_DEBUG("Cleanup completed - no expired alerts to remove");
     }
 }
 

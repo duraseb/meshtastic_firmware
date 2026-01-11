@@ -12,6 +12,10 @@
 #include "SPILock.h"
 #include "configuration.h"
 
+#ifdef ARCH_ESP32
+#include "esp_task_wdt.h"
+#endif
+
 // Software SPI is used by MUI so disable SD card here until it's also implemented
 #if defined(HAS_SDCARD) && !defined(SDCARD_USE_SOFT_SPI)
 #include <SD.h>
@@ -284,6 +288,103 @@ void rmDir(const char *dirname)
  */
 __attribute__((weak, noinline)) void preFSBegin() {}
 
+/**
+ * Emergency cleanup for /alerts/ directory if filesystem is critically full.
+ * This runs BEFORE normal boot to prevent crashes due to filesystem exhaustion.
+ * 
+ * When the filesystem is >90% full with many alert files, we aggressively delete
+ * files to free up space for config saves and other operations.
+ */
+void emergencyAlertCleanup()
+{
+#ifdef FSCom
+#if defined(ARCH_ESP32)
+    // Check if filesystem is critically full (>90% used)
+    size_t totalBytes = FSCom.totalBytes();
+    size_t usedBytes = FSCom.usedBytes();
+    
+    if (totalBytes == 0) return;
+    
+    size_t freeBytes = totalBytes - usedBytes;
+    size_t criticalThreshold = totalBytes / 10;  // 10% of total = critical threshold
+    
+    if (freeBytes > criticalThreshold) {
+        return;  // Filesystem has enough space, no emergency cleanup needed
+    }
+    
+    LOG_WARN("Filesystem critically full (%d/%d bytes, %d%% used) - running emergency /alerts/ cleanup",
+             usedBytes, totalBytes, (usedBytes * 100) / totalBytes);
+    
+    // Check if /alerts/ directory exists
+    File alertsDir = FSCom.open("/alerts", FILE_O_READ);
+    if (!alertsDir || !alertsDir.isDirectory()) {
+        if (alertsDir) alertsDir.close();
+        LOG_DEBUG("No /alerts/ directory found");
+        return;
+    }
+    
+    // AGGRESSIVE cleanup: delete ALL alert files in a single pass
+    // This is simpler and faster than trying to find "oldest" files
+    // We need to free space quickly to allow boot to continue
+    int filesDeleted = 0;
+    int filesProcessed = 0;
+    const int TARGET_FREE_PERCENT = 50;  // Free up to 50% of filesystem
+    size_t targetFreeBytes = totalBytes / 2;
+    
+    File file = alertsDir.openNextFile();
+    while (file) {
+        // Feed watchdog every 5 files to prevent timeout
+        filesProcessed++;
+        if (filesProcessed % 5 == 0) {
+            esp_task_wdt_reset();
+        }
+        
+        if (!file.isDirectory()) {
+            String filename = file.name();
+            file.close();  // Close before delete
+            
+            // Delete any .tmp or .bin file in /alerts/
+            if (filename.endsWith(".tmp") || filename.endsWith(".bin")) {
+                String fullPath = String("/alerts/") + filename;
+                if (FSCom.remove(fullPath.c_str())) {
+                    filesDeleted++;
+                    
+                    // Check if we've freed enough space (check every 10 deletes)
+                    if (filesDeleted % 10 == 0) {
+                        freeBytes = FSCom.totalBytes() - FSCom.usedBytes();
+                        if (freeBytes >= targetFreeBytes) {
+                            LOG_INFO("Emergency cleanup: freed enough space after %d files", filesDeleted);
+                            break;
+                        }
+                        // Feed watchdog after space check
+                        esp_task_wdt_reset();
+                    }
+                }
+            }
+        } else {
+            file.close();
+        }
+        
+        esp_task_wdt_reset();  // Feed watchdog before opening next file
+        file = alertsDir.openNextFile();
+    }
+    alertsDir.close();
+    
+    // Final watchdog feed
+    esp_task_wdt_reset();
+    
+    if (filesDeleted > 0) {
+        usedBytes = FSCom.usedBytes();
+        LOG_WARN("Emergency cleanup: deleted %d files", filesDeleted);
+        LOG_INFO("Filesystem now: %d/%d bytes (%d%% used)",
+                 usedBytes, totalBytes, (usedBytes * 100) / totalBytes);
+    } else {
+        LOG_WARN("Emergency cleanup: no files deleted, filesystem still full");
+    }
+#endif
+#endif
+}
+
 void fsInit()
 {
 #ifdef FSCom
@@ -293,12 +394,18 @@ void fsInit()
         LOG_ERROR("Filesystem mount failed");
         // assert(0); This auto-formats the partition, so no need to fail here.
     }
+    
+    // Run emergency cleanup BEFORE listing files (to prevent crash from full FS)
+    emergencyAlertCleanup();
+    
 #if defined(ARCH_ESP32)
-    LOG_DEBUG("Filesystem files (%d/%d Bytes):", FSCom.usedBytes(), FSCom.totalBytes());
+    LOG_DEBUG("Filesystem: %d/%d Bytes (%d%% used)", 
+              FSCom.usedBytes(), FSCom.totalBytes(),
+              (FSCom.usedBytes() * 100) / FSCom.totalBytes());
 #else
     LOG_DEBUG("Filesystem files:");
-#endif
     listDir("/", 10);
+#endif
 #endif
 }
 

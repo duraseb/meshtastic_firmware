@@ -274,7 +274,8 @@ If you see `0 AI provider(s) available`, the API keys weren't embedded correctly
 4. Try a clean rebuild:
    ```bash
    pio run -e seeed-xiao-s3 -t clean
-   ./tmp/build-with-env.sh run -e seeed-xiao-s3
+   cd variants/esp32s3/seeed_xiao_s3_alerts
+   ./bin/build-with-env.sh run -e seeed-xiao-s3-alerts
    ```
 
 ### LED not working / not blinking
@@ -316,7 +317,7 @@ Common causes:
 
 For debugging only (exposes your keys!):
 ```bash
-strings .pio/build/seeed-xiao-s3/firmware.bin | grep -E "AIza|pplx-|[a-z0-9]{32}"
+strings .pio/build/seeed-xiao-s3-alerts/firmware.bin | grep -E "AIza|pplx-|[a-z0-9]{32}"
 ```
 
 You should see your API key(s) in the output:
@@ -370,6 +371,43 @@ To add a new alert source:
 5. Register in `AlertsModule` constructor
 
 See `RCBAlertSource` and `IMGWAlertSource` for examples.
+
+---
+
+## Troubleshooting
+
+### Device Boot Loop or Crash During Boot
+
+If the device is stuck in a boot loop or crashes during boot with many alert files:
+
+**Symptoms:**
+- Device reboots repeatedly (high "Number of Device Reboots" count)
+- Crash during "Filesystem files" listing
+- Crash after "Opening /prefs/device.proto, fullAtomic=1"
+- Filesystem shows 100% used (e.g., "1572864/1572864 Bytes")
+
+**Cause:**
+The `/alerts/` directory has accumulated too many files, filling the LittleFS partition. This prevents atomic writes and can cause boot failures.
+
+**Automatic Recovery:**
+The firmware includes automatic emergency cleanup that runs during boot:
+1. If filesystem is >90% full, emergency cleanup triggers
+2. All `.tmp` files are deleted (failed write leftovers)
+3. Oldest alert files are deleted until filesystem has adequate space
+4. Normal boot continues
+
+**Manual Recovery (if automatic fails):**
+1. Erase flash and re-flash the firmware:
+   ```bash
+   esptool.py --port /dev/ttyACM0 erase_flash
+   ~/.platformio/penv/bin/pio run -e seeed-xiao-s3-alerts -t upload
+   ```
+
+**Prevention:**
+The module enforces these limits to prevent recurrence:
+- `MAX_FILES_ON_DISK = 100` - Maximum alert files kept
+- `ALERT_RETENTION_DAYS = 5` - Files older than 5 days are deleted
+- `MIN_FREE_SPACE_BYTES = 50KB` - Minimum free space before saving new alerts
 
 ---
 

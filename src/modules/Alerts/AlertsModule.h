@@ -78,7 +78,9 @@ class AlertsModule : public concurrency::OSThread {
 
     // Storage and cleanup settings
     static constexpr unsigned long CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
-    static constexpr unsigned long ALERT_RETENTION_DAYS = 5; // Keep processed markers for duplicate detection
+    static constexpr unsigned long ALERT_RETENTION_DAYS = 5; // Keep alerts for duplicate detection
+    static constexpr int MAX_FILES_ON_DISK = 100; // Maximum alert files to keep on filesystem
+    static constexpr size_t MIN_FREE_SPACE_BYTES = 50 * 1024; // Minimum 50KB free space required
 
     // Channel settings
     String alertChannelName; // Channel name (empty string = use default/primary channel)
@@ -97,10 +99,11 @@ class AlertsModule : public concurrency::OSThread {
     static constexpr int MAX_ALERTS_PER_CYCLE = 1;
 
     // Memory management settings
-    // No longer limited - we only keep valid (non-expired) alerts in memory
-    static constexpr int MAX_ALERTS_IN_MEMORY = 200; // Reasonable upper limit for edge cases
-    static constexpr int MAX_PENDING_ALERTS = 50; // Limit pending alerts queue
+    // We only keep valid (non-expired) alerts in memory
+    static constexpr int MAX_ALERTS_IN_MEMORY = 100; // Reasonable upper limit for edge cases
+    static constexpr int MAX_PENDING_ALERTS = 20; // Limit pending alerts queue
     static constexpr unsigned long MEMORY_CHECK_INTERVAL_MS = 60000;
+    static constexpr size_t MAX_PROCESSED_IDS_CACHE = 150; // Limit processed IDs cache size
 
     // Debugging settings
     static constexpr bool PURGE_ALERTS_ON_BOOT = false;
@@ -189,8 +192,14 @@ class AlertsModule : public concurrency::OSThread {
     bool saveAlertToFile(const Alert &alert, uint32_t id, const String &dateStr = "");
     bool loadAlertsFromDisk();
 
-    // Clean up old alert files (older than 30 days)
+    // Clean up old alert files (older than retention period)
     void cleanupOldAlerts();
+
+    // Enforce file limit by deleting oldest files if over MAX_FILES_ON_DISK
+    void enforceFileLimits();
+
+    // Check if there's enough free space on filesystem
+    bool hasEnoughFreeSpace();
 
     // Purge all alerts (delete all alert files and clear in-memory alerts)
     void purgeAllAlerts();

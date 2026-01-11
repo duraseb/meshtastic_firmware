@@ -50,6 +50,7 @@ using namespace Adafruit_LittleFS_Namespace;
 
 void fsInit();
 void fsListFiles();
+void emergencyAlertCleanup();  // Early boot cleanup for /alerts/ if filesystem is full
 bool copyFile(const char *from, const char *to);
 bool renameFile(const char *pathFrom, const char *pathTo);
 std::vector<meshtastic_FileInfo> getFiles(const char *dirname, uint8_t levels);
