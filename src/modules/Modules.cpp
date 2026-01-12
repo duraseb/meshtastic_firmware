@@ -42,7 +42,9 @@
 #include "modules/TrafficManagementModule.h"
 #endif
 #include "modules/TextMessageModule.h"
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
 #include "mesh/SignalRoutingModule.h"
+#endif
 #if !MESHTASTIC_EXCLUDE_TRACEROUTE
 #include "modules/TraceRouteModule.h"
 #endif
@@ -264,5 +266,7 @@ void setupModules()
     // NOTE! This module must be added LAST because it likes to check for replies from other modules and avoid sending extra
     // acks
     routingModule = new RoutingModule();
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
     signalRoutingModule = new SignalRoutingModule();
+#endif
 }
