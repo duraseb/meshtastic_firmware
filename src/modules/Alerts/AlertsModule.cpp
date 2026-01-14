@@ -2331,9 +2331,8 @@ bool AlertsModule::broadcastInfoMessage()
     String encryptionKey = getChannelEncryptionKey();
 
     // Format the message according to the template
-    String message = "Otrzymuj alerty, powiadomienia, informacje lokalne: dodaj kanał \"";
+    String message = "Otrzymuj alerty, powiadomienia, informacje lokalne: dodaj kanał ";
     message += channelName;
-    message += "\"";
     if (encryptionKey.length() > 0) {
         message += ", klucz: ";
         message += encryptionKey;

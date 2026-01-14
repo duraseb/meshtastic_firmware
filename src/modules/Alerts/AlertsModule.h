@@ -38,6 +38,9 @@ class AlertsModule : public concurrency::OSThread {
     // ===== Configuration Variables =====
     // These can be easily changed and later moved to config files
 
+      // Debugging settings
+      static constexpr bool PURGE_ALERTS_ON_BOOT = false;
+
     // Alert sources (pluggable architecture) - persistent alerts with AI processing
     static constexpr int MAX_ALERT_SOURCES = 5;
     AlertSource* sources[MAX_ALERT_SOURCES];
@@ -79,7 +82,7 @@ class AlertsModule : public concurrency::OSThread {
     // Storage and cleanup settings
     static constexpr unsigned long CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
     static constexpr unsigned long ALERT_RETENTION_DAYS = 5; // Keep alerts for duplicate detection
-    static constexpr int MAX_FILES_ON_DISK = 100; // Maximum alert files to keep on filesystem
+    static constexpr int MAX_FILES_ON_DISK = 200; // Maximum alert files to keep on filesystem
     static constexpr size_t MIN_FREE_SPACE_BYTES = 50 * 1024; // Minimum 50KB free space required
 
     // Channel settings
@@ -99,19 +102,16 @@ class AlertsModule : public concurrency::OSThread {
     static constexpr unsigned long ALERT_PROCESSING_YIELD_MS = 100;
     static constexpr unsigned long RESEND_CHECK_YIELD_MS = 50;
     static constexpr unsigned long MAX_RUNONCE_INTERVAL_MS = 15000;
-    static constexpr unsigned long ALERT_PROCESSING_THROTTLE_MS = 1000; // Minimum 1 second between alert processing starts
+    static constexpr unsigned long ALERT_PROCESSING_THROTTLE_MS = 2000; // Minimum 2 seconds between alert processing starts
     static constexpr int MAX_ALERTS_PER_CYCLE = 1;
 
     // Memory management settings
     // We only keep valid (non-expired) alerts in memory
-    static constexpr int MAX_ALERTS_IN_MEMORY = 100; // Reasonable upper limit for edge cases
-    static constexpr int MAX_PENDING_ALERTS = 20; // Limit pending alerts queue
+    static constexpr int MAX_ALERTS_IN_MEMORY = 200; // Reasonable upper limit for edge cases
+    static constexpr int MAX_PENDING_ALERTS = 30; // Limit pending alerts queue
     static constexpr unsigned long MEMORY_CHECK_INTERVAL_MS = 60000;
-    static constexpr size_t MAX_PROCESSED_IDS_CACHE = 150; // Limit processed IDs cache size
+    static constexpr size_t MAX_PROCESSED_IDS_CACHE = 200; // Limit processed IDs cache size
 
-    // Debugging settings
-    static constexpr bool PURGE_ALERTS_ON_BOOT = false;
-    
     // ===== Alert Storage Format =====
     // Binary format for disk storage (fixed size for fast I/O)
     struct AlertBinary {
