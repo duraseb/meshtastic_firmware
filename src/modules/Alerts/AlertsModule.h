@@ -86,6 +86,10 @@ class AlertsModule : public concurrency::OSThread {
     String alertChannelName; // Channel name (empty string = use default/primary channel)
     int8_t lastKnownChannelIndex = -2; // -2 = unknown, -1 = not found, 0+ = channel index
 
+    // Broadcasting settings
+    static constexpr unsigned long BROADCAST_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
+    static constexpr unsigned long BROADCAST_INITIAL_DELAY_MS = 20 * 60 * 1000; // 20 minutes after boot
+
     // Storage paths
     static constexpr const char* ALERTS_DIR = "/alerts";
     
@@ -176,6 +180,10 @@ class AlertsModule : public concurrency::OSThread {
     // Dynamic source processing state
     int currentDynamicSourceIndex;
 
+    // Broadcasting state
+    unsigned long nextBroadcastTimeMs;
+    bool broadcastingEnabled;
+
   public:
     // ===== Core Module Functions =====
     bool loadConfig();
@@ -242,6 +250,19 @@ class AlertsModule : public concurrency::OSThread {
 
     // Send a simple message to mesh network (for dynamic sources)
     bool sendMessageToMesh(const String &message);
+
+    // ===== Broadcasting Functions =====
+    // Check if broadcasting should be enabled (when alert channel is configured)
+    bool shouldBroadcastInfo();
+
+    // Get the encryption key for the alert channel as base64 string
+    String getChannelEncryptionKey();
+
+    // Broadcast channel information to primary channel
+    bool broadcastInfoMessage();
+
+    // Simple base64 encoder for PSK display
+    String base64Encode(const uint8_t* data, size_t length);
 
     // ===== Utility Functions =====
     // Calculate UTF-8 byte length of a string

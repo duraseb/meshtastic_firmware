@@ -70,6 +70,10 @@ AlertsModule::AlertsModule() : OSThread("AlertsModule")
     numSources = 0;
     currentSourceIndex = 0;
 
+    // Initialize broadcasting state
+    nextBroadcastTimeMs = BROADCAST_INITIAL_DELAY_MS; // First broadcast after initial delay
+    broadcastingEnabled = false;
+
     // Register RCB source
     sources[numSources] = new RCBAlertSource();
     sourceLastFetchTime[numSources] = 0;
@@ -1110,6 +1114,24 @@ int32_t AlertsModule::runOnce()
                 LOG_DEBUG("Long idle period (%lu sec), optimizing for power", returnInterval / 1000);
             }
 #endif
+
+            // Check if we should broadcast channel information
+            if (shouldBroadcastInfo() && currentMillis >= nextBroadcastTimeMs) {
+                LOG_DEBUG("[AlertsModule] Time to broadcast channel information");
+
+                if (broadcastInfoMessage()) {
+                    // Schedule next broadcast
+                    nextBroadcastTimeMs = currentMillis + BROADCAST_INTERVAL_MS;
+                    LOG_INFO("[AlertsModule] Channel info broadcast successful, next broadcast in %lu minutes",
+                             BROADCAST_INTERVAL_MS / 60000);
+                } else {
+                    // Failed to broadcast, retry in 1 minute
+                    nextBroadcastTimeMs = currentMillis + 1 * 60 * 1000;
+                    LOG_WARN("[AlertsModule] Channel info broadcast failed, retrying in 1 minute");
+                }
+
+                // Don't return immediately - allow other processing to continue
+            }
 
             return returnInterval;
         }
@@ -2235,6 +2257,139 @@ void AlertsModule::purgeAllAlerts()
     alerts.clear();
     processedAlertIds.clear();
     LOG_INFO("Purged %d alert files and cleared in-memory cache", deletedCount);
+}
+
+// ===== Broadcasting Functions =====
+
+bool AlertsModule::shouldBroadcastInfo()
+{
+    // Broadcasting is enabled when we have an alert channel configured
+    return alertChannelName.length() > 0;
+}
+
+String AlertsModule::getChannelEncryptionKey()
+{
+    int8_t channelIndex = findAlertChannel();
+    if (channelIndex < 0) {
+        LOG_WARN("[AlertsModule] Cannot get encryption key - alert channel not found");
+        return "";
+    }
+
+    const meshtastic_Channel &ch = channels.getByIndex(channelIndex);
+    if (!ch.has_settings) {
+        LOG_WARN("[AlertsModule] Cannot get encryption key - channel %d has no settings", channelIndex);
+        return "";
+    }
+
+    const meshtastic_ChannelSettings &channelSettings = ch.settings;
+    if (channelSettings.psk.size == 0) {
+        // Channel has no encryption enabled
+        LOG_DEBUG("[AlertsModule] Channel %d has no encryption set", channelIndex);
+        return "";
+    }
+
+    return base64Encode(channelSettings.psk.bytes, channelSettings.psk.size);
+}
+
+String AlertsModule::base64Encode(const uint8_t* data, size_t length)
+{
+    static const char* base64Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    String result = "";
+    size_t i = 0;
+
+    // Process 3 bytes at a time
+    while (i < length) {
+        uint32_t octet_a = i < length ? data[i++] : 0;
+        uint32_t octet_b = i < length ? data[i++] : 0;
+        uint32_t octet_c = i < length ? data[i++] : 0;
+
+        uint32_t triple = (octet_a << 16) + (octet_b << 8) + octet_c;
+
+        result += base64Chars[(triple >> 18) & 0x3F];
+        result += base64Chars[(triple >> 12) & 0x3F];
+        result += base64Chars[(triple >> 6) & 0x3F];
+        result += base64Chars[triple & 0x3F];
+    }
+
+    // Add padding
+    size_t padding = (3 - (length % 3)) % 3;
+    for (size_t p = 0; p < padding; p++) {
+        result[result.length() - 1 - p] = '=';
+    }
+
+    return result;
+}
+
+bool AlertsModule::broadcastInfoMessage()
+{
+    if (!shouldBroadcastInfo()) {
+        return false;
+    }
+
+    String channelName = alertChannelName;
+    String encryptionKey = getChannelEncryptionKey();
+
+    // Format the message according to the template
+    String message = "Otrzymuj alerty, powiadomienia, informacje lokalne: dodaj kanał \"";
+    message += channelName;
+    message += "\"";
+    if (encryptionKey.length() > 0) {
+        message += ", klucz: ";
+        message += encryptionKey;
+    } else {
+        message += " (bez szyfrowania)";
+    }
+
+    LOG_INFO("[AlertsModule] Broadcasting channel info: %s", message.c_str());
+
+    // Send to primary channel (not alert channel)
+    const int maxPayload = meshtastic_Constants_DATA_PAYLOAD_LEN;
+    size_t msgBytes = utf8ByteLength(message);
+
+    if (msgBytes > maxPayload) {
+        LOG_WARN("Broadcast message too long (%d bytes, max %d), trimming from beginning", msgBytes, maxPayload);
+        // Trim from the beginning to preserve channel name and key at the end
+        size_t bytesToTrim = msgBytes - maxPayload;
+        size_t trimPos = bytesToTrim;
+
+        // Find a safe place to trim (after a space if possible)
+        while (trimPos < message.length() && message[trimPos] != ' ') {
+            trimPos++;
+        }
+
+        // If no space found, just trim at the calculated position
+        if (trimPos >= message.length()) {
+            trimPos = bytesToTrim;
+        }
+
+        message = message.substring(trimPos);
+        msgBytes = message.length();
+        LOG_DEBUG("Message trimmed to %d bytes: %s", msgBytes, message.c_str());
+    }
+
+    // Allocate and prepare mesh packet
+    meshtastic_MeshPacket *p = router->allocForSending();
+    p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+    p->to = 0xffffffff; // Broadcast
+    p->channel = channels.getPrimaryIndex(); // Always send to primary channel
+    p->want_ack = true;
+    p->priority = meshtastic_MeshPacket_Priority_RELIABLE;
+
+    p->decoded.payload.size = msgBytes;
+    memcpy(p->decoded.payload.bytes, message.c_str(), msgBytes);
+
+    LOG_INFO("Broadcasting channel info to primary channel - size: %d", p->decoded.payload.size);
+
+    if (service) {
+        p->from = nodeDB->getNodeNum();
+        service->sendToMesh(p, RX_SRC_USER, true);
+        LOG_DEBUG("Channel info broadcast sent to mesh network");
+        return true;
+    }
+
+    LOG_ERROR("MeshService not available for broadcasting");
+    return false;
 }
 
 #endif // HAS_ALERTING

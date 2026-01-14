@@ -372,6 +372,85 @@ To add a new alert source:
 
 See `RCBAlertSource` and `IMGWAlertSource` for examples.
 
+## Channel Information Broadcasting
+
+The AlertsModule can automatically broadcast information about the alerts channel to help users discover and join the channel.
+
+### Broadcasting Configuration
+
+Broadcasting is automatically enabled when:
+- An alert channel name is configured (via `ALERT_CHANNEL_NAME` build flag)
+- The module has access to the channel's encryption key
+
+### Broadcasting Behavior
+
+When enabled, the module broadcasts channel information:
+- **Target Channel**: Primary channel (channel 0)
+- **First Broadcast**: 20 minutes after device boot
+- **Subsequent Broadcasts**: Every 4 hours
+- **Message Format**: Polish language template
+- **Content**: Channel name and base64-encoded encryption key
+
+### Broadcast Message Template
+
+**Encrypted channel:**
+```
+Otrzymuj alerty, powiadomienia, informacje lokalne: dodaj kanał "{channel name}", klucz: {encryption key}
+```
+
+**Unencrypted channel:**
+```
+Otrzymuj alerty, powiadomienia, informacje lokalne: dodaj kanał "{channel name}" (bez szyfrowania)
+```
+
+### Example Broadcast Messages
+
+**Encrypted channel:**
+```
+Otrzymuj alerty, powiadomienia, informacje lokalne: dodaj kanał "Alerty", klucz: ABCDEFGHIJKLMNOPabcdefghijklmnop
+```
+
+**Unencrypted channel:**
+```
+Otrzymuj alerty, powiadomienia, informacje lokalne: dodaj kanał "Alerty" (bez szyfrowania)
+```
+
+### Technical Details
+
+- **Message Format**: Different formatting for encrypted vs unencrypted channels
+**Truncation**: Messages exceeding payload limits are trimmed from the beginning to preserve channel name and key
+- **Broadcast Interval**: 4 hours (configurable via `BROADCAST_INTERVAL_MS`)
+- **Initial Delay**: 20 minutes after boot (configurable via `BROADCAST_INITIAL_DELAY_MS`)
+- **Timer**: Uses monotonic `millis()` for reliable timing
+- **Failure Handling**: Retries in 1 minute if broadcast fails
+
+### Configuration Constants
+
+Broadcasting timing can be adjusted in `src/modules/Alerts/AlertsModule.h`:
+
+```cpp
+// Broadcasting settings
+static constexpr unsigned long BROADCAST_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
+static constexpr unsigned long BROADCAST_INITIAL_DELAY_MS = 20 * 60 * 1000; // 20 minutes after boot
+```
+
+### Monitoring Broadcasting
+
+Check logs for broadcasting activity:
+```
+INFO | AlertsModule: Broadcasting channel info: Otrzymuj alerty...
+INFO | AlertsModule: Channel info broadcast successful, next broadcast in 240 minutes
+WARN | AlertsModule: Channel info broadcast failed, retrying in 1 minute
+```
+
+### Security Considerations
+
+- **Encrypted channels**: The broadcast message includes the channel's encryption key in base64 format
+- **Unencrypted channels**: The message indicates "bez szyfrowania" (without encryption)
+- Users can copy the key or join unencrypted channels on their devices
+- Broadcasting only occurs when an alert channel is configured
+- Messages are sent to the primary channel for maximum visibility
+
 ---
 
 ## Troubleshooting
