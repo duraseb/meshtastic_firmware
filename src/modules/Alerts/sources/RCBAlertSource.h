@@ -1,5 +1,7 @@
 #pragma once
 
+#if defined(HAS_ALERTING) && HAS_ALERTING
+
 #include "../AlertSource.h"
 
 /**
@@ -41,3 +43,4 @@ private:
     uint32_t hashString(const String &str);
 };
 
+#endif // HAS_ALERTING

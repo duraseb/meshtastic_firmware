@@ -1,3 +1,5 @@
+#if defined(HAS_ALERTING) && HAS_ALERTING
+
 #include "AIService.h"
 #include "main.h"
 #include <HTTPClient.h>
@@ -21,7 +23,7 @@ static inline void feedWatchdog()
 
 AIService* aiService = nullptr;
 
-AIService::AIService()
+AIService::AIService() : requestDoc(JSON_DOC_SIZE)
 {
     currentAIProviderIndex = 0;
     initializeProviders();
@@ -186,10 +188,10 @@ bool AIService::callGeminiAPI(const AIProvider& provider, const String& prompt, 
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(AI_TIMEOUT_MS);
 
-    // Build Gemini API request using ArduinoJson
-    DynamicJsonDocument doc(65536); // 64KB buffer for large prompts with Wikipedia content
+    // Build Gemini API request using reusable JSON document
+    requestDoc.clear();
 
-    JsonArray contents = doc.createNestedArray("contents");
+    JsonArray contents = requestDoc.createNestedArray("contents");
     JsonObject contentObj = contents.createNestedObject();
     JsonArray parts = contentObj.createNestedArray("parts");
     JsonObject partObj = parts.createNestedObject();
@@ -198,7 +200,7 @@ bool AIService::callGeminiAPI(const AIProvider& provider, const String& prompt, 
     partObj["text"] = prompt;
 
     String body;
-    serializeJson(doc, body);
+    serializeJson(requestDoc, body);
 
     LOG_DEBUG("[AIService] Sending Gemini request (prompt length: %d, body length: %d)", prompt.length(), body.length());
     int httpCode = http.POST(body);
@@ -220,21 +222,21 @@ bool AIService::callMistralAPI(const AIProvider& provider, const String& prompt,
     http.addHeader("Authorization", "Bearer " + provider.apiKey);
     http.setTimeout(AI_TIMEOUT_MS);
 
-    // Build Mistral API request using ArduinoJson
-    DynamicJsonDocument doc(65536); // 64KB buffer for large prompts with Wikipedia content
+    // Build Mistral API request using reusable JSON document
+    requestDoc.clear();
 
-    doc["model"] = provider.model;
+    requestDoc["model"] = provider.model;
 
-    JsonArray messages = doc.createNestedArray("messages");
+    JsonArray messages = requestDoc.createNestedArray("messages");
     JsonObject messageObj = messages.createNestedObject();
     messageObj["role"] = "user";
     messageObj["content"] = prompt; // ArduinoJson handles escaping automatically
 
-    doc["temperature"] = 0.1;
-    doc["max_tokens"] = 500;
+    requestDoc["temperature"] = 0.1;
+    requestDoc["max_tokens"] = 500;
 
     String body;
-    serializeJson(doc, body);
+    serializeJson(requestDoc, body);
 
     LOG_DEBUG("[AIService] Sending Mistral request to %s (prompt length: %d, body length: %d)", provider.name.c_str(), prompt.length(), body.length());
     int httpCode = http.POST(body);
@@ -256,21 +258,21 @@ bool AIService::callGroqAPI(const AIProvider& provider, const String& prompt, St
     http.addHeader("Authorization", "Bearer " + provider.apiKey);
     http.setTimeout(AI_TIMEOUT_MS);
 
-    // Build Groq API request using ArduinoJson
-    DynamicJsonDocument doc(65536); // 64KB buffer for large prompts with Wikipedia content
+    // Build Groq API request using reusable JSON document
+    requestDoc.clear();
 
-    doc["model"] = provider.model;
+    requestDoc["model"] = provider.model;
 
-    JsonArray messages = doc.createNestedArray("messages");
+    JsonArray messages = requestDoc.createNestedArray("messages");
     JsonObject messageObj = messages.createNestedObject();
     messageObj["role"] = "user";
     messageObj["content"] = prompt; // ArduinoJson handles escaping automatically
 
-    doc["temperature"] = 0.1;
-    doc["max_tokens"] = 500;
+    requestDoc["temperature"] = 0.1;
+    requestDoc["max_tokens"] = 500;
 
     String body;
-    serializeJson(doc, body);
+    serializeJson(requestDoc, body);
 
     LOG_DEBUG("[AIService] Sending Groq request to %s (prompt length: %d, body length: %d)", provider.name.c_str(), prompt.length(), body.length());
     int httpCode = http.POST(body);
@@ -413,3 +415,5 @@ bool AIService::extractTextFromAIResponse(const String& response, String& outTex
     LOG_DEBUG("[AIService::extractTextFromAIResponse] Successfully extracted text (length: %d)", outText.length());
     return true;
 }
+
+#endif // HAS_ALERTING

@@ -1,5 +1,7 @@
 #pragma once
 
+#if defined(HAS_ALERTING) && HAS_ALERTING
+
 #include <Arduino.h>
 #include <vector>
 
@@ -104,3 +106,4 @@ public:
     }
 };
 
+#endif // HAS_ALERTING

@@ -1,3 +1,5 @@
+#if defined(HAS_ALERTING) && HAS_ALERTING
+
 #include "AiWeatherSource.h"
 #include <time.h>
 #include <RTC.h>
@@ -31,6 +33,16 @@ String AiWeatherSource::fetchAndFormat(
     // Check if we're within the allowed fetch window
     if (!isWithinFetchWindow()) {
         LOG_INFO("[AiWeatherSource] Too early in day (before %02d:00), skipping fetch", getMinHourOfDay());
+        return "";
+    }
+
+    // Check if we have enough memory for AI processing
+    // AI calls require ~16KB for JSON buffer + HTTP client overhead
+    const size_t MIN_HEAP_FOR_AI = 40000; // 40KB minimum
+    size_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap < MIN_HEAP_FOR_AI) {
+        LOG_WARN("[AiWeatherSource] Insufficient heap for AI processing (%d bytes free, need %d). Skipping...",
+                 freeHeap, MIN_HEAP_FOR_AI);
         return "";
     }
 
@@ -310,3 +322,5 @@ int AiWeatherSource::getMinHourOfDay()
     return DEFAULT_MIN_HOUR_OF_DAY;
 }
 
+
+#endif // HAS_ALERTING

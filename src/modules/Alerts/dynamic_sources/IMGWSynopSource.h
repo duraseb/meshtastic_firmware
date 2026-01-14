@@ -1,5 +1,7 @@
 #pragma once
 
+#if defined(HAS_ALERTING) && HAS_ALERTING
+
 #include "../DynamicSource.h"
 
 /**
@@ -40,3 +42,5 @@ private:
     static String parseCSVField(const String& line, int fieldIndex);
 };
 
+
+#endif // HAS_ALERTING

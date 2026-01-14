@@ -1,3 +1,5 @@
+#if defined(HAS_ALERTING) && HAS_ALERTING
+
 #include "RCBAlertSource.h"
 #include "configuration.h"
 #include <ctime>
@@ -311,3 +313,4 @@ uint32_t RCBAlertSource::hashString(const String &str)
     return hash;
 }
 
+#endif // HAS_ALERTING

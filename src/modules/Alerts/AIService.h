@@ -1,8 +1,13 @@
 #pragma once
 
+#if defined(HAS_ALERTING) && HAS_ALERTING
+
+#include "configuration.h"
 #include <Arduino.h>
 #include <functional>
+#include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 
 /**
  * Shared AI service for interacting with various AI providers.
@@ -75,9 +80,13 @@ public:
 private:
     static constexpr int MAX_AI_PROVIDERS = 4;
     static constexpr unsigned long AI_TIMEOUT_MS = 15000;
+    static constexpr size_t JSON_DOC_SIZE = 16384; // 16KB for request building
 
     AIProvider aiProviders[MAX_AI_PROVIDERS];
     int currentAIProviderIndex;
+
+    // Reusable JSON document for request building (avoids repeated alloc/dealloc)
+    DynamicJsonDocument requestDoc;
 
     // Common HTTP response processing helper
     bool processHttpResponse(HTTPClient& http, int httpCode, const String& providerName, String& outResponse);
@@ -93,3 +102,5 @@ private:
 
 // Global instance
 extern AIService* aiService;
+
+#endif // HAS_ALERTING

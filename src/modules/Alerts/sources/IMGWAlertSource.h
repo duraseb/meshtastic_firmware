@@ -1,5 +1,8 @@
 #pragma once
 
+#if defined(HAS_ALERTING) && HAS_ALERTING
+
+#include "configuration.h"
 #include "../AlertSource.h"
 #include <ArduinoJson.h>
 #include <WiFiClient.h>
@@ -41,3 +44,4 @@ private:
     uint32_t hashString(const String &str);
 };
 
+#endif // HAS_ALERTING

@@ -346,4 +346,3 @@ uint32_t IMGWAlertSource::hashString(const String &str)
     }
     return hash;
 }
-

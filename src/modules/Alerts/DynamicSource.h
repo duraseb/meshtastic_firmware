@@ -1,5 +1,7 @@
 #pragma once
 
+#if defined(HAS_ALERTING) && HAS_ALERTING
+
 #include <Arduino.h>
 #include <functional>
 
@@ -51,3 +53,4 @@ public:
     virtual bool requiresWiFi() const { return true; }
 };
 
+#endif // HAS_ALERTING

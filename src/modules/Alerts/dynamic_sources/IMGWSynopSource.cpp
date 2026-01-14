@@ -1,3 +1,5 @@
+#if defined(HAS_ALERTING) && HAS_ALERTING
+
 #include "IMGWSynopSource.h"
 #include "configuration.h"
 
@@ -156,3 +158,5 @@ String IMGWSynopSource::parseCSVField(const String& line, int fieldIndex)
     return "";
 }
 
+
+#endif // HAS_ALERTING

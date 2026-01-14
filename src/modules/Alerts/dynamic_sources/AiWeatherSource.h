@@ -1,5 +1,7 @@
 #pragma once
 
+#if defined(HAS_ALERTING) && HAS_ALERTING
+
 #include "../DynamicSource.h"
 #include "../AIService.h"
 
@@ -69,3 +71,4 @@ private:
     String extractWeatherForecast(const String& fullResponse) const;
 
 };
+#endif // HAS_ALERTING
