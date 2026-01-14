@@ -10,26 +10,33 @@ The AlertsModule uses AI services for alert processing with automatic fallback s
 
 The module supports multiple AI providers with automatic fallback:
 
-1. **Gemini 2.0 Flash** - Fast, free tier: 15 req/min, 1,500 req/day (Primary)
-2. **Perplexity (Llama 3.1 Sonar)** - Pro tier: $5/month credit (Secondary)
-3. **Mistral 7B** - Free tier, good for Polish (Tertiary)
-4. **Groq (Llama 3.3 70B)** - Very fast, generous free tier: 30 req/min, 14,400 req/day (Last resort)
+1. **Gemini 2.0 Flash** ⭐ - Fast, free tier: 15 req/min, 1,500 req/day (Primary)
+2. **GPT-4o mini** ⭐ - Good performance, reasonable free tier: 50 req/day (Secondary)
+3. **Perplexity (Llama 3.1 Sonar)** - High quality, pro tier: $5/month credit (Tertiary)
+4. **Mistral 7B** - Free tier, good for Polish language (Quaternary)
+5. **Groq (Llama 3.3 70B)** - Very fast, generous free tier: 30 req/min, 14,400 req/day (Quinary)
+6. **Gemini 2.0 Flash (Fallback)** - Same as primary, for maximum reliability (Last resort)
 
 **You can configure:**
-- ✅ Only Gemini (single provider, free)
-- ✅ Only Groq (single provider, very fast and free)
+- ✅ Only Gemini (single provider, free) ⭐
+- ✅ Only GPT-4o mini (single provider, good balance, free) ⭐
+- ✅ Only Groq (single provider, very fast, free) ⭐
+- ✅ Only Mistral (single provider, free, Polish language)
 - ✅ Any combination (full fallback chain for maximum reliability)
-- ✅ All providers (4 levels of fallback, highest reliability)
+- ✅ All providers (6 levels of fallback, maximum reliability)
+
+**Currently configured:** All 6 AI providers enabled (maximum fallback reliability)
 
 The module will automatically use whichever providers you've configured. If one provider fails (e.g., quota exceeded, network error), it automatically tries the next configured provider.
 
 ### Required: At Least One API Key
 
 You must set at least one of:
-- `GEMINI_API_KEY` (recommended - free, reliable)
-- `PERPLEXITY_API_KEY` (paid - $5/month credit, very good quality)
+- `GEMINI_API_KEY` ⭐ (recommended - fast, free: 1,500 req/day)
+- `OPENAI_API_KEY` ⭐ (recommended - good balance, reasonable free tier: 50 req/day)
+- `GROQ_API_KEY` ⭐ (recommended - very fast, generous free tier: 14,400 req/day)
 - `MISTRAL_API_KEY` (free - good for Polish language)
-- `GROQ_API_KEY` (free - fast and generous limits, good fallback)
+- `PERPLEXITY_API_KEY` (paid - $5/month credit, very good quality)
 - Multiple keys (maximum resilience and quota)
 
 #### Method 1: Using `.env` file (Recommended)
@@ -117,6 +124,7 @@ The API keys are injected at compile time via build flags in `variants/esp32s3/s
 ```ini
 build_flags =
   -DGEMINI_API_KEY=\"${sysenv.GEMINI_API_KEY}\"
+  -DOPENAI_API_KEY=\"${sysenv.OPENAI_API_KEY}\"
   -DPERPLEXITY_API_KEY=\"${sysenv.PERPLEXITY_API_KEY}\"
   -DMISTRAL_API_KEY=\"${sysenv.MISTRAL_API_KEY}\"
   -DGROQ_API_KEY=\"${sysenv.GROQ_API_KEY}\"
@@ -135,10 +143,14 @@ When processing alerts, the module tries each configured provider in order:
 
 **If you have all keys:**
 1. Module tries **Gemini 2.0 Flash** first (fastest, free)
-2. If it fails (quota, network error, etc.) → tries **Perplexity (Llama 3.1 Sonar)**
-3. If still failing → tries **Mistral 7B** (good for Polish)
-4. If still failing → tries **Groq (Llama 3.3 70B)** (last resort, very fast, generous quota)
-5. If all providers fail → alert is retried on next fetch cycle
+2. If it fails → tries **GPT-4o mini** (good performance, reasonable free quota)
+3. If still failing → tries **Perplexity (Llama 3.1 Sonar)** (high quality, paid)
+4. If still failing → tries **Mistral 7B** (good for Polish language, free)
+5. If still failing → tries **Groq (Llama 3.3 70B)** (very fast, generous free quota)
+6. If still failing → tries **Gemini 2.0 Flash (Fallback)** (same as primary, maximum reliability)
+7. If all providers fail → alert is retried on next fetch cycle
+
+**Currently testing only GPT-4o mini and Groq** - other providers temporarily commented out
 
 **If you only have Gemini:**
 1. Uses Gemini 2.0 Flash
@@ -175,8 +187,30 @@ The module logs which provider succeeded for each alert, making it easy to track
 4. Click "Create API Key"
 5. Copy the key and add it to your `.env` file
 
-**Free Tier:** 30 requests/minute, 14,400 requests/day (with llama-3.3-70b-versatile)  
+**Free Tier:** 30 requests/minute, 14,400 requests/day (with llama-3.3-70b-versatile)
 **Why Groq:** Extremely fast inference (often <1 second), very generous free tier, excellent quality with Llama 3.3 70B
+
+### Claude API Key (High quality, pay-as-you-go)
+
+1. Visit: https://console.anthropic.com/
+2. Sign up or sign in (supports Google, GitHub)
+3. Go to API Keys section
+4. Click "Create API Key"
+5. Copy the key and add it to your `.env` file
+
+**Pricing:** Pay-as-you-go (no free tier)
+**Why Claude:** Excellent at structured data extraction, very reliable, highest-quality responses for alert processing
+
+### OpenAI API Key (Good balance)
+
+1. Visit: https://platform.openai.com/api-keys
+2. Sign up or sign in
+3. Go to API Keys section
+4. Click "Create new secret key"
+5. Copy the key and add it to your `.env` file
+
+**Free Tier:** 50 requests/day (with GPT-4o mini)
+**Why GPT-4o mini:** Good performance for alert extraction, reasonable free tier, reliable service
 
 ### Perplexity API Key (Optional, Paid)
 

@@ -35,7 +35,9 @@ AIService::~AIService()
 
 void AIService::initializeProviders()
 {
-    // AI provider fallback chain (Gemini → Perplexity → Mistral → Groq)
+    // AI provider fallback chain (Gemini → GPT-4o mini → Perplexity → Mistral → Groq → Gemini-Fallback)
+    // All experimented providers now active with Gemini as both primary and last-resort fallback
+
     aiProviders[0].name = "Gemini-2.5";
     aiProviders[0].endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
     #ifdef GEMINI_API_KEY
@@ -45,35 +47,54 @@ void AIService::initializeProviders()
     #endif
     aiProviders[0].requestFormat = "gemini";
 
-    aiProviders[1].name = "Perplexity-Sonar";
-    aiProviders[1].endpoint = "https://api.perplexity.ai/chat/completions";
-    aiProviders[1].model = "sonar";
-    #ifdef PERPLEXITY_API_KEY
-    aiProviders[1].apiKey = PERPLEXITY_API_KEY;
+    aiProviders[1].name = "GPT-4o mini";
+    aiProviders[1].endpoint = "https://api.openai.com/v1/chat/completions";
+    aiProviders[1].model = "gpt-4o-mini";
+    #ifdef OPENAI_API_KEY
+    aiProviders[1].apiKey = OPENAI_API_KEY;
     #else
     aiProviders[1].apiKey = "";
     #endif
-    aiProviders[1].requestFormat = "perplexity";
+    aiProviders[1].requestFormat = "openai";
 
-    aiProviders[2].name = "Mistral-7B";
-    aiProviders[2].endpoint = "https://api.mistral.ai/v1/chat/completions";
-    aiProviders[2].model = "open-mistral-7b";
-    #ifdef MISTRAL_API_KEY
-    aiProviders[2].apiKey = MISTRAL_API_KEY;
+    aiProviders[2].name = "Perplexity-Sonar";
+    aiProviders[2].endpoint = "https://api.perplexity.ai/chat/completions";
+    aiProviders[2].model = "sonar";
+    #ifdef PERPLEXITY_API_KEY
+    aiProviders[2].apiKey = PERPLEXITY_API_KEY;
     #else
     aiProviders[2].apiKey = "";
     #endif
-    aiProviders[2].requestFormat = "mistral";
+    aiProviders[2].requestFormat = "perplexity";
 
-    aiProviders[3].name = "Groq";
-    aiProviders[3].endpoint = "https://api.groq.com/openai/v1/chat/completions";
-    aiProviders[3].model = "llama-3.3-70b-versatile";
-    #ifdef GROQ_API_KEY
-    aiProviders[3].apiKey = GROQ_API_KEY;
+    aiProviders[3].name = "Mistral-7B";
+    aiProviders[3].endpoint = "https://api.mistral.ai/v1/chat/completions";
+    aiProviders[3].model = "open-mistral-7b";
+    #ifdef MISTRAL_API_KEY
+    aiProviders[3].apiKey = MISTRAL_API_KEY;
     #else
     aiProviders[3].apiKey = "";
     #endif
-    aiProviders[3].requestFormat = "groq";
+    aiProviders[3].requestFormat = "mistral";
+
+    aiProviders[4].name = "Groq";
+    aiProviders[4].endpoint = "https://api.groq.com/openai/v1/chat/completions";
+    aiProviders[4].model = "llama-3.3-70b-versatile";
+    #ifdef GROQ_API_KEY
+    aiProviders[4].apiKey = GROQ_API_KEY;
+    #else
+    aiProviders[4].apiKey = "";
+    #endif
+    aiProviders[4].requestFormat = "groq";
+
+    aiProviders[5].name = "Gemini-2.5-Fallback";
+    aiProviders[5].endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+    #ifdef GEMINI_API_KEY
+    aiProviders[5].apiKey = GEMINI_API_KEY;
+    #else
+    aiProviders[5].apiKey = "";
+    #endif
+    aiProviders[5].requestFormat = "gemini";
 
     LOG_INFO("[AIService] Initialized with %d AI providers", MAX_AI_PROVIDERS);
 }
@@ -99,12 +120,14 @@ String AIService::callAI(const String& prompt)
 
         if (provider.requestFormat == "gemini") {
             success = callGeminiAPI(provider, prompt, response);
-        } else if (provider.requestFormat == "perplexity") {
-            success = callMistralAPI(provider, prompt, response); // Reuse Mistral (OpenAI-compatible)
-        } else if (provider.requestFormat == "mistral") {
-            success = callMistralAPI(provider, prompt, response);
         } else if (provider.requestFormat == "groq") {
             success = callGroqAPI(provider, prompt, response);
+        } else if (provider.requestFormat == "openai") {
+            success = callOpenAIAPI(provider, prompt, response);
+        } else if (provider.requestFormat == "mistral") {
+            success = callMistralAPI(provider, prompt, response);
+        } else if (provider.requestFormat == "perplexity") {
+            success = callMistralAPI(provider, prompt, response); // Reuse Mistral (OpenAI-compatible)
         }
 
         if (success) {
@@ -283,6 +306,42 @@ bool AIService::callGroqAPI(const AIProvider& provider, const String& prompt, St
     return processHttpResponse(http, httpCode, provider.name, outResponse);
 }
 
+bool AIService::callOpenAIAPI(const AIProvider& provider, const String& prompt, String& outResponse)
+{
+    HTTPClient http;
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    http.begin(client, provider.endpoint.c_str());
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Authorization", "Bearer " + provider.apiKey);
+    http.setTimeout(AI_TIMEOUT_MS);
+
+    // Build OpenAI API request using reusable JSON document
+    requestDoc.clear();
+
+    requestDoc["model"] = provider.model;
+
+    JsonArray messages = requestDoc.createNestedArray("messages");
+    JsonObject messageObj = messages.createNestedObject();
+    messageObj["role"] = "user";
+    messageObj["content"] = prompt; // ArduinoJson handles escaping automatically
+
+    requestDoc["temperature"] = 0.1;
+    requestDoc["max_tokens"] = 500;
+
+    String body;
+    serializeJson(requestDoc, body);
+
+    LOG_DEBUG("[AIService] Sending OpenAI request to %s (prompt length: %d, body length: %d)", provider.name.c_str(), prompt.length(), body.length());
+    int httpCode = http.POST(body);
+
+    // Reset watchdog after potentially long AI API call
+    feedWatchdog();
+
+    return processHttpResponse(http, httpCode, provider.name, outResponse);
+}
+
 String AIService::httpPost(const char* url, const String& payload, const String& authHeader)
 {
     if (!WiFi.isConnected()) {
@@ -327,10 +386,14 @@ bool AIService::callProvider(int providerIdx, const String& prompt, String& outR
 
     if (provider.requestFormat == "gemini") {
         return callGeminiAPI(provider, prompt, outResponse);
-    } else if (provider.requestFormat == "perplexity" || provider.requestFormat == "mistral") {
-        return callMistralAPI(provider, prompt, outResponse);
     } else if (provider.requestFormat == "groq") {
         return callGroqAPI(provider, prompt, outResponse);
+    } else if (provider.requestFormat == "openai") {
+        return callOpenAIAPI(provider, prompt, outResponse);
+    } else if (provider.requestFormat == "mistral") {
+        return callMistralAPI(provider, prompt, outResponse);
+    } else if (provider.requestFormat == "perplexity") {
+        return callMistralAPI(provider, prompt, outResponse); // Reuse Mistral (OpenAI-compatible)
     }
 
     return false;

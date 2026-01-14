@@ -78,7 +78,7 @@ public:
     void setCurrentProviderIndex(int idx) { currentAIProviderIndex = idx; }
 
 private:
-    static constexpr int MAX_AI_PROVIDERS = 4;
+    static constexpr int MAX_AI_PROVIDERS = 6;
     static constexpr unsigned long AI_TIMEOUT_MS = 15000;
     static constexpr size_t JSON_DOC_SIZE = 16384; // 16KB for request building
 
@@ -95,6 +95,7 @@ private:
     bool callGeminiAPI(const AIProvider& provider, const String& prompt, String& outResponse);
     bool callMistralAPI(const AIProvider& provider, const String& prompt, String& outResponse);
     bool callGroqAPI(const AIProvider& provider, const String& prompt, String& outResponse);
+    bool callOpenAIAPI(const AIProvider& provider, const String& prompt, String& outResponse);
 
     // HTTP helper
     String httpPost(const char* url, const String& payload, const String& authHeader = "");
