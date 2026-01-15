@@ -15,6 +15,32 @@
 bool IMGWAlertSource::parseIMGWStream(WiFiClient* stream, std::vector<AlertSource::RawAlert>& alerts) {
     LOG_INFO("IMGWAlertSource: Starting chunked deserialization (ArduinoJson streaming)...");
 
+    auto updateFnv1a = [&](uint64_t hash, const String &value) -> uint64_t {
+        const uint64_t FNV_PRIME = 1099511628211ULL;
+        for (size_t i = 0; i < value.length(); i++) {
+            hash ^= static_cast<uint8_t>(value.charAt(i));
+            hash *= FNV_PRIME;
+        }
+        return hash;
+    };
+
+    auto updateSeparator = [&](uint64_t hash) -> uint64_t {
+        const uint64_t FNV_PRIME = 1099511628211ULL;
+        hash ^= static_cast<uint8_t>('|');
+        hash *= FNV_PRIME;
+        return hash;
+    };
+
+    auto appendAreaDesc = [&](String &target, const String &addition) {
+        if (addition.length() == 0) return;
+        if (target.length() == 0) {
+            target = addition;
+            return;
+        }
+        target += ", ";
+        target += addition;
+    };
+
     // Create filter for ArduinoJson - extracts only needed fields from each warning
     StaticJsonDocument<256> filter;
     JsonObject alertFilter = filter["alert"].to<JsonObject>();
@@ -36,6 +62,11 @@ bool IMGWAlertSource::parseIMGWStream(WiFiClient* stream, std::vector<AlertSourc
     const size_t DOC_SIZE = 16384;
     
     int warningsProcessed = 0;
+    uint64_t lastMessageHash = 0;
+    size_t lastMessageLength = 0;
+    String lastAreaDesc;
+    String lastContextSuffix;
+    bool hasGroupedAlert = false;
 
     // Step 1: Navigate to the warnings array using Stream::find()
     // ArduinoJson doc: "you can use Stream::find()" to jump to array start
@@ -96,8 +127,9 @@ bool IMGWAlertSource::parseIMGWStream(WiFiClient* stream, std::vector<AlertSourc
             rawAlert.id = hashString(identifier);
             rawAlert.title = headline;
             
-            if (info.containsKey("description"))
-                rawAlert.intro = String(info["description"].as<const char*>());
+            String description = info.containsKey("description") ?
+                                String(info["description"].as<const char*>()) : "";
+            rawAlert.intro = description;
             
             String onset = info.containsKey("onset") ? 
                           String(info["onset"].as<const char*>()) : "";
@@ -116,13 +148,12 @@ bool IMGWAlertSource::parseIMGWStream(WiFiClient* stream, std::vector<AlertSourc
             String areaDesc = "";
             if (info.containsKey("area") && info["area"].is<JsonArray>()) {
                 JsonArray areas = info["area"];
-                for (size_t k = 0; k < areas.size() && areaDesc.length() < 200; k++) {
+                for (size_t k = 0; k < areas.size(); k++) {
                     if (areas[k].containsKey("areaDesc")) {
                         if (areaDesc.length() > 0) areaDesc += ", ";
                         areaDesc += String(areas[k]["areaDesc"].as<const char*>());
                     }
                 }
-                if (areaDesc.length() > 200) areaDesc = areaDesc.substring(0, 200) + "...";
             }
             
             String severity = info.containsKey("severity") ? 
@@ -134,18 +165,57 @@ bool IMGWAlertSource::parseIMGWStream(WiFiClient* stream, std::vector<AlertSourc
             String instruction = info.containsKey("instruction") ? 
                                 String(info["instruction"].as<const char*>()) : "";
             
-            rawAlert.context = "AREA:" + areaDesc + "|SEVERITY:" + severity +
-                              "|CERTAINTY:" + certainty + "|URGENCY:" + urgency;
+            String instructionKey = "";
+            String contextSuffix = "|SEVERITY:" + severity +
+                                  "|CERTAINTY:" + certainty + "|URGENCY:" + urgency;
             if (instruction.length() > 0 && instruction.length() < 200) {
-                rawAlert.context += "|INSTRUCTION:" + instruction;
+                instructionKey = instruction;
+                contextSuffix += "|INSTRUCTION:" + instruction;
             }
-            
-            alerts.push_back(rawAlert);
-            
-            // Keep only the last 10 alerts (most recent are at end of JSON)
-            // Remove oldest if we exceed limit
-            if (alerts.size() > 10) {
-                alerts.erase(alerts.begin());
+
+            uint64_t messageHash = 14695981039346656037ULL;
+            size_t messageLength = 0;
+            messageHash = updateFnv1a(messageHash, headline);
+            messageLength += headline.length();
+            messageHash = updateSeparator(messageHash);
+            messageHash = updateFnv1a(messageHash, description);
+            messageLength += description.length();
+            messageHash = updateSeparator(messageHash);
+            messageHash = updateFnv1a(messageHash, instructionKey);
+            messageLength += instructionKey.length();
+            messageHash = updateSeparator(messageHash);
+            messageHash = updateFnv1a(messageHash, severity);
+            messageLength += severity.length();
+            messageHash = updateSeparator(messageHash);
+            messageHash = updateFnv1a(messageHash, certainty);
+            messageLength += certainty.length();
+            messageHash = updateSeparator(messageHash);
+            messageHash = updateFnv1a(messageHash, urgency);
+            messageLength += urgency.length();
+            messageHash = updateSeparator(messageHash);
+            messageHash = updateFnv1a(messageHash, onset);
+            messageLength += onset.length();
+            messageHash = updateSeparator(messageHash);
+            messageHash = updateFnv1a(messageHash, expires);
+            messageLength += expires.length();
+
+            if (!hasGroupedAlert || messageHash != lastMessageHash || messageLength != lastMessageLength) {
+                rawAlert.context = "AREA:" + areaDesc + contextSuffix;
+                alerts.push_back(rawAlert);
+                lastMessageHash = messageHash;
+                lastMessageLength = messageLength;
+                lastAreaDesc = areaDesc;
+                lastContextSuffix = contextSuffix;
+                hasGroupedAlert = true;
+
+                // Keep only the last 10 alerts (most recent are at end of JSON)
+                // Remove oldest if we exceed limit
+                if (alerts.size() > 10) {
+                    alerts.erase(alerts.begin());
+                }
+            } else {
+                appendAreaDesc(lastAreaDesc, areaDesc);
+                alerts.back().context = "AREA:" + lastAreaDesc + lastContextSuffix;
             }
             
             break;  // Found Polish, no need to check other languages
