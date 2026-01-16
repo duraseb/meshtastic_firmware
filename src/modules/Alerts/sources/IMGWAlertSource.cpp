@@ -208,9 +208,9 @@ bool IMGWAlertSource::parseIMGWStream(WiFiClient* stream, std::vector<AlertSourc
                 lastContextSuffix = contextSuffix;
                 hasGroupedAlert = true;
 
-                // Keep only the last 10 alerts (most recent are at end of JSON)
+                // Keep only the last few alerts (most recent are at end of JSON)
                 // Remove oldest if we exceed limit
-                if (alerts.size() > 10) {
+                if (alerts.size() > 15) {
                     alerts.erase(alerts.begin());
                 }
             } else {

@@ -162,6 +162,7 @@ AlertsModule::~AlertsModule() {
     pendingAlerts.clear();
     alerts.clear();
     processedAlertIds.clear();
+    processedAlertIdOrder.clear();
 
     // Note: aiService is a global managed elsewhere, not cleaned up here
 }
@@ -422,6 +423,54 @@ bool AlertsModule::isAlertProcessed(uint32_t id)
     return processedAlertIds.find(id) != processedAlertIds.end();
 }
 
+void AlertsModule::cacheProcessedAlertId(uint32_t id)
+{
+    if (id == 0) {
+        return;
+    }
+
+    if (processedAlertIds.find(id) != processedAlertIds.end()) {
+        return;
+    }
+
+    if (processedAlertIds.size() >= MAX_PROCESSED_IDS_CACHE) {
+        if (!processedAlertIdOrder.empty()) {
+            uint32_t oldest = processedAlertIdOrder.front();
+            processedAlertIdOrder.pop_front();
+            processedAlertIds.erase(oldest);
+        }
+    }
+
+    processedAlertIds.insert(id);
+    processedAlertIdOrder.push_back(id);
+}
+
+void AlertsModule::removeProcessedAlertId(uint32_t id)
+{
+    processedAlertIds.erase(id);
+    if (processedAlertIdOrder.empty()) {
+        return;
+    }
+
+    for (auto it = processedAlertIdOrder.begin(); it != processedAlertIdOrder.end(); ++it) {
+        if (*it == id) {
+            processedAlertIdOrder.erase(it);
+            break;
+        }
+    }
+}
+
+size_t AlertsModule::clampMessageToPayload(String &message, size_t maxPayloadBytes)
+{
+    size_t msgBytes = utf8ByteLength(message);
+    if (msgBytes <= maxPayloadBytes) {
+        return msgBytes;
+    }
+
+    message = message.substring(0, maxPayloadBytes);
+    return utf8ByteLength(message);
+}
+
 
 bool AlertsModule::saveAlertToDisk(const Alert &alert)
 {
@@ -521,7 +570,7 @@ void AlertsModule::enforceFileLimits()
             String idHex = filename.substring(underscorePos + 1, dotPos);
             uint32_t id = strtoul(idHex.c_str(), nullptr, 16);
             if (id > 0) {
-                processedAlertIds.erase(id);
+                removeProcessedAlertId(id);
                 // Remove from memory if present
                 for (auto it = alerts.begin(); it != alerts.end(); ++it) {
                     if (it->id == id) {
@@ -628,9 +677,7 @@ bool AlertsModule::saveAlertToFile(const Alert &alert, uint32_t id, const String
     LOG_DEBUG("Saved binary alert file: %s (%d bytes)", filename.c_str(), written);
 
     // Add to processed IDs cache for fast duplicate checking (only if cache not full)
-    if (processedAlertIds.size() < MAX_PROCESSED_IDS_CACHE) {
-        processedAlertIds.insert(id);
-    }
+    cacheProcessedAlertId(id);
 
     return true;
 }
@@ -640,6 +687,7 @@ bool AlertsModule::loadAlertsFromDisk()
     LOG_DEBUG("Loading alerts from disk (memory-optimized)");
     alerts.clear();
     processedAlertIds.clear();
+    processedAlertIdOrder.clear();
 
     int totalFiles = 0;
     int tmpFilesDeleted = 0;
@@ -750,9 +798,7 @@ bool AlertsModule::loadAlertsFromDisk()
 
                         // Add to processed IDs cache (always, for duplicate detection)
                         // Limit cache size to prevent unbounded growth
-                        if (processedAlertIds.size() < MAX_PROCESSED_IDS_CACHE) {
-                            processedAlertIds.insert(a.id);
-                        }
+                        cacheProcessedAlertId(a.id);
 
                         // Only load valid (non-expired) alerts into memory
                         if (isAlertValid(a)) {
@@ -1831,6 +1877,10 @@ bool AlertsModule::sendAlertToMesh(const Alert &alert)
 
     // Publish message to mesh
     meshtastic_MeshPacket *p = router->allocForSending();
+    if (!p) {
+        LOG_ERROR("Failed to allocate mesh packet for alert");
+        return false;
+    }
     p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
     p->to = 0xffffffff; // Broadcast
 
@@ -1849,7 +1899,7 @@ bool AlertsModule::sendAlertToMesh(const Alert &alert)
         p->priority = meshtastic_MeshPacket_Priority_RELIABLE;
     }
     
-    p->decoded.payload.size = utf8ByteLength(msg);
+    p->decoded.payload.size = clampMessageToPayload(msg, maxPayload);
     memcpy(p->decoded.payload.bytes, msg.c_str(), p->decoded.payload.size);
     
     LOG_INFO("Sending alert to mesh - channel: %d, size: %d, priority: %d", 
@@ -1876,12 +1926,14 @@ bool AlertsModule::sendMessageToMesh(const String &message)
 
     if (msgBytes > maxPayload) {
         LOG_WARN("Message too long (%d bytes, max %d), truncating", msgBytes, maxPayload);
-        // Simple truncation - not ideal for UTF-8 but acceptable for now
-        msgBytes = maxPayload;
     }
 
     // Allocate and prepare mesh packet
     meshtastic_MeshPacket *p = router->allocForSending();
+    if (!p) {
+        LOG_ERROR("Failed to allocate mesh packet for message");
+        return false;
+    }
     p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
     p->to = 0xffffffff; // Broadcast
 
@@ -1894,8 +1946,10 @@ bool AlertsModule::sendMessageToMesh(const String &message)
     p->want_ack = true;
     p->priority = meshtastic_MeshPacket_Priority_RELIABLE;
 
+    String payloadMessage = message;
+    msgBytes = clampMessageToPayload(payloadMessage, maxPayload);
     p->decoded.payload.size = msgBytes;
-    memcpy(p->decoded.payload.bytes, message.c_str(), msgBytes);
+    memcpy(p->decoded.payload.bytes, payloadMessage.c_str(), msgBytes);
 
     LOG_INFO("Sending message to mesh - channel: %d, size: %d", alertChannelIndex, p->decoded.payload.size);
 
@@ -2035,6 +2089,10 @@ void AlertsModule::cleanupOldAlerts()
     // Calculate cutoff date (configured retention period ago)
     time_t cutoffTime = now - (ALERT_RETENTION_DAYS * 24UL * 60UL * 60UL);
     struct tm *cutoffTm = gmtime(&cutoffTime);
+    if (!cutoffTm) {
+        LOG_WARN("Failed to get UTC time for cleanup cutoff, skipping cleanup");
+        return;
+    }
     char cutoffDateStr[9];
     snprintf(cutoffDateStr, sizeof(cutoffDateStr), "%04d%02d%02d",
              cutoffTm->tm_year + 1900, cutoffTm->tm_mon + 1, cutoffTm->tm_mday);
@@ -2106,7 +2164,7 @@ void AlertsModule::cleanupOldAlerts()
                             uint32_t id = strtoul(idHex.c_str(), nullptr, 16);
                             if (id > 0) {
                                 // Remove from processed IDs cache
-                                processedAlertIds.erase(id);
+                                removeProcessedAlertId(id);
 
                                 // Remove from memory if present
                                 for (auto it = alerts.begin(); it != alerts.end(); ++it) {
@@ -2256,6 +2314,7 @@ void AlertsModule::purgeAllAlerts()
     // Clear the in-memory alerts vector and processed IDs cache
     alerts.clear();
     processedAlertIds.clear();
+    processedAlertIdOrder.clear();
     LOG_INFO("Purged %d alert files and cleared in-memory cache", deletedCount);
 }
 
@@ -2369,12 +2428,17 @@ bool AlertsModule::broadcastInfoMessage()
 
     // Allocate and prepare mesh packet
     meshtastic_MeshPacket *p = router->allocForSending();
+    if (!p) {
+        LOG_ERROR("Failed to allocate mesh packet for channel info broadcast");
+        return false;
+    }
     p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
     p->to = 0xffffffff; // Broadcast
     p->channel = channels.getPrimaryIndex(); // Always send to primary channel
     p->want_ack = true;
     p->priority = meshtastic_MeshPacket_Priority_RELIABLE;
 
+    msgBytes = clampMessageToPayload(message, maxPayload);
     p->decoded.payload.size = msgBytes;
     memcpy(p->decoded.payload.bytes, message.c_str(), msgBytes);
 

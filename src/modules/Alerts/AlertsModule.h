@@ -10,6 +10,7 @@
 #include <Arduino.h>
 #include <vector>
 #include <unordered_set>
+#include <deque>
 
 // Alert structure - shared between AlertsModule and AlertSource
 struct Alert {
@@ -110,7 +111,7 @@ class AlertsModule : public concurrency::OSThread {
     static constexpr int MAX_ALERTS_IN_MEMORY = 200; // Reasonable upper limit for edge cases
     static constexpr int MAX_PENDING_ALERTS = 30; // Limit pending alerts queue
     static constexpr unsigned long MEMORY_CHECK_INTERVAL_MS = 60000;
-    static constexpr size_t MAX_PROCESSED_IDS_CACHE = 200; // Limit processed IDs cache size
+    static constexpr size_t MAX_PROCESSED_IDS_CACHE = 800; // Limit processed IDs cache size
 
     // ===== Alert Storage Format =====
     // Binary format for disk storage (fixed size for fast I/O)
@@ -172,6 +173,7 @@ class AlertsModule : public concurrency::OSThread {
 
     // Cache of processed alert IDs for fast duplicate checking (prevents slow filesystem scans)
     std::unordered_set<uint32_t> processedAlertIds;
+    std::deque<uint32_t> processedAlertIdOrder;
 
     // Memory management
     unsigned long lastMemoryCheckTime;
@@ -279,6 +281,13 @@ class AlertsModule : public concurrency::OSThread {
 
     // Hash a link string for duplicate detection
     uint32_t hashLink(const String &link);
+
+    // Processed ID cache helpers (bounded, prevents unbounded growth)
+    void cacheProcessedAlertId(uint32_t id);
+    void removeProcessedAlertId(uint32_t id);
+
+    // Ensure payload fits meshtastic limit (byte-based, defensive)
+    size_t clampMessageToPayload(String &message, size_t maxPayloadBytes);
 };
 
 #endif // HAS_ALERTING
