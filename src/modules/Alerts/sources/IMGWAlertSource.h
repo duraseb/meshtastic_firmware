@@ -32,7 +32,7 @@ public:
 
     // Streaming JSON parser using ArduinoJson chunked deserialization
     // See: https://arduinojson.org/v7/how-to/deserialize-a-very-large-document/
-    bool parseIMGWStream(WiFiClient* stream, std::vector<RawAlert>& alerts);
+    bool parseIMGWStream(WiFiClient* stream, DynamicJsonDocument& doc, std::vector<RawAlert>& alerts);
 
     String buildAIPrompt(const RawAlert &rawAlert,
                         int maxMessageBytes,

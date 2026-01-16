@@ -12,7 +12,7 @@
 // parse array elements one at a time. Combined with filtering, this uses only ~20KB memory.
 //
 // Memory usage: ~20KB total (16KB JsonDocument + 256B filter + overhead)
-bool IMGWAlertSource::parseIMGWStream(WiFiClient* stream, std::vector<AlertSource::RawAlert>& alerts) {
+bool IMGWAlertSource::parseIMGWStream(WiFiClient* stream, DynamicJsonDocument& doc, std::vector<AlertSource::RawAlert>& alerts) {
     LOG_INFO("IMGWAlertSource: Starting chunked deserialization (ArduinoJson streaming)...");
 
     auto updateFnv1a = [&](uint64_t hash, const String &value) -> uint64_t {
@@ -57,10 +57,6 @@ bool IMGWAlertSource::parseIMGWStream(WiFiClient* stream, std::vector<AlertSourc
     infoFilter["urgency"] = true;
     infoFilter["area"][0]["areaDesc"] = true;
 
-    // Small JsonDocument for parsing one warning at a time
-    // ArduinoJson stops reading at closing }, so only one warning is parsed per call
-    const size_t DOC_SIZE = 16384;
-    
     int warningsProcessed = 0;
     uint64_t lastMessageHash = 0;
     size_t lastMessageLength = 0;
@@ -71,18 +67,17 @@ bool IMGWAlertSource::parseIMGWStream(WiFiClient* stream, std::vector<AlertSourc
     // Step 1: Navigate to the warnings array using Stream::find()
     // ArduinoJson doc: "you can use Stream::find()" to jump to array start
     LOG_DEBUG("IMGWAlertSource: Searching for warnings array...");
-    
+
     if (!stream->find("\"warnings\":[")) {
         LOG_WARN("IMGWAlertSource: Could not find warnings array in response");
         return false;
     }
-    
+
     LOG_DEBUG("IMGWAlertSource: Found warnings array, starting chunked deserialization");
 
     // Step 2: Parse each warning object one at a time
     // ArduinoJson automatically stops reading at the closing brace of each object
     do {
-        DynamicJsonDocument doc(DOC_SIZE);
         DeserializationError error = deserializeJson(doc, *stream, DeserializationOption::Filter(filter));
 
         if (error) {
@@ -257,8 +252,8 @@ std::vector<AlertSource::RawAlert> IMGWAlertSource::fetchAndParseAlerts(
     // Use streaming JSON parsing with direct HTTP piping for memory efficiency
     LOG_DEBUG("IMGWAlertSource: Starting streaming JSON parse from %s", getFetchUrl().c_str());
 
-    // Use AlertsModule's streaming HTTP utility
-    auto jsonProcessor = [&](WiFiClient* stream) -> bool {
+    // Use AlertsModule's streaming HTTP utility with shared JSON document
+    auto jsonProcessor = [&](WiFiClient* stream, DynamicJsonDocument& doc) -> bool {
         if (!stream) {
             LOG_ERROR("IMGWAlertSource: Stream is null");
             return false;
@@ -268,7 +263,7 @@ std::vector<AlertSource::RawAlert> IMGWAlertSource::fetchAndParseAlerts(
 
         // Use our custom streaming parser that processes JSON in chunks
         // and only extracts Polish alerts without loading the entire 233KB response
-        bool success = this->parseIMGWStream(stream, alerts);
+        bool success = this->parseIMGWStream(stream, doc, alerts);
 
         if (!success) {
             LOG_ERROR("IMGWAlertSource: Streaming JSON parsing failed");
@@ -280,7 +275,7 @@ std::vector<AlertSource::RawAlert> IMGWAlertSource::fetchAndParseAlerts(
         return true;
     };
 
-    // Call the streaming HTTP method from AlertsModule
+    // Call the streaming HTTP method from AlertsModule with shared document
     if (!alertsModule->httpGetStream(getFetchUrl().c_str(), jsonProcessor)) {
         LOG_ERROR("IMGWAlertSource: Streaming HTTP request failed");
         return alerts;

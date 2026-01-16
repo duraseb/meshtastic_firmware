@@ -4,6 +4,7 @@
 #include "AIService.h"
 #include "sources/RCBAlertSource.h"
 #include "sources/IMGWAlertSource.h"
+#include "sources/POZAlertSource.h"
 #include "dynamic_sources/IMGWSynopSource.h"
 #include "dynamic_sources/AiWeatherSource.h"
 #include "mesh/wifi/WiFiAPClient.h"
@@ -45,7 +46,7 @@ static inline void feedWatchdog()
 
 AlertsModule *alertsModule = nullptr;
 
-AlertsModule::AlertsModule() : OSThread("AlertsModule")
+AlertsModule::AlertsModule() : OSThread("AlertsModule"), sharedJsonDoc(SHARED_JSON_DOC_SIZE)
 {
     LOG_INFO("[AlertsModule] Initializing Multi-Source Alert System");
 
@@ -84,6 +85,14 @@ AlertsModule::AlertsModule() : OSThread("AlertsModule")
 
     // Register IMGW source
     sources[numSources] = new IMGWAlertSource();
+    sourceLastFetchTime[numSources] = 0;
+    LOG_INFO("[AlertsModule] Registered source: %s (fetch every %lu min)",
+             sources[numSources]->getSourceId().c_str(),
+             sources[numSources]->getFetchIntervalMs() / 60000);
+    numSources++;
+
+    // Register POZ source
+    sources[numSources] = new POZAlertSource();
     sourceLastFetchTime[numSources] = 0;
     LOG_INFO("[AlertsModule] Registered source: %s (fetch every %lu min)",
              sources[numSources]->getSourceId().c_str(),
@@ -279,7 +288,8 @@ String AlertsModule::httpGet(const char *url, int &httpCode)
  * @param jsonProcessor Callback function that receives the stream and processes JSON
  * @return true if streaming completed successfully
  */
-bool AlertsModule::httpGetStream(const char *url, std::function<bool(WiFiClient* stream)> jsonProcessor)
+// Streaming method with shared JSON document for maximum memory efficiency
+bool AlertsModule::httpGetStream(const char *url, std::function<bool(WiFiClient* stream, DynamicJsonDocument& doc)> jsonProcessor)
 {
     if (!isWifiAvailable()) {
         LOG_DEBUG("[AlertsModule] WiFi not available for streaming HTTP request");
@@ -318,8 +328,8 @@ bool AlertsModule::httpGetStream(const char *url, std::function<bool(WiFiClient*
             WiFiClient* stream = http->getStreamPtr();
 
             if (stream) {
-                // Call the processor callback with the stream
-                success = jsonProcessor(stream);
+                // Call the processor callback with the stream and shared document
+                success = jsonProcessor(stream, sharedJsonDoc);
             } else {
                 LOG_ERROR("[AlertsModule] Failed to get HTTP stream pointer");
             }
@@ -905,6 +915,9 @@ int32_t AlertsModule::runOnce()
                 size_t alertsCheckedThisCycle = 0;
                 const size_t MAX_CHECKS_PER_CYCLE = 1;
 
+                // Check if it's time to log pending alerts (every 3 minutes)
+                bool shouldLogPending = (currentMillis - lastPendingAlertLogTime >= PENDING_ALERT_LOG_INTERVAL_MS);
+
                 for (size_t i = 0; i < alerts.size() && alertsCheckedThisCycle < MAX_CHECKS_PER_CYCLE; i++) {
                     size_t checkIndex = (lastCheckedIndex + i) % alerts.size();
                     auto &alert = alerts[checkIndex];
@@ -947,17 +960,24 @@ int32_t AlertsModule::runOnce()
                         return RESEND_CHECK_YIELD_MS;
                     } else {
                         // Alert is pending but not yet due
-                        // nextSendAt is now absolute Unix timestamp
-                        unsigned long remainingSec = alert.nextSendAt - currentTime;
-                    if (remainingSec > 120) {
-                        unsigned long remainingMin = remainingSec / 60;
-                        LOG_DEBUG("Alert pending (will send in %lu min, source: %s, severity: %d): %s",
-                                  remainingMin, alert.source.c_str(), alert.severity, alert.title.c_str());
-                    } else {
-                        LOG_DEBUG("Alert pending (will send in %lu sec, source: %s, severity: %d): %s",
-                                  remainingSec, alert.source.c_str(), alert.severity, alert.title.c_str());
+                        // Log all pending alerts if it's time to log (every 3 minutes)
+                        if (shouldLogPending) {
+                            unsigned long remainingSec = alert.nextSendAt - currentTime;
+                            if (remainingSec > 120) {
+                                unsigned long remainingMin = remainingSec / 60;
+                                LOG_DEBUG("Alert pending (will send in %lu min, source: %s, severity: %d): %s",
+                                          remainingMin, alert.source.c_str(), alert.severity, alert.title.c_str());
+                            } else {
+                                LOG_DEBUG("Alert pending (will send in %lu sec, source: %s, severity: %d): %s",
+                                          remainingSec, alert.source.c_str(), alert.severity, alert.title.c_str());
+                            }
+                        }
                     }
-                    }
+                }
+
+                // Update the logging timestamp after processing all alerts in this cycle
+                if (shouldLogPending) {
+                    lastPendingAlertLogTime = currentMillis;
                 }
 
                 // Update starting index for next cycle (guard against division by zero)
@@ -1189,6 +1209,9 @@ int32_t AlertsModule::runOnce()
             auto httpGetCallback = [this](const char* url, int& httpCode) -> String {
                 return httpGet(url, httpCode);
             };
+
+            // Clear shared JSON document for this source
+            sharedJsonDoc.clear();
 
             // Call source plugin to fetch and parse alerts (first pass - minimal data)
             std::vector<AlertSource::RawAlert> rawAlerts = sources[currentSourceIndex]->fetchAndParseAlerts(httpGetCallback);

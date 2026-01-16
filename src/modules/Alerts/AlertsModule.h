@@ -11,6 +11,7 @@
 #include <vector>
 #include <unordered_set>
 #include <deque>
+#include <ArduinoJson.h>
 
 // Alert structure - shared between AlertsModule and AlertSource
 struct Alert {
@@ -61,6 +62,10 @@ class AlertsModule : public concurrency::OSThread {
     // HTTP/Network settings
     static constexpr unsigned long HTTP_TIMEOUT_MS = 10000;
 
+    // Shared JSON document for streaming parsers (avoids per-source allocation)
+    static constexpr size_t SHARED_JSON_DOC_SIZE = 16384;
+    DynamicJsonDocument sharedJsonDoc;
+
     // Time synchronization settings
     static constexpr uint32_t MIN_VALID_EPOCH = 1577836800UL; // 2020-01-01 00:00:00 UTC
     static constexpr unsigned long TIME_SYNC_WAIT_MS = 30000;
@@ -101,17 +106,20 @@ class AlertsModule : public concurrency::OSThread {
 
     // Performance and throttling settings
     static constexpr unsigned long ALERT_PROCESSING_YIELD_MS = 100;
-    static constexpr unsigned long RESEND_CHECK_YIELD_MS = 50;
+    static constexpr unsigned long RESEND_CHECK_YIELD_MS = 500;
     static constexpr unsigned long MAX_RUNONCE_INTERVAL_MS = 15000;
     static constexpr unsigned long ALERT_PROCESSING_THROTTLE_MS = 2000; // Minimum 2 seconds between alert processing starts
     static constexpr int MAX_ALERTS_PER_CYCLE = 1;
 
     // Memory management settings
     // We only keep valid (non-expired) alerts in memory
-    static constexpr int MAX_ALERTS_IN_MEMORY = 200; // Reasonable upper limit for edge cases
+    static constexpr int MAX_ALERTS_IN_MEMORY = 400; // Reasonable upper limit for edge cases
     static constexpr int MAX_PENDING_ALERTS = 30; // Limit pending alerts queue
     static constexpr unsigned long MEMORY_CHECK_INTERVAL_MS = 60000;
     static constexpr size_t MAX_PROCESSED_IDS_CACHE = 800; // Limit processed IDs cache size
+
+    // Logging throttling settings
+    static constexpr unsigned long PENDING_ALERT_LOG_INTERVAL_MS = 3 * 60 * 1000; // Log pending alerts every 3 minutes
 
     // ===== Alert Storage Format =====
     // Binary format for disk storage (fixed size for fast I/O)
@@ -179,6 +187,9 @@ class AlertsModule : public concurrency::OSThread {
     unsigned long lastMemoryCheckTime;
     size_t lastReportedMemoryUsage;
 
+    // Logging throttling
+    unsigned long lastPendingAlertLogTime;
+
     // Dynamic source processing state
     int currentDynamicSourceIndex;
 
@@ -193,8 +204,8 @@ class AlertsModule : public concurrency::OSThread {
     // HTTP helper (used by sources via callback)
     String httpGet(const char *url, int &httpCode);
 
-    // Streaming HTTP helper for memory-efficient JSON parsing
-    bool httpGetStream(const char *url, std::function<bool(WiFiClient* stream)> jsonProcessor);
+    // Streaming HTTP helper with shared JSON document (for maximum memory efficiency)
+    bool httpGetStream(const char *url, std::function<bool(WiFiClient* stream, DynamicJsonDocument& doc)> jsonProcessor);
 
     // ===== Alert Storage and Management =====
     // Persist alerts to disk and load them (using individual files)
