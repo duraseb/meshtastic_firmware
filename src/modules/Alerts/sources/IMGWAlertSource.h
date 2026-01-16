@@ -39,6 +39,14 @@ public:
                         int maxLocationChars) const override;
     
 private:
+    // Temporary structure for deduplication
+    struct TempAlert {
+        RawAlert alert;
+        uint64_t messageHash;
+        size_t messageLength;
+    };
+
+    void deduplicateAlerts(std::vector<TempAlert>& rawAlerts, std::vector<RawAlert>& outputAlerts);
     uint8_t calculateSeverity(const String &severity, const String &certainty, const String &urgency) const;
     String convertISO8601ToMeshtastic(const String &iso8601) const;
     uint32_t hashString(const String &str);

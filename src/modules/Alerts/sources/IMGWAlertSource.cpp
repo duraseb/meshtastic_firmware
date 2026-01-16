@@ -4,6 +4,75 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <map>
+#include <utility>
+
+// Deduplicate alerts by message content, merging areas with semicolons
+void IMGWAlertSource::deduplicateAlerts(std::vector<TempAlert>& rawAlerts, std::vector<RawAlert>& outputAlerts) {
+    // Use a map to group alerts by message hash
+    std::map<std::pair<uint64_t, size_t>, TempAlert> deduped;
+
+    for (auto& tempAlert : rawAlerts) {
+        auto key = std::make_pair(tempAlert.messageHash, tempAlert.messageLength);
+
+        if (deduped.find(key) == deduped.end()) {
+            // First occurrence of this message - add it
+            deduped[key] = tempAlert;
+        } else {
+            // Duplicate message - merge areas with semicolon
+            String existingArea = "";
+            String newArea = "";
+
+            // Extract AREA from existing alert's context
+            int areaPos = deduped[key].alert.context.indexOf("AREA:");
+            if (areaPos >= 0) {
+                int nextPipe = deduped[key].alert.context.indexOf("|", areaPos);
+                if (nextPipe >= 0) {
+                    existingArea = deduped[key].alert.context.substring(areaPos + 5, nextPipe);
+                } else {
+                    existingArea = deduped[key].alert.context.substring(areaPos + 5);
+                }
+            }
+
+            // Extract AREA from new alert's context
+            areaPos = tempAlert.alert.context.indexOf("AREA:");
+            if (areaPos >= 0) {
+                int nextPipe = tempAlert.alert.context.indexOf("|", areaPos);
+                if (nextPipe >= 0) {
+                    newArea = tempAlert.alert.context.substring(areaPos + 5, nextPipe);
+                } else {
+                    newArea = tempAlert.alert.context.substring(areaPos + 5);
+                }
+            }
+
+            // Merge areas with semicolon if both exist and are different
+            if (existingArea.length() > 0 && newArea.length() > 0 && existingArea != newArea) {
+                if (existingArea.indexOf(newArea) < 0) { // Avoid duplicates
+                    existingArea += "; " + newArea;
+                }
+            } else if (newArea.length() > 0 && existingArea.length() == 0) {
+                existingArea = newArea;
+            }
+
+            // Update the context with merged area
+            String newContext = "AREA:" + existingArea;
+            int nextPipe = deduped[key].alert.context.indexOf("|");
+            if (nextPipe >= 0) {
+                newContext += deduped[key].alert.context.substring(nextPipe);
+            }
+            deduped[key].alert.context = newContext;
+        }
+    }
+
+    // Convert back to output format and keep only the first 15 after deduplication
+    for (auto& pair : deduped) {
+        outputAlerts.push_back(pair.second.alert);
+        // Stop after 15 alerts to limit memory usage
+        if (outputAlerts.size() >= 15) {
+            break;
+        }
+    }
+}
 
 // Low-memory streaming JSON parser using ArduinoJson's "deserialization in chunks" feature
 // See: https://arduinojson.org/v7/how-to/deserialize-a-very-large-document/
@@ -58,11 +127,9 @@ bool IMGWAlertSource::parseIMGWStream(WiFiClient* stream, DynamicJsonDocument& d
     infoFilter["area"][0]["areaDesc"] = true;
 
     int warningsProcessed = 0;
-    uint64_t lastMessageHash = 0;
-    size_t lastMessageLength = 0;
-    String lastAreaDesc;
-    String lastContextSuffix;
-    bool hasGroupedAlert = false;
+
+    // Temporary vector to collect all alerts before deduplication
+    std::vector<TempAlert> rawAlerts;
 
     // Step 1: Navigate to the warnings array using Stream::find()
     // ArduinoJson doc: "you can use Stream::find()" to jump to array start
@@ -170,9 +237,7 @@ bool IMGWAlertSource::parseIMGWStream(WiFiClient* stream, DynamicJsonDocument& d
 
             uint64_t messageHash = 14695981039346656037ULL;
             size_t messageLength = 0;
-            messageHash = updateFnv1a(messageHash, headline);
-            messageLength += headline.length();
-            messageHash = updateSeparator(messageHash);
+            // Exclude headline from hash to allow grouping alerts with same description but different areas
             messageHash = updateFnv1a(messageHash, description);
             messageLength += description.length();
             messageHash = updateSeparator(messageHash);
@@ -194,24 +259,14 @@ bool IMGWAlertSource::parseIMGWStream(WiFiClient* stream, DynamicJsonDocument& d
             messageHash = updateFnv1a(messageHash, expires);
             messageLength += expires.length();
 
-            if (!hasGroupedAlert || messageHash != lastMessageHash || messageLength != lastMessageLength) {
-                rawAlert.context = "AREA:" + areaDesc + contextSuffix;
-                alerts.push_back(rawAlert);
-                lastMessageHash = messageHash;
-                lastMessageLength = messageLength;
-                lastAreaDesc = areaDesc;
-                lastContextSuffix = contextSuffix;
-                hasGroupedAlert = true;
+            // Store alert data for later deduplication
+            TempAlert tempAlert;
+            tempAlert.alert = rawAlert;
+            tempAlert.alert.context = "AREA:" + areaDesc + contextSuffix;
+            tempAlert.messageHash = messageHash;
+            tempAlert.messageLength = messageLength;
 
-                // Keep only the last few alerts (most recent are at end of JSON)
-                // Remove oldest if we exceed limit
-                if (alerts.size() > 15) {
-                    alerts.erase(alerts.begin());
-                }
-            } else {
-                appendAreaDesc(lastAreaDesc, areaDesc);
-                alerts.back().context = "AREA:" + lastAreaDesc + lastContextSuffix;
-            }
+            rawAlerts.push_back(tempAlert);
             
             break;  // Found Polish, no need to check other languages
         }
@@ -225,7 +280,10 @@ bool IMGWAlertSource::parseIMGWStream(WiFiClient* stream, DynamicJsonDocument& d
     // ArduinoJson doc: "you can use Stream::findUntil()" to skip between elements
     } while (stream->findUntil(",", "]"));
 
-    LOG_INFO("IMGWAlertSource: Streaming complete, kept last %d Polish alerts from %d warnings", 
+    // Step 4: Deduplicate alerts by message content and merge areas
+    deduplicateAlerts(rawAlerts, alerts);
+
+    LOG_INFO("IMGWAlertSource: Streaming complete, kept %d deduplicated Polish alerts from %d warnings",
              alerts.size(), warningsProcessed);
     return alerts.size() > 0 || warningsProcessed > 0;
 }
