@@ -105,8 +105,8 @@ bool POZAlertSource::parsePOZStream(WiFiClient* stream, DynamicJsonDocument& doc
         rawAlert.id = hashString(id);
         rawAlert.title = title;
 
-        // Build message in the requested format: [POZ} {date_from} {hour_from} {title} {miejsce}
-        String message = "[POZ} " + date_from + " " + hour_from + " " + title + " " + miejsce;
+        // Build message in the requested format: {date_from} {hour_from} {title} {miejsce}
+        String message = date_from + " " + hour_from + " " + title + " " + miejsce;
         rawAlert.intro = message;
 
         // Set structured dates
