@@ -73,9 +73,16 @@ bool POZAlertSource::parsePOZStream(WiFiClient* stream, DynamicJsonDocument& doc
             continue;
         }
 
-        // Determine expiry date - use date_to/hour_to if not empty, otherwise date_from/hour_from
+        // Determine expiry date - use date_to/hour_to if available, otherwise end of date_from day
         String expiryDate = date_to.length() > 0 ? date_to : date_from;
-        String expiryTime = hour_to.length() > 0 ? hour_to : hour_from;
+        String expiryTime;
+        if (date_to.length() > 0) {
+            // If date_to exists, use hour_to (or default to end of day)
+            expiryTime = hour_to.length() > 0 ? hour_to : "23:59:59";
+        } else {
+            // If no date_to, use end of date_from day (not hour_from!)
+            expiryTime = "23:59:59";
+        }
 
         if (expiryDate.length() == 0) {
             LOG_DEBUG("POZAlertSource: Skipping event %s - no expiry date", id.c_str());
@@ -113,7 +120,7 @@ bool POZAlertSource::parsePOZStream(WiFiClient* stream, DynamicJsonDocument& doc
         if (date_from.length() >= 10 && hour_from.length() >= 5) {
             rawAlert.structuredStartDate = date_from + " " + hour_from;
         }
-        if (expiryDate.length() >= 10 && expiryTime.length() >= 5) {
+        if (expiryDate.length() >= 10) {
             rawAlert.structuredEndDate = expiryDate + " " + expiryTime;
         }
 
@@ -189,17 +196,20 @@ std::vector<AlertSource::RawAlert> POZAlertSource::fetchAndParseAlerts(
     return alerts;
 }
 
+String POZAlertSource::getPreprocessedMessage(const RawAlert &rawAlert, int maxMessageBytes) const
+{
+    // For POZ events, we return the pre-formatted message directly
+    // This bypasses AI processing entirely
+    return rawAlert.intro;
+}
+
 String POZAlertSource::buildAIPrompt(const RawAlert &rawAlert,
                                       int maxMessageBytes,
                                       int maxLocationChars) const
 {
-    // For POZ events, we don't need AI processing since we already formatted the message
-    // Return a prompt that just passes through the message as-is
-    String prompt = "POZ event - no AI processing needed. Return exactly:\n\n"
-                    "message:" + rawAlert.intro + "|||___|||where:|||___|||severity:6\n\n"
-                    "This is a cultural event from Poznań that should be passed through unchanged.";
-
-    return prompt;
+    // POZ events use direct processing via getPreprocessedMessage()
+    // This method is here for completeness but should not be called for POZ alerts
+    return "";
 }
 
 uint32_t POZAlertSource::hashString(const String &str)

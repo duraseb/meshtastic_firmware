@@ -34,6 +34,8 @@ public:
     // See: https://arduinojson.org/v7/how-to/deserialize-a-very-large-document/
     bool parsePOZStream(WiFiClient* stream, DynamicJsonDocument& doc, std::vector<RawAlert>& alerts);
 
+    String getPreprocessedMessage(const RawAlert &rawAlert, int maxMessageBytes) const override;
+
     String buildAIPrompt(const RawAlert &rawAlert,
                         int maxMessageBytes,
                         int maxLocationChars) const override;

@@ -1373,23 +1373,45 @@ int32_t AlertsModule::runOnce()
                          processingCtx.rawAlert.structuredEndDate.c_str());
             }
             
-            // Call AI for extraction (message, location, and dates if not structured)
+            // Calculate message size limits for this alert
+            String sourcePrefixStr = "[" + processingCtx.source->getSourceId() + "] ";
+            size_t sourcePrefixBytes = utf8ByteLength(sourcePrefixStr);
+            const int maxPayload = meshtastic_Constants_DATA_PAYLOAD_LEN;
+            const int maxLocationBytes = 35; // Approximate max for " [location]"
+            const int safetyMargin = 10; // Safety buffer
+            int maxMessageBytes = maxPayload - sourcePrefixBytes - maxLocationBytes - safetyMargin;
+
+            // Check if the source provides a pre-processed message
+            String preprocessedMessage = processingCtx.source->getPreprocessedMessage(processingCtx.rawAlert, maxMessageBytes);
+
             String message, aiStart, aiEnd, where;
             uint8_t aiSeverity = processingCtx.source->getDefaultSeverity();
-            
-            // Reset watchdog before starting AI processing (which can take up to 60 seconds with fallbacks)
-            feedWatchdog();
 
-            LOG_DEBUG("Calling AI for extraction (source: %s)",
-                     processingCtx.source->getSourceId().c_str());
+            if (preprocessedMessage.length() > 0) {
+                // Use pre-processed message directly (no AI needed)
+                message = preprocessedMessage;
 
-            if (!callAIForExtraction(processingCtx.source, processingCtx.rawAlert,
-                                    message, aiStart, aiEnd, where, aiSeverity)) {
-                LOG_ERROR("AI extraction failed for alert: %s",
-                         processingCtx.alert.title.c_str());
-                processingCtx.active = false;
-                currentState = ModuleState::IDLE;
-                return ALERT_PROCESSING_YIELD_MS;
+                // For pre-processed alerts, structured dates are already set in rawAlert
+                // The date assignment logic below will use them automatically
+
+                LOG_DEBUG("Using pre-processed message from %s: %s (severity: %d)",
+                         processingCtx.source->getSourceId().c_str(), message.c_str(), aiSeverity);
+            } else {
+                // Use AI processing flow
+                // Reset watchdog before starting AI processing (which can take up to 60 seconds with fallbacks)
+                feedWatchdog();
+
+                LOG_DEBUG("Calling AI for extraction (source: %s)",
+                         processingCtx.source->getSourceId().c_str());
+
+                if (!callAIForExtraction(processingCtx.source, processingCtx.rawAlert,
+                                        message, aiStart, aiEnd, where, aiSeverity)) {
+                    LOG_ERROR("AI extraction failed for alert: %s",
+                             processingCtx.alert.title.c_str());
+                    processingCtx.active = false;
+                    currentState = ModuleState::IDLE;
+                    return ALERT_PROCESSING_YIELD_MS;
+                }
             }
 
             // Reset watchdog after AI processing completes

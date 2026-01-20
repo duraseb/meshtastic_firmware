@@ -81,15 +81,28 @@ public:
     }
     
     /**
+     * Get pre-processed message for alerts that don't need AI processing.
+     * If this returns a non-empty string, it will be used directly as the message.
+     * If empty, the normal AI processing flow will be used.
+     *
+     * @param rawAlert The raw alert data
+     * @param maxMessageBytes Maximum bytes for the message field
+     * @return Pre-processed message string, or empty string to use AI processing
+     */
+    virtual String getPreprocessedMessage(const RawAlert &rawAlert, int maxMessageBytes) const {
+        return ""; // Default: use AI processing
+    }
+
+    /**
      * Build AI prompt for extracting structured information from this alert.
      * Each source can customize the prompt based on its specific needs.
-     * 
+     *
      * @param rawAlert The raw alert data
      * @param maxMessageBytes Maximum bytes for the message field
      * @param maxLocationChars Maximum characters for the location field
      * @return The complete prompt string for the AI
      */
-    virtual String buildAIPrompt(const RawAlert &rawAlert, 
+    virtual String buildAIPrompt(const RawAlert &rawAlert,
                                   int maxMessageBytes,
                                   int maxLocationChars) const = 0;
     
