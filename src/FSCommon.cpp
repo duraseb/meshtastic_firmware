@@ -328,7 +328,6 @@ void emergencyAlertCleanup()
     // We need to free space quickly to allow boot to continue
     int filesDeleted = 0;
     int filesProcessed = 0;
-    const int TARGET_FREE_PERCENT = 50;  // Free up to 50% of filesystem
     size_t targetFreeBytes = totalBytes / 2;
     
     File file = alertsDir.openNextFile();

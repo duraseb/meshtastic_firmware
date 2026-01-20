@@ -209,7 +209,7 @@ String AlertsModule::httpGet(const char *url, int &httpCode)
     http->setTimeout(HTTP_TIMEOUT_MS);
 
     // Add headers to reduce server load and identify ourselves
-    http->addHeader("User-Agent", "Meshtastic-Alerts/1.0");
+    http->addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
     http->addHeader("Accept", "text/html,application/json,text/plain,*/*");
 
     httpCode = http->GET();
@@ -322,8 +322,7 @@ bool AlertsModule::httpGetStream(const char *url, std::function<bool(WiFiClient*
         http->begin(*client, url);
         http->setTimeout(HTTP_TIMEOUT_MS);
 
-        // Add headers to reduce server load and identify ourselves
-        http->addHeader("User-Agent", "Meshtastic-Alerts/1.0");
+        http->addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
         http->addHeader("Accept", "application/json");
         http->addHeader("Accept-Encoding", "identity");  // Disable compression to reduce buffering
 
