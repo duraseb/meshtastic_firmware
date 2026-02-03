@@ -35,8 +35,7 @@ AIService::~AIService()
 
 void AIService::initializeProviders()
 {
-    // AI provider fallback chain (Gemini → GPT-4o mini → Perplexity → Mistral → Groq → Gemini-Fallback)
-    // All experimented providers now active with Gemini as both primary and last-resort fallback
+    // AI provider fallback chain (Gemini → GPT-4o mini → Mistral → Groq → Gemini-Fallback)
 
     aiProviders[0].name = "Gemini-2.5";
     aiProviders[0].endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
@@ -57,44 +56,34 @@ void AIService::initializeProviders()
     #endif
     aiProviders[1].requestFormat = "openai";
 
-    aiProviders[2].name = "Perplexity-Sonar";
-    aiProviders[2].endpoint = "https://api.perplexity.ai/chat/completions";
-    aiProviders[2].model = "sonar";
-    #ifdef PERPLEXITY_API_KEY
-    aiProviders[2].apiKey = PERPLEXITY_API_KEY;
+    aiProviders[2].name = "Mistral-7B";
+    aiProviders[2].endpoint = "https://api.mistral.ai/v1/chat/completions";
+    aiProviders[2].model = "open-mistral-7b";
+    #ifdef MISTRAL_API_KEY
+    aiProviders[2].apiKey = MISTRAL_API_KEY;
     #else
     aiProviders[2].apiKey = "";
     #endif
-    aiProviders[2].requestFormat = "perplexity";
+    aiProviders[2].requestFormat = "mistral";
 
-    aiProviders[3].name = "Mistral-7B";
-    aiProviders[3].endpoint = "https://api.mistral.ai/v1/chat/completions";
-    aiProviders[3].model = "open-mistral-7b";
-    #ifdef MISTRAL_API_KEY
-    aiProviders[3].apiKey = MISTRAL_API_KEY;
+    aiProviders[3].name = "Groq";
+    aiProviders[3].endpoint = "https://api.groq.com/openai/v1/chat/completions";
+    aiProviders[3].model = "llama-3.3-70b-versatile";
+    #ifdef GROQ_API_KEY
+    aiProviders[3].apiKey = GROQ_API_KEY;
     #else
     aiProviders[3].apiKey = "";
     #endif
-    aiProviders[3].requestFormat = "mistral";
+    aiProviders[3].requestFormat = "groq";
 
-    aiProviders[4].name = "Groq";
-    aiProviders[4].endpoint = "https://api.groq.com/openai/v1/chat/completions";
-    aiProviders[4].model = "llama-3.3-70b-versatile";
-    #ifdef GROQ_API_KEY
-    aiProviders[4].apiKey = GROQ_API_KEY;
+    aiProviders[4].name = "Gemini-2.5-Fallback";
+    aiProviders[4].endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+    #ifdef GEMINI_API_KEY
+    aiProviders[4].apiKey = GEMINI_API_KEY;
     #else
     aiProviders[4].apiKey = "";
     #endif
-    aiProviders[4].requestFormat = "groq";
-
-    aiProviders[5].name = "Gemini-2.5-Fallback";
-    aiProviders[5].endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
-    #ifdef GEMINI_API_KEY
-    aiProviders[5].apiKey = GEMINI_API_KEY;
-    #else
-    aiProviders[5].apiKey = "";
-    #endif
-    aiProviders[5].requestFormat = "gemini";
+    aiProviders[4].requestFormat = "gemini";
 
     LOG_INFO("[AIService] Initialized with %d AI providers", MAX_AI_PROVIDERS);
 }
@@ -126,8 +115,6 @@ String AIService::callAI(const String& prompt)
             success = callOpenAIAPI(provider, prompt, response);
         } else if (provider.requestFormat == "mistral") {
             success = callMistralAPI(provider, prompt, response);
-        } else if (provider.requestFormat == "perplexity") {
-            success = callMistralAPI(provider, prompt, response); // Reuse Mistral (OpenAI-compatible)
         }
 
         if (success) {
@@ -392,8 +379,6 @@ bool AIService::callProvider(int providerIdx, const String& prompt, String& outR
         return callOpenAIAPI(provider, prompt, outResponse);
     } else if (provider.requestFormat == "mistral") {
         return callMistralAPI(provider, prompt, outResponse);
-    } else if (provider.requestFormat == "perplexity") {
-        return callMistralAPI(provider, prompt, outResponse); // Reuse Mistral (OpenAI-compatible)
     }
 
     return false;
@@ -418,7 +403,7 @@ bool AIService::extractTextFromAIResponse(const String& response, String& outTex
     // Try to extract text content from different AI provider formats
     const char* text = nullptr;
 
-    // Check for OpenAI-compatible format (Perplexity, Mistral, Groq)
+    // Check for OpenAI-compatible format (Mistral, Groq)
     if (doc.containsKey("choices") && doc["choices"].is<JsonArray>() && doc["choices"].size() > 0) {
         JsonVariant choice = doc["choices"][0];
         if (choice.containsKey("message")) {

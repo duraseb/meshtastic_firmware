@@ -450,16 +450,24 @@ String AlertsModule::extractDateFromFilename(const String &filename)
 bool AlertsModule::isAlertProcessed(uint32_t id)
 {
     // Use the in-memory cache only - it's populated at startup from loadAlertsFromDisk()
-    return processedAlertIds.find(id) != processedAlertIds.end();
+    bool found = processedAlertIds.find(id) != processedAlertIds.end();
+    if (found) {
+        LOG_DEBUG("Alert ID 0x%x found in processed cache", id);
+    } else {
+        LOG_DEBUG("Alert ID 0x%x NOT in processed cache (cache size: %d)", id, processedAlertIds.size());
+    }
+    return found;
 }
 
 void AlertsModule::cacheProcessedAlertId(uint32_t id)
 {
     if (id == 0) {
+        LOG_DEBUG("Skipping cache for ID 0x0 (invalid)");
         return;
     }
 
     if (processedAlertIds.find(id) != processedAlertIds.end()) {
+        LOG_DEBUG("ID 0x%x already in cache, skipping", id);
         return;
     }
 
@@ -468,11 +476,13 @@ void AlertsModule::cacheProcessedAlertId(uint32_t id)
             uint32_t oldest = processedAlertIdOrder.front();
             processedAlertIdOrder.pop_front();
             processedAlertIds.erase(oldest);
+            LOG_DEBUG("Cache full (%d), removed oldest ID: 0x%x", MAX_PROCESSED_IDS_CACHE, oldest);
         }
     }
 
     processedAlertIds.insert(id);
     processedAlertIdOrder.push_back(id);
+    LOG_DEBUG("Added ID 0x%x to processed cache (cache now has %d items)", id, processedAlertIds.size());
 }
 
 void AlertsModule::removeProcessedAlertId(uint32_t id)
@@ -722,7 +732,6 @@ bool AlertsModule::loadAlertsFromDisk()
     int totalFiles = 0;
     int tmpFilesDeleted = 0;
     int invalidFilesDeleted = 0;
-    bool needsEnforceFileLimits = false;
 
     // Phase 1: Count files and clean up .tmp files (scoped lock)
     {
@@ -826,9 +835,12 @@ bool AlertsModule::loadAlertsFromDisk()
                             a.nextSendAt = 0;
                         }
 
-                        // Add to processed IDs cache (always, for duplicate detection)
+                        // Add to processed IDs cache (ALWAYS, for duplicate detection)
+                        // This MUST be done before checking validity, because expired alerts
+                        // should still be recognized as "already seen" to avoid re-fetching them
                         // Limit cache size to prevent unbounded growth
                         cacheProcessedAlertId(a.id);
+                        LOG_DEBUG("Cached processed alert ID: 0x%x", a.id);
 
                         // Only load valid (non-expired) alerts into memory
                         if (isAlertValid(a)) {
@@ -838,6 +850,8 @@ bool AlertsModule::loadAlertsFromDisk()
                             }
                         } else {
                             skippedExpired++;
+                            LOG_DEBUG("Alert expired, not loading into memory: %s (valid_to: %s)", 
+                                     a.title.c_str(), a.valid_to.c_str());
                         }
                     } else {
                         // Invalid file, delete it
@@ -1254,7 +1268,28 @@ int32_t AlertsModule::runOnce()
             for (const auto& rawAlert : rawAlerts) {
                 // Check if this alert has already been processed
                 if (isAlertProcessed(rawAlert.id)) {
-                    LOG_DEBUG("Alert already processed (ID: 0x%x), skipping", rawAlert.id);
+                    // Look up the existing alert to check if it's expired
+                    bool found = false;
+                    for (const auto& existingAlert : alerts) {
+                        if (existingAlert.id == rawAlert.id) {
+                            if (isAlertValid(existingAlert)) {
+                                LOG_DEBUG("Alert already processed and still valid (ID: 0x%x), skipping: %s", 
+                                         rawAlert.id, rawAlert.title.c_str());
+                            } else {
+                                LOG_DEBUG("Alert already processed but expired (ID: 0x%x), skipping: %s (expired %s)", 
+                                         rawAlert.id, rawAlert.title.c_str(), existingAlert.valid_to.c_str());
+                            }
+                            found = true;
+                            break;
+                        }
+                    }
+                    
+                    // If not found in alerts vector, it's in the processed cache but not in memory
+                    // (probably expired and pruned). Log this too.
+                    if (!found) {
+                        LOG_DEBUG("Alert already processed and likely expired (ID: 0x%x), skipping: %s", 
+                                 rawAlert.id, rawAlert.title.c_str());
+                    }
                     continue;
                 }
 

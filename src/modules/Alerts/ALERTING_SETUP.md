@@ -12,10 +12,9 @@ The module supports multiple AI providers with automatic fallback:
 
 1. **Gemini 2.0 Flash** ⭐ - Fast, free tier: 15 req/min, 1,500 req/day (Primary)
 2. **GPT-4o mini** ⭐ - Good performance, reasonable free tier: 50 req/day (Secondary)
-3. **Perplexity (Llama 3.1 Sonar)** - High quality, pro tier: $5/month credit (Tertiary)
-4. **Mistral 7B** - Free tier, good for Polish language (Quaternary)
-5. **Groq (Llama 3.3 70B)** - Very fast, generous free tier: 30 req/min, 14,400 req/day (Quinary)
-6. **Gemini 2.0 Flash (Fallback)** - Same as primary, for maximum reliability (Last resort)
+3. **Mistral 7B** - Free tier, good for Polish language (Tertiary)
+4. **Groq (Llama 3.3 70B)** - Very fast, generous free tier: 30 req/min, 14,400 req/day (Quaternary)
+5. **Gemini 2.0 Flash (Fallback)** - Same as primary, for maximum reliability (Last resort)
 
 **You can configure:**
 - ✅ Only Gemini (single provider, free) ⭐
@@ -23,9 +22,9 @@ The module supports multiple AI providers with automatic fallback:
 - ✅ Only Groq (single provider, very fast, free) ⭐
 - ✅ Only Mistral (single provider, free, Polish language)
 - ✅ Any combination (full fallback chain for maximum reliability)
-- ✅ All providers (6 levels of fallback, maximum reliability)
+- ✅ All providers (5 levels of fallback, maximum reliability)
 
-**Currently configured:** All 6 AI providers enabled (maximum fallback reliability)
+**Currently configured:** All 5 AI providers enabled (maximum fallback reliability)
 
 The module will automatically use whichever providers you've configured. If one provider fails (e.g., quota exceeded, network error), it automatically tries the next configured provider.
 
@@ -36,7 +35,6 @@ You must set at least one of:
 - `OPENAI_API_KEY` ⭐ (recommended - good balance, reasonable free tier: 50 req/day)
 - `GROQ_API_KEY` ⭐ (recommended - very fast, generous free tier: 14,400 req/day)
 - `MISTRAL_API_KEY` (free - good for Polish language)
-- `PERPLEXITY_API_KEY` (paid - $5/month credit, very good quality)
 - Multiple keys (maximum resilience and quota)
 
 #### Method 1: Using `.env` file (Recommended)
@@ -69,7 +67,7 @@ PlatformIO automatically loads environment variables from a `.env` file in the p
    **Option D: All providers (4 providers, maximum resilience)**
    ```bash
    GEMINI_API_KEY=your_gemini_key_here
-   PERPLEXITY_API_KEY=your_perplexity_key_here
+   OPENAI_API_KEY=your_openai_key_here
    MISTRAL_API_KEY=your_mistral_key_here
    GROQ_API_KEY=your_groq_key_here
    ```
@@ -101,7 +99,6 @@ Export the variables in your shell:
 
 ```bash
 export GEMINI_API_KEY="your_gemini_key_here"
-export PERPLEXITY_API_KEY="your_perplexity_key_here"  # Optional
 export MISTRAL_API_KEY="your_mistral_key_here"        # Optional
 export GROQ_API_KEY="your_groq_key_here"              # Optional
 pio run -e seeed-xiao-s3
@@ -125,7 +122,6 @@ The API keys are injected at compile time via build flags in `variants/esp32s3/s
 build_flags =
   -DGEMINI_API_KEY=\"${sysenv.GEMINI_API_KEY}\"
   -DOPENAI_API_KEY=\"${sysenv.OPENAI_API_KEY}\"
-  -DPERPLEXITY_API_KEY=\"${sysenv.PERPLEXITY_API_KEY}\"
   -DMISTRAL_API_KEY=\"${sysenv.MISTRAL_API_KEY}\"
   -DGROQ_API_KEY=\"${sysenv.GROQ_API_KEY}\"
 ```
@@ -144,11 +140,10 @@ When processing alerts, the module tries each configured provider in order:
 **If you have all keys:**
 1. Module tries **Gemini 2.0 Flash** first (fastest, free)
 2. If it fails → tries **GPT-4o mini** (good performance, reasonable free quota)
-3. If still failing → tries **Perplexity (Llama 3.1 Sonar)** (high quality, paid)
-4. If still failing → tries **Mistral 7B** (good for Polish language, free)
-5. If still failing → tries **Groq (Llama 3.3 70B)** (very fast, generous free quota)
-6. If still failing → tries **Gemini 2.0 Flash (Fallback)** (same as primary, maximum reliability)
-7. If all providers fail → alert is retried on next fetch cycle
+3. If still failing → tries **Mistral 7B** (good for Polish language, free)
+4. If still failing → tries **Groq (Llama 3.3 70B)** (very fast, generous free quota)
+5. If still failing → tries **Gemini 2.0 Flash (Fallback)** (same as primary, maximum reliability)
+6. If all providers fail → alert is retried on next fetch cycle
 
 **Currently testing only GPT-4o mini and Groq** - other providers temporarily commented out
 
@@ -211,17 +206,6 @@ The module logs which provider succeeded for each alert, making it easy to track
 
 **Free Tier:** 50 requests/day (with GPT-4o mini)
 **Why GPT-4o mini:** Good performance for alert extraction, reasonable free tier, reliable service
-
-### Perplexity API Key (Optional, Paid)
-
-1. Visit: https://www.perplexity.ai/settings/api
-2. Sign up or sign in
-3. Purchase credits ($5 minimum)
-4. Generate an API key
-5. Copy the key and add it to your `.env` file
-
-**Pricing:** Pay-as-you-go with $5 minimum credit  
-**Why Perplexity:** High quality, good for Polish text understanding, reliable
 
 ### Mistral API Key (Optional, Free)
 
@@ -293,10 +277,9 @@ This means you don't have any API keys configured. You need at least one:
 Check the logs at boot:
 ```
 INFO | AlertsModule: AI provider configured: Gemini-2.0
-INFO | AlertsModule: AI provider configured: Perplexity
 INFO | AlertsModule: AI provider configured: Mistral
 INFO | AlertsModule: AI provider configured: Groq
-INFO | AlertsModule: 4 AI provider(s) available
+INFO | AlertsModule: 3 AI provider(s) available
 ```
 
 If you see `0 AI provider(s) available`, the API keys weren't embedded correctly.
@@ -356,7 +339,6 @@ strings .pio/build/seeed-xiao-s3-alerts/firmware.bin | grep -E "AIza|pplx-|[a-z0
 
 You should see your API key(s) in the output:
 - Gemini keys start with `AIza`
-- Perplexity keys start with `pplx-`
 - Mistral/Groq keys are 32-character hex strings
 
 ## Additional Configuration

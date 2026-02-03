@@ -138,6 +138,9 @@ String AiWeatherSource::fetchAndFormat(
             continue;
         }
 
+        LOG_DEBUG("[AiWeatherSource] Extracted text from [%s] (length: %d bytes): %s",
+                 provider.name.c_str(), rawText.length(), rawText.c_str());
+
         // Parse the raw text to extract the weather forecast in expected format
         String message = extractWeatherForecast(rawText);
 
@@ -246,15 +249,37 @@ String AiWeatherSource::cleanFootnotes(const String& input) const
 String AiWeatherSource::extractWeatherForecast(const String& fullResponse) const
 {
     // Look for the specific format expected for weather forecasts: "{Name}: {weather forecast}"
+    // Also handle markdown formatting that some AI models add
+    LOG_DEBUG("[AiWeatherSource::extractWeatherForecast] Parsing response (length: %d bytes)", fullResponse.length());
+    
+    // Log first and last 200 chars for debugging
+    if (fullResponse.length() > 0) {
+        String preview = fullResponse.substring(0, (fullResponse.length() > 200) ? 200 : fullResponse.length());
+        LOG_DEBUG("[AiWeatherSource::extractWeatherForecast] Response preview (first %d chars): %s", 
+                 preview.length(), preview.c_str());
+        
+        if (fullResponse.length() > 400) {
+            String end = fullResponse.substring(fullResponse.length() - 200);
+            LOG_DEBUG("[AiWeatherSource::extractWeatherForecast] Response end (last 200 chars): %s", end.c_str());
+        }
+    }
 
     // First, try to find a line that exactly matches the expected format
     int start = 0;
+    int lineCount = 0;
     while (start < fullResponse.length()) {
         int end = fullResponse.indexOf('\n', start);
         if (end == -1) end = fullResponse.length();
 
         String line = fullResponse.substring(start, end);
         line.trim();
+        lineCount++;
+
+        // Log all non-empty lines for debugging
+        if (line.length() > 0) {
+            LOG_DEBUG("[AiWeatherSource::extractWeatherForecast] Line %d (%d chars): %s", 
+                     lineCount, line.length(), line.c_str());
+        }
 
         // Check if this line matches the expected weather forecast format
         int colonPos = line.indexOf(": ");
@@ -262,27 +287,70 @@ String AiWeatherSource::extractWeatherForecast(const String& fullResponse) const
             String namePart = line.substring(0, colonPos);
             String forecastPart = line.substring(colonPos + 2);
 
+            // Strip markdown formatting from name
+            // Remove ** from start and end
+            while (namePart.startsWith("**")) {
+                namePart = namePart.substring(2);
+            }
+            while (namePart.endsWith("**")) {
+                namePart = namePart.substring(0, namePart.length() - 2);
+            }
+            
+            // Strip single * markers from name
+            while (namePart.startsWith("*")) {
+                namePart = namePart.substring(1);
+            }
+            while (namePart.endsWith("*")) {
+                namePart = namePart.substring(0, namePart.length() - 1);
+            }
+            namePart.trim();
+
+            LOG_DEBUG("[AiWeatherSource::extractWeatherForecast] Found colon at pos %d: name=%d chars (cleaned), forecast=%d chars", 
+                     colonPos, namePart.length(), forecastPart.length());
+
             // Validate the format:
             // 1. Name part should be reasonable length (person's name)
             // 2. Forecast part should be reasonable length for weather content
+            // Note: Allow longer forecasts and truncate if needed
             if (namePart.length() >= 3 && namePart.length() <= 50 &&
-                forecastPart.length() >= 10 && forecastPart.length() <= MAX_MESSAGE_BYTES) {
+                forecastPart.length() >= 10) {
 
-                // Trust the AI to provide weather-related content when prompted
-                // The format validation and length checks are sufficient
-                String cleanedLine = cleanFootnotes(line);
-                LOG_DEBUG("[AiWeatherSource::extractWeatherForecast] Found weather forecast: %s", cleanedLine.c_str());
+                // If forecast is too long, truncate it while respecting UTF-8 boundaries
+                String finalForecast = forecastPart;
+                if (forecastPart.length() > MAX_MESSAGE_BYTES) {
+                    LOG_WARN("[AiWeatherSource::extractWeatherForecast] Forecast too long (%d bytes), truncating to %d",
+                            forecastPart.length(), MAX_MESSAGE_BYTES);
+                    finalForecast = forecastPart.substring(0, MAX_MESSAGE_BYTES);
+                    // Trim to avoid cutting in middle of word
+                    int lastSpace = finalForecast.lastIndexOf(' ');
+                    if (lastSpace > MAX_MESSAGE_BYTES - 50) {  // If space is reasonably close
+                        finalForecast = finalForecast.substring(0, lastSpace);
+                    }
+                    finalForecast.trim();
+                }
+
+                // Reconstruct the clean line
+                String cleanedLine = namePart + ": " + finalForecast;
+                cleanedLine = cleanFootnotes(cleanedLine);
+                LOG_INFO("[AiWeatherSource::extractWeatherForecast] Found weather forecast: %s", cleanedLine.c_str());
                 return cleanedLine;
+            } else {
+                LOG_DEBUG("[AiWeatherSource::extractWeatherForecast] Line has colon but failed validation: name=%d (need 3-50), forecast=%d (need 10+)",
+                         namePart.length(), forecastPart.length());
             }
         }
 
         start = end + 1;
     }
 
+    LOG_WARN("[AiWeatherSource::extractWeatherForecast] No matching lines found in first pass (parsed %d lines)", lineCount);
+
     // If no perfect match found, try to extract the last reasonable line with weather content
     // This handles cases where the AI puts the result at the end
     start = fullResponse.length() - 300;  // Check last 300 chars
     if (start < 0) start = 0;
+
+    LOG_DEBUG("[AiWeatherSource::extractWeatherForecast] Trying fallback (searching last 300 chars from pos %d)", start);
 
     while (start < fullResponse.length()) {
         int end = fullResponse.indexOf('\n', start);
@@ -291,20 +359,41 @@ String AiWeatherSource::extractWeatherForecast(const String& fullResponse) const
         String line = fullResponse.substring(start, end);
         line.trim();
 
-        if (line.indexOf(": ") > 0 && line.length() > 15 && line.length() < MAX_MESSAGE_BYTES) {
-            // Clean up footnote/reference markers that AI models sometimes add
+        if (line.indexOf(": ") > 0 && line.length() > 15) {
+            // Clean up markdown and footnote/reference markers
             String cleanedLine = cleanFootnotes(line);
+            
+            // Strip markdown
+            while (cleanedLine.startsWith("**")) {
+                cleanedLine = cleanedLine.substring(2);
+            }
+            while (cleanedLine.startsWith("*")) {
+                cleanedLine = cleanedLine.substring(1);
+            }
+            cleanedLine.trim();
+
+            // Truncate if needed
+            if (cleanedLine.length() > MAX_MESSAGE_BYTES) {
+                cleanedLine = cleanedLine.substring(0, MAX_MESSAGE_BYTES);
+                int lastSpace = cleanedLine.lastIndexOf(' ');
+                if (lastSpace > MAX_MESSAGE_BYTES - 50) {
+                    cleanedLine = cleanedLine.substring(0, lastSpace);
+                }
+                cleanedLine.trim();
+            }
 
             // Accept any reasonable line with colon as potential weather forecast
-            // Trust the AI prompt to produce weather-related content
-            LOG_DEBUG("[AiWeatherSource::extractWeatherForecast] Using fallback line: %s", cleanedLine.c_str());
+            LOG_INFO("[AiWeatherSource::extractWeatherForecast] Using fallback line: %s", cleanedLine.c_str());
             return cleanedLine;
+        } else if (line.length() > 15) {
+            LOG_DEBUG("[AiWeatherSource::extractWeatherForecast] Fallback: Line doesn't match pattern: %d chars, has colon: %s",
+                     line.length(), (line.indexOf(": ") > 0) ? "yes" : "no");
         }
 
         start = end + 1;
     }
 
-    LOG_DEBUG("[AiWeatherSource::extractWeatherForecast] No weather forecast found in response");
+    LOG_ERROR("[AiWeatherSource::extractWeatherForecast] No weather forecast found in response of %d bytes", fullResponse.length());
     return "";
 }
 

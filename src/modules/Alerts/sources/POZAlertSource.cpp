@@ -102,9 +102,13 @@ bool POZAlertSource::parsePOZStream(WiFiClient* stream, DynamicJsonDocument& doc
         time_t currentTime = getTime(false);
 
         if (expiryTimestamp <= currentTime) {
-            LOG_DEBUG("POZAlertSource: Skipping expired event %s (expiry: %s)", id.c_str(), expiryDateTime.c_str());
+            LOG_WARN("POZAlertSource: Skipping expired event %s (expiry: %s, current: %u, expiry_ts: %u)", 
+                    id.c_str(), expiryDateTime.c_str(), currentTime, expiryTimestamp);
             continue;
         }
+
+        LOG_DEBUG("POZAlertSource: Event is valid - expiry: %s (timestamp: %u > current: %u)", 
+                expiryDateTime.c_str(), expiryTimestamp, currentTime);
 
         // Create alert
         RawAlert rawAlert;
@@ -126,7 +130,9 @@ bool POZAlertSource::parsePOZStream(WiFiClient* stream, DynamicJsonDocument& doc
 
         alerts.push_back(rawAlert);
 
-        LOG_DEBUG("POZAlertSource: Added event %s: %s", id.c_str(), title.c_str());
+        LOG_INFO("POZAlertSource: Added valid event %s: %s (expiry: %s, structured dates: %s-%s)", 
+                id.c_str(), title.c_str(), expiryDateTime.c_str(), 
+                rawAlert.structuredStartDate.c_str(), rawAlert.structuredEndDate.c_str());
 
         // Feed watchdog periodically during large response processing
         if (eventsProcessed % 50 == 0) {
@@ -137,8 +143,8 @@ bool POZAlertSource::parsePOZStream(WiFiClient* stream, DynamicJsonDocument& doc
     // ArduinoJson doc: "you can use Stream::findUntil()" to skip between elements
     } while (stream->findUntil(",", "]"));
 
-    LOG_INFO("POZAlertSource: Streaming complete, processed %d events, kept %d valid events",
-             eventsProcessed, alerts.size());
+    LOG_INFO("POZAlertSource: Streaming complete, processed %d events, kept %d valid events, skipped %d expired",
+             eventsProcessed, alerts.size(), eventsProcessed - (int)alerts.size());
     return alerts.size() > 0 || eventsProcessed > 0;
 }
 
