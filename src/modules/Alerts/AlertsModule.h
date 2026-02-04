@@ -96,7 +96,7 @@ class AlertsModule : public concurrency::OSThread {
     int8_t lastKnownChannelIndex = -2; // -2 = unknown, -1 = not found, 0+ = channel index
 
     // Broadcasting settings
-    static constexpr unsigned long BROADCAST_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
+    static constexpr unsigned long BROADCAST_INTERVAL_MS = 8 * 60 * 60 * 1000; // 8 hours
     static constexpr unsigned long BROADCAST_INITIAL_DELAY_MS = 20 * 60 * 1000; // 20 minutes after boot
 
     // Storage paths
