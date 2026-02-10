@@ -57,10 +57,11 @@ private:
      * Build the AI prompt for weather forecast generation
      * @param weatherJson Real weather data JSON from Open-Meteo API
      * @param tomorrowDate Formatted date string for tomorrow (Polish format)
+     * @param birthDate Formatted date string for birth (Polish format)
      * @param apiDate Date string formatted for API URL (day_month)
      * @return Complete prompt string
      */
-    String buildWeatherPrompt(const String& weatherJson, const String& tomorrowDate, const String& apiDate) const;
+    String buildWeatherPrompt(const String& weatherJson, const String& tomorrowDate, const String& birthDate, const String& apiDate) const;
 
     /**
      * Extract weather forecast from AI response text

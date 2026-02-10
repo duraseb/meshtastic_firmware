@@ -38,7 +38,7 @@ void AIService::initializeProviders()
     // AI provider fallback chain (Gemini → GPT-4o mini → Mistral → Groq → Gemini-Fallback)
 
     aiProviders[0].name = "Gemini-2.5";
-    aiProviders[0].endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+    aiProviders[0].endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent";
     #ifdef GEMINI_API_KEY
     aiProviders[0].apiKey = GEMINI_API_KEY;
     #else

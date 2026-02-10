@@ -86,20 +86,21 @@ String AiWeatherSource::fetchAndFormat(
     };
 
     // Format date as "DD miesiąc YYYY" (Polish format for display)
-    String tomorrowDate = String(timeinfo.tm_mday) + " " +
-                         String(months[timeinfo.tm_mon]) + " " +
+    String birthDate = String(timeinfo.tm_mday) + " " +
+                         String(months[timeinfo.tm_mon]);
+    String tomorrowDate = birthDate + " " +
                          String(timeinfo.tm_year + 1900);
 
     // Format date for API URL as "DD_miesiąca" (without year)
     String apiDate = String(timeinfo.tm_mday) + "_" + String(months[timeinfo.tm_mon]);
 
-    LOG_DEBUG("[AiWeatherSource] Using tomorrow's date: %s (API format: %s)", tomorrowDate.c_str(), apiDate.c_str());
+    LOG_DEBUG("[AiWeatherSource] Using tomorrow's date: %s (API format: %s)", birthDate.c_str(), apiDate.c_str());
 
     // Don't fetch Wikipedia content - let AI handle it
     String wikiContent = ""; // Not used anymore
 
     // Build the AI prompt with real weather data and formatted date
-    String prompt = buildWeatherPrompt(weatherJson, tomorrowDate, apiDate);
+    String prompt = buildWeatherPrompt(weatherJson, tomorrowDate, birthDate, apiDate);
     if (prompt.length() == 0) {
         LOG_ERROR("[AiWeatherSource] Failed to build AI prompt");
         return "";
@@ -177,12 +178,12 @@ bool AiWeatherSource::isWithinFetchWindow() const
     return currentHour >= getMinHourOfDay();
 }
 
-String AiWeatherSource::buildWeatherPrompt(const String& weatherJson, const String& tomorrowDate, const String& apiDate) const
+String AiWeatherSource::buildWeatherPrompt(const String& weatherJson, const String& tomorrowDate, const String& birthDate, const String& apiDate) const
 {
 
     return String("Jesteś kreatywnym asystentem AI specjalizującym się w tworzeniu polskich prognoz pogody w stylu historycznych postaci.\n\n") +
            "Wykonaj dokładnie te kroki:\n\n" +
-           "1. Wybierz losowo jedną sławną postać historyczną urodzoną " + tomorrowDate + ". Osoba może pochodzić z dowolnego kraju, ale musi być rozpoznawalna i znana Polakom. Wybierz kogoś o charakterystycznym stylu wyrażania się - może to być styl pisania, mówienia, tworzenia muzyki, malowania, czy inne formy artystycznego wyrazu.\n\n" +
+           "1. Wybierz losowo jedną sławną postać historyczną urodzoną " + birthDate + ". Osoba może pochodzić z dowolnego kraju, ale musi być rozpoznawalna i znana Polakom. Wybierz kogoś o charakterystycznym stylu wyrażania się - może to być styl pisania, mówienia, tworzenia muzyki, malowania, czy inne formy artystycznego wyrazu.\n\n" +
            "Sprawdź listę osób urodzonych tego dnia używając API: https://api.wikimedia.org/core/v1/wikipedia/pl/page/" + apiDate + "\n\n" +
            "API zwraca JSON z polem 'content' zawierającym wikitext. Przeszukaj sekcję '== Urodzili się ==' i wybierz jedną osobę, która jest znana i ma charakterystyczny styl. Jeśli strona nie istnieje lub nie zawiera odpowiednich osób, możesz wybrać inną znaną postać historyczną. MUSISZ wybrać osobę urodzoną DOKŁADNIE " + tomorrowDate + ".\n\n" +
            "2. Przeanalizuj poniższe rzeczywiste dane pogodowe dla Poznania na jutro (" + tomorrowDate + ") z Open-Meteo API:\n\n" +
