@@ -48,22 +48,6 @@ void TransmitHistory::loadFromDisk()
                     Entry entry{};
                     if (file.read((uint8_t *)&entry, sizeof(entry)) == sizeof(entry) && entry.epochSeconds > 0) {
                         history[entry.key] = makeStoredTimestamp(entry.epochSeconds, entry.flags);
-                        // Do NOT seed lastMillis here.
-                        //
-                        // getLastSentToMeshMillis() reconstructs a millis()-relative value
-                        // from the stored epoch, and Throttle::isWithinTimespanMs() uses
-                        // the same unsigned subtraction pattern. Once getTime() has a valid
-                        // wall-clock epoch comparable to stored values, recent reboots still
-                        // throttle correctly while long power-off periods no longer look like
-                        // "just sent" and incorrectly suppress the first send.
-                        //
-                        // Before RTC/NTP/GPS time is valid, persisted absolute epochs do not
-                        // contribute, but boot-relative entries still suppress near-term reboot
-                        // chatter via a narrow recovery window.
-                        //
-                        // If we seeded lastMillis to millis() here, every loaded entry would
-                        // appear to have been sent at boot time, regardless of the true age
-                        // of the last transmission. That was the regression behind #9901.
                     }
                 }
             }
