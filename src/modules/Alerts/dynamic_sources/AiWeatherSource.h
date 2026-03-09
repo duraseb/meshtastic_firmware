@@ -25,16 +25,16 @@ public:
     String fetchAndFormat(
         std::function<String(const char*, int&)> httpGetCallback) override;
 
-private:
-    // Configuration constants
-    static constexpr unsigned long DEFAULT_FETCH_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
-    static constexpr int DEFAULT_MIN_HOUR_OF_DAY = 20; // Don't fetch before 20:00
-
     /**
      * Get the minimum hour of day for fetches
      * @return configured minimum hour or default (20)
      */
-    static int getMinHourOfDay();
+     static int getMinHourOfDay();
+
+private:
+    // Configuration constants
+    static constexpr unsigned long DEFAULT_FETCH_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+    static constexpr int DEFAULT_MIN_HOUR_OF_DAY = 20; // Don't fetch before 20:00
 
     /**
      * Clean footnote/reference markers from AI response

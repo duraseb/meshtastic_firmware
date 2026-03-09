@@ -25,7 +25,7 @@ public:
     String getSourceId() const override { return "POZ"; }
     String getFetchUrl() const override;
     unsigned long getFetchIntervalMs() const override;
-    uint8_t getDefaultSeverity() const override { return 6; }
+    uint8_t getDefaultSeverity() const override { return 10; }
 
     std::vector<RawAlert> fetchAndParseAlerts(
         std::function<String(const char*, int&)> httpGetCallback) override;

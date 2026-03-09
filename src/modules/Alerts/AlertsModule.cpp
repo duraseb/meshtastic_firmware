@@ -124,7 +124,7 @@ AlertsModule::AlertsModule() : OSThread("AlertsModule"), sharedJsonDoc(SHARED_JS
     LOG_INFO("[AlertsModule] Registered dynamic source: %s (fetch every %lu hours, after %02d:00)",
              dynamicSources[numDynamicSources]->getSourceId().c_str(),
              dynamicSources[numDynamicSources]->getFetchIntervalMs() / (60 * 60 * 1000),
-             20); // MIN_HOUR_OF_DAY from AiWeatherSource
+             AiWeatherSource::getMinHourOfDay());
     numDynamicSources++;
 
     LOG_INFO("[AlertsModule] Total dynamic sources registered: %d", numDynamicSources);
@@ -178,8 +178,6 @@ AlertsModule::~AlertsModule() {
 
 bool AlertsModule::loadConfig()
 {
-    if (config.network.wifi_enabled) {
-    }
     return true;
 }
 
@@ -963,7 +961,7 @@ int32_t AlertsModule::runOnce()
                     alertsCheckedThisCycle++;
 
                     // Check if it's time to send based on pre-calculated nextSendAt
-                    // nextSendAt is now stored as absolute Unix timestamp
+                    // nextSendAt is stored as absolute Unix timestamp
                     if (currentTime >= alert.nextSendAt) {
                         // Time to re-send this alert (mesh only, no WiFi needed)
                         if (sendAlertToMesh(alert)) {
@@ -982,12 +980,7 @@ int32_t AlertsModule::runOnce()
                                      alert.source.c_str(), alert.severity, alert.title.c_str(), interval / 60);
                         } else {
                             // Failed to send - set retry delay to avoid tight loop
-                            // Store absolute time instead of relative time from boot
-                            if (currentTime > 0) {
-                                alert.nextSendAt = currentTime + 60; // Retry in 1 minute
-                            } else {
-                                alert.nextSendAt = currentTime + 60; // Retry in 1 minute
-                            }
+                            alert.nextSendAt = currentTime + 60;
                         }
                         // Only resend one alert per cycle to avoid blocking
                         lastCheckedIndex = (checkIndex + 1) % alerts.size(); // Resume after this alert
@@ -1262,6 +1255,8 @@ int32_t AlertsModule::runOnce()
             LOG_INFO("Found %d new alerts from source %s",
                      rawAlerts.size(), sources[currentSourceIndex]->getSourceId().c_str());
 
+            uint32_t nextSendAtTime = getTime(false);
+
             // Queue raw alerts for full content fetching (without fetching content yet)
             // Content will be fetched one-at-a-time in FETCHING_ARTICLE state
             int queuedCount = 0;
@@ -1323,8 +1318,9 @@ int32_t AlertsModule::runOnce()
                             expiredMarker.severity = 10;
                             expiredMarker.addedAt = now;
                             expiredMarker.lastSent = 0;
-                            expiredMarker.nextSendAt = 0;
+                            expiredMarker.nextSendAt = nextSendAtTime;
                             saveAlertToDisk(expiredMarker);
+                            nextSendAtTime += 10;
                             continue;
                         }
                     }
@@ -1508,8 +1504,7 @@ int32_t AlertsModule::runOnce()
                             // Expire after 24 hours
                             startTime += (24 * 60 * 60);
                         } else {
-                            // Other sources - expire after 7 days
-                            startTime += (7 * 24 * 60 * 60);
+                            startTime += (2 * 24 * 60 * 60);
                         }
 
                         // Convert back to string format
@@ -1615,24 +1610,14 @@ int32_t AlertsModule::runOnce()
                     processingCtx.alert.lastSent = currentMillis;
                     // Calculate next send time based on severity
                     unsigned long interval = getSendInterval(processingCtx.alert.severity);
-                    // Store absolute time instead of relative time from boot
-                    if (currentTime > 0) {
-                        processingCtx.alert.nextSendAt = currentTime + interval;
-                    } else {
-                        processingCtx.alert.nextSendAt = currentTime + interval;
-                    }
+                    processingCtx.alert.nextSendAt = currentTime + interval;
                     saveAlertToFile(processingCtx.alert, id, processingCtx.alert.valid_from);
                     LOG_INFO("Sent NEW alert [%s, sev:%d]: %s (next in %lu min)",
                              processingCtx.alert.source.c_str(), processingCtx.alert.severity,
                              processingCtx.alert.title.c_str(), interval / 60);
                 } else {
                     // Failed to send - set retry delay to avoid tight loop
-                    // Store absolute time instead of relative time from boot
-                    if (currentTime > 0) {
-                        processingCtx.alert.nextSendAt = currentTime + 60; // Retry in 1 minute
-                    } else {
-                        processingCtx.alert.nextSendAt = currentTime + 60; // Retry in 1 minute
-                    }
+                    processingCtx.alert.nextSendAt = currentTime + 60; // Retry in 1 minute
                     saveAlertToFile(processingCtx.alert, id, processingCtx.alert.valid_from);
                     LOG_WARN("Failed to send new alert, will retry in 1 min [%s, sev:%d]: %s",
                              processingCtx.alert.source.c_str(), processingCtx.alert.severity,
