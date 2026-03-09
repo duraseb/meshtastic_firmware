@@ -4,6 +4,17 @@
 #include <time.h>
 #include <RTC.h>
 #include <ctype.h>
+#ifdef ARCH_ESP32
+#include <esp_task_wdt.h>
+#endif
+
+// Helper to reset watchdog timer (architecture-aware)
+static inline void feedWatchdog()
+{
+#ifdef ARCH_ESP32
+    esp_task_wdt_reset();
+#endif
+}
 
 // Initialize AIService if not already done
 extern AIService* aiService;
@@ -61,7 +72,9 @@ String AiWeatherSource::fetchAndFormat(
     String weatherApiUrl = "https://api.open-meteo.com/v1/forecast?latitude=52.4069&longitude=16.9299&hourly=temperature_2m,relative_humidity_2m,precipitation_probability,precipitation,surface_pressure,cloud_cover,visibility,wind_speed_10m,wind_direction_10m,soil_temperature_0cm&timezone=Europe%2FBerlin&forecast_days=1&forecast_hours=24&temporal_resolution=hourly_6&format=json&timeformat=unixtime";
 
     int httpCode = 0;
+    feedWatchdog();
     String weatherJson = httpGetCallback(weatherApiUrl.c_str(), httpCode);
+    feedWatchdog();
 
     if (httpCode != 200 || weatherJson.length() == 0) {
         LOG_ERROR("[AiWeatherSource] Failed to fetch weather data (HTTP %d)", httpCode);
@@ -115,6 +128,7 @@ String AiWeatherSource::fetchAndFormat(
 
     // Try each AI provider until one succeeds (both HTTP call AND parsing)
     for (int providerIdx = 0; providerIdx < aiService->getMaxProviders(); providerIdx++) {
+        feedWatchdog();
         AIService::AIProvider& provider = aiService->getProviders()[providerIdx];
 
         // Skip if provider not configured
@@ -123,9 +137,11 @@ String AiWeatherSource::fetchAndFormat(
         }
 
         LOG_INFO("[AiWeatherSource] Attempting AI call with [%s]...", provider.name.c_str());
+        feedWatchdog();
 
         String aiResponse;
         bool httpSuccess = aiService->callProvider(providerIdx, prompt, aiResponse);
+        feedWatchdog();
 
         if (!httpSuccess) {
             LOG_WARN("[AiWeatherSource] HTTP call failed for [%s], trying next provider...", provider.name.c_str());
@@ -136,8 +152,10 @@ String AiWeatherSource::fetchAndFormat(
         String rawText;
         if (!aiService->extractTextFromAIResponse(aiResponse, rawText)) {
             LOG_WARN("[AiWeatherSource] Failed to extract text from AI response from [%s], trying next provider...", provider.name.c_str());
+            feedWatchdog();
             continue;
         }
+        feedWatchdog();
 
         LOG_DEBUG("[AiWeatherSource] Extracted text from [%s] (length: %d bytes): %s",
                  provider.name.c_str(), rawText.length(), rawText.c_str());
