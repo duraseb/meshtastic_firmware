@@ -29,6 +29,8 @@
 
 #ifdef ARCH_ESP32
 #include "esp_task_wdt.h"
+#include "esp_heap_caps.h"
+#include "freertos/task.h"
 #endif
 
 #ifndef DISABLE_NTP
@@ -58,10 +60,12 @@ AlertsModule::AlertsModule() : OSThread("AlertsModule"), sharedJsonDoc(SHARED_JS
 
     currentState = ModuleState::INIT;
     initializationDone = false;
+    lastFetchTime = 0;
     lastCleanupTime = 0;
     intervalMs = 5 * 60 * 1000; // Default 5 minute check interval
 
     lastMemoryCheckTime = 0;
+    lastPendingAlertLogTime = 0;
     lastReportedMemoryUsage = 0;
 
     processingCtx.active = false;
@@ -194,8 +198,11 @@ String AlertsModule::httpGet(const char *url, int &httpCode)
     LOG_DEBUG("Fetching URL: %s", url);
 
     // Use unique_ptr for automatic cleanup
-    std::unique_ptr<HTTPClient> http(new HTTPClient());
+    // IMPORTANT: client must be declared before http so that http is destroyed first
+    // (C++ destroys locals in reverse declaration order). HTTPClient holds a reference
+    // to the WiFiClient, so the client must outlive http to avoid use-after-free.
     std::unique_ptr<WiFiClientSecure> client(new WiFiClientSecure());
+    std::unique_ptr<HTTPClient> http(new HTTPClient());
 
     if (!http || !client) {
         LOG_ERROR("Failed to allocate HTTP client resources");
@@ -308,8 +315,9 @@ bool AlertsModule::httpGetStream(const char *url, std::function<bool(WiFiClient*
         }
 
         // Use unique_ptr for automatic cleanup
-        std::unique_ptr<HTTPClient> http(new HTTPClient());
+        // client declared before http to ensure correct destruction order
         std::unique_ptr<WiFiClientSecure> client(new WiFiClientSecure());
+        std::unique_ptr<HTTPClient> http(new HTTPClient());
 
         if (!http || !client) {
             LOG_ERROR("[AlertsModule] Failed to allocate HTTP client resources for streaming");
@@ -374,77 +382,6 @@ bool AlertsModule::alertExists(uint32_t id)
     return false;
 }
 
-String AlertsModule::getAlertFilename(uint32_t id, const String &dateStr)
-{
-    // Create directory if it doesn't exist
-    FSCom.mkdir(ALERTS_DIR);
-    
-    String datePrefix;
-    if (dateStr.length() > 0) {
-        if (dateStr.indexOf('-') >= 0) {
-            datePrefix = dateStr;
-            datePrefix.replace("-", "");
-            datePrefix = datePrefix.substring(0, 8);
-        } else if (dateStr.indexOf('.') >= 0) {
-            int firstDot = dateStr.indexOf('.');
-            int secondDot = dateStr.indexOf('.', firstDot + 1);
-            if (firstDot > 0 && secondDot > firstDot) {
-                String day = dateStr.substring(0, firstDot);
-                String month = dateStr.substring(firstDot + 1, secondDot);
-                String year = dateStr.substring(secondDot + 1);
-                if (day.length() == 1) day = "0" + day;
-                if (month.length() == 1) month = "0" + month;
-                datePrefix = year + month + day;
-            } else {
-                datePrefix = "";
-            }
-        } else {
-            datePrefix = dateStr.substring(0, 8);
-        }
-    } else {
-        uint32_t now = getTime(false);
-        if (now > 0) {
-            struct tm *timeinfo = gmtime((time_t *)&now);
-            char dateBuf[9];
-            snprintf(dateBuf, sizeof(dateBuf), "%04d%02d%02d",
-                     timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday);
-            datePrefix = String(dateBuf);
-        } else {
-            datePrefix = "00000000";
-        }
-    }
-
-    return String(ALERTS_DIR) + "/" + datePrefix + "_" + String(id, HEX) + ".bin";
-}
-
-String AlertsModule::extractDateFromFilename(const String &filename)
-{
-    // Extract date from filename: {YYYYMMDD}_{alertId}.bin or {ALERTS_DIR}/{YYYYMMDD}_{alertId}.bin
-    // Find the start of the actual filename (after last slash if present)
-    int lastSlash = filename.lastIndexOf('/');
-    int startPos = (lastSlash >= 0) ? lastSlash + 1 : 0;
-    
-    // Find the underscore that separates date from hash
-    int underscore = filename.indexOf('_', startPos);
-    if (underscore > startPos) {
-        String dateStr = filename.substring(startPos, underscore);
-        // Validate it's 8 digits (YYYYMMDD)
-        if (dateStr.length() == 8) {
-            bool allDigits = true;
-            for (int i = 0; i < 8; i++) {
-                if (!isdigit(dateStr.charAt(i))) {
-                    allDigits = false;
-                    break;
-                }
-            }
-            if (allDigits) {
-                return dateStr;
-            }
-        }
-    }
-    return String();
-}
-
 bool AlertsModule::isAlertProcessed(uint32_t id)
 {
     // Use the in-memory cache only - it's populated at startup from loadAlertsFromDisk()
@@ -465,6 +402,15 @@ void AlertsModule::cacheProcessedAlertId(uint32_t id)
     }
 
     if (processedAlertIds.find(id) != processedAlertIds.end()) {
+        // Keep most-recent usage order and persist current order
+        for (auto it = processedAlertIdOrder.begin(); it != processedAlertIdOrder.end(); ++it) {
+            if (*it == id) {
+                processedAlertIdOrder.erase(it);
+                break;
+            }
+        }
+        processedAlertIdOrder.push_back(id);
+        saveProcessedIdsToSingleFile();
         LOG_DEBUG("ID 0x%x already in cache, skipping", id);
         return;
     }
@@ -480,6 +426,7 @@ void AlertsModule::cacheProcessedAlertId(uint32_t id)
 
     processedAlertIds.insert(id);
     processedAlertIdOrder.push_back(id);
+    saveProcessedIdsToSingleFile();
     LOG_DEBUG("Added ID 0x%x to processed cache (cache now has %d items)", id, processedAlertIds.size());
 }
 
@@ -496,17 +443,136 @@ void AlertsModule::removeProcessedAlertId(uint32_t id)
             break;
         }
     }
+
+    saveProcessedIdsToSingleFile();
 }
 
 size_t AlertsModule::clampMessageToPayload(String &message, size_t maxPayloadBytes)
 {
+    if (maxPayloadBytes == 0) {
+        message = "";
+        return 0;
+    }
+
     size_t msgBytes = utf8ByteLength(message);
     if (msgBytes <= maxPayloadBytes) {
         return msgBytes;
     }
 
-    message = message.substring(0, maxPayloadBytes);
-    return utf8ByteLength(message);
+    size_t bytesUsed = 0;
+    size_t byteIndex = 0;
+    size_t totalBytes = message.length();
+
+    while (byteIndex < totalBytes) {
+        uint8_t leadByte = static_cast<uint8_t>(message.charAt(byteIndex));
+        size_t charLen = 1;
+
+        if ((leadByte & 0x80) == 0x00) {
+            charLen = 1;
+        } else if ((leadByte & 0xE0) == 0xC0) {
+            charLen = 2;
+        } else if ((leadByte & 0xF0) == 0xE0) {
+            charLen = 3;
+        } else if ((leadByte & 0xF8) == 0xF0) {
+            charLen = 4;
+        } else {
+            // Invalid UTF-8 lead byte; treat as single byte to keep behavior safe
+            charLen = 1;
+        }
+
+        if (bytesUsed + charLen > maxPayloadBytes) {
+            break;
+        }
+
+        bytesUsed += charLen;
+        byteIndex += charLen;
+    }
+
+    message = message.substring(0, byteIndex);
+    return bytesUsed;
+}
+
+void AlertsModule::upsertAlertInMemory(const Alert &alert)
+{
+    bool found = false;
+    for (auto &existing : alerts) {
+        if (existing.id == alert.id) {
+            existing = alert;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        alerts.push_back(alert);
+    }
+}
+
+Alert AlertsModule::toAlert(const AlertBinary &binAlert)
+{
+    auto safeString = [](const char *field, size_t fieldLen) -> String {
+        size_t len = 0;
+        while (len < fieldLen && field[len] != '\0') {
+            ++len;
+        }
+        return String(field, len);
+    };
+
+    Alert a;
+    a.id = binAlert.id;
+    a.title = safeString(binAlert.title, sizeof(binAlert.title));
+    a.link = "";
+    a.valid_from = safeString(binAlert.valid_from, sizeof(binAlert.valid_from));
+    a.valid_to = safeString(binAlert.valid_to, sizeof(binAlert.valid_to));
+    a.location = safeString(binAlert.location, sizeof(binAlert.location));
+    a.message = safeString(binAlert.message, sizeof(binAlert.message));
+    a.source = safeString(binAlert.source, sizeof(binAlert.source));
+    a.severity = binAlert.severity;
+    a.addedAt = binAlert.addedAt;
+    a.alert_type = a.title;
+    a.lastSent = 0;
+
+    if (binAlert.nextSendAt >= MIN_VALID_EPOCH) {
+        a.nextSendAt = binAlert.nextSendAt;
+    } else {
+        a.nextSendAt = 0;
+    }
+
+    return a;
+}
+
+bool AlertsModule::fillAlertBinary(const Alert &alert, AlertBinary &binAlert)
+{
+    memset(&binAlert, 0, sizeof(AlertBinary));
+    if (alert.id == 0) {
+        LOG_ERROR("Cannot save alert with invalid ID");
+        return false;
+    }
+
+    strncpy(binAlert.title, alert.title.c_str(), sizeof(binAlert.title) - 1);
+    binAlert.title[sizeof(binAlert.title) - 1] = '\0';
+
+    strncpy(binAlert.message, alert.message.c_str(), sizeof(binAlert.message) - 1);
+    binAlert.message[sizeof(binAlert.message) - 1] = '\0';
+
+    strncpy(binAlert.location, alert.location.c_str(), sizeof(binAlert.location) - 1);
+    binAlert.location[sizeof(binAlert.location) - 1] = '\0';
+
+    strncpy(binAlert.source, alert.source.c_str(), sizeof(binAlert.source) - 1);
+    binAlert.source[sizeof(binAlert.source) - 1] = '\0';
+
+    strncpy(binAlert.valid_from, alert.valid_from.c_str(), sizeof(binAlert.valid_from) - 1);
+    binAlert.valid_from[sizeof(binAlert.valid_from) - 1] = '\0';
+
+    strncpy(binAlert.valid_to, alert.valid_to.c_str(), sizeof(binAlert.valid_to) - 1);
+    binAlert.valid_to[sizeof(binAlert.valid_to) - 1] = '\0';
+
+    binAlert.severity = alert.severity;
+    binAlert.addedAt = alert.addedAt;
+    binAlert.lastSent = alert.lastSent;
+    binAlert.nextSendAt = alert.nextSendAt;
+    binAlert.id = alert.id;
+
+    return true;
 }
 
 
@@ -542,98 +608,435 @@ bool AlertsModule::hasEnoughFreeSpace()
     return hasSpace;
 }
 
-void AlertsModule::enforceFileLimits()
+bool AlertsModule::cleanupTempFilesFromAlertsDir()
 {
-    // Collect all filenames, sort by name (oldest first since format is YYYYMMDD_id.bin),
-    // then delete oldest until under limit.
+    uint32_t startMs = millis();
+    bool removed = false;
     concurrency::LockGuard g(spiLock);
 
     FSCom.mkdir(ALERTS_DIR);
     File root = FSCom.open(ALERTS_DIR, FILE_O_READ);
     if (!root || !root.isDirectory()) {
         if (root) root.close();
-        return;
+        return false;
     }
-
-    // Collect all .bin filenames (format YYYYMMDD_id.bin sorts correctly)
-    std::vector<String> filenames;
-    filenames.reserve(MAX_FILES_ON_DISK + 100);  // Reserve reasonable capacity
 
     int filesScanned = 0;
     File file = root.openNextFile();
     while (file) {
         filesScanned++;
-        if (filesScanned % 20 == 0) {
-            feedWatchdog();
-        }
-
         if (!file.isDirectory()) {
             String filename = file.name();
-            if (filename.endsWith(".bin") && !filename.endsWith(".tmp")) {
-                filenames.push_back(filename);
+            if (filename.endsWith(".tmp")) {
+                String fullPath = String(ALERTS_DIR) + "/" + filename;
+                file.close();
+                if (FSCom.remove(fullPath.c_str())) {
+                    removed = true;
+                }
+                file = root.openNextFile();
+                continue;
             }
+        }
+
+        if (filesScanned % 20 == 0) {
+            feedWatchdog();
         }
         file.close();
         file = root.openNextFile();
     }
     root.close();
 
-    if ((int)filenames.size() <= MAX_FILES_ON_DISK) {
-        return;  // Under limit, nothing to do
+    if (removed) {
+        LOG_INFO("Removed stale temporary alert files in %s", ALERTS_DIR);
     }
 
-    LOG_WARN("Too many alert files on disk (%d > %d), enforcing limits", 
-             filenames.size(), MAX_FILES_ON_DISK);
+    uint32_t elapsedMs = millis() - startMs;
+    if (elapsedMs > 100) {
+        LOG_WARN("cleanupTempFilesFromAlertsDir took %lu ms", elapsedMs);
+    }
+    return removed;
+}
 
-    // Sort by filename (oldest first - YYYYMMDD format sorts correctly)
-    std::sort(filenames.begin(), filenames.end());
+bool AlertsModule::saveAlertsToSingleFile()
+{
+    uint32_t startMs = millis();
+    FSCom.mkdir(ALERTS_DIR);
+    concurrency::LockGuard g(spiLock);
     feedWatchdog();
 
-    // Delete oldest files until under limit
-    int targetDeletes = filenames.size() - MAX_FILES_ON_DISK;
-    int deletedCount = 0;
+    File f = FSCom.open(ALERTS_DATA_FILE_TMP, FILE_O_WRITE);
+    if (!f) {
+        LOG_ERROR("Failed to open temp alert data file for writing: %s", ALERTS_DATA_FILE_TMP);
+        return false;
+    }
 
-    for (int i = 0; i < targetDeletes && i < (int)filenames.size(); i++) {
-        if (i % 5 == 0) {
+    AlertStorageHeader header = {};
+    header.magic = ALERTS_STORAGE_MAGIC;
+    header.version = ALERTS_STORAGE_VERSION;
+    header.reserved = 0;
+    header.alertCount = alerts.size();
+
+    size_t writtenHeader = f.write((const uint8_t*)&header, sizeof(header));
+    if (writtenHeader != sizeof(header)) {
+        LOG_ERROR("Failed to write alert data header (%d bytes)", writtenHeader);
+        f.close();
+        FSCom.remove(ALERTS_DATA_FILE_TMP);
+        return false;
+    }
+
+    AlertBinary *binAlert = new AlertBinary;
+    if (!binAlert) {
+        LOG_ERROR("Failed to allocate AlertBinary for save");
+        f.close();
+        FSCom.remove(ALERTS_DATA_FILE_TMP);
+        return false;
+    }
+
+    for (size_t i = 0; i < alerts.size(); i++) {
+        const auto &alert = alerts[i];
+        if (!fillAlertBinary(alert, *binAlert)) {
+            delete binAlert;
+            f.close();
+            FSCom.remove(ALERTS_DATA_FILE_TMP);
+            return false;
+        }
+
+        size_t written = f.write((const uint8_t*)binAlert, sizeof(AlertBinary));
+        if (written != sizeof(AlertBinary)) {
+            LOG_ERROR("Failed to write alert record for id 0x%x", alert.id);
+            delete binAlert;
+            f.close();
+            FSCom.remove(ALERTS_DATA_FILE_TMP);
+            return false;
+        }
+
+        if ((i + 1) % 16 == 0) {
+            feedWatchdog();
+        }
+    }
+    delete binAlert;
+
+    f.flush();
+    f.close();
+
+    if (!FSCom.rename(ALERTS_DATA_FILE_TMP, ALERTS_DATA_FILE)) {
+        LOG_ERROR("Failed to commit alert data temp file");
+        FSCom.remove(ALERTS_DATA_FILE_TMP);
+        return false;
+    }
+
+    uint32_t elapsedMs = millis() - startMs;
+    if (elapsedMs > 100) {
+        LOG_WARN("saveAlertsToSingleFile took %lu ms for %d alerts", elapsedMs, alerts.size());
+    }
+
+    LOG_DEBUG("Saved %d alerts to %s", alerts.size(), ALERTS_DATA_FILE);
+    return true;
+}
+
+bool AlertsModule::saveProcessedIdsToSingleFile()
+{
+    uint32_t startMs = millis();
+    FSCom.mkdir(ALERTS_DIR);
+    concurrency::LockGuard g(spiLock);
+    feedWatchdog();
+
+    File f = FSCom.open(PROCESSED_IDS_FILE_TMP, FILE_O_WRITE);
+    if (!f) {
+        LOG_ERROR("Failed to open temp processed IDs file for writing: %s", PROCESSED_IDS_FILE_TMP);
+        return false;
+    }
+
+    ProcessedRefsHeader header = {};
+    header.magic = PROCESSED_IDS_MAGIC;
+    header.version = PROCESSED_IDS_VERSION;
+    header.reserved = 0;
+    header.refCount = processedAlertIdOrder.size();
+
+    size_t writtenHeader = f.write((const uint8_t*)&header, sizeof(header));
+    if (writtenHeader != sizeof(header)) {
+        LOG_ERROR("Failed to write processed IDs header (%d bytes)", writtenHeader);
+        f.close();
+        FSCom.remove(PROCESSED_IDS_FILE_TMP);
+        return false;
+    }
+
+    size_t index = 0;
+    for (const auto id : processedAlertIdOrder) {
+        ProcessedRefRecord rec;
+        rec.id = id;
+        rec.seenAt = getTime(false);
+        size_t written = f.write((const uint8_t*)&rec, sizeof(ProcessedRefRecord));
+        if (written != sizeof(ProcessedRefRecord)) {
+            LOG_ERROR("Failed to write processed ID record 0x%x", id);
+            f.close();
+            FSCom.remove(PROCESSED_IDS_FILE_TMP);
+            return false;
+        }
+
+        if (++index % 16 == 0) {
+            feedWatchdog();
+        }
+    }
+
+    f.flush();
+    f.close();
+
+    if (!FSCom.rename(PROCESSED_IDS_FILE_TMP, PROCESSED_IDS_FILE)) {
+        LOG_ERROR("Failed to commit processed IDs temp file");
+        FSCom.remove(PROCESSED_IDS_FILE_TMP);
+        return false;
+    }
+
+    uint32_t elapsedMs = millis() - startMs;
+    if (elapsedMs > 100) {
+        LOG_WARN("saveProcessedIdsToSingleFile took %lu ms for %d ids", elapsedMs, processedAlertIdOrder.size());
+    }
+
+    LOG_DEBUG("Saved %d processed IDs to %s", processedAlertIdOrder.size(), PROCESSED_IDS_FILE);
+    return true;
+}
+
+bool AlertsModule::loadAlertsFromSingleFile()
+{
+    concurrency::LockGuard g(spiLock);
+
+    File f = FSCom.open(ALERTS_DATA_FILE, FILE_O_READ);
+    if (!f) {
+        return false;
+    }
+    if (!f.isDirectory()) {
+        AlertStorageHeader header;
+        if (f.size() < (long)sizeof(AlertStorageHeader)) {
+            LOG_WARN("Alert storage file too small: %s", ALERTS_DATA_FILE);
+            f.close();
+            FSCom.remove(ALERTS_DATA_FILE);
+            return false;
+        }
+
+        size_t headerRead = f.read((uint8_t*)&header, sizeof(AlertStorageHeader));
+        if (headerRead != sizeof(AlertStorageHeader) ||
+            header.magic != ALERTS_STORAGE_MAGIC ||
+            header.version != ALERTS_STORAGE_VERSION) {
+            LOG_WARN("Invalid alert storage header in %s", ALERTS_DATA_FILE);
+            f.close();
+            FSCom.remove(ALERTS_DATA_FILE);
+            return false;
+        }
+
+        if (f.size() != (long)(sizeof(AlertStorageHeader) + header.alertCount * sizeof(AlertBinary))) {
+            LOG_WARN("Alert storage size mismatch in %s", ALERTS_DATA_FILE);
+            f.close();
+            FSCom.remove(ALERTS_DATA_FILE);
+            return false;
+        }
+
+        uint32_t count = header.alertCount;
+        AlertBinary *binAlert = new AlertBinary;
+        if (!binAlert) {
+            LOG_ERROR("Failed to allocate AlertBinary for load");
+            f.close();
+            return false;
+        }
+        for (uint32_t i = 0; i < count; i++) {
+            size_t bytesRead = f.read((uint8_t*)binAlert, sizeof(AlertBinary));
+            if (bytesRead != sizeof(AlertBinary) || binAlert->id == 0) {
+                LOG_WARN("Invalid alert record in %s", ALERTS_DATA_FILE);
+                delete binAlert;
+                f.close();
+                FSCom.remove(ALERTS_DATA_FILE);
+                return false;
+            }
+
+            Alert a = toAlert(*binAlert);
+            if (isAlertValid(a)) {
+                upsertAlertInMemory(a);
+            }
+            // Even if alert is expired, keep ID for duplicate suppression
+            if (processedAlertIds.find(binAlert->id) == processedAlertIds.end()) {
+                processedAlertIds.insert(binAlert->id);
+                processedAlertIdOrder.push_back(binAlert->id);
+            }
+        }
+        delete binAlert;
+        while (processedAlertIdOrder.size() > MAX_PROCESSED_IDS_CACHE) {
+            uint32_t oldestId = processedAlertIdOrder.front();
+            processedAlertIdOrder.pop_front();
+            processedAlertIds.erase(oldestId);
+        }
+    } else {
+        f.close();
+        return false;
+    }
+
+    f.close();
+    return true;
+}
+
+bool AlertsModule::loadProcessedIdsFromSingleFile()
+{
+    concurrency::LockGuard g(spiLock);
+
+    File f = FSCom.open(PROCESSED_IDS_FILE, FILE_O_READ);
+    if (!f) {
+        return false;
+    }
+
+    ProcessedRefsHeader header;
+    if (f.size() < (long)sizeof(ProcessedRefsHeader)) {
+        LOG_WARN("Processed IDs file too small: %s", PROCESSED_IDS_FILE);
+        f.close();
+        FSCom.remove(PROCESSED_IDS_FILE);
+        return false;
+    }
+
+    size_t headerRead = f.read((uint8_t*)&header, sizeof(ProcessedRefsHeader));
+    if (headerRead != sizeof(ProcessedRefsHeader) ||
+        header.magic != PROCESSED_IDS_MAGIC ||
+        header.version != PROCESSED_IDS_VERSION) {
+        LOG_WARN("Invalid processed IDs header in %s", PROCESSED_IDS_FILE);
+        f.close();
+        FSCom.remove(PROCESSED_IDS_FILE);
+        return false;
+    }
+
+    if (f.size() != (long)(sizeof(ProcessedRefsHeader) + header.refCount * sizeof(ProcessedRefRecord))) {
+        LOG_WARN("Processed IDs size mismatch in %s", PROCESSED_IDS_FILE);
+        f.close();
+        FSCom.remove(PROCESSED_IDS_FILE);
+        return false;
+    }
+
+    for (uint32_t i = 0; i < header.refCount; i++) {
+        ProcessedRefRecord rec;
+        size_t bytesRead = f.read((uint8_t*)&rec, sizeof(ProcessedRefRecord));
+        if (bytesRead != sizeof(ProcessedRefRecord) || rec.id == 0) {
+            LOG_WARN("Invalid processed ID record in %s", PROCESSED_IDS_FILE);
+            f.close();
+            FSCom.remove(PROCESSED_IDS_FILE);
+            return false;
+        }
+
+        if (processedAlertIds.find(rec.id) == processedAlertIds.end()) {
+            processedAlertIds.insert(rec.id);
+            processedAlertIdOrder.push_back(rec.id);
+        }
+    }
+
+    f.close();
+
+    while (processedAlertIdOrder.size() > MAX_PROCESSED_IDS_CACHE) {
+        processedAlertIdOrder.pop_front();
+    }
+    // Rebuild set to match order after trimming
+    std::unordered_set<uint32_t> trimmedSet;
+    for (const auto id : processedAlertIdOrder) {
+        trimmedSet.insert(id);
+    }
+    processedAlertIds.swap(trimmedSet);
+
+    return true;
+}
+
+bool AlertsModule::loadLegacyAlertFiles()
+{
+    bool migrated = false;
+    concurrency::LockGuard g(spiLock);
+
+    FSCom.mkdir(ALERTS_DIR);
+    File root = FSCom.open(ALERTS_DIR, FILE_O_READ);
+    if (!root || !root.isDirectory()) {
+        if (root) root.close();
+        return false;
+    }
+
+    std::vector<String> legacyFiles;
+    int filesProcessed = 0;
+    AlertBinary *binAlert = new AlertBinary;
+    if (!binAlert) {
+        root.close();
+        return false;
+    }
+    File file = root.openNextFile();
+    while (file) {
+        filesProcessed++;
+        if (filesProcessed % 10 == 0) {
             feedWatchdog();
         }
 
-        const String &filename = filenames[i];
-        String fullPath = String(ALERTS_DIR) + "/" + filename;
+        if (!file.isDirectory()) {
+            String filename = file.name();
+            bool isKnownContainer = filename == "alerts.bin" || filename == "alerts.bin.tmp" ||
+                                   filename == "processed_ids.bin" || filename == "processed_ids.bin.tmp";
+            if (!isKnownContainer && filename.endsWith(".bin") && !filename.endsWith(".tmp")) {
+                size_t bytesRead = file.read((uint8_t*)binAlert, sizeof(AlertBinary));
+                file.close();
 
-        // Extract ID for cache cleanup
-        int underscorePos = filename.indexOf('_');
-        int dotPos = filename.lastIndexOf('.');
-        if (underscorePos >= 0 && dotPos > underscorePos) {
-            String idHex = filename.substring(underscorePos + 1, dotPos);
-            uint32_t id = strtoul(idHex.c_str(), nullptr, 16);
-            if (id > 0) {
-                removeProcessedAlertId(id);
-                // Remove from memory if present
-                for (auto it = alerts.begin(); it != alerts.end(); ++it) {
-                    if (it->id == id) {
-                        alerts.erase(it);
-                        break;
+                if (bytesRead == sizeof(AlertBinary) && binAlert->id > 0) {
+                    Alert a = toAlert(*binAlert);
+                    upsertAlertInMemory(a);
+
+                    if (processedAlertIds.find(a.id) == processedAlertIds.end()) {
+                        processedAlertIds.insert(a.id);
+                        processedAlertIdOrder.push_back(a.id);
+                    }
+                    legacyFiles.push_back(filename);
+                    migrated = true;
+                    LOG_DEBUG("Migrating legacy alert file: %s", filename.c_str());
+                } else {
+                    if (FSCom.remove((String(ALERTS_DIR) + "/" + filename).c_str())) {
+                        LOG_WARN("Deleted invalid legacy file: %s", filename.c_str());
                     }
                 }
+                file = root.openNextFile();
+                continue;
             }
         }
+        file.close();
+        file = root.openNextFile();
+    }
+    root.close();
+    delete binAlert;
 
+    if (!migrated) {
+        return false;
+    }
+
+    for (const auto &filename : legacyFiles) {
+        String fullPath = String(ALERTS_DIR) + "/" + filename;
         if (FSCom.remove(fullPath.c_str())) {
-            deletedCount++;
+            LOG_DEBUG("Deleted legacy file after migration: %s", fullPath.c_str());
+        } else {
+            LOG_WARN("Failed to remove legacy file: %s", fullPath.c_str());
         }
     }
 
-    feedWatchdog();
-
-    if (deletedCount > 0) {
-        LOG_INFO("Enforced file limit: deleted %d oldest files (now %d files)", 
-                 deletedCount, (int)filenames.size() - deletedCount);
+    while (processedAlertIdOrder.size() > MAX_PROCESSED_IDS_CACHE) {
+        uint32_t oldestId = processedAlertIdOrder.front();
+        processedAlertIdOrder.pop_front();
+        processedAlertIds.erase(oldestId);
     }
+
+    return migrated;
+}
+
+void AlertsModule::enforceFileLimits()
+{
+    if ((int)alerts.size() <= MAX_FILES_ON_DISK) {
+        return;  // Under limit, nothing to do
+    }
+
+    size_t targetCount = MAX_FILES_ON_DISK;
+    std::sort(alerts.begin(), alerts.end(), [](const Alert &a, const Alert &b) {
+        return a.addedAt < b.addedAt;
+    });
+    alerts.erase(alerts.begin(), alerts.begin() + (alerts.size() - targetCount));
+    saveAlertsToSingleFile();
 }
 
 bool AlertsModule::saveAlertToFile(const Alert &alert, uint32_t id, const String &dateStr)
 {
+    (void)dateStr;
     // Check filesystem space before attempting to save
     if (!hasEnoughFreeSpace()) {
         LOG_WARN("Insufficient filesystem space, running cleanup before save");
@@ -646,76 +1049,24 @@ bool AlertsModule::saveAlertToFile(const Alert &alert, uint32_t id, const String
         }
     }
 
-    concurrency::LockGuard g(spiLock);
-
     if (id == 0) {
         LOG_ERROR("Cannot save alert with invalid ID");
         return false;
     }
 
-    String useDate = dateStr.length() > 0 ? dateStr : (alert.valid_from.length() > 0 ? alert.valid_from : String());
-    String filename = getAlertFilename(id, useDate);
+    upsertAlertInMemory(alert);
 
-    AlertBinary binAlert = {};
+    if ((int)alerts.size() > MAX_FILES_ON_DISK) {
+        enforceFileLimits();
+    }
 
-    // Copy strings with bounds checking and null termination
-    strncpy(binAlert.title, alert.title.c_str(), sizeof(binAlert.title) - 1);
-    binAlert.title[sizeof(binAlert.title) - 1] = '\0';
-
-    strncpy(binAlert.message, alert.message.c_str(), sizeof(binAlert.message) - 1);
-    binAlert.message[sizeof(binAlert.message) - 1] = '\0';
-
-    strncpy(binAlert.location, alert.location.c_str(), sizeof(binAlert.location) - 1);
-    binAlert.location[sizeof(binAlert.location) - 1] = '\0';
-
-    strncpy(binAlert.source, alert.source.c_str(), sizeof(binAlert.source) - 1);
-    binAlert.source[sizeof(binAlert.source) - 1] = '\0';
-
-    strncpy(binAlert.valid_from, alert.valid_from.c_str(), sizeof(binAlert.valid_from) - 1);
-    binAlert.valid_from[sizeof(binAlert.valid_from) - 1] = '\0';
-
-    strncpy(binAlert.valid_to, alert.valid_to.c_str(), sizeof(binAlert.valid_to) - 1);
-    binAlert.valid_to[sizeof(binAlert.valid_to) - 1] = '\0';
-
-    binAlert.severity = alert.severity;
-    binAlert.addedAt = alert.addedAt;
-    binAlert.lastSent = alert.lastSent / 1000;  // Keep lastSent in seconds for compatibility
-    binAlert.nextSendAt = alert.nextSendAt;     // nextSendAt is now stored as Unix timestamp in seconds
-    binAlert.id = alert.id;
-
-    // Atomic write with temp file
-    String tempFilename = filename + ".tmp";
-
-    File f = FSCom.open(tempFilename.c_str(), FILE_O_WRITE);
-    if (!f) {
-        LOG_ERROR("Failed to open temp file for writing: %s", tempFilename.c_str());
+    if (!saveAlertsToSingleFile()) {
+        LOG_ERROR("Failed to persist alerts after processing id 0x%x", id);
         return false;
     }
 
-    size_t written = f.write((const uint8_t*)&binAlert, sizeof(AlertBinary));
-    f.flush();
-    bool flushOk = (written == sizeof(AlertBinary));
-
-    if (written != sizeof(AlertBinary) || !flushOk) {
-        LOG_ERROR("Failed to write/flush temp file %s (wrote %d bytes, flush: %s)",
-                  tempFilename.c_str(), written, flushOk ? "ok" : "failed");
-        f.close();
-        FSCom.remove(tempFilename.c_str());
-        return false;
-    }
-
-    f.close();
-
-    if (!FSCom.rename(tempFilename.c_str(), filename.c_str())) {
-        LOG_ERROR("Failed to rename temp file to %s", filename.c_str());
-        FSCom.remove(tempFilename.c_str());
-        return false;
-    }
-
-    LOG_DEBUG("Saved binary alert file: %s (%d bytes)", filename.c_str(), written);
-
-    // Add to processed IDs cache for fast duplicate checking (only if cache not full)
     cacheProcessedAlertId(id);
+    LOG_DEBUG("Persisted alert id 0x%x into single-file storage", id);
 
     return true;
 }
@@ -726,167 +1077,70 @@ bool AlertsModule::loadAlertsFromDisk()
     alerts.clear();
     processedAlertIds.clear();
     processedAlertIdOrder.clear();
-
-    int totalFiles = 0;
-    int tmpFilesDeleted = 0;
-    int invalidFilesDeleted = 0;
-
-    // Phase 1: Count files and clean up .tmp files (scoped lock)
-    {
-        concurrency::LockGuard g(spiLock);
-
-        FSCom.mkdir(ALERTS_DIR);
-        File root = FSCom.open(ALERTS_DIR, FILE_O_READ);
-
-        if (!root || !root.isDirectory()) {
-            if (root) root.close();
-            LOG_DEBUG("%s directory does not exist or is not a directory", ALERTS_DIR);
-            return false;
-        }
-
-        File file = root.openNextFile();
-        while (file) {
-            if (!file.isDirectory()) {
-                String filename = file.name();
-
-                // Clean up leftover .tmp files immediately
-                if (filename.endsWith(".tmp")) {
-                    file.close();
-                    String fullPath = String(ALERTS_DIR) + "/" + filename;
-                    if (FSCom.remove(fullPath.c_str())) {
-                        tmpFilesDeleted++;
-                    }
-                    file = root.openNextFile();
-                    continue;
-                }
-
-                if (filename.endsWith(".bin")) {
-                    totalFiles++;
-                }
-            }
-            file.close();
-
-            // Reset watchdog periodically
-            if (totalFiles % 20 == 0) {
-                feedWatchdog();
-            }
-
-            file = root.openNextFile();
-        }
-        root.close();
-    } // Lock released here
-
-    if (tmpFilesDeleted > 0) {
-        LOG_INFO("Cleaned up %d leftover .tmp files during boot", tmpFilesDeleted);
+    bool tmpCleaned = cleanupTempFilesFromAlertsDir();
+    if (tmpCleaned) {
+        LOG_INFO("Cleaned up stale temporary alert files during boot");
     }
 
-    feedWatchdog();
+    bool loadedProcessedIds = loadProcessedIdsFromSingleFile();
+    bool loadedAlerts = loadAlertsFromSingleFile();
 
-    // Phase 2: Enforce file limits if needed (has its own lock internally)
-    if (totalFiles > MAX_FILES_ON_DISK) {
+    if (!loadedAlerts) {
+        // No consolidated alerts file loaded. Try legacy migration.
+        alerts.clear();
+        if (!loadedProcessedIds) {
+            processedAlertIds.clear();
+            processedAlertIdOrder.clear();
+        }
+        if (loadLegacyAlertFiles()) {
+            if (!saveAlertsToSingleFile()) {
+                LOG_ERROR("Failed to persist migrated alerts");
+            }
+            if (!saveProcessedIdsToSingleFile()) {
+                LOG_WARN("Failed to persist migrated processed IDs");
+            }
+            loadedAlerts = true;
+        }
+    }
+
+    if ((int)alerts.size() > MAX_FILES_ON_DISK) {
         enforceFileLimits();
     }
 
-    // Phase 3: Load valid alerts (scoped lock)
-    int loadedCount = 0;
-    int skippedExpired = 0;
-    int filesProcessed = 0;
+    if ((int)alerts.size() > MAX_ALERTS_IN_MEMORY) {
+        alerts.resize(MAX_ALERTS_IN_MEMORY);
+    }
 
-    {
-        concurrency::LockGuard g(spiLock);
-
-        File root = FSCom.open(ALERTS_DIR, FILE_O_READ);
-        if (!root || !root.isDirectory()) {
-            if (root) root.close();
-            return false;
-        }
-
-        File file = root.openNextFile();
-        while (file) {
-            if (!file.isDirectory()) {
-                String filename = file.name();
-
-                if (filename.endsWith(".bin") && !filename.endsWith(".tmp")) {
-                    AlertBinary binAlert;
-                    size_t bytesRead = file.read((uint8_t*)&binAlert, sizeof(AlertBinary));
-                    file.close();
-
-                    if (bytesRead == sizeof(AlertBinary) && binAlert.id > 0) {
-                        Alert a;
-                        a.id = binAlert.id;
-                        a.title = String(binAlert.title);
-                        a.link = "";
-                        a.valid_from = String(binAlert.valid_from);
-                        a.valid_to = String(binAlert.valid_to);
-                        a.location = String(binAlert.location);
-                        a.message = String(binAlert.message);
-                        a.source = String(binAlert.source);
-                        a.severity = binAlert.severity;
-                        a.addedAt = binAlert.addedAt;
-                        a.alert_type = a.title;
-                        a.lastSent = 0;
-
-                        // Handle nextSendAt format
-                        if (binAlert.nextSendAt >= MIN_VALID_EPOCH) {
-                            a.nextSendAt = binAlert.nextSendAt;
-                        } else {
-                            a.nextSendAt = 0;
-                        }
-
-                        // Add to processed IDs cache (ALWAYS, for duplicate detection)
-                        // This MUST be done before checking validity, because expired alerts
-                        // should still be recognized as "already seen" to avoid re-fetching them
-                        // Limit cache size to prevent unbounded growth
-                        cacheProcessedAlertId(a.id);
-                        LOG_DEBUG("Cached processed alert ID: 0x%x", a.id);
-
-                        // Only load valid (non-expired) alerts into memory
-                        if (isAlertValid(a)) {
-                            if (loadedCount < MAX_ALERTS_IN_MEMORY) {
-                                alerts.push_back(a);
-                                loadedCount++;
-                            }
-                        } else {
-                            skippedExpired++;
-                            LOG_DEBUG("Alert expired, not loading into memory: %s (valid_to: %s)", 
-                                     a.title.c_str(), a.valid_to.c_str());
-                        }
-                    } else {
-                        // Invalid file, delete it
-                        String fullPath = String(ALERTS_DIR) + "/" + filename;
-                        if (FSCom.remove(fullPath.c_str())) {
-                            invalidFilesDeleted++;
-                            LOG_DEBUG("Deleted invalid alert file: %s", fullPath.c_str());
-                        }
-                    }
-
-                    filesProcessed++;
-                } else {
-                    file.close();
-                }
-            } else {
-                file.close();
-            }
-
-            // Reset watchdog periodically
-            if (filesProcessed % 10 == 0) {
-                feedWatchdog();
-            }
-
-            file = root.openNextFile();
-        }
-        root.close();
-    } // Lock released here
-
-    LOG_INFO("Loaded %d valid alerts from disk (skipped %d expired, deleted %d invalid)",
-             loadedCount, skippedExpired, invalidFilesDeleted);
-    return loadedCount > 0;
+    LOG_INFO("Loaded %d valid alerts from disk (processed IDs: %d)",
+             alerts.size(), processedAlertIds.size());
+    return loadedAlerts || loadedProcessedIds;
 }
 
 
 
 // ========== Alert Processing Functions ==========
 
+const char* AlertsModule::stateName(ModuleState state)
+{
+    switch (state) {
+        case ModuleState::INIT: return "INIT";
+        case ModuleState::IDLE: return "IDLE";
+        case ModuleState::FETCHING_PAGE: return "FETCHING_PAGE";
+        case ModuleState::SAVING_ALERT: return "SAVING_ALERT";
+        case ModuleState::SENDING_ALERT: return "SENDING_ALERT";
+        case ModuleState::FETCHING_DYNAMIC: return "FETCHING_DYNAMIC";
+        case ModuleState::CALLING_AI: return "CALLING_AI";
+        default: return "UNKNOWN";
+    }
+}
+
+void AlertsModule::transitionToState(ModuleState nextState, const char *reason)
+{
+    if (currentState != nextState) {
+        LOG_INFO("State transition: %s -> %s (%s)", stateName(currentState), stateName(nextState), reason);
+    }
+    currentState = nextState;
+}
 
 int32_t AlertsModule::runOnce()
 {
@@ -930,7 +1184,7 @@ int32_t AlertsModule::runOnce()
             }
             
             initializationDone = true;
-            currentState = ModuleState::IDLE;
+            transitionToState(ModuleState::IDLE, "initialization complete");
             LOG_INFO("Initialization complete - system responsive");
             return ALERT_PROCESSING_YIELD_MS; // Quick return to continue
         }
@@ -952,7 +1206,7 @@ int32_t AlertsModule::runOnce()
 
                 for (size_t i = 0; i < alerts.size() && alertsCheckedThisCycle < MAX_CHECKS_PER_CYCLE; i++) {
                     size_t checkIndex = (lastCheckedIndex + i) % alerts.size();
-                    auto &alert = alerts[checkIndex];
+                    const Alert alert = alerts[checkIndex];
 
                     if (!isAlertValid(alert)) {
                         continue;
@@ -965,22 +1219,22 @@ int32_t AlertsModule::runOnce()
                     if (currentTime >= alert.nextSendAt) {
                         // Time to re-send this alert (mesh only, no WiFi needed)
                         if (sendAlertToMesh(alert)) {
-                            alert.lastSent = currentMillis;
+                            alerts[checkIndex].lastSent = currentMillis;
                             // Calculate next send time based on severity
                             unsigned long interval = getSendInterval(alert.severity);
                             // Store absolute time instead of relative time from boot
                             if (currentTime > 0) {
-                                alert.nextSendAt = currentTime + interval;
+                                alerts[checkIndex].nextSendAt = currentTime + interval;
                             } else {
                                 // Fallback if time not synced (shouldn't happen in resend logic)
-                                alert.nextSendAt = currentTime + interval;
+                                alerts[checkIndex].nextSendAt = currentTime + interval;
                             }
-                            saveAlertToDisk(alert);
+                            saveAlertToDisk(alerts[checkIndex]);
                             LOG_INFO("Re-sent alert [%s, sev:%d]: %s (next in %lu min)",
                                      alert.source.c_str(), alert.severity, alert.title.c_str(), interval / 60);
                         } else {
                             // Failed to send - set retry delay to avoid tight loop
-                            alert.nextSendAt = currentTime + 60;
+                            alerts[checkIndex].nextSendAt = currentTime + 60;
                         }
                         // Only resend one alert per cycle to avoid blocking
                         lastCheckedIndex = (checkIndex + 1) % alerts.size(); // Resume after this alert
@@ -1074,7 +1328,7 @@ int32_t AlertsModule::runOnce()
                 lastAlertProcessingTime = currentMillis;
 
                 // Proceed to AI extraction
-                currentState = ModuleState::CALLING_AI;
+                transitionToState(ModuleState::CALLING_AI, "pending alert ready for AI processing");
                 return ALERT_PROCESSING_YIELD_MS; // Yield before starting AI request
             }
             
@@ -1093,13 +1347,13 @@ int32_t AlertsModule::runOnce()
                          0
 #endif
                          );
-                return MAX_RUNONCE_INTERVAL_MS; // Return 1 minute, not WIFI_UNAVAILABLE_WAIT_MS
+                return MAX_RUNONCE_INTERVAL_MS;
             }
             
             // Also check if time is synced before fetching (need valid dates)
             if (currentTime == 0 || currentTime < MIN_VALID_EPOCH) {
                 LOG_DEBUG("Time not synced yet (now=%lu), waiting 60s", currentTime);
-                return MAX_RUNONCE_INTERVAL_MS; // Return 1 minute, not TIME_SYNC_WAIT_MS
+                return MAX_RUNONCE_INTERVAL_MS;
             }
             
             // Priority 3: Check all sources for fetching (round-robin, each has its own interval)
@@ -1119,7 +1373,7 @@ int32_t AlertsModule::runOnce()
                         LOG_INFO("Fetch interval elapsed for source %s (%lu min), fetching new alerts", 
                                  sources[i]->getSourceId().c_str(), fetchInterval / 60000);
                     }
-                    currentState = ModuleState::FETCHING_PAGE;
+                    transitionToState(ModuleState::FETCHING_PAGE, "source fetch interval elapsed");
                     return ALERT_PROCESSING_YIELD_MS;
                 }
             }
@@ -1139,7 +1393,7 @@ int32_t AlertsModule::runOnce()
                         LOG_INFO("Fetch interval elapsed for dynamic source %s (%lu min)",
                                  dynamicSources[i]->getSourceId().c_str(), fetchInterval / 60000);
                     }
-                    currentState = ModuleState::FETCHING_DYNAMIC;
+                    transitionToState(ModuleState::FETCHING_DYNAMIC, "dynamic source fetch interval elapsed");
                     return ALERT_PROCESSING_YIELD_MS;
                 }
             }
@@ -1172,21 +1426,6 @@ int32_t AlertsModule::runOnce()
                     }
                 }
                 checked++;
-            }
-
-            // Priority 5: Clean up any expired alerts from memory (more responsive than hourly cleanup)
-            int expiredRemoved = 0;
-            for (auto it = alerts.begin(); it != alerts.end();) {
-                if (!isAlertValid(*it)) {
-                    LOG_DEBUG("Removing expired alert during idle check: %s", it->title.c_str());
-                    it = alerts.erase(it);
-                    expiredRemoved++;
-                } else {
-                    ++it;
-                }
-            }
-            if (expiredRemoved > 0) {
-                LOG_INFO("Removed %d expired alerts during idle check", expiredRemoved);
             }
 
             // Cap at 1 minute for responsive operation
@@ -1248,7 +1487,7 @@ int32_t AlertsModule::runOnce()
 
             if (rawAlerts.empty()) {
                 LOG_INFO("No new alerts from source %s", sources[currentSourceIndex]->getSourceId().c_str());
-                currentState = ModuleState::IDLE;
+                transitionToState(ModuleState::IDLE, "no new alerts from source");
                 return ALERT_PROCESSING_YIELD_MS;
             }
 
@@ -1353,7 +1592,7 @@ int32_t AlertsModule::runOnce()
                           sources[currentSourceIndex]->getSourceId().c_str(), rawAlerts.size());
             }
 
-            currentState = ModuleState::IDLE;
+            transitionToState(ModuleState::IDLE, "fetch processed, returning to idle");
             return ALERT_PROCESSING_YIELD_MS; // Quick return to start processing
         }
         
@@ -1374,7 +1613,7 @@ int32_t AlertsModule::runOnce()
                 deferred.needsFullFetch = false;
                 pendingAlerts.insert(pendingAlerts.begin(), deferred);
                 processingCtx.active = false;
-                currentState = ModuleState::IDLE;
+                transitionToState(ModuleState::IDLE, "insufficient heap to continue AI");
                 return 5000; // Wait 5 seconds before retrying
             }
 
@@ -1439,7 +1678,7 @@ int32_t AlertsModule::runOnce()
                     LOG_ERROR("AI extraction failed for alert: %s",
                              processingCtx.alert.title.c_str());
                     processingCtx.active = false;
-                    currentState = ModuleState::IDLE;
+                    transitionToState(ModuleState::IDLE, "AI extraction failed");
                     return ALERT_PROCESSING_YIELD_MS;
                 }
             }
@@ -1560,14 +1799,14 @@ int32_t AlertsModule::runOnce()
             if (!processingCtx.source->validateAndCleanup(processingCtx.alert)) {
                 LOG_WARN("Alert validation failed, skipping");
                 processingCtx.active = false;
-                currentState = ModuleState::IDLE;
+                transitionToState(ModuleState::IDLE, "alert validation failed");
                 return ALERT_PROCESSING_YIELD_MS;
             }
 
             LOG_DEBUG("AI extraction successful - severity: %d, location: %s",
                      processingCtx.alert.severity, processingCtx.alert.location.c_str());
 
-            currentState = ModuleState::SAVING_ALERT;
+            transitionToState(ModuleState::SAVING_ALERT, "AI extraction succeeded");
             return ALERT_PROCESSING_YIELD_MS; // Yield before disk I/O
         }
         
@@ -1580,13 +1819,13 @@ int32_t AlertsModule::runOnce()
             if (!saveAlertToFile(processingCtx.alert, id, processingCtx.alert.valid_from)) {
                 LOG_ERROR("Failed to save alert to disk");
                 processingCtx.active = false;
-                currentState = ModuleState::IDLE;
+                transitionToState(ModuleState::IDLE, "failed to save alert");
                 return ALERT_PROCESSING_YIELD_MS;
             }
 
             LOG_DEBUG("Alert saved to disk");
 
-            currentState = ModuleState::SENDING_ALERT;
+            transitionToState(ModuleState::SENDING_ALERT, "alert saved to disk");
             return ALERT_PROCESSING_YIELD_MS; // Yield before sending
         }
         
@@ -1599,7 +1838,7 @@ int32_t AlertsModule::runOnce()
                 LOG_WARN("Alert expired before sending, skipping: %s", 
                         processingCtx.alert.title.c_str());
                 processingCtx.active = false;
-                currentState = ModuleState::IDLE;
+                transitionToState(ModuleState::IDLE, "alert expired before sending");
                 return ALERT_PROCESSING_YIELD_MS;
             }
             
@@ -1632,7 +1871,7 @@ int32_t AlertsModule::runOnce()
             
             // Done processing this alert
             processingCtx.active = false;
-            currentState = ModuleState::IDLE;
+            transitionToState(ModuleState::IDLE, "send flow complete");
             return ALERT_PROCESSING_YIELD_MS; // Quick return to process next alert
         }
 
@@ -1654,7 +1893,7 @@ int32_t AlertsModule::runOnce()
 
             if (message.length() == 0) {
                 LOG_WARN("No data from dynamic source %s", source->getSourceId().c_str());
-                currentState = ModuleState::IDLE;
+                transitionToState(ModuleState::IDLE, "dynamic source empty response");
                 return ALERT_PROCESSING_YIELD_MS;
             }
 
@@ -1667,13 +1906,13 @@ int32_t AlertsModule::runOnce()
                          source->getSourceId().c_str());
             }
 
-            currentState = ModuleState::IDLE;
+            transitionToState(ModuleState::IDLE, "dynamic source processing done");
             return ALERT_PROCESSING_YIELD_MS;
         }
 
         default:
             LOG_ERROR("Invalid state %d", (int)currentState);
-            currentState = ModuleState::IDLE;
+            transitionToState(ModuleState::IDLE, "recovering from invalid state");
             return MAX_RUNONCE_INTERVAL_MS; // Return 1 minute on error
     }
 }
@@ -1984,8 +2223,21 @@ bool AlertsModule::sendAlertToMesh(const Alert &alert)
         p->priority = meshtastic_MeshPacket_Priority_RELIABLE;
     }
     
-    p->decoded.payload.size = clampMessageToPayload(msg, maxPayload);
-    memcpy(p->decoded.payload.bytes, msg.c_str(), p->decoded.payload.size);
+    const size_t meshPayloadCapacity = sizeof(p->decoded.payload.bytes);
+    const size_t effectiveMaxPayload = (meshPayloadCapacity < (size_t)maxPayload) ? meshPayloadCapacity : (size_t)maxPayload;
+    size_t payloadBytes = clampMessageToPayload(msg, effectiveMaxPayload);
+    if (payloadBytes > meshPayloadCapacity) {
+        LOG_ERROR("Payload clamp guard triggered in sendAlertToMesh (want %u, cap %u), forcing clamp",
+                  payloadBytes, meshPayloadCapacity);
+        payloadBytes = meshPayloadCapacity;
+    }
+    p->decoded.payload.size = payloadBytes;
+    if (payloadBytes > 0) {
+        memcpy(p->decoded.payload.bytes, msg.c_str(), payloadBytes);
+    }
+    if (payloadBytes < meshPayloadCapacity) {
+        p->decoded.payload.bytes[payloadBytes] = '\0';
+    }
     
     LOG_INFO("Sending alert to mesh - channel: %d, size: %d, priority: %d", 
              alertChannelIndex, p->decoded.payload.size, p->priority);
@@ -1997,6 +2249,8 @@ bool AlertsModule::sendAlertToMesh(const Alert &alert)
         LOG_DEBUG("Alert sent to mesh network");
     } else {
         LOG_ERROR("MeshService not available");
+        packetPool.release(p);
+        return false;
     }
 
     return true;
@@ -2032,9 +2286,20 @@ bool AlertsModule::sendMessageToMesh(const String &message)
     p->priority = meshtastic_MeshPacket_Priority_RELIABLE;
 
     String payloadMessage = message;
-    msgBytes = clampMessageToPayload(payloadMessage, maxPayload);
+    const size_t meshPayloadCapacity = sizeof(p->decoded.payload.bytes);
+    const size_t effectiveMaxPayload = (meshPayloadCapacity < (size_t)maxPayload) ? meshPayloadCapacity : (size_t)maxPayload;
+    msgBytes = clampMessageToPayload(payloadMessage, effectiveMaxPayload);
+    if (msgBytes > meshPayloadCapacity) {
+        LOG_ERROR("Payload clamp guard triggered in sendMessageToMesh (want %u, cap %u), forcing clamp", msgBytes, meshPayloadCapacity);
+        msgBytes = meshPayloadCapacity;
+    }
     p->decoded.payload.size = msgBytes;
-    memcpy(p->decoded.payload.bytes, payloadMessage.c_str(), msgBytes);
+    if (msgBytes > 0) {
+        memcpy(p->decoded.payload.bytes, payloadMessage.c_str(), msgBytes);
+    }
+    if (msgBytes < meshPayloadCapacity) {
+        p->decoded.payload.bytes[msgBytes] = '\0';
+    }
 
     LOG_INFO("Sending message to mesh - channel: %d, size: %d", alertChannelIndex, p->decoded.payload.size);
 
@@ -2046,6 +2311,7 @@ bool AlertsModule::sendMessageToMesh(const String &message)
     }
 
     LOG_ERROR("MeshService not available");
+    packetPool.release(p);
     return false;
 }
 
@@ -2159,145 +2425,23 @@ uint32_t AlertsModule::hashLink(const String &link)
 
 void AlertsModule::cleanupOldAlerts()
 {
+    uint32_t startMs = millis();
     LOG_DEBUG("Starting cleanup of old alerts");
-    concurrency::LockGuard g(spiLock);
+    feedWatchdog();
 
-    // Calculate cutoff date (configured retention period ago) in YYYYMMDD format
+    cleanupTempFilesFromAlertsDir();
+
     uint32_t now = getTime(false); // Get current Unix timestamp (UTC)
 
     // If time is not available, skip cleanup (time might not be synced yet)
     if (now == 0 || now < MIN_VALID_EPOCH) {
         LOG_DEBUG("Time not synced yet (now=%lu), skipping cleanup", now);
+        LOG_WARN("cleanupOldAlerts aborted after %lu ms because time is not synced", millis() - startMs);
         return;
     }
 
-    // Calculate cutoff date (configured retention period ago)
-    time_t cutoffTime = now - (ALERT_RETENTION_DAYS * 24UL * 60UL * 60UL);
-    struct tm *cutoffTm = gmtime(&cutoffTime);
-    if (!cutoffTm) {
-        LOG_WARN("Failed to get UTC time for cleanup cutoff, skipping cleanup");
-        return;
-    }
-    char cutoffDateStr[9];
-    snprintf(cutoffDateStr, sizeof(cutoffDateStr), "%04d%02d%02d",
-             cutoffTm->tm_year + 1900, cutoffTm->tm_mon + 1, cutoffTm->tm_mday);
-    String cutoffDate = String(cutoffDateStr);
-
-    LOG_DEBUG("Cleanup cutoff date: %s (%d days ago)", cutoffDate.c_str(), ALERT_RETENTION_DAYS);
-
-    // Create directory if it doesn't exist
-    FSCom.mkdir(ALERTS_DIR);
-
-    // List all files in /alerts directory
-    File root = FSCom.open(ALERTS_DIR, FILE_O_READ);
-    if (!root || !root.isDirectory()) {
-        if (root) root.close();
-        LOG_DEBUG("%s directory not found, skipping cleanup", ALERTS_DIR);
-        return;
-    }
-
-    // Collect files to delete and IDs to remove from memory
-    // Use small fixed-size buffers to avoid memory exhaustion with many files
-    // Process in batches if needed
-    int filesDeleted = 0;
-    int tmpFilesDeleted = 0;
-    int filesScanned = 0;
-
-    File file = root.openNextFile();
-    while (file) {
-        if (!file.isDirectory()) {
-            String filename = file.name();
-
-            // Clean up .tmp files (leftover from failed atomic writes)
-            if (filename.endsWith(".tmp")) {
-                file.close();
-
-                String fullPath = String(ALERTS_DIR) + "/" + filename;
-                if (FSCom.remove(fullPath.c_str())) {
-                    tmpFilesDeleted++;
-                    LOG_DEBUG("Deleted leftover temp file: %s", fullPath.c_str());
-                }
-
-                // Reset watchdog and continue
-                filesScanned++;
-                if (filesScanned % 10 == 0) {
-                    feedWatchdog();
-                }
-                file = root.openNextFile();
-                continue;
-            }
-
-            // Only process .bin files with date prefix format: {YYYYMMDD}_{alertId}.bin
-            if (filename.endsWith(".bin") && filename.indexOf('_') >= 0) {
-                // Extract date from filename
-                String fileDate = extractDateFromFilename(filename);
-
-                if (fileDate.length() == 8) {
-                    // Check if this file is for an expired alert
-                    if (fileDate < cutoffDate) {
-                        // Close file before deleting
-                        file.close();
-
-                        // Build full path and delete the file
-                        String fullPath = String(ALERTS_DIR) + "/" + filename;
-
-                        // Extract ID from filename for cache cleanup
-                        int underscorePos = filename.indexOf('_');
-                        int dotPos = filename.lastIndexOf('.');
-                        if (underscorePos >= 0 && dotPos > underscorePos) {
-                            String idHex = filename.substring(underscorePos + 1, dotPos);
-                            uint32_t id = strtoul(idHex.c_str(), nullptr, 16);
-                            if (id > 0) {
-                                // Remove from processed IDs cache
-                                removeProcessedAlertId(id);
-
-                                // Remove from memory if present
-                                for (auto it = alerts.begin(); it != alerts.end(); ++it) {
-                                    if (it->id == id) {
-                                        LOG_DEBUG("Removing expired alert from memory: %s", it->title.c_str());
-                                        alerts.erase(it);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        // Delete the file
-                        if (FSCom.remove(fullPath.c_str())) {
-                            filesDeleted++;
-                            LOG_DEBUG("Deleted expired alert file: %s", fullPath.c_str());
-                        } else {
-                            LOG_WARN("Failed to delete expired file: %s", fullPath.c_str());
-                        }
-
-                        // Reset watchdog and continue (file already closed)
-                        filesScanned++;
-                        if (filesScanned % 10 == 0) {
-                            feedWatchdog();
-                        }
-                        file = root.openNextFile();
-                        continue;
-                    }
-                } else {
-                    // Invalid date format, skip (might be legacy file without date prefix)
-                    LOG_DEBUG("Skipping file with invalid date format: %s", filename.c_str());
-                }
-            }
-        }
-        file.close();
-
-        // Reset watchdog periodically during cleanup
-        filesScanned++;
-        if (filesScanned % 10 == 0) {
-            feedWatchdog();
-        }
-
-        file = root.openNextFile();
-    }
-    root.close();
-
-    // Also check for any alerts in memory that are expired (defensive programming)
     int expiredInMemory = 0;
+    int watchdogCounter = 0;
     for (auto it = alerts.begin(); it != alerts.end();) {
         if (!isAlertValid(*it)) {
             LOG_DEBUG("Found and removing expired alert from memory: %s", it->title.c_str());
@@ -2306,13 +2450,28 @@ void AlertsModule::cleanupOldAlerts()
         } else {
             ++it;
         }
+
+        if (++watchdogCounter % 20 == 0) {
+            feedWatchdog();
+        }
     }
 
-    if (filesDeleted > 0 || tmpFilesDeleted > 0 || expiredInMemory > 0) {
-        LOG_INFO("Cleanup completed - deleted %d expired files, %d temp files, removed %d expired from memory",
-                 filesDeleted, tmpFilesDeleted, expiredInMemory);
+    if (expiredInMemory > 0) {
+        uint32_t saveStartMs = millis();
+        feedWatchdog();
+        if (!saveAlertsToSingleFile()) {
+            LOG_WARN("Failed to persist alerts after cleanup");
+        } else {
+            LOG_INFO("Cleanup removed %d expired alerts and updated single-file storage", expiredInMemory);
+            LOG_WARN("cleanupOldAlerts persisted %d removals in %lu ms", expiredInMemory, millis() - saveStartMs);
+        }
     } else {
         LOG_DEBUG("Cleanup completed - no expired alerts to remove");
+    }
+
+    uint32_t totalMs = millis() - startMs;
+    if (totalMs > 200) {
+        LOG_WARN("cleanupOldAlerts total duration %lu ms (expired=%d)", totalMs, expiredInMemory);
     }
 }
 
@@ -2321,86 +2480,47 @@ void AlertsModule::purgeAllAlerts()
 {
     LOG_INFO("Purging all alerts");
     concurrency::LockGuard g(spiLock);
-    
-    // Create directory if it doesn't exist (shouldn't happen, but safe)
+
+    int deletedCount = 0;
     FSCom.mkdir(ALERTS_DIR);
-    
-    // List all files in /alerts directory
+    if (FSCom.remove(ALERTS_DATA_FILE)) {
+        deletedCount++;
+    }
+    if (FSCom.remove(PROCESSED_IDS_FILE)) {
+        deletedCount++;
+    }
+
     File root = FSCom.open(ALERTS_DIR, FILE_O_READ);
     if (!root || !root.isDirectory()) {
         if (root) root.close();
         LOG_DEBUG("%s directory not found or is not a directory", ALERTS_DIR);
-        return;
-    }
-    
-    int deletedCount = 0;
-    int filesProcessed = 0;
-    File file = root.openNextFile();
-    while (file) {
-        String filename;
-        bool isAlertFile = false;
-
-        if (!file.isDirectory()) {
-            filename = file.name();
-            // Only process .bin files (binary format)
-            if (filename.endsWith(".bin")) {
-                isAlertFile = true;
+    } else {
+        File file = root.openNextFile();
+        while (file) {
+            String filename = file.name();
+            file.close();
+            if (!filename.startsWith("/")) {
+                filename = String(ALERTS_DIR) + "/" + filename;
             }
-        }
-
-        // IMPORTANT: Close the file before trying to delete it
-        // LittleFS cannot delete files that are currently open
-        file.close();
-
-        // Now try to delete if it's an alert file
-        if (isAlertFile && filename.length() > 0) {
-            // file.name() might return full path or just filename
-            String fullPath;
-            if (filename.startsWith("/")) {
-                // Already a full path
-                fullPath = filename;
-            } else {
-                // Just filename, construct full path
-                fullPath = String(ALERTS_DIR) + "/" + filename;
-            }
-
-            // Try to delete the file
-            if (FSCom.remove(fullPath.c_str())) {
+            if (filename.length() > 0 && FSCom.remove(filename.c_str())) {
                 deletedCount++;
-                LOG_DEBUG("Deleted alert file: %s", fullPath.c_str());
-            } else {
-                // Try alternative: if fullPath failed, try just filename
-                if (filename.startsWith("/")) {
-                    // Try without leading slash
-                    String altPath = filename.substring(1);
-                    if (FSCom.remove(altPath.c_str())) {
-                        deletedCount++;
-                        LOG_DEBUG("Deleted alert file (alt path): %s", altPath.c_str());
-                    } else {
-                        LOG_ERROR("Failed to delete alert file: %s (also tried: %s)", fullPath.c_str(), altPath.c_str());
-                    }
-                } else {
-                    LOG_ERROR("Failed to delete alert file: %s", fullPath.c_str());
-                }
             }
+            file = root.openNextFile();
         }
-
-        // Reset watchdog periodically during purge
-        filesProcessed++;
-        if (filesProcessed % 10 == 0) {
-            feedWatchdog();
-        }
-
-        // Get next file
-        file = root.openNextFile();
+        root.close();
     }
-    root.close();
-    
-    // Clear the in-memory alerts vector and processed IDs cache
+
+    if (FSCom.remove(ALERTS_DATA_FILE_TMP)) {
+        deletedCount++;
+    }
+    if (FSCom.remove(PROCESSED_IDS_FILE_TMP)) {
+        deletedCount++;
+    }
+
     alerts.clear();
     processedAlertIds.clear();
     processedAlertIdOrder.clear();
-    LOG_INFO("Purged %d alert files and cleared in-memory cache", deletedCount);
+    LOG_INFO("Purged %d files and cleared in-memory cache", deletedCount);
 }
 
 // ===== Broadcasting Functions =====
@@ -2523,9 +2643,20 @@ bool AlertsModule::broadcastInfoMessage()
     p->want_ack = true;
     p->priority = meshtastic_MeshPacket_Priority_RELIABLE;
 
-    msgBytes = clampMessageToPayload(message, maxPayload);
+    const size_t meshPayloadCapacity = sizeof(p->decoded.payload.bytes);
+    const size_t effectiveMaxPayload = (meshPayloadCapacity < (size_t)maxPayload) ? meshPayloadCapacity : (size_t)maxPayload;
+    msgBytes = clampMessageToPayload(message, effectiveMaxPayload);
+    if (msgBytes > meshPayloadCapacity) {
+        LOG_ERROR("Payload clamp guard triggered in broadcastInfoMessage (want %u, cap %u), forcing clamp", msgBytes, meshPayloadCapacity);
+        msgBytes = meshPayloadCapacity;
+    }
     p->decoded.payload.size = msgBytes;
-    memcpy(p->decoded.payload.bytes, message.c_str(), msgBytes);
+    if (msgBytes > 0) {
+        memcpy(p->decoded.payload.bytes, message.c_str(), msgBytes);
+    }
+    if (msgBytes < meshPayloadCapacity) {
+        p->decoded.payload.bytes[msgBytes] = '\0';
+    }
 
     LOG_INFO("Broadcasting channel info to primary channel - size: %d", p->decoded.payload.size);
 
@@ -2537,6 +2668,7 @@ bool AlertsModule::broadcastInfoMessage()
     }
 
     LOG_ERROR("MeshService not available for broadcasting");
+    packetPool.release(p);
     return false;
 }
 

@@ -88,7 +88,7 @@ class AlertsModule : public concurrency::OSThread {
     // Storage and cleanup settings
     static constexpr unsigned long CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
     static constexpr unsigned long ALERT_RETENTION_DAYS = 5; // Keep alerts for duplicate detection
-    static constexpr int MAX_FILES_ON_DISK = 200; // Maximum alert files to keep on filesystem
+    static constexpr int MAX_FILES_ON_DISK = 200; // Maximum alerts kept in alerts.bin
     static constexpr size_t MIN_FREE_SPACE_BYTES = 50 * 1024; // Minimum 50KB free space required
 
     // Channel settings
@@ -101,6 +101,10 @@ class AlertsModule : public concurrency::OSThread {
 
     // Storage paths
     static constexpr const char* ALERTS_DIR = "/alerts";
+    static constexpr const char* ALERTS_DATA_FILE = "/alerts/alerts.bin";
+    static constexpr const char* ALERTS_DATA_FILE_TMP = "/alerts/alerts.bin.tmp";
+    static constexpr const char* PROCESSED_IDS_FILE = "/alerts/processed_ids.bin";
+    static constexpr const char* PROCESSED_IDS_FILE_TMP = "/alerts/processed_ids.bin.tmp";
     
     // ===== End Configuration Variables =====
 
@@ -137,6 +141,31 @@ class AlertsModule : public concurrency::OSThread {
         uint32_t nextSendAt;
     };
     // Total: 548 bytes fixed size (19% smaller than previous 676 bytes)
+
+    struct AlertStorageHeader {
+        uint32_t magic;
+        uint16_t version;
+        uint16_t reserved;
+        uint32_t alertCount;
+    };
+
+    static constexpr uint32_t ALERTS_STORAGE_MAGIC = 0x41524c54; // "ALRT"
+    static constexpr uint16_t ALERTS_STORAGE_VERSION = 1;
+
+    struct ProcessedRefRecord {
+        uint32_t id;
+        uint32_t seenAt;
+    };
+
+    struct ProcessedRefsHeader {
+        uint32_t magic;
+        uint16_t version;
+        uint16_t reserved;
+        uint32_t refCount;
+    };
+
+    static constexpr uint32_t PROCESSED_IDS_MAGIC = 0x50524f43; // "PROC"
+    static constexpr uint16_t PROCESSED_IDS_VERSION = 1;
     
     // ===== State Management =====
     enum class ModuleState {
@@ -208,15 +237,25 @@ class AlertsModule : public concurrency::OSThread {
     bool httpGetStream(const char *url, std::function<bool(WiFiClient* stream, DynamicJsonDocument& doc)> jsonProcessor);
 
     // ===== Alert Storage and Management =====
-    // Persist alerts to disk and load them (using individual files)
+    // Persist alerts to disk and load them (using alert storage container)
     bool saveAlertToDisk(const Alert &alert);
     bool saveAlertToFile(const Alert &alert, uint32_t id, const String &dateStr = "");
     bool loadAlertsFromDisk();
 
+    bool saveAlertsToSingleFile();
+    bool saveProcessedIdsToSingleFile();
+    bool loadAlertsFromSingleFile();
+    bool loadLegacyAlertFiles();
+    bool loadProcessedIdsFromSingleFile();
+    bool cleanupTempFilesFromAlertsDir();
+    void upsertAlertInMemory(const Alert &alert);
+    Alert toAlert(const AlertBinary &binAlert);
+    bool fillAlertBinary(const Alert &alert, AlertBinary &binAlert);
+
     // Clean up old alert files (older than retention period)
     void cleanupOldAlerts();
 
-    // Enforce file limit by deleting oldest files if over MAX_FILES_ON_DISK
+    // Enforce storage limit by trimming alerts vector and rewriting alerts.bin
     void enforceFileLimits();
 
     // Check if there's enough free space on filesystem
@@ -228,12 +267,6 @@ class AlertsModule : public concurrency::OSThread {
     // Helper to check duplicate
     bool alertExists(uint32_t id);
     bool isAlertProcessed(uint32_t id);
-
-    // Get filename for alert based on date and alert ID
-    String getAlertFilename(uint32_t id, const String &dateStr = "");
-
-    // Extract date from filename (YYYYMMDD format)
-    String extractDateFromFilename(const String &filename);
 
     // ===== AI Processing =====
     // Call AI to extract structured data from raw alert
@@ -278,6 +311,10 @@ class AlertsModule : public concurrency::OSThread {
     String base64Encode(const uint8_t* data, size_t length);
 
     // ===== Utility Functions =====
+    // State machine helpers
+    static const char* stateName(ModuleState state);
+    void transitionToState(ModuleState nextState, const char *reason);
+
     // Calculate UTF-8 byte length of a string
     size_t utf8ByteLength(const String &str);
 

@@ -185,8 +185,8 @@ bool AIService::processHttpResponse(HTTPClient& http, int httpCode, const String
 bool AIService::callGeminiAPI(const AIProvider& provider, const String& prompt, String& outResponse)
 {
     // Call AI endpoint with POST
-    HTTPClient http;
     WiFiClientSecure client;
+    HTTPClient http;
     client.setInsecure();
 
     // Add API key to URL as query parameter for Gemini API
@@ -223,8 +223,8 @@ bool AIService::callGeminiAPI(const AIProvider& provider, const String& prompt, 
 
 bool AIService::callMistralAPI(const AIProvider& provider, const String& prompt, String& outResponse)
 {
-    HTTPClient http;
     WiFiClientSecure client;
+    HTTPClient http;
     client.setInsecure();
 
     http.begin(client, provider.endpoint.c_str());
@@ -259,8 +259,8 @@ bool AIService::callMistralAPI(const AIProvider& provider, const String& prompt,
 
 bool AIService::callGroqAPI(const AIProvider& provider, const String& prompt, String& outResponse)
 {
-    HTTPClient http;
     WiFiClientSecure client;
+    HTTPClient http;
     client.setInsecure();
 
     http.begin(client, provider.endpoint.c_str());
@@ -295,8 +295,8 @@ bool AIService::callGroqAPI(const AIProvider& provider, const String& prompt, St
 
 bool AIService::callOpenAIAPI(const AIProvider& provider, const String& prompt, String& outResponse)
 {
-    HTTPClient http;
     WiFiClientSecure client;
+    HTTPClient http;
     client.setInsecure();
 
     http.begin(client, provider.endpoint.c_str());
@@ -336,8 +336,8 @@ String AIService::httpPost(const char* url, const String& payload, const String&
         return "";
     }
 
-    HTTPClient http;
     WiFiClientSecure client;
+    HTTPClient http;
     client.setInsecure();
 
     http.begin(client, url);
