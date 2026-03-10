@@ -1206,7 +1206,7 @@ typedef struct _meshtastic_NeighborInfo {
 
 /* Signal-based routing information exchanged between nodes.
  Used for building a network graph and calculating optimal routes.
- Sent on SIGNAL_ROUTING_APP port (75). */
+ Sent on SIGNAL_ROUTING_APP port. */
 typedef struct _meshtastic_SignalRoutingInfo {
     /* Routing protocol version indicator for compatibility checking.
  Placed first to allow early rejection of incompatible versions.
