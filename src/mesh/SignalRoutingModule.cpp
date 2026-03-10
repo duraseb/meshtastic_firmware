@@ -13,6 +13,34 @@
 
 SignalRoutingModule *signalRoutingModule;
 
+// --- Fixed-size topology version table helpers ---
+uint8_t SignalRoutingModule::getTopologyVersion(const TopologyVersionEntry *table, uint8_t count, NodeNum nodeId) const
+{
+    for (uint8_t i = 0; i < count; i++) {
+        if (table[i].nodeId == nodeId) return table[i].version;
+    }
+    return 0;
+}
+
+void SignalRoutingModule::setTopologyVersion(TopologyVersionEntry *table, uint8_t &count, NodeNum nodeId, uint8_t version)
+{
+    for (uint8_t i = 0; i < count; i++) {
+        if (table[i].nodeId == nodeId) {
+            table[i].version = version;
+            return;
+        }
+    }
+    if (count < MAX_TOPOLOGY_VERSION_ENTRIES) {
+        table[count].nodeId = nodeId;
+        table[count].version = version;
+        count++;
+    } else {
+        // Overwrite oldest (slot 0) and shift isn't worth it — just overwrite first slot
+        table[0].nodeId = nodeId;
+        table[0].version = version;
+    }
+}
+
 // Helper to get node display name for logging
 static void getNodeDisplayName(NodeNum nodeId, char *buf, size_t bufSize) {
     if (!nodeDB) {
@@ -175,47 +203,40 @@ void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
         return;
     }
 
-    // Collect all neighbors we want to broadcast
-    std::vector<meshtastic_SignalNeighbor> allNeighbors;
-    collectNeighborsForBroadcast(allNeighbors);
+    // Collect all neighbors into fixed-size array (max 2 packets worth = 28 neighbors)
+    static constexpr uint8_t MAX_BROADCAST_NEIGHBORS = MAX_SIGNAL_ROUTING_NEIGHBORS * 2;
+    meshtastic_SignalNeighbor allNeighbors[MAX_BROADCAST_NEIGHBORS];
+    uint8_t totalNeighbors = 0;
+    collectNeighborsForBroadcast(allNeighbors, totalNeighbors, MAX_BROADCAST_NEIGHBORS);
 
-    if (allNeighbors.empty()) {
+    if (totalNeighbors == 0) {
         // Send empty broadcast to announce capability
-        sendTopologyPacket(dest, std::vector<meshtastic_SignalNeighbor>());
+        sendTopologyPacket(dest, nullptr, 0);
         return;
     }
 
     // Split into chunks of MAX_SIGNAL_ROUTING_NEIGHBORS and send multiple packets
-    // All packets in this broadcast batch will have the same topology_version
-    uint8_t topologyVersion = currentTopologyVersion++;  // Increment version for this batch
+    uint8_t topologyVersion = currentTopologyVersion++;
+    uint8_t packetsNeeded = (totalNeighbors + MAX_SIGNAL_ROUTING_NEIGHBORS - 1) / MAX_SIGNAL_ROUTING_NEIGHBORS;
 
-    size_t totalNeighbors = allNeighbors.size();
-    size_t packetsNeeded = (totalNeighbors + MAX_SIGNAL_ROUTING_NEIGHBORS - 1) / MAX_SIGNAL_ROUTING_NEIGHBORS;
-
-    char ourName[64];
+    char ourName[48];
     getNodeDisplayName(nodeDB->getNodeNum(), ourName, sizeof(ourName));
 
     LOG_INFO("[SR] SENDING: Broadcasting %u neighbors in %u packet(s) from %s (version %u)",
-             static_cast<unsigned int>(totalNeighbors), static_cast<unsigned int>(packetsNeeded), ourName, topologyVersion);
+             totalNeighbors, packetsNeeded, ourName, topologyVersion);
 
-    // Send packets in chunks
-    for (size_t packetIndex = 0; packetIndex < packetsNeeded; packetIndex++) {
-        size_t startIdx = packetIndex * MAX_SIGNAL_ROUTING_NEIGHBORS;
-        size_t endIdx = std::min(startIdx + MAX_SIGNAL_ROUTING_NEIGHBORS, totalNeighbors);
-
-        std::vector<meshtastic_SignalNeighbor> packetNeighbors(
-            allNeighbors.begin() + startIdx,
-            allNeighbors.begin() + endIdx
-        );
-
-        sendTopologyPacket(dest, packetNeighbors, topologyVersion);
+    for (uint8_t packetIndex = 0; packetIndex < packetsNeeded; packetIndex++) {
+        uint8_t startIdx = packetIndex * MAX_SIGNAL_ROUTING_NEIGHBORS;
+        uint8_t count = std::min((uint8_t)MAX_SIGNAL_ROUTING_NEIGHBORS, (uint8_t)(totalNeighbors - startIdx));
+        sendTopologyPacket(dest, &allNeighbors[startIdx], count, topologyVersion);
     }
 
     // Update our own capability after sending
     trackNodeCapability(nodeDB->getNodeNum(), isActiveRoutingRole() ? CapabilityStatus::SRactive : CapabilityStatus::Passive);
 }
-void SignalRoutingModule::collectNeighborsForBroadcast(std::vector<meshtastic_SignalNeighbor> &allNeighbors)
+void SignalRoutingModule::collectNeighborsForBroadcast(meshtastic_SignalNeighbor *outNeighbors, uint8_t &outCount, uint8_t maxCount)
 {
+    outCount = 0;
     if (!routingGraph || !nodeDB) return;
 
     const NodeEdges* nodeEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
@@ -223,31 +244,32 @@ void SignalRoutingModule::collectNeighborsForBroadcast(std::vector<meshtastic_Si
         return;
     }
 
-    // Prefer reported edges (peer perspective) over mirrored estimates, then order by ETX
-    std::vector<const Edge*> allEdges;
-    for (uint8_t i = 0; i < nodeEdges->edgeCount; i++) {
-        const Edge* e = &nodeEdges->edges[i];
-        if (!isPlaceholderNode(e->to)) {  // Filter out placeholders
-            allEdges.push_back(e);
+    // Collect non-placeholder edge pointers into a fixed-size array for sorting
+    const Edge* edgePtrs[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
+    uint8_t edgeCount = 0;
+    for (uint8_t i = 0; i < nodeEdges->edgeCount && edgeCount < NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE; i++) {
+        if (!isPlaceholderNode(nodeEdges->edges[i].to)) {
+            edgePtrs[edgeCount++] = &nodeEdges->edges[i];
         }
     }
 
     // Sort by quality (reported first, then by ETX)
-    std::sort(allEdges.begin(), allEdges.end(), [](const Edge* a, const Edge* b) {
+    std::sort(edgePtrs, edgePtrs + edgeCount, [](const Edge* a, const Edge* b) {
         if (a->source != b->source) {
-            return a->source == Edge::Source::Reported; // Reported edges first
+            return a->source == Edge::Source::Reported;
         }
-        return a->getEtx() < b->getEtx(); // Then by ETX
+        return a->getEtx() < b->getEtx();
     });
 
     // Convert to SignalNeighbor format
-    for (const Edge* edge : allEdges) {
-        meshtastic_SignalNeighbor neighbor = meshtastic_SignalNeighbor_init_zero;
+    for (uint8_t i = 0; i < edgeCount && outCount < maxCount; i++) {
+        const Edge* edge = edgePtrs[i];
+        meshtastic_SignalNeighbor &neighbor = outNeighbors[outCount];
+        memset(&neighbor, 0, sizeof(neighbor));
 
         neighbor.node_id = edge->to;
         neighbor.position_variance = edge->variance;
 
-        // Mark neighbor based on local knowledge of their SR capability
         CapabilityStatus neighborStatus = getCapabilityStatus(edge->to);
         neighbor.signal_routing_active = (neighborStatus == CapabilityStatus::SRactive);
 
@@ -256,20 +278,20 @@ void SignalRoutingModule::collectNeighborsForBroadcast(std::vector<meshtastic_Si
         neighbor.rssi = static_cast<int8_t>(std::max((int32_t)-128, std::min((int32_t)127, rssi32)));
         neighbor.snr = static_cast<int8_t>(std::max((int32_t)-128, std::min((int32_t)127, snr32)));
 
-        allNeighbors.push_back(neighbor);
+        outCount++;
     }
 }
 
-void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const std::vector<meshtastic_SignalNeighbor> &neighbors, uint8_t topologyVersion)
+void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const meshtastic_SignalNeighbor *neighbors, uint8_t count, uint8_t topologyVersion)
 {
     meshtastic_SignalRoutingInfo info = meshtastic_SignalRoutingInfo_init_zero;
     info.signal_routing_active = isActiveRoutingRole();
     info.routing_version = SIGNAL_ROUTING_VERSION;
     info.topology_version = topologyVersion;
-    info.neighbors_count = neighbors.size();
+    info.neighbors_count = count;
 
     // Copy neighbors to info struct
-    for (size_t i = 0; i < neighbors.size() && i < MAX_SIGNAL_ROUTING_NEIGHBORS; i++) {
+    for (uint8_t i = 0; i < count && i < MAX_SIGNAL_ROUTING_NEIGHBORS; i++) {
         info.neighbors[i] = neighbors[i];
     }
 
@@ -433,7 +455,7 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
 
     // Check version validity with wraparound logic
     uint8_t receivedVersion = info.topology_version;
-    uint8_t lastProcessedVersion = lastTopologyVersion[p->from];
+    uint8_t lastProcessedVersion = getTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, p->from);
 
     bool accept = false;
     if (receivedVersion > lastProcessedVersion) {
@@ -461,7 +483,7 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     bool isNewVersion = (receivedVersion != lastProcessedVersion);
     
     // Update version tracking
-    lastTopologyVersion[p->from] = receivedVersion;
+    setTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, p->from, receivedVersion);
 
     // Update capability status for the sender (this is normally done in handleReceivedProtobuf)
     CapabilityStatus newStatus = info.signal_routing_active ? CapabilityStatus::SRactive : CapabilityStatus::Passive;
@@ -552,10 +574,10 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     }
 
     // Update last processed version (minimal state tracking)
-    lastTopologyVersion[p->from] = receivedVersion;
+    setTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, p->from, receivedVersion);
 
     // Record that this version was pre-processed so handleReceivedProtobuf can skip redundant work
-    lastPreProcessedVersion[p->from] = receivedVersion;
+    setTopologyVersion(lastPreProcessedVersion, lastPreProcessedVersionCount, p->from, receivedVersion);
 
 }
 bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshtastic_SignalRoutingInfo *p)
@@ -621,9 +643,8 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
 
     // Check if preProcessSignalRoutingPacket already handled edge clearing and rebuilding
     // for this exact version — skip redundant work if so
-    auto preProcessIt = lastPreProcessedVersion.find(mp.from);
-    bool alreadyPreProcessed = (preProcessIt != lastPreProcessedVersion.end() &&
-                                preProcessIt->second == p->routing_version);
+    uint8_t preProcessedVer = getTopologyVersion(lastPreProcessedVersion, lastPreProcessedVersionCount, mp.from);
+    bool alreadyPreProcessed = (preProcessedVer != 0 && preProcessedVer == p->routing_version);
 
     if (!alreadyPreProcessed) {
         // Clear all existing edges for this node before adding the new ones from the broadcast
@@ -826,24 +847,25 @@ bool SignalRoutingModule::shouldRelayForStockNeighbors(NodeNum myNode, NodeNum s
     }
 
     // Find stock firmware nodes that might need coverage: direct neighbors + downstream nodes
-    std::vector<NodeNum> stockNeighbors;
+    NodeNum stockNeighbors[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
+    uint8_t stockCount = 0;
 
     // Check our direct neighbors for stock firmware nodes
     const NodeEdges* myEdges = routingGraph->getEdgesFrom(myNode);
     if (myEdges) {
-        for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+        for (uint8_t i = 0; i < myEdges->edgeCount && stockCount < NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE; i++) {
             NodeNum neighbor = myEdges->edges[i].to;
             if (getCapabilityStatus(neighbor) == CapabilityStatus::Legacy) {
-                stockNeighbors.push_back(neighbor);
+                stockNeighbors[stockCount++] = neighbor;
             }
         }
     }
 
-    if (stockNeighbors.empty()) {
+    if (stockCount == 0) {
         return false; // No stock neighbors to worry about
     }
 
-    LOG_INFO("[SR] Checking broadcast coverage for %u stock neighbors", static_cast<unsigned int>(stockNeighbors.size()));
+    LOG_INFO("[SR] Checking broadcast coverage for %u stock neighbors", stockCount);
 
     // Check if any stock neighbor needs this packet
     // A stock neighbor needs the packet if they didn't hear it directly from the source
@@ -851,7 +873,8 @@ bool SignalRoutingModule::shouldRelayForStockNeighbors(NodeNum myNode, NodeNum s
     NodeNum bestStockNeighbor = 0;
     float bestStockCost = std::numeric_limits<float>::max();
 
-    for (NodeNum stockNeighbor : stockNeighbors) {
+    for (uint8_t si = 0; si < stockCount; si++) {
+        NodeNum stockNeighbor = stockNeighbors[si];
         // Check if stock neighbor heard the transmission directly
         // If source can reach stock neighbor directly, they already heard it
         // Also check if heardFrom (relaying SR node) can reach them directly
@@ -911,7 +934,7 @@ bool SignalRoutingModule::shouldRelayForStockNeighbors(NodeNum myNode, NodeNum s
     }
 
     if (hasUncoveredStockNeighbor) {
-        LOG_DEBUG("[SR] STOCK COVERAGE: Found %u uncovered stock neighbors but no valid relay path from this node", static_cast<unsigned int>(stockNeighbors.size()));
+        LOG_DEBUG("[SR] STOCK COVERAGE: Found %u uncovered stock neighbors but no valid relay path from this node", stockCount);
     }
 
     return false;
@@ -979,15 +1002,16 @@ void SignalRoutingModule::logNetworkTopology()
     }
 
     NodeNum ourNode = nodeDB->getNodeNum();
-    char ourName[48];
-    getNodeDisplayName(ourNode, ourName, sizeof(ourName));
+    // Single shared name buffer to minimize stack usage in nested loops
+    char nameBuf[48];
+    getNodeDisplayName(ourNode, nameBuf, sizeof(nameBuf));
 
     // Get our direct edges
     const NodeEdges* ourEdges = routingGraph->getEdgesFrom(ourNode);
     uint8_t directCount = ourEdges ? ourEdges->edgeCount : 0;
 
     LOG_INFO("[SR] Network Topology: %d nodes, %u direct neighbors", nodeCount, directCount);
-    LOG_INFO("[SR] %s (us)", ourName);
+    LOG_INFO("[SR] %s (us)", nameBuf);
 
     if (!ourEdges || ourEdges->edgeCount == 0) {
         LOG_INFO("[SR]   (no direct neighbors)");
@@ -996,8 +1020,7 @@ void SignalRoutingModule::logNetworkTopology()
         for (uint8_t i = 0; i < ourEdges->edgeCount; i++) {
             const Edge& edge = ourEdges->edges[i];
 
-            char neighborName[48];
-            getNodeDisplayName(edge.to, neighborName, sizeof(neighborName));
+            getNodeDisplayName(edge.to, nameBuf, sizeof(nameBuf));
 
             CapabilityStatus neighborStatus = getCapabilityStatus(edge.to);
             const char* nprefix = "";
@@ -1031,22 +1054,21 @@ void SignalRoutingModule::logNetworkTopology()
             uint8_t listenerCount = neighborEdges ? neighborEdges->edgeCount : 0;
 
             // Get downstream nodes that route through this neighbor
-            static constexpr size_t MAX_DS_DISPLAY = 64;
+            static constexpr size_t MAX_DS_DISPLAY = 16;
             NodeNum dsBuf[MAX_DS_DISPLAY];
             uint16_t dsCosts[MAX_DS_DISPLAY];
             size_t totalDsCount = routingGraph->getDownstreamCountForRelay(edge.to);
             size_t dsCount = routingGraph->getDownstreamNodesForRelay(edge.to, dsBuf, dsCosts, MAX_DS_DISPLAY);
 
             LOG_INFO("[SR]   %s %s%s: %s (ETX=%.1f, %ss ago, covers %u nodes, relay for %u downstream)",
-                     branch, nprefix, neighborName, quality, etx, ageBuf,
+                     branch, nprefix, nameBuf, quality, etx, ageBuf,
                      static_cast<unsigned int>(listenerCount), static_cast<unsigned int>(totalDsCount));
 
             // Show nodes that can hear this neighbor (their topology-reported edges)
             if (listenerCount > 0) {
                 for (uint8_t n = 0; n < listenerCount; n++) {
                     const Edge& nEdge = neighborEdges->edges[n];
-                    char lName[48];
-                    getNodeDisplayName(nEdge.to, lName, sizeof(lName));
+                    getNodeDisplayName(nEdge.to, nameBuf, sizeof(nameBuf));
 
                     CapabilityStatus lStatus = getCapabilityStatus(nEdge.to);
                     const char* lprefix = "";
@@ -1055,15 +1077,14 @@ void SignalRoutingModule::logNetworkTopology()
 
                     bool lLast = (n == listenerCount - 1) && (totalDsCount == 0);
                     const char* lBranch = lLast ? "\\-" : "+-";
-                    LOG_INFO("[SR]   %s    %s %s%s (ETX=%.1f)", cont, lBranch, lprefix, lName, nEdge.getEtx());
+                    LOG_INFO("[SR]   %s    %s %s%s (ETX=%.1f)", cont, lBranch, lprefix, nameBuf, nEdge.getEtx());
                 }
             }
 
             // Show downstream nodes (inferred relay relationships) separately
             if (totalDsCount > 0) {
                 for (size_t d = 0; d < dsCount; d++) {
-                    char dsName[48];
-                    getNodeDisplayName(dsBuf[d], dsName, sizeof(dsName));
+                    getNodeDisplayName(dsBuf[d], nameBuf, sizeof(nameBuf));
 
                     CapabilityStatus dsStatus = getCapabilityStatus(dsBuf[d]);
                     const char* dsprefix = "";
@@ -1073,7 +1094,7 @@ void SignalRoutingModule::logNetworkTopology()
                     bool dsLast = (d == dsCount - 1) && (dsCount == totalDsCount);
                     const char* dsBranch = dsLast ? "\\-" : "+-";
                     float dsCost = dsCosts[d] / 100.0f;
-                    LOG_INFO("[SR]   %s    %s [downstream] %s%s (ETX=%.1f)", cont, dsBranch, dsprefix, dsName, dsCost);
+                    LOG_INFO("[SR]   %s    %s [downstream] %s%s (ETX=%.1f)", cont, dsBranch, dsprefix, nameBuf, dsCost);
                 }
                 if (dsCount < totalDsCount) {
                     LOG_INFO("[SR]   %s    \\- ... and %u more downstream", cont, static_cast<unsigned int>(totalDsCount - dsCount));

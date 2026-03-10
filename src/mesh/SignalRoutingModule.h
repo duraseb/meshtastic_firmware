@@ -3,7 +3,6 @@
 #include "concurrency/OSThread.h"
 #include "mesh/generated/meshtastic/mesh.pb.h"
 #include "mesh/generated/meshtastic/telemetry.pb.h"
-#include <vector>
 
 #include "graph/NeighborGraph.h"
 
@@ -61,8 +60,20 @@ private:
     bool topologyDirty = false; // Set when topology changes; log dump deferred to runOnce
     uint32_t lastBroadcast = 0;
     uint8_t currentTopologyVersion = 0;
-    std::unordered_map<NodeNum, uint8_t> lastTopologyVersion;
-    std::unordered_map<NodeNum, uint8_t> lastPreProcessedVersion;
+
+    // Fixed-size topology version cache — replaces std::unordered_map to avoid heap fragmentation
+    static constexpr size_t MAX_TOPOLOGY_VERSION_ENTRIES = 24;
+    struct TopologyVersionEntry {
+        NodeNum nodeId = 0;
+        uint8_t version = 0;
+    };
+    TopologyVersionEntry lastTopologyVersion[MAX_TOPOLOGY_VERSION_ENTRIES];
+    uint8_t lastTopologyVersionCount = 0;
+    TopologyVersionEntry lastPreProcessedVersion[MAX_TOPOLOGY_VERSION_ENTRIES];
+    uint8_t lastPreProcessedVersionCount = 0;
+
+    uint8_t getTopologyVersion(const TopologyVersionEntry *table, uint8_t count, NodeNum nodeId) const;
+    void setTopologyVersion(TopologyVersionEntry *table, uint8_t &count, NodeNum nodeId, uint8_t version);
 
     bool hasNodeBeenExcludedFromRelay(NodeNum nodeId, PacketId packetId);
     void processContentionWindows(uint32_t nowMs);
@@ -71,8 +82,8 @@ private:
     void clearRelayExclusionsForPacket(PacketId packetId);
     bool isSignalBasedCapable(NodeNum nodeId) const;
     float getDirectNeighborsSignalActivePercentage() const;
-    void collectNeighborsForBroadcast(std::vector<meshtastic_SignalNeighbor> &allNeighbors);
-    void sendTopologyPacket(NodeNum dest, const std::vector<meshtastic_SignalNeighbor> &neighbors, uint8_t topologyVersion = 0);
+    void collectNeighborsForBroadcast(meshtastic_SignalNeighbor *outNeighbors, uint8_t &outCount, uint8_t maxCount);
+    void sendTopologyPacket(NodeNum dest, const meshtastic_SignalNeighbor *neighbors, uint8_t count, uint8_t topologyVersion = 0);
     void buildSignalRoutingInfo(meshtastic_SignalRoutingInfo &info);
     void setRgbLed(uint8_t r, uint8_t g, uint8_t b);
     void turnOffRgbLed();
