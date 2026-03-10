@@ -118,26 +118,6 @@ SignalRoutingModule::SignalRoutingModule()
     // Set initial broadcast delay (30 seconds after startup)
     setIntervalFromNow(30 * 1000);
 
-    // Initialize RGB LED pins and turn off
-#if defined(RGBLED_RED) && defined(RGBLED_GREEN) && defined(RGBLED_BLUE)
-    pinMode(RGBLED_RED, OUTPUT);
-    pinMode(RGBLED_GREEN, OUTPUT);
-    pinMode(RGBLED_BLUE, OUTPUT);
-#ifdef RGBLED_CA
-    // Common anode: high = off
-    analogWrite(RGBLED_RED, 255);
-    analogWrite(RGBLED_GREEN, 255);
-    analogWrite(RGBLED_BLUE, 255);
-#else
-    // Common cathode: low = off
-    analogWrite(RGBLED_RED, 0);
-    analogWrite(RGBLED_GREEN, 0);
-    analogWrite(RGBLED_BLUE, 0);
-#endif
-    // Initialize heartbeat timing so first heartbeat is delayed
-    LOG_INFO("[SR] RGB LED initialized");
-#endif
-
     LOG_INFO("[SR] Module initialized (version %d)", SIGNAL_ROUTING_VERSION);
 }
 
@@ -148,14 +128,6 @@ int32_t SignalRoutingModule::runOnce()
 
     pruneCapabilityCache(nowSecs);
     pruneRelayIdentityCache(nowMs);
-
-#if defined(RGBLED_RED) && defined(RGBLED_GREEN) && defined(RGBLED_BLUE)
-    // Turn off heartbeat LED if duration expired (for operation feedback)
-    if (heartbeatEndTime > 0 && nowMs >= heartbeatEndTime) {
-        turnOffRgbLed();
-        heartbeatEndTime = 0;
-    }
-#endif
 
     if (routingGraph && signalBasedRoutingEnabled) {
         if (nowMs - lastBroadcast >= SIGNAL_ROUTING_BROADCAST_SECS * 1000) {
@@ -171,12 +143,6 @@ int32_t SignalRoutingModule::runOnce()
         }
     }
 
-    // Track time until LED operation feedback should turn off
-    uint32_t timeToLedOff = UINT32_MAX;
-    if (heartbeatEndTime > nowMs) {
-        timeToLedOff = heartbeatEndTime - nowMs;
-    }
-
     uint32_t timeToBroadcast = SIGNAL_ROUTING_BROADCAST_SECS * 1000;
     if (nowMs - lastBroadcast < SIGNAL_ROUTING_BROADCAST_SECS * 1000) {
         timeToBroadcast = (SIGNAL_ROUTING_BROADCAST_SECS * 1000) - (nowMs - lastBroadcast);
@@ -185,10 +151,7 @@ int32_t SignalRoutingModule::runOnce()
     // Process unicast relay contention windows
     processContentionWindows(nowMs);
 
-    // Turn off LED when RTOS task completes
-    turnOffRgbLed();
-
-    uint32_t nextDelay = std::min({timeToLedOff, timeToBroadcast});
+    uint32_t nextDelay = timeToBroadcast;
     if (nextDelay < 20) {
         nextDelay = 20;
     }
@@ -630,9 +593,6 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
     LOG_INFO("[SR] RECEIVED: %s reports %d neighbors (SR v%d, %s)",
              senderName, p->neighbors_count, p->routing_version,
              p->signal_routing_active ? "SR-active" : "passive");
-
-    // Set cyan for network topology update (operation start)
-    setRgbLed(0, 255, 255);
 
     // For passive SR nodes (signal_routing_active = false), we still need to store their edges for direct connection checks
     // Active nodes use these edges to determine if a passive SR node has direct connections to destinations
@@ -1122,11 +1082,6 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
         return ProcessMessage::CONTINUE;
     }
 
-    // Turn on LED to indicate SR processing active
-    // We'll turn it off when this RTOS task completes
-    // For now, use a neutral color - will be overridden by specific operations
-    setRgbLed(255, 255, 255);  // White for SR active
-
     // Update node activity for packet reception and relay tracking
     // For active nodes: track all packets (needed for full topology and routing)
     // For passive nodes: only track direct packets (only need direct neighbors)
@@ -1218,9 +1173,6 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
 
         LOG_INFO("[SR] Direct neighbor %s: RSSI=%d, SNR=%.1f, ETX=%.2f",
                  senderName, mp.rx_rssi, mp.rx_snr, etx);
-
-        // Purple for direct packet received (operation start)
-        setRgbLed(128, 0, 128);
 
         // Record that this node transmitted (for contention window tracking)
         if (routingGraph) {
@@ -1848,9 +1800,6 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
 
     if (shouldRelay) {
         routingGraph->recordNodeTransmission(myNode, p->id, currentTime);
-        setRgbLed(255, 128, 0);  // Orange for relaying
-    } else {
-        setRgbLed(255, 0, 0);    // Red for not relaying
     }
 
     return shouldRelay;
@@ -2145,13 +2094,9 @@ void SignalRoutingModule::updateNeighborInfo(NodeNum nodeId, int32_t rssi, float
             // that were created based on topology broadcasts before we heard from them directly
             routingGraph->clearDownstreamForDestination(nodeId);
 
-            // Set green for new neighbor (operation start)
-            setRgbLed(0, 255, 0);
             LOG_INFO("[SR] Topology changed: new neighbor %s (total nodes: %u)", neighborName, static_cast<unsigned int>(routingGraph->getNodeCount()));
             topologyDirty = true;
         } else if (changeType == EDGE_SIGNIFICANT_CHANGE) {
-            // Set blue for signal quality change (operation start)
-            setRgbLed(0, 0, 255);
             LOG_INFO("[SR] Topology changed: ETX change for %s (total nodes: %u)", neighborName, static_cast<unsigned int>(routingGraph->getNodeCount()));
             topologyDirty = true;
         }
@@ -2232,45 +2177,6 @@ float SignalRoutingModule::getDirectNeighborsSignalActivePercentage() const
     float percentage = (static_cast<float>(activeNeighbors) * 100.0f) / static_cast<float>(totalNeighbors);
     LOG_DEBUG("[SR] Direct neighbor capability: %d/%d = %.1f%%", activeNeighbors, totalNeighbors, percentage);
     return percentage;
-}
-
-/**
- * Flash RGB LED for Signal Routing notifications
- * Colors: Green = new neighbor, Blue = signal change, Cyan = topology update
- */
-void SignalRoutingModule::setRgbLed(uint8_t r, uint8_t g, uint8_t b)
-{
-#if defined(RGBLED_RED) && defined(RGBLED_GREEN) && defined(RGBLED_BLUE)
-    // Set LED to specified color
-#ifdef RGBLED_CA
-    // Common anode: high = off, low = on (invert values)
-    analogWrite(RGBLED_RED, 255 - r);
-    analogWrite(RGBLED_GREEN, 255 - g);
-    analogWrite(RGBLED_BLUE, 255 - b);
-#else
-    // Common cathode: low = off, high = on
-    analogWrite(RGBLED_RED, r);
-    analogWrite(RGBLED_GREEN, g);
-    analogWrite(RGBLED_BLUE, b);
-#endif
-#endif
-}
-
-void SignalRoutingModule::turnOffRgbLed()
-{
-#if defined(RGBLED_RED) && defined(RGBLED_GREEN) && defined(RGBLED_BLUE)
-#ifdef RGBLED_CA
-    // Common anode: high = off
-    analogWrite(RGBLED_RED, 255);
-    analogWrite(RGBLED_GREEN, 255);
-    analogWrite(RGBLED_BLUE, 255);
-#else
-    // Common cathode: low = off
-    analogWrite(RGBLED_RED, 0);
-    analogWrite(RGBLED_GREEN, 0);
-    analogWrite(RGBLED_BLUE, 0);
-#endif
-#endif
 }
 
 void SignalRoutingModule::handleNodeInfoPacket(const meshtastic_MeshPacket &mp)

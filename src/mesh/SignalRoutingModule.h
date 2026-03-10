@@ -85,11 +85,6 @@ private:
     void collectNeighborsForBroadcast(meshtastic_SignalNeighbor *outNeighbors, uint8_t &outCount, uint8_t maxCount);
     void sendTopologyPacket(NodeNum dest, const meshtastic_SignalNeighbor *neighbors, uint8_t count, uint8_t topologyVersion = 0);
     void buildSignalRoutingInfo(meshtastic_SignalRoutingInfo &info);
-    void setRgbLed(uint8_t r, uint8_t g, uint8_t b);
-    void turnOffRgbLed();
-
-    uint32_t lastNotificationTime = 0;
-    uint32_t heartbeatEndTime = 0;
 
     enum class CapabilityStatus : uint8_t {
         Unknown = 0,
