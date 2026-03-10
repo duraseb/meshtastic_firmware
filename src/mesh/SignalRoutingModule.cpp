@@ -2909,20 +2909,32 @@ NodeNum SignalRoutingModule::resolveHeardFrom(const meshtastic_MeshPacket *p, No
 
     // Check ALL known nodes (both Reported and Mirrored edges), not just direct neighbors,
     // because the relay might be a node we only know through topology broadcasts
+    NodeNum placeholderMatch = 0;
     if (routingGraph && nodeDB) {
         const NodeEdges *myEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
         if (myEdges) {
             for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
-                if ((myEdges->edges[i].to & 0xFF) == p->relay_node && !isPlaceholderNode(myEdges->edges[i].to)) {
-                    // Remember this mapping for future use
-                    const_cast<SignalRoutingModule*>(this)->rememberRelayIdentity(myEdges->edges[i].to, p->relay_node);
-                    return myEdges->edges[i].to;
+                if ((myEdges->edges[i].to & 0xFF) == p->relay_node) {
+                    if (!isPlaceholderNode(myEdges->edges[i].to)) {
+                        // Remember this mapping for future use
+                        const_cast<SignalRoutingModule*>(this)->rememberRelayIdentity(myEdges->edges[i].to, p->relay_node);
+                        return myEdges->edges[i].to;
+                    }
+                    // Remember the placeholder in case no real node matches
+                    placeholderMatch = myEdges->edges[i].to;
                 }
             }
         }
     }
 
-    return sourceNode;
+    // Return placeholder if we found one in the graph
+    if (placeholderMatch != 0) {
+        return placeholderMatch;
+    }
+
+    // Last resort: synthesize placeholder ID from relay byte so we never
+    // falsely claim the packet came directly from the source
+    return 0xFF000000 | p->relay_node;
 }
 
 uint64_t SignalRoutingModule::makeSpeculativeKey(NodeNum origin, uint32_t packetId)
