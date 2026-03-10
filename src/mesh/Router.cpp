@@ -84,13 +84,15 @@ Router::Router() : concurrency::OSThread("Router"), fromRadioQueue(MAX_RX_FROMRA
 
 bool Router::shouldDecrementHopLimit(const meshtastic_MeshPacket *p)
 {
-    // Signal-based routing: do NOT decrement hop_limit
-    // Old nodes still see the original hop_limit for correct TTL behaviour
-    // New nodes use explicit next-hop + speculative retransmit → hop_limit is irrelevant
-    // Packet ID + sender deduplication already prevents loops
+    // Signal-based routing: decrement hop_limit normally but clamp at 1.
+    // Stock nodes see the count going down (preventing duplicate relays from them),
+    // while SR nodes can keep routing beyond the original hop limit.
     if (signalRoutingModule && signalRoutingModule->shouldUseSignalBasedRouting(p)) {
-        LOG_DEBUG("Signal-based routing: preserving hop_limit for packet 0x%08x", p->id);
-        return false;
+        if (p->hop_limit <= 1) {
+            LOG_DEBUG("Signal-based routing: preserving hop_limit=1 for packet 0x%08x", p->id);
+            return false; // Don't decrement below 1
+        }
+        // Otherwise fall through to normal decrement logic
     }
 
     // First hop MUST always decrement to prevent retry issues

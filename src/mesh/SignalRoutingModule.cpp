@@ -2539,17 +2539,13 @@ bool SignalRoutingModule::canSendTopology() const
 SignalRoutingModule::CapabilityStatus SignalRoutingModule::capabilityFromRole(
     meshtastic_Config_DeviceConfig_Role role) const
 {
-    // Passive roles that participate in SR (can send topology broadcasts)
+    // Role alone cannot determine SR capability — stock firmware uses the same roles.
+    // Only mark as Legacy for roles that definitely cannot participate in routing.
+    // SR-passive/SR-active status is set exclusively when we receive an actual SR topology packet.
     switch (role) {
+    case meshtastic_Config_DeviceConfig_Role_LOST_AND_FOUND:
     case meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE:
     case meshtastic_Config_DeviceConfig_Role_CLIENT_HIDDEN:
-    case meshtastic_Config_DeviceConfig_Role_TRACKER:
-    case meshtastic_Config_DeviceConfig_Role_SENSOR:
-    case meshtastic_Config_DeviceConfig_Role_TAK:
-    case meshtastic_Config_DeviceConfig_Role_TAK_TRACKER:
-        return CapabilityStatus::Passive;
-    // Fully mute roles don't participate in SR
-    case meshtastic_Config_DeviceConfig_Role_LOST_AND_FOUND:
         return CapabilityStatus::Legacy;
     default:
         return CapabilityStatus::Unknown;
@@ -3213,8 +3209,8 @@ void SignalRoutingModule::queueUnicastRelay(ContentionCheck& check)
     meshtastic_MeshPacket *p = check.packetCopy;
     check.packetCopy = nullptr; // Take ownership
 
-    // Decrement hop limit for the relay
-    if (p->hop_limit > 0) {
+    // Decrement hop limit for the relay, but clamp at 1 for SR routing
+    if (p->hop_limit > 1) {
         p->hop_limit--;
     }
 
