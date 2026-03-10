@@ -100,6 +100,8 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     bool isReceiving = false;
 
   public:
+    virtual ~RadioLibInterface() { if (instance == this) instance = nullptr; }
+
     /** Our ISR code currently needs this to find our active instance
      */
     static RadioLibInterface *instance;
