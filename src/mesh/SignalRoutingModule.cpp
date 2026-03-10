@@ -1081,23 +1081,26 @@ void SignalRoutingModule::logNetworkTopology()
                 }
             }
 
-            // Show downstream nodes (inferred relay relationships) separately
+            // Show all downstream nodes in pages of MAX_DS_DISPLAY
             if (totalDsCount > 0) {
-                for (size_t d = 0; d < dsCount; d++) {
-                    getNodeDisplayName(dsBuf[d], nameBuf, sizeof(nameBuf));
+                size_t printed = 0;
+                while (printed < totalDsCount) {
+                    dsCount = routingGraph->getDownstreamNodesForRelay(edge.to, dsBuf, dsCosts, MAX_DS_DISPLAY, printed);
+                    if (dsCount == 0) break;
+                    for (size_t d = 0; d < dsCount; d++) {
+                        getNodeDisplayName(dsBuf[d], nameBuf, sizeof(nameBuf));
 
-                    CapabilityStatus dsStatus = getCapabilityStatus(dsBuf[d]);
-                    const char* dsprefix = "";
-                    if (dsStatus == CapabilityStatus::SRactive) dsprefix = "[SR-active] ";
-                    else if (dsStatus == CapabilityStatus::Passive) dsprefix = "[SR-passive] ";
+                        CapabilityStatus dsStatus = getCapabilityStatus(dsBuf[d]);
+                        const char* dsprefix = "";
+                        if (dsStatus == CapabilityStatus::SRactive) dsprefix = "[SR-active] ";
+                        else if (dsStatus == CapabilityStatus::Passive) dsprefix = "[SR-passive] ";
 
-                    bool dsLast = (d == dsCount - 1) && (dsCount == totalDsCount);
-                    const char* dsBranch = dsLast ? "\\-" : "+-";
-                    float dsCost = dsCosts[d] / 100.0f;
-                    LOG_INFO("[SR]   %s    %s [downstream] %s%s (ETX=%.1f)", cont, dsBranch, dsprefix, nameBuf, dsCost);
-                }
-                if (dsCount < totalDsCount) {
-                    LOG_INFO("[SR]   %s    \\- ... and %u more downstream", cont, static_cast<unsigned int>(totalDsCount - dsCount));
+                        bool dsLast = (printed + 1 == totalDsCount);
+                        const char* dsBranch = dsLast ? "\\-" : "+-";
+                        float dsCost = dsCosts[d] / 100.0f;
+                        LOG_INFO("[SR]   %s    %s [downstream] %s%s (ETX=%.1f)", cont, dsBranch, dsprefix, nameBuf, dsCost);
+                        printed++;
+                    }
                 }
             }
         }
