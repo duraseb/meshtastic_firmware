@@ -8,7 +8,7 @@
 #include "graph/NeighborGraph.h"
 
 // Routing protocol version for compatibility checking
-#define SIGNAL_ROUTING_VERSION 1
+#define SIGNAL_ROUTING_VERSION 2
 
 // Maximum neighbors we track/broadcast (optimized to fit 14 in 233 byte payload)
 #define MAX_SIGNAL_ROUTING_NEIGHBORS 14
