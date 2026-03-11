@@ -144,6 +144,12 @@ bool FloodingRouter::roleAllowsCancelingDupe(const meshtastic_MeshPacket *p)
 
 void FloodingRouter::perhapsCancelDupe(const meshtastic_MeshPacket *p)
 {
+    // If SR committed to relay this packet, don't cancel — our relay decision takes priority over dupes
+    if (signalRoutingModule && signalRoutingModule->isCommittedRelay(p->id)) {
+        LOG_DEBUG("[SR] Not canceling committed relay for 0x%08x despite dupe", p->id);
+        return;
+    }
+
     if (p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA && roleAllowsCancelingDupe(p)) {
         // cancel rebroadcast of this message *if* there was already one, unless we're a router!
         // But only LoRa packets should be able to trigger this.

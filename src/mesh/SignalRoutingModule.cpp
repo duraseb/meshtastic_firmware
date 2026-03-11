@@ -1593,6 +1593,43 @@ bool SignalRoutingModule::shouldUseSignalBasedRouting(const meshtastic_MeshPacke
     return topologyHealthyForBroadcast();
 }
 
+void SignalRoutingModule::commitRelay(PacketId packetId)
+{
+    // Don't add duplicates
+    for (uint8_t i = 0; i < committedRelayCount; i++) {
+        if (committedRelays[i] == packetId)
+            return;
+    }
+    if (committedRelayCount < MAX_COMMITTED_RELAYS) {
+        committedRelays[committedRelayCount++] = packetId;
+    } else {
+        // Overwrite oldest entry
+        memmove(committedRelays, committedRelays + 1, (MAX_COMMITTED_RELAYS - 1) * sizeof(PacketId));
+        committedRelays[MAX_COMMITTED_RELAYS - 1] = packetId;
+    }
+    LOG_DEBUG("[SR] Committed relay for packet 0x%08x", packetId);
+}
+
+bool SignalRoutingModule::isCommittedRelay(PacketId packetId) const
+{
+    for (uint8_t i = 0; i < committedRelayCount; i++) {
+        if (committedRelays[i] == packetId)
+            return true;
+    }
+    return false;
+}
+
+void SignalRoutingModule::clearCommittedRelay(PacketId packetId)
+{
+    for (uint8_t i = 0; i < committedRelayCount; i++) {
+        if (committedRelays[i] == packetId) {
+            committedRelays[i] = committedRelays[--committedRelayCount];
+            committedRelays[committedRelayCount] = 0;
+            return;
+        }
+    }
+}
+
 bool SignalRoutingModule::shouldRelay(const meshtastic_MeshPacket *p)
 {
     if (!routingGraph || !nodeDB) {
@@ -3138,6 +3175,9 @@ void SignalRoutingModule::queueUnicastRelay(ContentionCheck& check)
     char destName[64];
     getNodeDisplayName(check.destination, destName, sizeof(destName));
     LOG_INFO("[SR] queueUnicastRelay: Relaying packet %08x to %s (hop_limit=%d)", check.packetId, destName, p->hop_limit);
+
+    // Commit this relay so dupe arrivals don't cancel it
+    commitRelay(check.packetId);
 
     // Send via router — this handles encryption, radio queueing, etc.
     router->send(p);

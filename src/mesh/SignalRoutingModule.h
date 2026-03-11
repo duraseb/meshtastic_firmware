@@ -179,6 +179,16 @@ private:
     void logNetworkTopology();
     bool evaluateContentionExpiry(const ContentionCheck& check, NodeNum myNode);
     void queueUnicastRelay(ContentionCheck& check);
+
+    // Committed relay tracking — prevents dupe cancellation of SR relay decisions
+    static constexpr size_t MAX_COMMITTED_RELAYS = 8;
+    PacketId committedRelays[MAX_COMMITTED_RELAYS] = {};
+    uint8_t committedRelayCount = 0;
+
+public:
+    void commitRelay(PacketId packetId);
+    bool isCommittedRelay(PacketId packetId) const;
+    void clearCommittedRelay(PacketId packetId);
 };
 
 extern SignalRoutingModule *signalRoutingModule;

@@ -154,6 +154,8 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                             LOG_INFO("[SR] Not relaying 0x%08x", p->id);
                             return false;
                         }
+                        // Mark this packet as committed so dupe arrivals don't cancel our relay
+                        signalRoutingModule->commitRelay(p->id);
                     }
 
                     meshtastic_MeshPacket *tosend = packetPool.allocCopy(*p); // keep a copy because we will be sending it
