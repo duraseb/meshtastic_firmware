@@ -754,6 +754,11 @@ bool SignalRoutingModule::resolvePlaceholder(NodeNum placeholderId, NodeNum real
         // (downstream entries already transferred by replaceGatewayNode above)
         routingGraph->removeNode(placeholderId);
 
+        // Also explicitly remove any orphaned edges pointing to the placeholder
+        // (removeNode may not find the placeholder if it was already aged out,
+        // but edges from our node to it can still linger in our edge list)
+        routingGraph->removeEdgesTo(placeholderId);
+
         LOG_INFO("[SR] Resolved placeholder %08x -> real node %08x", placeholderId, realNodeId);
         LOG_DEBUG("[SR] Removed placeholder node %08x from graph", placeholderId);
     }
@@ -1338,7 +1343,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
         if (currentTime - lastGraphUpdate > GRAPH_UPDATE_INTERVAL_SECS) {
             uint32_t nodeCountBefore = routingGraph->getNodeCount();
             
-            // Use capability-based TTL: SR-active nodes (5 min), stock/mute nodes (30 min)
+            // Use capability-based TTL: ACTIVE_NODE_TTL_SECS for SR nodes, MUTE_NODE_TTL_SECS for stock/unknown/placeholders
             auto getTtlForNode = [this](NodeNum nodeId) -> uint32_t {
                 CapabilityStatus status = getCapabilityStatus(nodeId);
                 return getNodeTtlSeconds(status);

@@ -240,6 +240,8 @@ class NeighborGraph {
 
     void clearEdgesForNode(NodeNum nodeId);
 
+    void removeEdgesTo(NodeNum nodeId);
+
     void clearInferredEdgesToNode(NodeNum nodeId);
 
     uint8_t getNeighborCount(NodeNum node) const;

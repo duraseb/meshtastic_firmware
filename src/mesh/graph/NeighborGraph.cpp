@@ -273,10 +273,7 @@ void NeighborGraph::ageEdges(uint32_t currentTimeSecs, std::function<uint32_t(No
             node->edgeCount = writeIdx;
         }
 
-        bool isPlaceholder = (node->nodeId & 0xFF000000) == 0xFF000000;
-        uint32_t ttl = isPlaceholder ? 300 : nodeTtl; // Placeholders: 5 min
-
-        if (currentTimeSecs - node->lastFullUpdate > ttl || node->edgeCount == 0) {
+        if (currentTimeSecs - node->lastFullUpdate > nodeTtl || node->edgeCount == 0) {
             // Remove downstream entries that reference this neighbor as relay
             NodeNum removedNode = node->nodeId;
             for (uint16_t i = 0; i < downstreamCount;) {
@@ -294,6 +291,21 @@ void NeighborGraph::ageEdges(uint32_t currentTimeSecs, std::function<uint32_t(No
                 neighbors[n] = neighbors[neighborCount - 1];
             }
             neighborCount--;
+
+            // Clear edges pointing TO the removed node from all remaining nodes
+            for (uint8_t m = 0; m < neighborCount; m++) {
+                for (uint8_t e = 0; e < neighbors[m].edgeCount;) {
+                    if (neighbors[m].edges[e].to == removedNode) {
+                        if (e < neighbors[m].edgeCount - 1) {
+                            neighbors[m].edges[e] = neighbors[m].edges[neighbors[m].edgeCount - 1];
+                        }
+                        neighbors[m].edgeCount--;
+                    } else {
+                        e++;
+                    }
+                }
+            }
+
             edgesRemoved = true;
             continue;
         }
@@ -864,6 +876,22 @@ void NeighborGraph::clearEdgesForNode(NodeNum nodeId)
             routeCacheCount--;
         } else {
             i++;
+        }
+    }
+}
+
+void NeighborGraph::removeEdgesTo(NodeNum nodeId)
+{
+    for (uint8_t m = 0; m < neighborCount; m++) {
+        for (uint8_t e = 0; e < neighbors[m].edgeCount;) {
+            if (neighbors[m].edges[e].to == nodeId) {
+                if (e < neighbors[m].edgeCount - 1) {
+                    neighbors[m].edges[e] = neighbors[m].edges[neighbors[m].edgeCount - 1];
+                }
+                neighbors[m].edgeCount--;
+            } else {
+                e++;
+            }
         }
     }
 }
