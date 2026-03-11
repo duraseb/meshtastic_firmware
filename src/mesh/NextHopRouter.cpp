@@ -155,7 +155,8 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                             return false;
                         }
                         // Mark this packet as committed so dupe arrivals don't cancel our relay
-                        signalRoutingModule->commitRelay(p->id);
+                        NodeNum heardFrom = signalRoutingModule->resolveHeardFrom(p, p->from);
+                        signalRoutingModule->commitRelay(p->id, heardFrom);
                     }
 
                     meshtastic_MeshPacket *tosend = packetPool.allocCopy(*p); // keep a copy because we will be sending it

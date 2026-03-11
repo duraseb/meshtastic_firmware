@@ -129,6 +129,14 @@ int32_t SignalRoutingModule::runOnce()
     pruneCapabilityCache(nowSecs);
     pruneRelayIdentityCache(nowMs);
 
+    // Send deferred topology request 60s after boot to resolve placeholders.
+    // Nearby SR nodes will reply with their own topology, identifying themselves.
+    if (needsNodeInfoBroadcast && nowSecs > 60) {
+        needsNodeInfoBroadcast = false;
+        LOG_INFO("[SR] Sending topology request to resolve placeholders");
+        sendSignalRoutingInfo(NODENUM_BROADCAST, true);
+    }
+
     if (routingGraph && signalBasedRoutingEnabled) {
         if (nowMs - lastBroadcast >= SIGNAL_ROUTING_BROADCAST_SECS * 1000) {
             sendSignalRoutingInfo();
@@ -158,7 +166,7 @@ int32_t SignalRoutingModule::runOnce()
     return static_cast<int32_t>(nextDelay);
 }
 
-void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
+void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest, bool wantResponse)
 {
     // Allow mute nodes to broadcast their direct neighbors to help active SR nodes
     // make better unicast routing decisions, even though mute nodes don't participate in relaying
@@ -174,7 +182,7 @@ void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
 
     if (totalNeighbors == 0) {
         // Send empty broadcast to announce capability
-        sendTopologyPacket(dest, nullptr, 0);
+        sendTopologyPacket(dest, nullptr, 0, 0, wantResponse);
         return;
     }
 
@@ -191,7 +199,8 @@ void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
     for (uint8_t packetIndex = 0; packetIndex < packetsNeeded; packetIndex++) {
         uint8_t startIdx = packetIndex * MAX_SIGNAL_ROUTING_NEIGHBORS;
         uint8_t count = std::min((uint8_t)MAX_SIGNAL_ROUTING_NEIGHBORS, (uint8_t)(totalNeighbors - startIdx));
-        sendTopologyPacket(dest, &allNeighbors[startIdx], count, topologyVersion);
+        // Only set want_response on the first packet
+        sendTopologyPacket(dest, &allNeighbors[startIdx], count, topologyVersion, wantResponse && packetIndex == 0);
     }
 
     // Update our own capability after sending
@@ -245,7 +254,7 @@ void SignalRoutingModule::collectNeighborsForBroadcast(meshtastic_SignalNeighbor
     }
 }
 
-void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const meshtastic_SignalNeighbor *neighbors, uint8_t count, uint8_t topologyVersion)
+void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const meshtastic_SignalNeighbor *neighbors, uint8_t count, uint8_t topologyVersion, bool wantResponse)
 {
     meshtastic_SignalRoutingInfo info = meshtastic_SignalRoutingInfo_init_zero;
     info.signal_routing_active = isActiveRoutingRole();
@@ -260,6 +269,7 @@ void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const meshtastic_Sign
 
     meshtastic_MeshPacket *p = allocDataProtobuf(info);
     p->to = dest;
+    p->decoded.want_response = wantResponse;
     p->priority = meshtastic_MeshPacket_Priority_BACKGROUND;
 
     service->sendToMesh(p);
@@ -543,6 +553,23 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     setTopologyVersion(lastPreProcessedVersion, lastPreProcessedVersionCount, p->from, receivedVersion);
 
 }
+meshtastic_MeshPacket *SignalRoutingModule::allocReply()
+{
+    // Throttle topology replies to avoid flooding
+    uint32_t now = millis();
+    if (lastTopologyReplyMs != 0 && (now - lastTopologyReplyMs) < TOPOLOGY_REPLY_THROTTLE_MS) {
+        LOG_DEBUG("[SR] Throttling topology reply (last sent %us ago)", (now - lastTopologyReplyMs) / 1000);
+        ignoreRequest = true;
+        return nullptr;
+    }
+    lastTopologyReplyMs = now;
+
+    meshtastic_SignalRoutingInfo info;
+    buildSignalRoutingInfo(info);
+    LOG_INFO("[SR] Sending topology reply to resolve placeholders");
+    return allocDataProtobuf(info);
+}
+
 bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshtastic_SignalRoutingInfo *p)
 {
     // Reject packets from invalid node IDs (0 is invalid)
@@ -1216,6 +1243,10 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
             inferredRelayer = createPlaceholderNode(mp.relay_node);
             LOG_DEBUG("[SR] Created placeholder %08x for unknown relay 0x%02x",
                      inferredRelayer, mp.relay_node);
+
+            // Flag that we need to send a topology request to resolve placeholders.
+            // Deferred to runOnce() (60s after boot) to let the node settle first.
+            needsNodeInfoBroadcast = true;
         }
 
         if (inferredRelayer != 0 && inferredRelayer != mp.from) {
@@ -1598,27 +1629,30 @@ bool SignalRoutingModule::shouldUseSignalBasedRouting(const meshtastic_MeshPacke
     return topologyHealthyForBroadcast();
 }
 
-void SignalRoutingModule::commitRelay(PacketId packetId)
+void SignalRoutingModule::commitRelay(PacketId packetId, NodeNum originalHeardFrom)
 {
     // Don't add duplicates
     for (uint8_t i = 0; i < committedRelayCount; i++) {
-        if (committedRelays[i] == packetId)
+        if (committedRelays[i].packetId == packetId)
             return;
     }
+    CommittedRelay entry;
+    entry.packetId = packetId;
+    entry.originalHeardFrom = originalHeardFrom;
     if (committedRelayCount < MAX_COMMITTED_RELAYS) {
-        committedRelays[committedRelayCount++] = packetId;
+        committedRelays[committedRelayCount++] = entry;
     } else {
         // Overwrite oldest entry
-        memmove(committedRelays, committedRelays + 1, (MAX_COMMITTED_RELAYS - 1) * sizeof(PacketId));
-        committedRelays[MAX_COMMITTED_RELAYS - 1] = packetId;
+        memmove(committedRelays, committedRelays + 1, (MAX_COMMITTED_RELAYS - 1) * sizeof(CommittedRelay));
+        committedRelays[MAX_COMMITTED_RELAYS - 1] = entry;
     }
-    LOG_DEBUG("[SR] Committed relay for packet 0x%08x", packetId);
+    LOG_DEBUG("[SR] Committed relay for packet 0x%08x (heardFrom 0x%08x)", packetId, originalHeardFrom);
 }
 
 bool SignalRoutingModule::isCommittedRelay(PacketId packetId) const
 {
     for (uint8_t i = 0; i < committedRelayCount; i++) {
-        if (committedRelays[i] == packetId)
+        if (committedRelays[i].packetId == packetId)
             return true;
     }
     return false;
@@ -1627,12 +1661,74 @@ bool SignalRoutingModule::isCommittedRelay(PacketId packetId) const
 void SignalRoutingModule::clearCommittedRelay(PacketId packetId)
 {
     for (uint8_t i = 0; i < committedRelayCount; i++) {
-        if (committedRelays[i] == packetId) {
+        if (committedRelays[i].packetId == packetId) {
             committedRelays[i] = committedRelays[--committedRelayCount];
-            committedRelays[committedRelayCount] = 0;
+            committedRelays[committedRelayCount] = CommittedRelay();
             return;
         }
     }
+}
+
+bool SignalRoutingModule::isDupeRelayRedundant(const meshtastic_MeshPacket *p)
+{
+    if (!routingGraph || !nodeDB || !p) {
+        return false; // Can't evaluate — keep our relay
+    }
+
+    // Resolve the dupe's relay node
+    NodeNum dupeRelayer = 0;
+    if (p->relay_node != 0) {
+        dupeRelayer = resolveRelayIdentity(p->relay_node);
+        if (dupeRelayer == 0) {
+            // Try matching from our known neighbors
+            NodeNum myNode = nodeDB->getNodeNum();
+            const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
+            if (myEdges) {
+                for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+                    if ((myEdges->edges[i].to & 0xFF) == p->relay_node && !isPlaceholderNode(myEdges->edges[i].to)) {
+                        dupeRelayer = myEdges->edges[i].to;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    NodeNum myNode = nodeDB->getNodeNum();
+
+    if (dupeRelayer == 0 || dupeRelayer == myNode) {
+        return false; // Unknown relayer or it's us — keep our relay
+    }
+
+    // Look up the original heardFrom stored when we committed to relay
+    NodeNum originalHeardFrom = 0;
+    for (uint8_t i = 0; i < committedRelayCount; i++) {
+        if (committedRelays[i].packetId == p->id) {
+            originalHeardFrom = committedRelays[i].originalHeardFrom;
+            break;
+        }
+    }
+
+    // Check coverage against the original deliverer + dupe relayer
+    NodeNum coveredBy[2];
+    uint8_t coveredByCount = 0;
+    if (originalHeardFrom != 0 && originalHeardFrom != myNode)
+        coveredBy[coveredByCount++] = originalHeardFrom;
+    if (dupeRelayer != originalHeardFrom)
+        coveredBy[coveredByCount++] = dupeRelayer;
+    bool unique = routingGraph->hasUniqueCoverage(myNode, coveredBy, coveredByCount);
+
+    if (unique) {
+        char relayerName[64];
+        getNodeDisplayName(dupeRelayer, relayerName, sizeof(relayerName));
+        LOG_DEBUG("[SR] Dupe relayer %s does not cover all our neighbors — keeping relay", relayerName);
+    } else {
+        char relayerName[64];
+        getNodeDisplayName(dupeRelayer, relayerName, sizeof(relayerName));
+        LOG_INFO("[SR] Dupe relayer %s covers all our neighbors — relay is redundant", relayerName);
+    }
+
+    return !unique;
 }
 
 bool SignalRoutingModule::shouldRelay(const meshtastic_MeshPacket *p)
@@ -3182,7 +3278,10 @@ void SignalRoutingModule::queueUnicastRelay(ContentionCheck& check)
     LOG_INFO("[SR] queueUnicastRelay: Relaying packet %08x to %s (hop_limit=%d)", check.packetId, destName, p->hop_limit);
 
     // Commit this relay so dupe arrivals don't cancel it
-    commitRelay(check.packetId);
+    NodeNum heardFrom = check.heardFrom;
+    if (heardFrom == 0)
+        heardFrom = resolveHeardFrom(p, p->from);
+    commitRelay(check.packetId, heardFrom);
 
     // Send via router — this handles encryption, radio queueing, etc.
     router->send(p);

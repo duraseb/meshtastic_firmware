@@ -1005,6 +1005,54 @@ RelayCandidate NeighborGraph::findBestRelayCandidate(const NodeSet &candidates,
     return bestCandidate;
 }
 
+bool NeighborGraph::hasUniqueCoverage(NodeNum myNode, const NodeNum *coveredBy, size_t coveredByCount) const
+{
+    const NodeEdges *myEdges = findNeighbor(myNode);
+    if (!myEdges || myEdges->edgeCount == 0) {
+        return false;
+    }
+
+    for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+        NodeNum neighbor = myEdges->edges[i].to;
+
+        // Placeholder neighbors have unknown identity — they could be any of the
+        // coveredBy nodes' neighbors, so don't count them as unique coverage
+        if ((neighbor & 0xFF000000) == 0xFF000000) {
+            continue;
+        }
+
+        // Skip nodes that are themselves in the coveredBy set
+        bool isCoverer = false;
+        for (size_t c = 0; c < coveredByCount; c++) {
+            if (neighbor == coveredBy[c]) {
+                isCoverer = true;
+                break;
+            }
+        }
+        if (isCoverer) continue;
+
+        // Check if any coveredBy node covers this neighbor
+        bool covered = false;
+        for (size_t c = 0; c < coveredByCount && !covered; c++) {
+            const NodeEdges *covererEdges = findNeighbor(coveredBy[c]);
+            if (covererEdges) {
+                for (uint8_t j = 0; j < covererEdges->edgeCount; j++) {
+                    if (covererEdges->edges[j].to == neighbor) {
+                        covered = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!covered) {
+            return true; // Found a neighbor not covered by anyone
+        }
+    }
+
+    return false;
+}
+
 bool NeighborGraph::isGatewayNode(NodeNum nodeId, NodeNum sourceNode) const
 {
     const NodeEdges *nodeEdges = findNeighbor(nodeId);

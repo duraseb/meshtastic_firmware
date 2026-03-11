@@ -225,6 +225,8 @@ class NeighborGraph {
     size_t getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, size_t maxNodes, const NodeNum *alreadyCovered,
                                size_t alreadyCoveredCount) const;
 
+    bool hasUniqueCoverage(NodeNum myNode, const NodeNum *coveredBy, size_t coveredByCount) const;
+
     bool isGatewayNode(NodeNum nodeId, NodeNum sourceNode) const;
 
     bool shouldRelayWithContention(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom, uint32_t packetId,

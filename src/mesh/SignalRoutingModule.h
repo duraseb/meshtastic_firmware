@@ -36,7 +36,7 @@ public:
     bool hasDirectConnectivity(NodeNum nodeA, NodeNum nodeB);
     bool hasVerifiedConnectivity(NodeNum transmitter, NodeNum receiver, bool* unknownOut = nullptr);
     void updateNeighborInfo(NodeNum nodeId, int32_t rssi, float snr, uint32_t lastRxTime, uint32_t variance = 0);
-    void sendSignalRoutingInfo(NodeNum dest = NODENUM_BROADCAST);
+    void sendSignalRoutingInfo(NodeNum dest = NODENUM_BROADCAST, bool wantResponse = false);
     void preProcessSignalRoutingPacket(const meshtastic_MeshPacket *p, uint32_t packetReceivedTimestamp = 0);
 
 protected:
@@ -44,6 +44,7 @@ protected:
     void updateGraphWithNeighbor(NodeNum sender, const meshtastic_SignalNeighbor &neighbor);
     virtual ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override;
     virtual bool wantPacket(const meshtastic_MeshPacket *p) override { return true; }
+    virtual meshtastic_MeshPacket *allocReply() override;
     virtual int32_t runOnce() override;
 
 private:
@@ -57,6 +58,9 @@ private:
     static constexpr uint32_t RELAY_ID_CACHE_TTL_MS = 600 * 1000;  // 10 min
 
     bool signalBasedRoutingEnabled = true;
+    bool needsNodeInfoBroadcast = false;
+    uint32_t lastTopologyReplyMs = 0;
+    static constexpr uint32_t TOPOLOGY_REPLY_THROTTLE_MS = 60 * 1000;
     bool topologyDirty = false; // Set when topology changes; log dump deferred to runOnce
     uint32_t lastBroadcast = 0;
     uint8_t currentTopologyVersion = 0;
@@ -83,7 +87,7 @@ private:
     bool isSignalBasedCapable(NodeNum nodeId) const;
     float getDirectNeighborsSignalActivePercentage() const;
     void collectNeighborsForBroadcast(meshtastic_SignalNeighbor *outNeighbors, uint8_t &outCount, uint8_t maxCount);
-    void sendTopologyPacket(NodeNum dest, const meshtastic_SignalNeighbor *neighbors, uint8_t count, uint8_t topologyVersion = 0);
+    void sendTopologyPacket(NodeNum dest, const meshtastic_SignalNeighbor *neighbors, uint8_t count, uint8_t topologyVersion = 0, bool wantResponse = false);
     void buildSignalRoutingInfo(meshtastic_SignalRoutingInfo &info);
 
     enum class CapabilityStatus : uint8_t {
@@ -154,7 +158,9 @@ private:
     void rememberRelayIdentity(NodeNum nodeId, uint8_t relayId);
     void pruneRelayIdentityCache(uint32_t nowMs);
     NodeNum resolveRelayIdentity(uint8_t relayId) const;
+public:
     NodeNum resolveHeardFrom(const meshtastic_MeshPacket *p, NodeNum sourceNode) const;
+private:
     static uint64_t makeSpeculativeKey(NodeNum origin, uint32_t packetId);
     uint32_t getNodeLastActivityTime(NodeNum nodeId) const;
     bool isActiveRoutingRole() const;
@@ -182,13 +188,18 @@ private:
 
     // Committed relay tracking — prevents dupe cancellation of SR relay decisions
     static constexpr size_t MAX_COMMITTED_RELAYS = 8;
-    PacketId committedRelays[MAX_COMMITTED_RELAYS] = {};
+    struct CommittedRelay {
+        PacketId packetId = 0;
+        NodeNum originalHeardFrom = 0;
+    };
+    CommittedRelay committedRelays[MAX_COMMITTED_RELAYS];
     uint8_t committedRelayCount = 0;
 
 public:
-    void commitRelay(PacketId packetId);
+    void commitRelay(PacketId packetId, NodeNum originalHeardFrom);
     bool isCommittedRelay(PacketId packetId) const;
     void clearCommittedRelay(PacketId packetId);
+    bool isDupeRelayRedundant(const meshtastic_MeshPacket *p);
 };
 
 extern SignalRoutingModule *signalRoutingModule;

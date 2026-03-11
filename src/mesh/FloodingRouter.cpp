@@ -144,10 +144,16 @@ bool FloodingRouter::roleAllowsCancelingDupe(const meshtastic_MeshPacket *p)
 
 void FloodingRouter::perhapsCancelDupe(const meshtastic_MeshPacket *p)
 {
-    // If SR committed to relay this packet, don't cancel — our relay decision takes priority over dupes
+    // If SR committed to relay this packet, check if the dupe relayer already covers our nodes
     if (signalRoutingModule && signalRoutingModule->isCommittedRelay(p->id)) {
-        LOG_DEBUG("[SR] Not canceling committed relay for 0x%08x despite dupe", p->id);
-        return;
+        if (signalRoutingModule->isDupeRelayRedundant(p)) {
+            LOG_INFO("[SR] Canceling committed relay for 0x%08x - dupe relayer covers our nodes", p->id);
+            signalRoutingModule->clearCommittedRelay(p->id);
+            // Fall through to normal cancel logic
+        } else {
+            LOG_DEBUG("[SR] Not canceling committed relay for 0x%08x - we have unique coverage", p->id);
+            return;
+        }
     }
 
     if (p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA && roleAllowsCancelingDupe(p)) {
