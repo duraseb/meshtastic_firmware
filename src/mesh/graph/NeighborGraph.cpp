@@ -1171,9 +1171,14 @@ bool NeighborGraph::shouldRelayEnhanced(NodeNum myNode, NodeNum sourceNode, Node
         return false;
     }
 
+    // No relay candidates had unique coverage — check if WE have unique coverage
     const NodeEdges *myEdges = findNeighbor(myNode);
-    if (myEdges && myEdges->edgeCount > 0) {
-        return true;
+    if (myEdges) {
+        for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+            if (!alreadyCovered.contains(myEdges->edges[i].to)) {
+                return true;
+            }
+        }
     }
 
     return false;

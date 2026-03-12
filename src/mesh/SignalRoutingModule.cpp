@@ -156,10 +156,18 @@ int32_t SignalRoutingModule::runOnce()
         timeToBroadcast = (SIGNAL_ROUTING_BROADCAST_SECS * 1000) - (nowMs - lastBroadcast);
     }
 
-    // Process unicast relay contention windows
+    // Process relay contention windows (unicast and broadcast)
     processContentionWindows(nowMs);
 
     uint32_t nextDelay = timeToBroadcast;
+
+    // If contention checks are pending, wake up in time to process them
+    for (uint8_t i = 0; i < contentionCheckCount; i++) {
+        uint32_t remaining = (nowMs < contentionChecks[i].expiryMs) ? (contentionChecks[i].expiryMs - nowMs) : 0;
+        if (remaining < nextDelay)
+            nextDelay = remaining;
+    }
+
     if (nextDelay < 20) {
         nextDelay = 20;
     }
@@ -998,13 +1006,20 @@ bool SignalRoutingModule::shouldRelayForStockNeighbors(NodeNum myNode, NodeNum s
         // Also check if heardFrom (relaying SR node) can reach them directly
         bool heardDirectly = false;
 
+        // If the stock neighbor IS the relay node, it obviously heard the packet
+        if (stockNeighbor == heardFrom || stockNeighbor == sourceNode) {
+            heardDirectly = true;
+        }
+
         // Check if original source can reach stock neighbor
-        const NodeEdges* sourceEdges = routingGraph->getEdgesFrom(sourceNode);
-        if (sourceEdges) {
-            for (uint8_t i = 0; i < sourceEdges->edgeCount; i++) {
-                if (sourceEdges->edges[i].to == stockNeighbor) {
-                    heardDirectly = true;
-                    break;
+        if (!heardDirectly) {
+            const NodeEdges* sourceEdges = routingGraph->getEdgesFrom(sourceNode);
+            if (sourceEdges) {
+                for (uint8_t i = 0; i < sourceEdges->edgeCount; i++) {
+                    if (sourceEdges->edges[i].to == stockNeighbor) {
+                        heardDirectly = true;
+                        break;
+                    }
                 }
             }
         }
@@ -1547,7 +1562,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
 
     if (myNextHop == 0) {
         // I don't have a route to the destination, so I can't be part of the relay chain
-        LOG_DEBUG("[SR] UNICAST RELAY: No route to %s - cannot participate in relay coordination", destName);
+        LOG_INFO("[SR-DECISION] UNICAST SUPPRESS: to %s, no route via SR topology", destName);
         return false;
     }
 
@@ -1561,7 +1576,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     if (sourceRelay != 0 && sourceRelay == destRelay && sourceRelay != myNode) {
         char relayName[64];
         getNodeDisplayName(sourceRelay, relayName, sizeof(relayName));
-        LOG_DEBUG("[SR] UNICAST RELAY: Source and destination both downstream of %s - not our relay path", relayName);
+        LOG_INFO("[SR-DECISION] UNICAST SUPPRESS: to %s, src and dst both downstream of %s", destName, relayName);
         return false;
     }
 
@@ -1586,16 +1601,14 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
                                     routingGraph->getDownstreamRelay(destination) == heardFrom;
         }
         if (heardFromCanReachDest) {
-            LOG_DEBUG("[SR] UNICAST RELAY: heardFrom %s can reach destination %s directly - no relay needed",
-                     heardFromName, destName);
+            LOG_INFO("[SR-DECISION] UNICAST SUPPRESS: to %s, heardFrom %s can reach dst directly", destName, heardFromName);
             return false;
         }
 
         // If heardFrom is a stock node, its edges may be incomplete in our graph.
         // Check if an SR neighbor that also hears heardFrom can reach the destination.
         if (!heardFromCanReachDest && hasBetterPositionedSRNeighbor(myNode, heardFrom, destination)) {
-            LOG_DEBUG("[SR] UNICAST RELAY: SR neighbor that hears %s can reach %s - no relay needed",
-                     heardFromName, destName);
+            LOG_INFO("[SR-DECISION] UNICAST SUPPRESS: to %s, SR neighbor covering %s can reach dst", destName, heardFromName);
             return false;
         }
     }
@@ -1603,7 +1616,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     // If next hop IS the destination, it means destination is a direct neighbor.
     // We should deliver directly, not wait for destination to "relay to itself".
     if (myNextHop == destination) {
-        LOG_INFO("[SR] UNICAST RELAY: Destination %s is direct neighbor - delivering directly", destName);
+        LOG_INFO("[SR-DECISION] UNICAST RELAY: to %s, dst is direct neighbor", destName);
         return true;
     }
 
@@ -1620,12 +1633,11 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
                 routingGraph->getEdgesFrom(relayForDest) != nullptr) {
                 char relayName[64];
                 getNodeDisplayName(relayForDest, relayName, sizeof(relayName));
-                LOG_DEBUG("[SR] UNICAST RELAY: Relay byte 0x%02x matches direct neighbor %s (downstream relay for %s) - already relayed",
-                         p->relay_node, relayName, destName);
+                LOG_INFO("[SR-DECISION] UNICAST SUPPRESS: to %s, relay 0x%02x = %s already relayed toward dst", destName, p->relay_node, relayName);
                 return false;
             }
         }
-        LOG_INFO("[SR] UNICAST RELAY: I am the next hop to %s - relaying unicast", destName);
+        LOG_INFO("[SR-DECISION] UNICAST RELAY: to %s, we are next hop", destName);
         return true;
     }
 
@@ -1640,9 +1652,8 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         receivedFromNextHop = true;
     }
     if (receivedFromNextHop) {
-        LOG_DEBUG("[SR] UNICAST RELAY: Received from next hop %s who can reach %s - destination should have it",
-                 nextHopName, destName);
-        return false;  // Next hop already transmitted, destination should have received it
+        LOG_INFO("[SR-DECISION] UNICAST SUPPRESS: to %s, received from next hop %s who can reach dst", destName, nextHopName);
+        return false;
     }
 
     // Check if heardFrom is ALSO a relay for the destination.
@@ -1652,8 +1663,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     if (heardFrom != 0 && heardFrom != sourceNode) {
         NodeNum relayForDest = routingGraph->getDownstreamRelay(destination);
         if (relayForDest == heardFrom) {
-            LOG_DEBUG("[SR] UNICAST RELAY: Received from relay %s which leads to %s - no relay needed",
-                     heardFromName, destName);
+            LOG_INFO("[SR-DECISION] UNICAST SUPPRESS: to %s, heardFrom %s is relay for dst", destName, heardFromName);
             return false;
         }
     }
@@ -1663,8 +1673,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
             routingGraph->getEdgesFrom(relayForDest) != nullptr) {
             char relayName[64];
             getNodeDisplayName(relayForDest, relayName, sizeof(relayName));
-            LOG_DEBUG("[SR] UNICAST RELAY: Relay byte 0x%02x matches direct neighbor %s (downstream relay for %s) - no relay needed",
-                     p->relay_node, relayName, destName);
+            LOG_INFO("[SR-DECISION] UNICAST SUPPRESS: to %s, relay 0x%02x = %s is downstream relay for dst", destName, p->relay_node, relayName);
             return false;
         }
     }
@@ -1693,8 +1702,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         // Can't verify stock/placeholder gateway heard the transmitter
         // If we heard directly from the source, we should relay ourselves
         if (heardFrom == sourceNode) {
-            LOG_INFO("[SR] UNICAST RELAY: Cannot verify stock gateway %s heard source %s - relaying",
-                    nextHopName, heardFromName);
+            LOG_INFO("[SR-DECISION] UNICAST RELAY: to %s, stock gateway %s can't verify hearing src %s", destName, nextHopName, heardFromName);
             return true;
         }
         // If we heard from an intermediate relayer, still be conservative for stock gateways
@@ -1714,7 +1722,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         NodeNum opportunisticNextHop = getNextHop(destination, sourceNode, heardFrom, true);
         if (opportunisticNextHop != 0 && opportunisticNextHop != myNextHop) {
             if (opportunisticNextHop == myNode || opportunisticNextHop == destination) {
-                LOG_INFO("[SR] UNICAST RELAY: Using opportunistic routing - delivering to %s", destName);
+                LOG_INFO("[SR-DECISION] UNICAST RELAY: to %s, opportunistic routing (primary excluded)", destName);
                 return true;
             }
             // Check if opportunistic next hop can hear transmitter
@@ -1723,14 +1731,13 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
             if (oppCanHear && !hasNodeBeenExcludedFromRelay(opportunisticNextHop, p->id)) {
                 char oppName[64];
                 getNodeDisplayName(opportunisticNextHop, oppName, sizeof(oppName));
-                LOG_DEBUG("[SR] UNICAST RELAY: Waiting for opportunistic next hop %s", oppName);
+                LOG_INFO("[SR-DECISION] UNICAST DEFER: to %s, waiting for opportunistic next hop %s", destName, oppName);
                 scheduleContentionWindowCheck(opportunisticNextHop, p->id, destination, p);
                 return false;
             }
         }
 
-        // No valid alternative found - we should relay ourselves as last resort
-        LOG_INFO("[SR] UNICAST RELAY: No alternative candidates - relaying to %s ourselves", destName);
+        LOG_INFO("[SR-DECISION] UNICAST RELAY: to %s, no alternative candidates (last resort)", destName);
         return true;
     }
 
@@ -1746,7 +1753,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
 
     // I'm not the next hop, so I should wait for the next hop node to relay
     // This is the contention window waiting period like broadcasts
-    LOG_DEBUG("[SR] UNICAST RELAY: Waiting for next hop %s to relay to %s", nextHopName, destName);
+    LOG_INFO("[SR-DECISION] UNICAST DEFER: to %s, waiting for next hop %s CW", destName, nextHopName);
 
     // Set up contention window monitoring - if next hop doesn't relay within timeout, exclude it
     scheduleContentionWindowCheck(myNextHop, p->id, destination, p);
@@ -1917,10 +1924,10 @@ bool SignalRoutingModule::shouldRelay(const meshtastic_MeshPacket *p)
         // If the node exists in NodeDB, fall back to broadcast-style relay
         // This handles legacy/stock nodes not in the SR graph
         if (nodeDB->getMeshNode(p->to)) {
-            LOG_INFO("[SR] Unicast to %s not routable via SR, relaying as known NodeDB node", destName);
+            LOG_INFO("[SR-DECISION] UNICAST RELAY: to %s, not routable via SR but known in NodeDB", destName);
             return true;
         }
-        LOG_DEBUG("[SR] Not relaying unicast to unknown destination %s", destName);
+        LOG_INFO("[SR-DECISION] UNICAST SUPPRESS: to %s, unknown destination", destName);
         return false;
     }
 
@@ -1956,8 +1963,8 @@ bool SignalRoutingModule::shouldRelay(const meshtastic_MeshPacket *p)
             if (nextHopHeardFromSource) {
                 char nextHopName[64];
                 getNodeDisplayName(nextHop, nextHopName, sizeof(nextHopName));
-                LOG_DEBUG("[SR] Unicast: next hop %s already heard from source %s - no relay needed",
-                         nextHopName, senderName);
+                LOG_INFO("[SR-DECISION] UNICAST SUPPRESS: to %s, next hop %s already heard source %s",
+                         destName, nextHopName, senderName);
                 return false;
             }
         }
@@ -2063,7 +2070,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     // Relay override: force relay if we are the recorded relay for source OR destination
     if (!shouldRelay && (weAreRelayForSource || weAreRelayForDest)) {
         NodeNum forcedFor = weAreRelayForSource ? sourceNode : p->to;
-        LOG_INFO("[SR] We are relay for %08x (downstream=%u) -> force relay", forcedFor, static_cast<unsigned int>(downstreamCount));
+        LOG_INFO("[SR-DECISION] BROADCAST RELAY (forced): we are relay for %08x (downstream=%u)", forcedFor, static_cast<unsigned int>(downstreamCount));
         shouldRelay = true;
     }
 
@@ -2077,13 +2084,13 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         // Check if stock nodes need guaranteed coverage
         bool stockCoverageNeeded = shouldRelayForStockNeighbors(myNode, sourceNode, heardFrom, relayDecisionTime);
         if (stockCoverageNeeded) {
-            LOG_INFO("[SR] UNIFIED COVERAGE: SR coordination declined relay, but stock nodes require guaranteed coverage");
+            LOG_INFO("[SR-DECISION] BROADCAST RELAY: SR declined but stock nodes need guaranteed coverage");
             shouldRelay = true;
         } else {
-            LOG_DEBUG("[SR] UNIFIED COVERAGE: No relay needed - SR coordination satisfied and stock nodes covered");
+            LOG_DEBUG("[SR] Rationale: SR coordination satisfied and stock nodes covered");
         }
     } else {
-        LOG_DEBUG("[SR] UNIFIED COVERAGE: Relay required by SR coordination");
+        LOG_DEBUG("[SR] Rationale: SR coordination requires relay");
     }
 
     char myName[64], sourceName[64], heardFromName[64];
@@ -2095,11 +2102,32 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         "SR coordination requires relay" :
         "Stock coverage requires relay";
 
-    LOG_INFO("[SR] Broadcast from %s (heard via %s): %s relay (%s)",
-             sourceName, heardFromName, shouldRelay ? "SHOULD" : "should NOT",
-             shouldRelay ? decisionReason : "No relay needed");
+    LOG_INFO("[SR-DECISION] BROADCAST %s: from %s via %s (%s)",
+             shouldRelay ? "RELAY" : "SUPPRESS", sourceName, heardFromName,
+             shouldRelay ? decisionReason : "no unique coverage");
 
     if (shouldRelay) {
+        // Check if we have stock router direct neighbors that might relay faster
+        // If so, defer our relay to let them go first, then re-evaluate coverage
+        NodeNum stockRouterRelay = 0;
+        const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
+        if (myEdges) {
+            for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+                NodeNum neighbor = myEdges->edges[i].to;
+                if (neighbor != heardFrom && neighbor != sourceNode && isLegacyRouter(neighbor)) {
+                    stockRouterRelay = neighbor;
+                    break;
+                }
+            }
+        }
+
+        if (stockRouterRelay != 0) {
+            // Defer relay: wait for stock router's CW, then re-evaluate coverage
+            LOG_INFO("[SR-DECISION] BROADCAST DEFER: pkt %08x, waiting for stock router %08x CW", p->id, stockRouterRelay);
+            scheduleContentionWindowCheck(stockRouterRelay, p->id, NODENUM_BROADCAST, p);
+            return false;
+        }
+
         routingGraph->recordNodeTransmission(myNode, p->id, currentTime);
     }
 
@@ -3263,14 +3291,116 @@ void SignalRoutingModule::processContentionWindows(uint32_t nowMs)
             LOG_DEBUG("[SR] Contention window expired for relay %s on packet %08x to %s - excluding from future attempts",
                      relayName, check.packetId, destName);
 
-            // Re-evaluate: find next best candidate or relay ourselves
-            bool shouldRelayNow = evaluateContentionExpiry(check, myNode);
+            bool shouldRelayNow = false;
 
-            if (shouldRelayNow && check.hopLimit > 0 && check.packetCopy) {
-                LOG_INFO("[SR] Contention re-evaluation: relaying packet %08x to %s ourselves", check.packetId, destName);
-                queueUnicastRelay(check);
-                // queueUnicastRelay takes ownership of packetCopy
-                check.packetCopy = nullptr;
+            if (isBroadcast(check.destination)) {
+                // Broadcast contention: expected relay's CW expired
+                bool expectedRelayed = routingGraph->hasNodeTransmitted(check.expectedRelay, check.packetId, nowMs / 1000);
+
+                if (expectedRelayed) {
+                    // Expected relay transmitted — check if we still have unique coverage
+                    // Build combined coverage from transmitter + all confirmed relayers
+                    NodeSet alreadyCovered;
+                    alreadyCovered.clear();
+
+                    // Add heardFrom's coverage
+                    const NodeEdges *heardFromEdges = routingGraph->getEdgesFrom(check.heardFrom);
+                    if (heardFromEdges) {
+                        for (uint8_t e = 0; e < heardFromEdges->edgeCount; e++)
+                            alreadyCovered.insert(heardFromEdges->edges[e].to);
+                    }
+                    alreadyCovered.insert(check.heardFrom);
+
+                    // Add coverage from all stock router/repeater neighbors that relayed
+                    const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
+                    if (myEdges) {
+                        for (uint8_t e = 0; e < myEdges->edgeCount; e++) {
+                            NodeNum neighbor = myEdges->edges[e].to;
+                            if (isLegacyRouter(neighbor) &&
+                                routingGraph->hasNodeTransmitted(neighbor, check.packetId, nowMs / 1000)) {
+                                alreadyCovered.insert(neighbor);
+                                const NodeEdges *neighborEdges = routingGraph->getEdgesFrom(neighbor);
+                                if (neighborEdges) {
+                                    for (uint8_t j = 0; j < neighborEdges->edgeCount; j++)
+                                        alreadyCovered.insert(neighborEdges->edges[j].to);
+                                }
+                            }
+                        }
+                    }
+
+                    // Check if we have any unique coverage
+                    if (myEdges) {
+                        for (uint8_t e = 0; e < myEdges->edgeCount; e++) {
+                            if (!alreadyCovered.contains(myEdges->edges[e].to)) {
+                                shouldRelayNow = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (shouldRelayNow) {
+                        LOG_INFO("[SR-DECISION] BROADCAST RELAY: pkt %08x, %s relayed but we have unique coverage",
+                                 check.packetId, relayName);
+                    } else {
+                        LOG_INFO("[SR-DECISION] BROADCAST SUPPRESS: pkt %08x, %s relayed and covers our nodes",
+                                  check.packetId, relayName);
+                    }
+                } else {
+                    // Expected relay did NOT transmit — exclude it and find next candidate
+                    LOG_INFO("[SR-DECISION] BROADCAST RE-EVAL: pkt %08x, %s did not relay - finding next candidate",
+                              check.packetId, relayName);
+
+                    // Find the next stock router/repeater neighbor that hasn't been excluded
+                    NodeNum nextCandidate = 0;
+                    const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
+                    if (myEdges) {
+                        for (uint8_t e = 0; e < myEdges->edgeCount; e++) {
+                            NodeNum neighbor = myEdges->edges[e].to;
+                            if (neighbor != check.heardFrom && neighbor != check.sourceNode &&
+                                isLegacyRouter(neighbor) &&
+                                !hasNodeBeenExcludedFromRelay(neighbor, check.packetId)) {
+                                nextCandidate = neighbor;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (nextCandidate != 0 && check.packetCopy) {
+                        // Wait for the next stock router candidate
+                        char nextName[64];
+                        getNodeDisplayName(nextCandidate, nextName, sizeof(nextName));
+                        LOG_INFO("[SR-DECISION] BROADCAST DEFER: pkt %08x, waiting for next stock router %s", check.packetId, nextName);
+                        scheduleContentionWindowCheck(nextCandidate, check.packetId, NODENUM_BROADCAST, check.packetCopy);
+                    } else {
+                        // No more stock routers — re-run SR relay decision
+                        uint32_t relayDecisionTime = nowMs / 1000;
+                        shouldRelayNow = routingGraph->shouldRelayEnhanced(myNode, check.sourceNode, check.heardFrom,
+                                                                            relayDecisionTime, check.packetId, relayDecisionTime);
+                        if (shouldRelayNow) {
+                            LOG_INFO("[SR-DECISION] BROADCAST RELAY: pkt %08x, no more stock routers, SR has unique coverage", check.packetId);
+                        } else {
+                            LOG_INFO("[SR-DECISION] BROADCAST SUPPRESS: pkt %08x, no more stock routers, no unique coverage", check.packetId);
+                        }
+                    }
+                }
+
+                if (shouldRelayNow && check.hopLimit > 0 && check.packetCopy) {
+                    meshtastic_MeshPacket *tosend = check.packetCopy;
+                    check.packetCopy = nullptr;
+                    routingGraph->recordNodeTransmission(myNode, check.packetId, nowMs / 1000);
+                    commitRelay(check.packetId, check.heardFrom);
+                    router->send(tosend);
+                }
+            } else {
+                // Unicast contention: existing logic
+                shouldRelayNow = evaluateContentionExpiry(check, myNode);
+
+                if (shouldRelayNow && check.hopLimit > 0 && check.packetCopy) {
+                    LOG_INFO("[SR-DECISION] UNICAST RELAY: pkt %08x to %s, CW expired for %s", check.packetId, destName, relayName);
+                    queueUnicastRelay(check);
+                    // queueUnicastRelay takes ownership of packetCopy
+                    check.packetCopy = nullptr;
+                }
             }
 
             // Free packet copy if not consumed by relay
