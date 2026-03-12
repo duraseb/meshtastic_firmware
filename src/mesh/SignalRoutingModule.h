@@ -179,6 +179,7 @@ private:
     void replaceGatewayNode(NodeNum oldNode, NodeNum newNode);
     bool isPlaceholderConnectedToUs(NodeNum placeholderId) const;
     bool shouldRelayForStockNeighbors(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom, uint32_t currentTime);
+    bool hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum heardFrom, NodeNum destination = 0);
     bool isDownstreamOfHeardRelay(NodeNum destination, NodeNum myNode);
     uint32_t getNodeTtlSeconds(CapabilityStatus status) const;
     bool isNodeRoutable(NodeNum nodeId) const;

@@ -832,6 +832,132 @@ bool SignalRoutingModule::isPlaceholderConnectedToUs(NodeNum placeholderId) cons
     return false;
 }
 
+bool SignalRoutingModule::hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum heardFrom, NodeNum destination)
+{
+    if (!routingGraph || heardFrom == 0 || heardFrom == myNode)
+        return false;
+
+    const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
+    if (!myEdges)
+        return false;
+
+    for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+        NodeNum neighbor = myEdges->edges[i].to;
+        if (neighbor == heardFrom || neighbor == myNode || isPlaceholderNode(neighbor))
+            continue;
+
+        // Only consider SR-active neighbors
+        CapabilityStatus status = getCapabilityStatus(neighbor);
+        if (status != CapabilityStatus::SRactive)
+            continue;
+
+        const NodeEdges *neighborEdges = routingGraph->getEdgesFrom(neighbor);
+        if (!neighborEdges)
+            continue;
+
+        // Check if this SR neighbor also has heardFrom as a neighbor
+        bool neighborHearsSource = false;
+        for (uint8_t j = 0; j < neighborEdges->edgeCount; j++) {
+            if (neighborEdges->edges[j].to == heardFrom) {
+                neighborHearsSource = true;
+                break;
+            }
+        }
+        if (!neighborHearsSource)
+            continue;
+
+        // For unicasts, also check if the neighbor can reach the destination
+        if (destination != 0) {
+            bool canReachDest = false;
+            for (uint8_t j = 0; j < neighborEdges->edgeCount; j++) {
+                if (neighborEdges->edges[j].to == destination) {
+                    canReachDest = true;
+                    break;
+                }
+            }
+            if (!canReachDest) {
+                // Check if destination is downstream of this neighbor (in piko's table)
+                canReachDest = routingGraph->isDownstream(destination) &&
+                               routingGraph->getDownstreamRelay(destination) == neighbor;
+            }
+            if (!canReachDest) {
+                // Check if this neighbor has a route to the destination via its own neighbors
+                // (destination is a neighbor-of-neighbor, i.e. the neighbor can relay to reach it)
+                for (uint8_t j = 0; j < neighborEdges->edgeCount; j++) {
+                    NodeNum neighborOfNeighbor = neighborEdges->edges[j].to;
+                    if (neighborOfNeighbor == myNode || neighborOfNeighbor == heardFrom)
+                        continue;
+                    const NodeEdges *nnEdges = routingGraph->getEdgesFrom(neighborOfNeighbor);
+                    if (nnEdges) {
+                        for (uint8_t k = 0; k < nnEdges->edgeCount; k++) {
+                            if (nnEdges->edges[k].to == destination) {
+                                canReachDest = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (canReachDest)
+                        break;
+                    // Also check if destination is downstream of the neighbor's neighbor
+                    if (routingGraph->isDownstream(destination) &&
+                        routingGraph->getDownstreamRelay(destination) == neighborOfNeighbor) {
+                        canReachDest = true;
+                        break;
+                    }
+                }
+            }
+            if (!canReachDest)
+                continue;
+        }
+
+        // For unicasts: the SR neighbor hears the source and can reach the destination — sufficient
+        if (destination != 0) {
+            char neighborName[64];
+            getNodeDisplayName(neighbor, neighborName, sizeof(neighborName));
+            LOG_DEBUG("[SR] SR neighbor %s hears %08x and can reach destination - no relay needed",
+                     neighborName, heardFrom);
+            return true;
+        }
+
+        // For broadcasts: build a combined coverage set from the transmitter and the SR neighbor.
+        // If piko has any neighbor not in that set, piko has unique coverage and should still relay.
+        NodeSet coveredNodes;
+        coveredNodes.insert(heardFrom);
+        coveredNodes.insert(neighbor);
+
+        // Add all nodes covered by the transmitter
+        const NodeEdges *transmitterEdges = routingGraph->getEdgesFrom(heardFrom);
+        if (transmitterEdges) {
+            for (uint8_t j = 0; j < transmitterEdges->edgeCount; j++)
+                coveredNodes.insert(transmitterEdges->edges[j].to);
+        }
+        // Add all nodes covered by the SR neighbor
+        for (uint8_t j = 0; j < neighborEdges->edgeCount; j++)
+            coveredNodes.insert(neighborEdges->edges[j].to);
+
+        // Check if piko has any neighbor not in the combined coverage set
+        bool pikoHasUniqueCoverage = false;
+        for (uint8_t m = 0; m < myEdges->edgeCount; m++) {
+            NodeNum myNeighbor = myEdges->edges[m].to;
+            if (isPlaceholderNode(myNeighbor))
+                continue;
+            if (!coveredNodes.contains(myNeighbor)) {
+                pikoHasUniqueCoverage = true;
+                break;
+            }
+        }
+
+        if (!pikoHasUniqueCoverage) {
+            char neighborName[64];
+            getNodeDisplayName(neighbor, neighborName, sizeof(neighborName));
+            LOG_DEBUG("[SR] SR neighbor %s also hears %08x and covers all our unique neighbors",
+                     neighborName, heardFrom);
+            return true;
+        }
+    }
+    return false;
+}
+
 bool SignalRoutingModule::shouldRelayForStockNeighbors(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom, uint32_t currentTime)
 {
     if (!routingGraph) {
@@ -1464,6 +1590,14 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
                      heardFromName, destName);
             return false;
         }
+
+        // If heardFrom is a stock node, its edges may be incomplete in our graph.
+        // Check if an SR neighbor that also hears heardFrom can reach the destination.
+        if (!heardFromCanReachDest && hasBetterPositionedSRNeighbor(myNode, heardFrom, destination)) {
+            LOG_DEBUG("[SR] UNICAST RELAY: SR neighbor that hears %s can reach %s - no relay needed",
+                     heardFromName, destName);
+            return false;
+        }
     }
 
     // If next hop IS the destination, it means destination is a direct neighbor.
@@ -1903,12 +2037,14 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         }
     }
 
-    // Key insight: If packet comes from a stock gateway, we MUST relay it within the branch
-    // to ensure all local nodes receive packets from outside the branch
-    bool mustRelayForBranchCoverage = heardFromStockGateway;
+    bool mustRelayForBranchCoverage = false;
 
     if (heardFromStockGateway) {
-        LOG_DEBUG("[SR] Packet from stock gateway %08x - prioritizing branch distribution", heardFrom);
+        LOG_DEBUG("[SR] Packet from stock gateway %08x - checking if SR neighbors also heard it", heardFrom);
+        if (!hasBetterPositionedSRNeighbor(myNode, heardFrom)) {
+            mustRelayForBranchCoverage = true;
+            LOG_DEBUG("[SR] No better-positioned SR neighbor for stock gateway %08x - must relay", heardFrom);
+        }
     }
 
     bool shouldRelay = routingGraph->shouldRelayEnhanced(myNode, sourceNode, heardFrom, relayDecisionTime, p->id, packetReceivedTimestamp);
