@@ -1439,6 +1439,33 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         return false;
     }
 
+    // If we heard the packet from a node that can reach the destination (as a direct neighbor
+    // or downstream node), that node already has the packet and can deliver it — we don't need
+    // to relay back into that branch.
+    if (heardFrom != 0 && heardFrom != myNode && heardFrom != sourceNode) {
+        // Check if destination is a direct neighbor of heardFrom
+        const NodeEdges *heardFromEdges = routingGraph->getEdgesFrom(heardFrom);
+        bool heardFromCanReachDest = false;
+        if (heardFromEdges) {
+            for (uint8_t i = 0; i < heardFromEdges->edgeCount; i++) {
+                if (heardFromEdges->edges[i].to == destination) {
+                    heardFromCanReachDest = true;
+                    break;
+                }
+            }
+        }
+        // Also check if destination is downstream of heardFrom
+        if (!heardFromCanReachDest) {
+            heardFromCanReachDest = routingGraph->isDownstream(destination) &&
+                                    routingGraph->getDownstreamRelay(destination) == heardFrom;
+        }
+        if (heardFromCanReachDest) {
+            LOG_DEBUG("[SR] UNICAST RELAY: heardFrom %s can reach destination %s directly - no relay needed",
+                     heardFromName, destName);
+            return false;
+        }
+    }
+
     // If next hop IS the destination, it means destination is a direct neighbor.
     // We should deliver directly, not wait for destination to "relay to itself".
     if (myNextHop == destination) {
