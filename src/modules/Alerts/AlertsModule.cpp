@@ -2688,7 +2688,7 @@ bool AlertsModule::broadcastInfoMessage()
     String encryptionKey = getChannelEncryptionKey();
 
     // Format the message according to the template
-    String message = "Otrzymuj alerty, powiadomienia, informacje lokalne: dodaj kanał ";
+    String message = "Otrzymuj alerty i powiadomienia o zagrożeniach ogólnopolskich (RCB, IMGW, itp.): dodaj kanał ";
     message += channelName;
     if (encryptionKey.length() > 0) {
         message += ", klucz: ";
