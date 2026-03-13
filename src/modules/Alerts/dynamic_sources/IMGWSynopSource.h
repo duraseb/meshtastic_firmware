@@ -18,6 +18,7 @@ public:
 
     String getSourceId() const override { return "SYNOP"; }
     String getFetchUrl() const override;
+    String getChannelName() const override { return "PoznanEvent"; }
     unsigned long getFetchIntervalMs() const override;
 
     String fetchAndFormat(
