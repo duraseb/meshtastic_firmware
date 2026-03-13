@@ -1897,7 +1897,26 @@ int32_t AlertsModule::runOnce()
 
         case ModuleState::FETCHING_DYNAMIC: {
             DynamicSource* source = dynamicSources[currentDynamicSourceIndex];
-            LOG_INFO("Fetching data from dynamic source [%s]...", source->getSourceId().c_str());
+            static unsigned long lastAiWeatherFetchLogMs = 0;
+            static unsigned long lastAiWeatherPreparingLogMs = 0;
+            static String lastLoggedDynamicSource;
+            const bool isAiWeatherSource = source->getSourceId() == "AI_WEATHER";
+            const unsigned long now = millis();
+
+            if (!isAiWeatherSource || (lastLoggedDynamicSource != source->getSourceId())) {
+                LOG_INFO("Fetching data from dynamic source [%s]...", source->getSourceId().c_str());
+                lastLoggedDynamicSource = source->getSourceId();
+            } else if (now - lastAiWeatherFetchLogMs > 30000UL) {
+                LOG_DEBUG("[AlertsModule] Fetching data from dynamic source [%s]...", source->getSourceId().c_str());
+                lastAiWeatherFetchLogMs = now;
+            }
+
+            bool sourceAsyncInProgress = false;
+            AiWeatherSource* aiSource = nullptr;
+            if (source->getSourceId() == "AI_WEATHER") {
+                aiSource = static_cast<AiWeatherSource *>(source);
+                sourceAsyncInProgress = aiSource != nullptr && aiSource->isAsyncFetchInProgress();
+            }
 
             // Create HTTP GET callback for the source to use
             auto httpGetCallback = [this](const char* url, int& httpCode) -> String {
@@ -1908,14 +1927,39 @@ int32_t AlertsModule::runOnce()
             String message = source->fetchAndFormat(httpGetCallback);
             feedWatchdog();
 
-            // Update last fetch time for this source
-            dynamicSourceLastFetchTime[currentDynamicSourceIndex] = currentMillis;
-
             if (message.length() == 0) {
-                LOG_WARN("No data from dynamic source %s", source->getSourceId().c_str());
-                transitionToState(ModuleState::IDLE, "dynamic source empty response");
-                return ALERT_PROCESSING_YIELD_MS;
+                // If async work is still running, wait and retry on next loop tick.
+                if (sourceAsyncInProgress || (aiSource != nullptr && aiSource->isAsyncFetchInProgress())) {
+                    if (isAiWeatherSource) {
+                        if (now - lastAiWeatherPreparingLogMs > 30000UL) {
+                            LOG_DEBUG("Dynamic source %s is still preparing data in background", source->getSourceId().c_str());
+                            lastAiWeatherPreparingLogMs = now;
+                        }
+                    } else {
+                        LOG_DEBUG("Dynamic source %s is still preparing data in background", source->getSourceId().c_str());
+                    }
+                    return ALERT_PROCESSING_YIELD_MS;
+                }
+
+                // Handle race when async completion happens between source status checks.
+                if (aiSource != nullptr && aiSource->isAsyncFetchReady()) {
+                    LOG_INFO("AI source [%s] became ready after initial fetch call; retrying once to consume async result",
+                             source->getSourceId().c_str());
+                    message = source->fetchAndFormat(httpGetCallback);
+                    feedWatchdog();
+                }
+
+                if (message.length() == 0) {
+                    // Update last fetch time for this source only when no async background work is pending
+                    dynamicSourceLastFetchTime[currentDynamicSourceIndex] = currentMillis;
+                    LOG_WARN("No data from dynamic source %s", source->getSourceId().c_str());
+                    transitionToState(ModuleState::IDLE, "dynamic source empty response");
+                    return ALERT_PROCESSING_YIELD_MS;
+                }
             }
+
+            // Update last fetch time for successful fetch
+            dynamicSourceLastFetchTime[currentDynamicSourceIndex] = currentMillis;
 
             // Send immediately to mesh (no storage, no resending)
             String sourceChannel = source->getChannelName();
