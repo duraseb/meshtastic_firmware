@@ -2810,7 +2810,7 @@ void AlertsModule::broadcastProviderInfo(const String& sourceId, const String& m
 
     p->from = nodeDB->getNodeNum();
     service->sendToMesh(p, RX_SRC_LOCAL, true);
-    LOG_INFO("[Alerts] Broadcast provider info from %s (%d bytes)", sourceId.c_str(), payloadBytes);
+    LOG_INFO("[Alerts] Broadcast provider info from %s (%d bytes): %s", sourceId.c_str(), payloadBytes, fullMsg.c_str());
 }
 
 #endif // HAS_ALERTING

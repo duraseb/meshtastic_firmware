@@ -169,8 +169,9 @@ String AiWeatherSource::fetchAndFormat(
             continue;
         }
 
-        if (message.length() > MAX_MESSAGE_BYTES) {
-            LOG_WARN("[AiWeatherSource] Weather forecast from [%s] too long (%d > %d bytes), trying next provider...", provider.name.c_str(), message.length(), MAX_MESSAGE_BYTES);
+        if (message.length() > meshtastic_Constants_DATA_PAYLOAD_LEN) {
+            LOG_WARN("[AiWeatherSource] Weather forecast from [%s] too long (%d > %d bytes), trying next provider...", provider.name.c_str(), message.length(),
+                     meshtastic_Constants_DATA_PAYLOAD_LEN);
             continue;
         }
 
@@ -203,7 +204,7 @@ String AiWeatherSource::buildWeatherPrompt(const String& weatherJson, const Stri
            "Wykonaj dokładnie te kroki:\n\n" +
            "1. Wybierz losowo jedną sławną postać historyczną urodzoną " + birthDate + ". Osoba może pochodzić z dowolnego kraju, ale musi być rozpoznawalna i znana Polakom. Wybierz kogoś o charakterystycznym stylu wyrażania się - może to być styl pisania, mówienia, tworzenia muzyki, malowania, czy inne formy artystycznego wyrazu.\n\n" +
            "Sprawdź listę osób urodzonych tego dnia używając API: https://api.wikimedia.org/core/v1/wikipedia/pl/page/" + apiDate + "\n\n" +
-           "API zwraca JSON z polem 'content' zawierającym wikitext. Przeszukaj sekcję '== Urodzili się ==' i wybierz jedną osobę, która jest znana i ma charakterystyczny styl. Jeśli strona nie istnieje lub nie zawiera odpowiednich osób, możesz wybrać inną znaną postać historyczną. MUSISZ wybrać osobę urodzoną DOKŁADNIE " + tomorrowDate + ".\n\n" +
+           "API zwraca JSON z polem 'content' zawierającym wikitext. Przeszukaj sekcję '== Urodzili się ==' i wybierz jedną osobę, która jest znana i ma charakterystyczny styl. Jeśli strona nie istnieje lub nie zawiera odpowiednich osób, możesz wybrać inną znaną postać historyczną. MUSISZ wybrać osobę urodzoną DOKŁADNIE " + birthDate + ".\n\n" +
            "2. Przeanalizuj poniższe rzeczywiste dane pogodowe dla Poznania na jutro (" + tomorrowDate + ") z Open-Meteo API:\n\n" +
            weatherJson + "\n\n" +
            "Dane zawierają:\n" +
@@ -224,7 +225,9 @@ String AiWeatherSource::buildWeatherPrompt(const String& weatherJson, const Stri
            "FORMAT PRZYKŁADU (tylko dla pokazania formatu - NIE KOPIUJ treści):\n" +
            "Maria Skłodowska-Curie: Dzisiaj będzie słonecznie z temperaturą 15-18°C w dzień i 8-10°C w nocy.\n\n" +
            "UWAGA: NIE KOPIUJ przykładu dosłownie! Użyj prawdziwych danych pogodowych z JSON powyżej. Przeanalizuj liczby i stwórz oryginalną prognozę.\n\n" +
-           "WAŻNE: Całkowita długość odpowiedzi musi być bliska, ale nie może przekroczyć " + String(MAX_MESSAGE_BYTES - 5) + " znaków. Odpowiedź musi zawierać analizę prawdziwych danych pogodowych, nie kopię przykładu.\n\n" +
+           "WAŻNE: Całkowita długość odpowiedzi musi być bliska, ale nie może przekroczyć " + String(MAX_MESSAGE_BYTES - 25) + " znaków.\n\n" +
+           "WAŻNE: Odpowiedź musi zawierać analizę prawdziwych danych pogodowych, nie kopię przykładu.\n\n" +
+           "BEZWZGLĘDNIE WAŻNE: Po wygenerowaniu odpowiedzi sprawdź ją jeszcze raz. Jesli jej całkowita długość przekracza " + String(MAX_MESSAGE_BYTES - 25) + " znaków, edytuj ją i skróć do MAKSIMUM" + String(MAX_MESSAGE_BYTES - 25) + " znaków.\n\n" +
            "BEZWZGLĘDNIE ZAKAZANE: NIE DODAWAJ żadnych meta-informacji do odpowiedzi! NIE podawaj liczby znaków, słów, bajtów. NIE dodawaj komentarzy w nawiasach typu '(X znaków)', '(X słów)'. NIE wyjaśniaj formatu. Zwróć TYLKO prognozę pogody w wymaganym formacie, nic więcej.";
 }
 

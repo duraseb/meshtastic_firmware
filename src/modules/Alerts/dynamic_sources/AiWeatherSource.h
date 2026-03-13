@@ -4,6 +4,7 @@
 
 #include "../DynamicSource.h"
 #include "../AIService.h"
+#include "mesh/generated/meshtastic/mesh.pb.h"
 
 /**
  * Dynamic source for AI-generated Polish weather forecasts from famous Polish figures.
@@ -20,6 +21,7 @@ public:
 
     String getSourceId() const override { return "AI_WEATHER"; }
     String getFetchUrl() const override { return ""; } // Not needed for AI source
+    String getChannelName() const override { return "PoznanEvent"; }
     unsigned long getFetchIntervalMs() const override;
 
     String fetchAndFormat(
@@ -44,8 +46,7 @@ private:
     String cleanFootnotes(const String& input) const;
 
     // Message length limits (same as alert sources - let system handle payload sizing)
-    static constexpr int MAX_MESSAGE_BYTES = 218; // Slightly increased buffer for AI-generated content
-    static constexpr int MAX_TOTAL_BYTES = 233;   // Meshtastic payload limit
+    static constexpr int MAX_MESSAGE_BYTES = meshtastic_Constants_DATA_PAYLOAD_LEN - 15; // Slightly shorter than full payload
 
     /**
      * Check if current time is within allowed fetch window
