@@ -290,12 +290,13 @@ class AlertsModule : public concurrency::OSThread {
 
     // Find Alert channel by name, returns -1 if not found
     int8_t findAlertChannel();
+    int8_t findChannelByName(const String& channelName);
 
     // Send alert to mesh network
     bool sendAlertToMesh(const Alert &alert);
 
     // Send a simple message to mesh network (for dynamic sources)
-    bool sendMessageToMesh(const String &message);
+    bool sendMessageToMesh(const String &message, int8_t alertChannelIndex = -1);
 
     // ===== Broadcasting Functions =====
     // Check if broadcasting should be enabled (when alert channel is configured)
@@ -303,9 +304,11 @@ class AlertsModule : public concurrency::OSThread {
 
     // Get the encryption key for the alert channel as base64 string
     String getChannelEncryptionKey();
+    String getChannelEncryptionKey(const String& channelName);
 
     // Broadcast channel information to primary channel
     bool broadcastInfoMessage();
+    void broadcastProviderInfo(const String& sourceId, const String& message);
 
     // Simple base64 encoder for PSK display
     String base64Encode(const uint8_t* data, size_t length);

@@ -1405,6 +1405,26 @@ int32_t AlertsModule::runOnce()
                 lastCleanupTime = currentMillis;
                 return ALERT_PROCESSING_YIELD_MS;
             }
+
+            // Priority 6: Check provider info prompts (every ~60s)
+            static unsigned long lastInfoPoll = 0;
+            if (currentMillis - lastInfoPoll >= 60000) {
+                lastInfoPoll = currentMillis;
+
+                for (int i = 0; i < numSources; i++) {
+                    String info = sources[i]->getInfoPrompt();
+                    if (info.length() > 0) {
+                        broadcastProviderInfo(sources[i]->getSourceId(), info);
+                    }
+                }
+
+                for (int i = 0; i < numDynamicSources; i++) {
+                    String info = dynamicSources[i]->getInfoPrompt();
+                    if (info.length() > 0) {
+                        broadcastProviderInfo(dynamicSources[i]->getSourceId(), info);
+                    }
+                }
+            }
             
             // Nothing to do, calculate next wake time but cap at 1 minute for responsive checks
             unsigned long minInterval = intervalMs;
@@ -1898,12 +1918,33 @@ int32_t AlertsModule::runOnce()
             }
 
             // Send immediately to mesh (no storage, no resending)
-            if (sendMessageToMesh(message)) {
-                LOG_INFO("Sent dynamic data from [%s]: %s",
-                         source->getSourceId().c_str(), message.c_str());
+            String sourceChannel = source->getChannelName();
+            int8_t dynamicChannelIndex = sourceChannel.length() > 0 ? findChannelByName(sourceChannel) : findAlertChannel();
+            auto getChannelNameByIndex = [&](int8_t channelIndex) -> String {
+                if (channelIndex < 0) {
+                    return "invalid";
+                }
+                const char *name = channels.getName(channelIndex);
+                return (name != nullptr) ? String(name) : String("index ") + String(channelIndex);
+            };
+
+            if (dynamicChannelIndex < 0) {
+                if (sourceChannel.length() > 0) {
+                    LOG_WARN("Dynamic source %s requested unknown channel '%s', using primary channel",
+                             source->getSourceId().c_str(), sourceChannel.c_str());
+                }
+                dynamicChannelIndex = channels.getPrimaryIndex();
+            }
+
+            String selectedChannelName = getChannelNameByIndex(dynamicChannelIndex);
+
+            if (sendMessageToMesh(message, dynamicChannelIndex)) {
+                LOG_INFO("Sent dynamic data from [%s] on channel '%s' (%d): %s",
+                         source->getSourceId().c_str(), selectedChannelName.c_str(), dynamicChannelIndex,
+                         message.c_str());
             } else {
-                LOG_WARN("Failed to send dynamic data from [%s]",
-                         source->getSourceId().c_str());
+                LOG_WARN("Failed to send dynamic data from [%s] on channel '%s' (%d)",
+                         source->getSourceId().c_str(), selectedChannelName.c_str(), dynamicChannelIndex);
             }
 
             transitionToState(ModuleState::IDLE, "dynamic source processing done");
@@ -2209,6 +2250,34 @@ bool AlertsModule::sendAlertToMesh(const Alert &alert)
     p->to = 0xffffffff; // Broadcast
 
     int8_t alertChannelIndex = findAlertChannel();
+    String selectedChannelName = "";
+
+    String sourceChannel = "";
+    for (int i = 0; i < numSources; i++) {
+        if (sources[i] && sources[i]->getSourceId() == alert.source) {
+            sourceChannel = sources[i]->getChannelName();
+            break;
+        }
+    }
+
+    if (sourceChannel.length() > 0) {
+        int8_t sourceChannelIndex = findChannelByName(sourceChannel);
+        if (sourceChannelIndex >= 0) {
+            alertChannelIndex = sourceChannelIndex;
+        } else {
+            LOG_WARN("Alert source %s requested unknown channel '%s', using primary channel",
+                     alert.source.c_str(), sourceChannel.c_str());
+            alertChannelIndex = channels.getPrimaryIndex();
+        }
+    }
+
+    if (alertChannelIndex >= 0) {
+        const char *selectedName = channels.getName(alertChannelIndex);
+        selectedChannelName = (selectedName != nullptr) ? String(selectedName) : String("index ") + String(alertChannelIndex);
+    } else {
+        selectedChannelName = "invalid";
+    }
+
     if (alertChannelIndex < 0) {
         packetPool.release(p);
         return false;
@@ -2239,8 +2308,8 @@ bool AlertsModule::sendAlertToMesh(const Alert &alert)
         p->decoded.payload.bytes[payloadBytes] = '\0';
     }
     
-    LOG_INFO("Sending alert to mesh - channel: %d, size: %d, priority: %d", 
-             alertChannelIndex, p->decoded.payload.size, p->priority);
+    LOG_INFO("Sending alert to mesh - channel: '%s' (%d), size: %d, priority: %d",
+             selectedChannelName.c_str(), alertChannelIndex, p->decoded.payload.size, p->priority);
     LOG_INFO("Message: %s", msg.c_str());
     
     if (service) {
@@ -2256,7 +2325,7 @@ bool AlertsModule::sendAlertToMesh(const Alert &alert)
     return true;
 }
 
-bool AlertsModule::sendMessageToMesh(const String &message)
+bool AlertsModule::sendMessageToMesh(const String &message, int8_t alertChannelIndex)
 {
     LOG_DEBUG("Sending message to mesh: %s", message.c_str());
 
@@ -2276,7 +2345,9 @@ bool AlertsModule::sendMessageToMesh(const String &message)
     p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
     p->to = 0xffffffff; // Broadcast
 
-    int8_t alertChannelIndex = findAlertChannel();
+    if (alertChannelIndex < 0) {
+        alertChannelIndex = findAlertChannel();
+    }
     if (alertChannelIndex < 0) {
         packetPool.release(p);
         return false;
@@ -2294,6 +2365,9 @@ bool AlertsModule::sendMessageToMesh(const String &message)
         msgBytes = meshPayloadCapacity;
     }
     p->decoded.payload.size = msgBytes;
+    const char *selectedName = channels.getName(alertChannelIndex);
+    String selectedChannelName = (selectedName != nullptr) ? String(selectedName) : String("index ") + String(alertChannelIndex);
+
     if (msgBytes > 0) {
         memcpy(p->decoded.payload.bytes, payloadMessage.c_str(), msgBytes);
     }
@@ -2301,7 +2375,8 @@ bool AlertsModule::sendMessageToMesh(const String &message)
         p->decoded.payload.bytes[msgBytes] = '\0';
     }
 
-    LOG_INFO("Sending message to mesh - channel: %d, size: %d", alertChannelIndex, p->decoded.payload.size);
+    LOG_INFO("Sending message to mesh - channel: '%s' (%d), size: %d", selectedChannelName.c_str(),
+             alertChannelIndex, p->decoded.payload.size);
 
     if (service) {
         p->from = nodeDB->getNodeNum();
@@ -2322,20 +2397,7 @@ int8_t AlertsModule::findAlertChannel()
         return channels.getPrimaryIndex();
     }
 
-    // Look for existing channel with matching name
-    int8_t foundIndex = -1;
-    for (ChannelIndex i = 0; i < channels.getNumChannels(); i++) {
-        meshtastic_Channel &ch = channels.getByIndex(i);
-        if (ch.role == meshtastic_Channel_Role_DISABLED) {
-            continue;
-        }
-
-        const char *channelName = channels.getName(i);
-        if (strcasecmp(channelName, alertChannelName.c_str()) == 0) {
-            foundIndex = i;
-            break;
-        }
-    }
+    int8_t foundIndex = findChannelByName(alertChannelName);
 
     // Log state changes only
     if (foundIndex >= 0 && lastKnownChannelIndex < 0) {
@@ -2349,6 +2411,32 @@ int8_t AlertsModule::findAlertChannel()
     }
 
     lastKnownChannelIndex = foundIndex;
+    return foundIndex;
+}
+
+int8_t AlertsModule::findChannelByName(const String& channelName)
+{
+    // If channel name is empty, use primary channel
+    if (channelName.length() == 0) {
+        return channels.getPrimaryIndex();
+    }
+
+    // Look for existing channel with matching name
+    int8_t foundIndex = -1;
+    for (ChannelIndex i = 0; i < channels.getNumChannels(); i++) {
+        meshtastic_Channel &ch = channels.getByIndex(i);
+        if (ch.role == meshtastic_Channel_Role_DISABLED) {
+            continue;
+        }
+
+        const char *configuredChannelName = channels.getName(i);
+        if (configuredChannelName != nullptr &&
+            strcasecmp(configuredChannelName, channelName.c_str()) == 0) {
+            foundIndex = i;
+            break;
+        }
+    }
+
     return foundIndex;
 }
 
@@ -2533,9 +2621,14 @@ bool AlertsModule::shouldBroadcastInfo()
 
 String AlertsModule::getChannelEncryptionKey()
 {
-    int8_t channelIndex = findAlertChannel();
+    return getChannelEncryptionKey(alertChannelName);
+}
+
+String AlertsModule::getChannelEncryptionKey(const String& channelName)
+{
+    int8_t channelIndex = findChannelByName(channelName);
     if (channelIndex < 0) {
-        LOG_WARN("[AlertsModule] Cannot get encryption key - alert channel not found");
+        LOG_WARN("[AlertsModule] Cannot get encryption key - channel '%s' not found", channelName.c_str());
         return "";
     }
 
@@ -2670,6 +2763,54 @@ bool AlertsModule::broadcastInfoMessage()
     LOG_ERROR("MeshService not available for broadcasting");
     packetPool.release(p);
     return false;
+}
+
+void AlertsModule::broadcastProviderInfo(const String& sourceId, const String& message)
+{
+    // Send to primary channel (index 0), same as broadcastInfoMessage()
+    int8_t primaryIdx = channels.getPrimaryIndex();
+
+    meshtastic_MeshPacket *p = router->allocForSending();
+    if (!p) {
+        LOG_WARN("[Alerts] Failed to allocate packet for provider info from %s", sourceId.c_str());
+        return;
+    }
+
+    String fullMsg = "[" + sourceId + "] " + message;
+
+    // Clamp to max payload size (same logic as sendAlertToMesh)
+    size_t maxPayload = meshtastic_Constants_DATA_PAYLOAD_LEN;
+    size_t payloadBytes = clampMessageToPayload(fullMsg, maxPayload);
+
+    p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+    p->to = 0xffffffff;
+    p->channel = primaryIdx;
+    p->want_ack = false;
+    p->priority = meshtastic_MeshPacket_Priority_DEFAULT;
+
+    const size_t meshPayloadCapacity = sizeof(p->decoded.payload.bytes);
+    if (payloadBytes > meshPayloadCapacity) {
+        LOG_ERROR("Payload clamp guard triggered in broadcastProviderInfo (want %u, cap %u), forcing clamp",
+                  payloadBytes, meshPayloadCapacity);
+        payloadBytes = meshPayloadCapacity;
+    }
+    p->decoded.payload.size = payloadBytes;
+    if (payloadBytes > 0) {
+        memcpy(p->decoded.payload.bytes, fullMsg.c_str(), payloadBytes);
+    }
+    if (payloadBytes < meshPayloadCapacity) {
+        p->decoded.payload.bytes[payloadBytes] = '\0';
+    }
+
+    if (!service) {
+        LOG_ERROR("[Alerts] MeshService not available for provider info");
+        packetPool.release(p);
+        return;
+    }
+
+    p->from = nodeDB->getNodeNum();
+    service->sendToMesh(p, RX_SRC_LOCAL, true);
+    LOG_INFO("[Alerts] Broadcast provider info from %s (%d bytes)", sourceId.c_str(), payloadBytes);
 }
 
 #endif // HAS_ALERTING

@@ -26,6 +26,8 @@ public:
     String getFetchUrl() const override;
     unsigned long getFetchIntervalMs() const override;
     uint8_t getDefaultSeverity() const override { return 10; }
+    String getChannelName() const override { return "PoznanEvent"; }
+    String getInfoPrompt() override;
 
     std::vector<RawAlert> fetchAndParseAlerts(
         std::function<String(const char*, int&)> httpGetCallback) override;
@@ -41,7 +43,10 @@ public:
                         int maxLocationChars) const override;
 
 private:
+    static constexpr unsigned long INFO_INITIAL_DELAY_MS = 60 * 60 * 1000;
+    static constexpr unsigned long INFO_INTERVAL_MS = 12UL * 60 * 60 * 1000;
     uint32_t hashString(const String &str);
+    unsigned long lastInfoBroadcast = 0;
 };
 
 #endif // HAS_ALERTING

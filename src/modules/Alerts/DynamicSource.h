@@ -28,6 +28,22 @@ public:
      * Get the URL to fetch data from
      */
     virtual String getFetchUrl() const = 0;
+    
+    /**
+     * Returns the channel name this source's alerts should be sent to.
+     * Override to use a dedicated channel. Default returns empty string,
+     * meaning the global alert channel (alertChannelName) will be used.
+     */
+    virtual String getChannelName() const { return ""; }
+    
+    /**
+     * Returns an info/notification string to broadcast on the primary channel.
+     * Called approximately every 60 seconds by the main loop.
+     * The provider should track its own cadence internally and return
+     * an empty string when it has nothing to broadcast.
+     * Non-empty return value will be sent once to the primary channel.
+     */
+    virtual String getInfoPrompt() { return ""; }
 
     /**
      * Get the fetch interval in milliseconds

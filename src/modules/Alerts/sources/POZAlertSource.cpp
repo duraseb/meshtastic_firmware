@@ -73,15 +73,14 @@ bool POZAlertSource::parsePOZStream(WiFiClient* stream, DynamicJsonDocument& doc
             continue;
         }
 
-        // Determine expiry date - use date_to/hour_to if available, otherwise end of date_from day
+        // Determine expiry date - prefer explicit end date/time when available,
+        // otherwise use the event start timestamp as expiry.
         String expiryDate = date_to.length() > 0 ? date_to : date_from;
-        String expiryTime;
+        String expiryTime = "00:00:00";
         if (date_to.length() > 0) {
-            // If date_to exists, use hour_to (or default to end of day)
             expiryTime = hour_to.length() > 0 ? hour_to : "23:59:59";
-        } else {
-            // If no date_to, use end of date_from day (not hour_from!)
-            expiryTime = "23:59:59";
+        } else if (hour_from.length() > 0) {
+            expiryTime = hour_from;
         }
 
         if (expiryDate.length() == 0) {
@@ -160,6 +159,38 @@ String POZAlertSource::getFetchUrl() const {
 
 unsigned long POZAlertSource::getFetchIntervalMs() const {
     return 60 * 60 * 1000; // 60 minutes - events don't change rapidly
+}
+
+String POZAlertSource::getInfoPrompt()
+{
+    String channelName = getChannelName();
+    if (channelName.length() == 0) {
+        return "";
+    }
+
+    unsigned long now = millis();
+    if (lastInfoBroadcast == 0 && now < INFO_INITIAL_DELAY_MS) {
+        return "";
+    }
+    if (lastInfoBroadcast != 0 && (now - lastInfoBroadcast) < INFO_INTERVAL_MS) {
+        return "";
+    }
+
+    String encryptionKey = (alertsModule != nullptr) ? alertsModule->getChannelEncryptionKey(channelName) : "";
+
+    String message = "Otrzymuj powiadomienia i informacje lokalne z Poznania i Wielkopolski: dodaj kanał ";
+    message += channelName;
+
+    if (encryptionKey.length() > 0) {
+        message += ", klucz: ";
+        message += encryptionKey;
+    } else {
+        message += " (bez szyfrowania)";
+    }
+
+    lastInfoBroadcast = now;
+
+    return message;
 }
 
 std::vector<AlertSource::RawAlert> POZAlertSource::fetchAndParseAlerts(

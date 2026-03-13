@@ -43,6 +43,22 @@ public:
     virtual uint8_t getDefaultSeverity() const = 0;
     
     /**
+     * Returns the channel name this source's alerts should be sent to.
+     * Override to use a dedicated channel. Default returns empty string,
+     * meaning the global alert channel (alertChannelName) will be used.
+     */
+    virtual String getChannelName() const { return ""; }
+    
+    /**
+     * Returns an info/notification string to broadcast on the primary channel.
+     * Called approximately every 60 seconds by the main loop.
+     * The provider should track its own cadence internally and return
+     * an empty string when it has nothing to broadcast.
+     * Non-empty return value will be sent once to the primary channel.
+     */
+    virtual String getInfoPrompt() { return ""; }
+    
+    /**
      * Fetch and parse alerts from the source.
      * This is source-specific: RCB scrapes HTML, IMGW parses JSON, etc.
      * 
