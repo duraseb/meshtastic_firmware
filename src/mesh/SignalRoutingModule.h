@@ -50,11 +50,10 @@ protected:
 private:
     NeighborGraph *routingGraph = nullptr;
     uint32_t lastGraphUpdate = 0;
-    static constexpr uint32_t GRAPH_UPDATE_INTERVAL_SECS = 300;
+    static constexpr uint32_t GRAPH_UPDATE_INTERVAL_SECS = 60;
     static constexpr uint32_t EARLY_BROADCAST_DELAY_MS = 15 * 1000;
-    static constexpr uint32_t ACTIVE_NODE_TTL_SECS = 2700;   // 45 min for SR nodes
-    static constexpr uint32_t MUTE_NODE_TTL_SECS = 5400;    // 90 min for legacy/stock nodes
-    static constexpr uint32_t CAPABILITY_TTL_SECS = 2700;   // 45 min
+    static constexpr uint32_t NODE_TTL_SECS = 5400;    // 90 min for all nodes in the graph
+    static constexpr uint32_t CAPABILITY_TTL_SECS = SIGNAL_ROUTING_BROADCAST_SECS * 3 + 10;  // detect when SR node stops being SR
     static constexpr uint32_t RELAY_ID_CACHE_TTL_MS = 600 * 1000;  // 10 min
 
     bool signalBasedRoutingEnabled = true;
@@ -181,7 +180,6 @@ private:
     bool shouldRelayForStockNeighbors(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom, uint32_t currentTime);
     bool hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum heardFrom, NodeNum destination = 0);
     bool isDownstreamOfHeardRelay(NodeNum destination, NodeNum myNode);
-    uint32_t getNodeTtlSeconds(CapabilityStatus status) const;
     bool isNodeRoutable(NodeNum nodeId) const;
     void logNetworkTopology();
     bool evaluateContentionExpiry(const ContentionCheck& check, NodeNum myNode);

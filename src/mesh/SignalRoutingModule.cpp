@@ -1117,14 +1117,6 @@ bool SignalRoutingModule::isDownstreamOfHeardRelay(NodeNum destination, NodeNum 
     return false;
 }
 
-uint32_t SignalRoutingModule::getNodeTtlSeconds(CapabilityStatus status) const
-{
-    if (status == CapabilityStatus::SRactive || status == CapabilityStatus::Passive) {
-        return ACTIVE_NODE_TTL_SECS;  // 30 min for known SR nodes
-    }
-    // Legacy, Unknown, and any other status get longer TTL
-    return MUTE_NODE_TTL_SECS;  // 1 hr for stock/unknown nodes
-}
 
 void SignalRoutingModule::logNetworkTopology()
 {
@@ -1544,12 +1536,8 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
         if (currentTime - lastGraphUpdate > GRAPH_UPDATE_INTERVAL_SECS) {
             uint32_t nodeCountBefore = routingGraph->getNodeCount();
             
-            // Use capability-based TTL: ACTIVE_NODE_TTL_SECS for SR nodes, MUTE_NODE_TTL_SECS for stock/unknown/placeholders
-            auto getTtlForNode = [this](NodeNum nodeId) -> uint32_t {
-                CapabilityStatus status = getCapabilityStatus(nodeId);
-                return getNodeTtlSeconds(status);
-            };
-            routingGraph->ageEdges(currentTime, getTtlForNode);
+            // Single TTL for all nodes in the graph; SR capability expiry handles coverage separately
+            routingGraph->ageEdges(currentTime, NODE_TTL_SECS);
             
             uint32_t nodeCountAfter = routingGraph->getNodeCount();
             lastGraphUpdate = currentTime;
@@ -2860,8 +2848,14 @@ void SignalRoutingModule::pruneCapabilityCache(uint32_t nowSecs)
             continue;
         }
 
-        uint32_t ttl = getNodeTtlSeconds(capabilityRecords[i].record.status);
-        if ((nowSecs - capabilityRecords[i].record.lastUpdated) > ttl) {
+        if ((nowSecs - capabilityRecords[i].record.lastUpdated) > CAPABILITY_TTL_SECS) {
+            // When an SR node's capability expires, clear hearsUs so we stop counting it for coverage
+            if (routingGraph && (capabilityRecords[i].record.status == CapabilityStatus::SRactive ||
+                                 capabilityRecords[i].record.status == CapabilityStatus::Passive)) {
+                NodeNum expiredNode = capabilityRecords[i].nodeId;
+                routingGraph->setEdgeHearsUs(myNode, expiredNode, false);
+                LOG_INFO("[SR] Capability expired for %08x — cleared hearsUs", expiredNode);
+            }
             if (i < capabilityRecordCount - 1) {
                 capabilityRecords[i] = capabilityRecords[capabilityRecordCount - 1];
             }
@@ -2903,9 +2897,8 @@ SignalRoutingModule::CapabilityStatus SignalRoutingModule::getCapabilityStatus(N
                 return capabilityRecords[i].record.status;
             }
 
-            uint32_t ttl = getNodeTtlSeconds(capabilityRecords[i].record.status);
             uint32_t age = now - capabilityRecords[i].record.lastUpdated;
-            if (age > ttl) {
+            if (age > CAPABILITY_TTL_SECS) {
                 return CapabilityStatus::Unknown;
             }
             return capabilityRecords[i].record.status;
@@ -3190,8 +3183,7 @@ uint32_t SignalRoutingModule::getNodeLastActivityTime(NodeNum nodeId) const
     // Lite mode: linear search
     for (uint8_t i = 0; i < capabilityRecordCount; i++) {
         if (capabilityRecords[i].nodeId == nodeId) {
-            uint32_t ttl = getNodeTtlSeconds(capabilityRecords[i].record.status);
-            if ((now - capabilityRecords[i].record.lastUpdated) > ttl) {
+            if ((now - capabilityRecords[i].record.lastUpdated) > CAPABILITY_TTL_SECS) {
                 return 0; // Too old, consider inactive
             }
             return capabilityRecords[i].record.lastUpdated;

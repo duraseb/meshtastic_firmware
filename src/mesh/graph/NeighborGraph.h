@@ -157,7 +157,7 @@ struct DownstreamEntry {
 class NeighborGraph {
   public:
     static uint32_t getContentionWindowMs();
-    static constexpr uint32_t EDGE_AGING_TIMEOUT_SECS = 2700; // 45 min default (matches SR node TTL)
+
 
     NeighborGraph();
 
@@ -170,7 +170,7 @@ class NeighborGraph {
 
     void updateNodeActivity(NodeNum nodeId, uint32_t timestamp);
 
-    void ageEdges(uint32_t currentTimeSecs, std::function<uint32_t(NodeNum)> getTtlForNode = nullptr);
+    void ageEdges(uint32_t currentTimeSecs, uint32_t ttlSecs);
 
     Route calculateRoute(NodeNum destination, uint32_t currentTime, std::function<bool(NodeNum)> nodeFilter = nullptr);
 
@@ -270,6 +270,8 @@ class NeighborGraph {
     Route routeCache[NEIGHBOR_GRAPH_MAX_CACHED_ROUTES];
     uint8_t routeCacheCount;
     static constexpr uint32_t ROUTE_CACHE_TIMEOUT_SECS = 300;
+
+    uint32_t nodeTtlSecs = 5400; // Set by ageEdges(), used for downstream freshness checks
 
     // Find or create neighbor slot (returns nullptr if full)
     NodeEdges *findOrCreateNeighbor(NodeNum nodeId);

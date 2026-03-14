@@ -251,8 +251,9 @@ void NeighborGraph::updateNodeActivity(NodeNum nodeId, uint32_t timestamp)
     }
 }
 
-void NeighborGraph::ageEdges(uint32_t currentTimeSecs, std::function<uint32_t(NodeNum)> getTtlForNode)
+void NeighborGraph::ageEdges(uint32_t currentTimeSecs, uint32_t ttlSecs)
 {
+    nodeTtlSecs = ttlSecs;
     NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
     uint16_t currentLo = static_cast<uint16_t>(currentTimeSecs & 0xFFFF);
     bool edgesRemoved = false;
@@ -265,12 +266,10 @@ void NeighborGraph::ageEdges(uint32_t currentTimeSecs, std::function<uint32_t(No
             continue;
         }
 
-        uint32_t nodeTtl = getTtlForNode ? getTtlForNode(node->nodeId) : EDGE_AGING_TIMEOUT_SECS;
-
         // Age individual edges
         uint8_t writeIdx = 0;
         for (uint8_t i = 0; i < node->edgeCount; i++) {
-            if ((currentTimeSecs - node->edges[i].lastUpdate) <= nodeTtl) {
+            if ((currentTimeSecs - node->edges[i].lastUpdate) <= ttlSecs) {
                 if (writeIdx != i) {
                     node->edges[writeIdx] = node->edges[i];
                 }
@@ -282,7 +281,7 @@ void NeighborGraph::ageEdges(uint32_t currentTimeSecs, std::function<uint32_t(No
             node->edgeCount = writeIdx;
         }
 
-        if (currentTimeSecs - node->lastFullUpdate > nodeTtl || node->edgeCount == 0) {
+        if (currentTimeSecs - node->lastFullUpdate > ttlSecs || node->edgeCount == 0) {
             // Remove downstream entries that reference this neighbor as relay
             NodeNum removedNode = node->nodeId;
             for (uint16_t i = 0; i < downstreamCount;) {
@@ -323,8 +322,7 @@ void NeighborGraph::ageEdges(uint32_t currentTimeSecs, std::function<uint32_t(No
 
     // Age downstream entries
     for (uint16_t i = 0; i < downstreamCount;) {
-        uint32_t dsTtl = getTtlForNode ? getTtlForNode(downstream[i].destination) : EDGE_AGING_TIMEOUT_SECS;
-        if ((currentTimeSecs - downstream[i].lastUpdate) > dsTtl) {
+        if ((currentTimeSecs - downstream[i].lastUpdate) > ttlSecs) {
             if (i < downstreamCount - 1) {
                 downstream[i] = downstream[downstreamCount - 1];
             }
@@ -588,7 +586,7 @@ NodeNum NeighborGraph::getDownstreamRelay(NodeNum destination) const
     NodeNum bestRelay = 0;
     uint16_t bestCost = UINT16_MAX;
     for (uint16_t i = 0; i < downstreamCount; i++) {
-        if (downstream[i].destination == destination && (now - downstream[i].lastUpdate) < EDGE_AGING_TIMEOUT_SECS) {
+        if (downstream[i].destination == destination && (now - downstream[i].lastUpdate) < nodeTtlSecs) {
             if (downstream[i].costFixed < bestCost) {
                 bestCost = downstream[i].costFixed;
                 bestRelay = downstream[i].relay;
@@ -608,7 +606,7 @@ size_t NeighborGraph::getDownstreamCountForRelay(NodeNum relay) const
     size_t count = 0;
     uint32_t now = millis() / 1000;
     for (uint16_t i = 0; i < downstreamCount; i++) {
-        if (downstream[i].relay == relay && (now - downstream[i].lastUpdate) < EDGE_AGING_TIMEOUT_SECS) {
+        if (downstream[i].relay == relay && (now - downstream[i].lastUpdate) < nodeTtlSecs) {
             count++;
         }
     }
@@ -622,7 +620,7 @@ size_t NeighborGraph::getDownstreamNodesForRelay(NodeNum relay, NodeNum *outArra
     size_t skipped = 0;
     uint32_t now = millis() / 1000;
     for (uint16_t i = 0; i < downstreamCount && count < maxCount; i++) {
-        if (downstream[i].relay == relay && (now - downstream[i].lastUpdate) < EDGE_AGING_TIMEOUT_SECS) {
+        if (downstream[i].relay == relay && (now - downstream[i].lastUpdate) < nodeTtlSecs) {
             if (skipped < skipCount) {
                 skipped++;
                 continue;
@@ -640,7 +638,7 @@ bool NeighborGraph::isRelayFor(NodeNum myNode, NodeNum destination) const
     for (uint16_t i = 0; i < downstreamCount; i++) {
         if (downstream[i].destination == destination && downstream[i].relay == myNode) {
             uint32_t now = millis() / 1000;
-            if ((now - downstream[i].lastUpdate) < EDGE_AGING_TIMEOUT_SECS) {
+            if ((now - downstream[i].lastUpdate) < nodeTtlSecs) {
                 return true;
             }
         }
