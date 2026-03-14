@@ -252,6 +252,7 @@ void SignalRoutingModule::collectNeighborsForBroadcast(meshtastic_SignalNeighbor
 
         CapabilityStatus neighborStatus = getCapabilityStatus(edge->to);
         neighbor.signal_routing_active = (neighborStatus == CapabilityStatus::SRactive);
+        neighbor.hears_us = edge->hearsUs;
 
         int32_t rssi32, snr32;
         NeighborGraph::etxToSignal(edge->getEtx(), rssi32, snr32);
@@ -385,6 +386,9 @@ void SignalRoutingModule::updateGraphWithNeighbor(NodeNum sender, const meshtast
         uint32_t currentTime = millis() / 1000;
 
         routingGraph->updateEdge(sender, neighbor.node_id, etx, currentTime);
+
+        // Propagate the bidirectional link flag from the authoritative sender
+        routingGraph->setEdgeHearsUs(sender, neighbor.node_id, neighbor.hears_us);
 
         LOG_DEBUG("[SR] Added edge %08x -> %08x from topology", sender, neighbor.node_id);
     }
@@ -666,6 +670,10 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
                                      Edge::Source::Reported);
             routingGraph->updateEdge(mp.from, neighbor.node_id, etx, rxTime, scaledVariance,
                                      Edge::Source::Mirrored);
+
+            // Propagate the bidirectional link flag from the authoritative sender.
+            // SR nodes report their own edges — always trust their current claim.
+            routingGraph->setEdgeHearsUs(mp.from, neighbor.node_id, neighbor.hears_us);
         }
     } else {
         LOG_DEBUG("[SR] Skipping redundant edge rebuild for %s (already pre-processed version %u)",
@@ -977,12 +985,24 @@ bool SignalRoutingModule::shouldRelayForStockNeighbors(NodeNum myNode, NodeNum s
     uint8_t stockCount = 0;
 
     // Check our direct neighbors for stock firmware nodes
+    // For active stock nodes (CLIENT, ROUTER, etc.), only consider them if they've confirmed
+    // they can hear us by relaying our packets (hearsUs flag on the edge).
+    // For mute stock nodes (CLIENT_MUTE, CLIENT_HIDDEN, LOST_AND_FOUND), hearing them is enough.
     const NodeEdges* myEdges = routingGraph->getEdgesFrom(myNode);
     if (myEdges) {
         for (uint8_t i = 0; i < myEdges->edgeCount && stockCount < NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE; i++) {
             NodeNum neighbor = myEdges->edges[i].to;
             if (getCapabilityStatus(neighbor) == CapabilityStatus::Legacy) {
-                stockNeighbors[stockCount++] = neighbor;
+                if (isNonRelayingLegacyRole(neighbor)) {
+                    // Mute node: we hear it, so we cover it
+                    stockNeighbors[stockCount++] = neighbor;
+                } else if (myEdges->edges[i].hearsUs) {
+                    // Active stock node: only cover if it has relayed our packets (bidirectional)
+                    stockNeighbors[stockCount++] = neighbor;
+                } else {
+                    LOG_DEBUG("[SR] Skipping active stock neighbor %08x — no confirmed bidirectional link (hearsUs=false)",
+                             neighbor);
+                }
             }
         }
     }
@@ -1193,9 +1213,10 @@ void SignalRoutingModule::logNetworkTopology()
             size_t totalDsCount = routingGraph->getDownstreamCountForRelay(edge.to);
             size_t dsCount = routingGraph->getDownstreamNodesForRelay(edge.to, dsBuf, dsCosts, MAX_DS_DISPLAY);
 
-            LOG_INFO("[SR]   %s %s%s: %s (ETX=%.1f, %ss ago, covers %u nodes, relay for %u downstream)",
+            const char* bidir = edge.hearsUs ? ", hearsUs" : "";
+            LOG_INFO("[SR]   %s %s%s: %s (ETX=%.1f, %ss ago, covers %u nodes, relay for %u downstream%s)",
                      branch, nprefix, nameBuf, quality, etx, ageBuf,
-                     static_cast<unsigned int>(listenerCount), static_cast<unsigned int>(totalDsCount));
+                     static_cast<unsigned int>(listenerCount), static_cast<unsigned int>(totalDsCount), bidir);
 
             // Show nodes that can hear this neighbor (their topology-reported edges)
             if (listenerCount > 0) {
@@ -1499,6 +1520,14 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                 uint32_t currentTime = millis() / 1000;  // Use monotonic time
                 routingGraph->recordNodeTransmission(mp.from, mp.id, currentTime);
                 routingGraph->recordNodeTransmission(inferredRelayer, mp.id, currentTime);
+
+                // If this node relayed a packet we originated or previously relayed,
+                // it can hear us. Mark the edge as bidirectional (hearsUs) for coverage decisions.
+                NodeNum ourNode = nodeDB ? nodeDB->getNodeNum() : 0;
+                if (ourNode != 0 && inferredRelayer != 0 && inferredRelayer != ourNode &&
+                    (mp.from == ourNode || isCommittedRelay(mp.id))) {
+                    markStockNodeRelayedOurPacket(inferredRelayer);
+                }
             }
         }  // End of else block for active routing roles relayed packet processing
     }
@@ -2904,6 +2933,51 @@ bool SignalRoutingModule::isLegacyRouter(NodeNum nodeId) const
         return true;
     default:
         return false;
+    }
+}
+
+/**
+ * Check if a stock node has a non-relaying role (CLIENT_MUTE, CLIENT_HIDDEN, LOST_AND_FOUND).
+ * These nodes never relay packets in stock firmware, so hearing them is sufficient proof of coverage.
+ */
+bool SignalRoutingModule::isNonRelayingLegacyRole(NodeNum nodeId) const
+{
+    if (!nodeDB) return true;
+    const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(nodeId);
+    if (!node || !node->has_user) return true; // Unknown role — assume non-relaying (conservative)
+
+    switch (node->user.role) {
+    case meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE:
+    case meshtastic_Config_DeviceConfig_Role_CLIENT_HIDDEN:
+    case meshtastic_Config_DeviceConfig_Role_LOST_AND_FOUND:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/**
+ * Mark the edge to a stock node as hearsUs (confirmed bidirectional link).
+ * Called when we observe a stock node relaying a packet we transmitted.
+ */
+void SignalRoutingModule::markStockNodeRelayedOurPacket(NodeNum stockNode)
+{
+    if (!routingGraph || !nodeDB || stockNode == 0) return;
+
+    NodeNum myNode = nodeDB->getNodeNum();
+    NodeEdges *myEdges = const_cast<NodeEdges *>(routingGraph->getEdgesFrom(myNode));
+    if (!myEdges) return;
+
+    for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+        if (myEdges->edges[i].to == stockNode) {
+            if (!myEdges->edges[i].hearsUs) {
+                myEdges->edges[i].hearsUs = true;
+                char nodeName[64];
+                getNodeDisplayName(stockNode, nodeName, sizeof(nodeName));
+                LOG_INFO("[SR] Stock node %s relayed our packet — confirmed bidirectional link", nodeName);
+            }
+            return;
+        }
     }
 }
 

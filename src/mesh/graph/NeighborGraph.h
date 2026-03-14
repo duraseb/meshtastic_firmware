@@ -87,8 +87,9 @@ struct Edge {
     uint32_t lastUpdate; // Full timestamp (seconds since boot)
     uint8_t variance;    // Position variance (0-255, scaled)
     Source source;
+    bool hearsUs;        // True if this node has relayed our packets (confirmed bidirectional link)
 
-    Edge() : to(0), etxFixed(100), lastUpdate(0), variance(0), source(Source::Mirrored) {}
+    Edge() : to(0), etxFixed(100), lastUpdate(0), variance(0), source(Source::Mirrored), hearsUs(false) {}
 
     float getEtx() const { return etxFixed / 100.0f; }
     void setEtx(float etx) { etxFixed = static_cast<uint16_t>(etx * 100.0f); }
@@ -237,6 +238,8 @@ class NeighborGraph {
     bool hasNodeTransmitted(NodeNum nodeId, uint32_t packetId, uint32_t currentTime) const;
 
     // --- Node management ---
+
+    void setEdgeHearsUs(NodeNum from, NodeNum to, bool hearsUs);
 
     void removeNode(NodeNum nodeId);
 

@@ -700,6 +700,10 @@ typedef struct _meshtastic_SignalNeighbor {
     uint8_t position_variance;
     /* Whether this neighbor is actively participating in signal-based routing */
     bool signal_routing_active;
+    /* Whether this neighbor has confirmed it can hear us (bidirectional link).
+ Set when we observe this neighbor relaying a packet we transmitted.
+ Used by other SR nodes to make accurate coverage/relay decisions. */
+    bool hears_us;
 } meshtastic_SignalNeighbor;
 
 typedef PB_BYTES_ARRAY_T(32) meshtastic_User_public_key_t;
@@ -1493,7 +1497,7 @@ extern "C" {
 
 /* Initializer values for message structs */
 #define meshtastic_Position_init_default         {false, 0, false, 0, false, 0, 0, _meshtastic_Position_LocSource_MIN, _meshtastic_Position_AltSource_MIN, 0, 0, false, 0, false, 0, 0, 0, 0, 0, false, 0, false, 0, 0, 0, 0, 0, 0, 0, 0}
-#define meshtastic_SignalNeighbor_init_default   {0, 0, 0, 0, 0}
+#define meshtastic_SignalNeighbor_init_default   {0, 0, 0, 0, 0, 0}
 #define meshtastic_User_init_default             {"", "", "", {0}, _meshtastic_HardwareModel_MIN, 0, _meshtastic_Config_DeviceConfig_Role_MIN, {0, {0}}, false, 0}
 #define meshtastic_RouteDiscovery_init_default   {0, {0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0}}
 #define meshtastic_Routing_init_default          {0, {meshtastic_RouteDiscovery_init_default}}
@@ -1528,7 +1532,7 @@ extern "C" {
 #define meshtastic_resend_chunks_init_default    {{{NULL}, NULL}}
 #define meshtastic_ChunkedPayloadResponse_init_default {0, 0, {0}}
 #define meshtastic_Position_init_zero            {false, 0, false, 0, false, 0, 0, _meshtastic_Position_LocSource_MIN, _meshtastic_Position_AltSource_MIN, 0, 0, false, 0, false, 0, 0, 0, 0, 0, false, 0, false, 0, 0, 0, 0, 0, 0, 0, 0}
-#define meshtastic_SignalNeighbor_init_zero      {0, 0, 0, 0, 0}
+#define meshtastic_SignalNeighbor_init_zero      {0, 0, 0, 0, 0, 0}
 #define meshtastic_User_init_zero                {"", "", "", {0}, _meshtastic_HardwareModel_MIN, 0, _meshtastic_Config_DeviceConfig_Role_MIN, {0, {0}}, false, 0}
 #define meshtastic_RouteDiscovery_init_zero      {0, {0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0}}
 #define meshtastic_Routing_init_zero             {0, {meshtastic_RouteDiscovery_init_zero}}
@@ -1592,6 +1596,7 @@ extern "C" {
 #define meshtastic_SignalNeighbor_snr_tag        3
 #define meshtastic_SignalNeighbor_position_variance_tag 4
 #define meshtastic_SignalNeighbor_signal_routing_active_tag 5
+#define meshtastic_SignalNeighbor_hears_us_tag   6
 #define meshtastic_User_id_tag                   1
 #define meshtastic_User_long_name_tag            2
 #define meshtastic_User_short_name_tag           3
@@ -1807,7 +1812,8 @@ X(a, STATIC,   SINGULAR, FIXED32,  node_id,           1) \
 X(a, STATIC,   SINGULAR, SINT32,   rssi,              2) \
 X(a, STATIC,   SINGULAR, SINT32,   snr,               3) \
 X(a, STATIC,   SINGULAR, UINT32,   position_variance,   4) \
-X(a, STATIC,   SINGULAR, BOOL,     signal_routing_active,   5)
+X(a, STATIC,   SINGULAR, BOOL,     signal_routing_active,   5) \
+X(a, STATIC,   SINGULAR, BOOL,     hears_us,          6)
 #define meshtastic_SignalNeighbor_CALLBACK NULL
 #define meshtastic_SignalNeighbor_DEFAULT NULL
 
@@ -2262,8 +2268,8 @@ extern const pb_msgdesc_t meshtastic_ChunkedPayloadResponse_msg;
 #define meshtastic_QueueStatus_size              23
 #define meshtastic_RouteDiscovery_size           256
 #define meshtastic_Routing_size                  259
-#define meshtastic_SignalNeighbor_size           16
-#define meshtastic_SignalRoutingInfo_size        263
+#define meshtastic_SignalNeighbor_size           18
+#define meshtastic_SignalRoutingInfo_size        291
 #define meshtastic_StatusMessage_size            81
 #define meshtastic_StoreForwardPlusPlus_size     377
 #define meshtastic_ToRadio_size                  504

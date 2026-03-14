@@ -187,6 +187,9 @@ private:
     bool evaluateContentionExpiry(const ContentionCheck& check, NodeNum myNode);
     void queueUnicastRelay(ContentionCheck& check);
 
+    bool isNonRelayingLegacyRole(NodeNum nodeId) const;
+    void markStockNodeRelayedOurPacket(NodeNum stockNode);
+
     // Committed relay tracking — prevents dupe cancellation of SR relay decisions
     static constexpr size_t MAX_COMMITTED_RELAYS = 8;
     struct CommittedRelay {

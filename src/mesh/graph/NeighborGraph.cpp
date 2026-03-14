@@ -223,10 +223,19 @@ int NeighborGraph::updateEdge(NodeNum from, NodeNum to, float etx, uint32_t time
         edge->lastUpdate = timestamp;
         edge->variance = ((variance + 6) / 12 > 255) ? 255 : static_cast<uint8_t>((variance + 6) / 12);
         edge->source = source;
+        edge->hearsUs = false; // Reset on edge replacement — must be re-confirmed
         return EDGE_SIGNIFICANT_CHANGE;
     }
 
     return EDGE_NO_CHANGE;
+}
+
+void NeighborGraph::setEdgeHearsUs(NodeNum from, NodeNum to, bool hearsUs)
+{
+    NodeEdges *node = findNeighbor(from);
+    if (!node) return;
+    Edge *edge = findEdge(node, to);
+    if (edge) edge->hearsUs = hearsUs;
 }
 
 const NodeEdges *NeighborGraph::getEdgesFrom(NodeNum node) const
@@ -1257,6 +1266,8 @@ bool NeighborGraph::shouldRelaySimpleConservative(NodeNum myNode, NodeNum source
 
     uint8_t uniqueSrNeighbors = 0;
     uint8_t totalNeighborsNotCovered = 0;
+    static constexpr uint8_t MAX_LOG_NODES = 10;
+    NodeNum uncoveredNodes[MAX_LOG_NODES];
     for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
         NodeNum neighbor = myEdges->edges[i].to;
         if (neighbor == sourceNode || neighbor == heardFrom) {
@@ -1272,6 +1283,9 @@ bool NeighborGraph::shouldRelaySimpleConservative(NodeNum myNode, NodeNum source
         }
 
         if (!transmittingHasIt) {
+            if (totalNeighborsNotCovered < MAX_LOG_NODES) {
+                uncoveredNodes[totalNeighborsNotCovered] = neighbor;
+            }
             uniqueSrNeighbors++;
             totalNeighborsNotCovered++;
         }
@@ -1282,7 +1296,15 @@ bool NeighborGraph::shouldRelaySimpleConservative(NodeNum myNode, NodeNum source
     }
 
     if (totalNeighborsNotCovered > 0) {
-        LOG_DEBUG("NeighborGraph: Conservative fallback - have %u uncovered neighbors, relaying", totalNeighborsNotCovered);
+        char nodeList[128] = "";
+        int offset = 0;
+        uint8_t logCount = totalNeighborsNotCovered < MAX_LOG_NODES ? totalNeighborsNotCovered : MAX_LOG_NODES;
+        for (uint8_t i = 0; i < logCount; i++) {
+            offset += snprintf(nodeList + offset, sizeof(nodeList) - offset, "%s%08x", i > 0 ? ", " : "", uncoveredNodes[i]);
+            if (offset >= (int)sizeof(nodeList) - 1)
+                break;
+        }
+        LOG_DEBUG("NeighborGraph: Conservative fallback - have %u uncovered neighbors [%s], relaying", totalNeighborsNotCovered, nodeList);
         return true;
     }
 
