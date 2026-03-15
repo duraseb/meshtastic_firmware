@@ -36,7 +36,11 @@ public:
     bool hasDirectConnectivity(NodeNum nodeA, NodeNum nodeB);
     bool hasVerifiedConnectivity(NodeNum transmitter, NodeNum receiver, bool* unknownOut = nullptr);
     void updateNeighborInfo(NodeNum nodeId, int32_t rssi, float snr, uint32_t lastRxTime, uint32_t variance = 0);
-    void sendSignalRoutingInfo(NodeNum dest = NODENUM_BROADCAST, bool wantResponse = false);
+    void sendSignalRoutingInfo(NodeNum dest = NODENUM_BROADCAST);
+
+    // Returns true if the packet was received directly from the sender (not relayed).
+    // Checks both hop_start==hop_limit and relay_node matching the sender's last byte.
+    static bool isDirectPacket(const meshtastic_MeshPacket &mp);
     void preProcessSignalRoutingPacket(const meshtastic_MeshPacket *p, uint32_t packetReceivedTimestamp = 0);
 
 protected:
@@ -57,9 +61,7 @@ private:
     static constexpr uint32_t RELAY_ID_CACHE_TTL_MS = 600 * 1000;  // 10 min
 
     bool signalBasedRoutingEnabled = true;
-    bool needsNodeInfoBroadcast = false;
-    uint32_t lastTopologyReplyMs = 0;
-    static constexpr uint32_t TOPOLOGY_REPLY_THROTTLE_MS = 60 * 1000;
+    bool needsBootBroadcast = false;
     bool topologyDirty = false; // Set when topology changes; log dump deferred to runOnce
     uint32_t lastBroadcast = 0;
     uint8_t currentTopologyVersion = 0;
@@ -86,7 +88,7 @@ private:
     bool isSignalBasedCapable(NodeNum nodeId) const;
     float getDirectNeighborsSignalActivePercentage() const;
     void collectNeighborsForBroadcast(meshtastic_SignalNeighbor *outNeighbors, uint8_t &outCount, uint8_t maxCount);
-    void sendTopologyPacket(NodeNum dest, const meshtastic_SignalNeighbor *neighbors, uint8_t count, uint8_t topologyVersion = 0, bool wantResponse = false);
+    void sendTopologyPacket(NodeNum dest, const meshtastic_SignalNeighbor *neighbors, uint8_t count, uint8_t topologyVersion = 0);
     void buildSignalRoutingInfo(meshtastic_SignalRoutingInfo &info);
 
     enum class CapabilityStatus : uint8_t {

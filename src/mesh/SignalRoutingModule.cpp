@@ -70,6 +70,17 @@ static int32_t computeAgeSecs(uint32_t last, uint32_t now)
 
 
 
+bool SignalRoutingModule::isDirectPacket(const meshtastic_MeshPacket &mp)
+{
+    if (mp.hop_start != mp.hop_limit)
+        return false;
+    // If relay_node is set and doesn't match the sender's last byte,
+    // a different node relayed this (stock nodes may not decrement hop_limit)
+    if (mp.relay_node != 0 && mp.relay_node != (mp.from & 0xFF))
+        return false;
+    return true;
+}
+
 SignalRoutingModule::SignalRoutingModule()
     : ProtobufModule("SignalRouting", meshtastic_PortNum_SIGNAL_ROUTING_APP, &meshtastic_SignalRoutingInfo_msg),
       concurrency::OSThread("SignalRouting")
@@ -115,8 +126,11 @@ SignalRoutingModule::SignalRoutingModule()
     // We want to see all packets for signal quality updates
     isPromiscuous = true;
 
-    // Set initial broadcast delay (30 seconds after startup)
-    setIntervalFromNow(30 * 1000);
+    // Send empty SR broadcast shortly after boot to announce our presence.
+    // SR neighbors that receive this will trigger an early broadcast of their
+    // own topology, helping us bootstrap our graph quickly.
+    needsBootBroadcast = true;
+    setIntervalFromNow(5 * 1000);
 
     LOG_INFO("[SR] Module initialized (version %d)", SIGNAL_ROUTING_VERSION);
 }
@@ -129,16 +143,15 @@ int32_t SignalRoutingModule::runOnce()
     pruneCapabilityCache(nowSecs);
     pruneRelayIdentityCache(nowMs);
 
-    // Send deferred topology request 60s after boot to resolve placeholders.
-    // Nearby SR nodes will reply with their own topology, identifying themselves.
-    if (needsNodeInfoBroadcast && nowSecs > 60) {
-        needsNodeInfoBroadcast = false;
-        LOG_INFO("[SR] Sending topology request to resolve placeholders");
-        sendSignalRoutingInfo(NODENUM_BROADCAST, true);
-    }
-
     if (routingGraph && signalBasedRoutingEnabled) {
-        if (nowMs - lastBroadcast >= SIGNAL_ROUTING_BROADCAST_SECS * 1000) {
+        // Send empty SR broadcast at boot to announce presence and trigger
+        // neighbor topology responses, regardless of whether we have neighbors yet
+        if (needsBootBroadcast) {
+            needsBootBroadcast = false;
+            LOG_INFO("[SR] Sending empty boot broadcast to bootstrap topology");
+            sendTopologyPacket(NODENUM_BROADCAST, nullptr, 0, 0);
+            lastBroadcast = nowMs;
+        } else if (nowMs - lastBroadcast >= SIGNAL_ROUTING_BROADCAST_SECS * 1000) {
             sendSignalRoutingInfo();
         }
 
@@ -174,7 +187,7 @@ int32_t SignalRoutingModule::runOnce()
     return static_cast<int32_t>(nextDelay);
 }
 
-void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest, bool wantResponse)
+void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
 {
     // Allow mute nodes to broadcast their direct neighbors to help active SR nodes
     // make better unicast routing decisions, even though mute nodes don't participate in relaying
@@ -182,15 +195,17 @@ void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest, bool wantResponse)
         return;
     }
 
-    // Collect all neighbors into fixed-size array (max 2 packets worth = 28 neighbors)
+    // Collect all neighbors into fixed-size array (max 2 packets worth = 22 neighbors)
     static constexpr uint8_t MAX_BROADCAST_NEIGHBORS = MAX_SIGNAL_ROUTING_NEIGHBORS * 2;
     meshtastic_SignalNeighbor allNeighbors[MAX_BROADCAST_NEIGHBORS];
     uint8_t totalNeighbors = 0;
     collectNeighborsForBroadcast(allNeighbors, totalNeighbors, MAX_BROADCAST_NEIGHBORS);
 
     if (totalNeighbors == 0) {
-        // Send empty broadcast to announce capability
-        sendTopologyPacket(dest, nullptr, 0, 0, wantResponse);
+        // Send empty broadcast to announce SR capability.
+        // SR nodes that receive this from a direct neighbor will trigger an early
+        // broadcast of their own topology, helping the new node bootstrap.
+        sendTopologyPacket(dest, nullptr, 0, 0);
         return;
     }
 
@@ -207,8 +222,7 @@ void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest, bool wantResponse)
     for (uint8_t packetIndex = 0; packetIndex < packetsNeeded; packetIndex++) {
         uint8_t startIdx = packetIndex * MAX_SIGNAL_ROUTING_NEIGHBORS;
         uint8_t count = std::min((uint8_t)MAX_SIGNAL_ROUTING_NEIGHBORS, (uint8_t)(totalNeighbors - startIdx));
-        // Only set want_response on the first packet
-        sendTopologyPacket(dest, &allNeighbors[startIdx], count, topologyVersion, wantResponse && packetIndex == 0);
+        sendTopologyPacket(dest, &allNeighbors[startIdx], count, topologyVersion);
     }
 
     // Update our own capability after sending
@@ -263,7 +277,7 @@ void SignalRoutingModule::collectNeighborsForBroadcast(meshtastic_SignalNeighbor
     }
 }
 
-void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const meshtastic_SignalNeighbor *neighbors, uint8_t count, uint8_t topologyVersion, bool wantResponse)
+void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const meshtastic_SignalNeighbor *neighbors, uint8_t count, uint8_t topologyVersion)
 {
     meshtastic_SignalRoutingInfo info = meshtastic_SignalRoutingInfo_init_zero;
     info.signal_routing_active = isActiveRoutingRole();
@@ -278,7 +292,6 @@ void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const meshtastic_Sign
 
     meshtastic_MeshPacket *p = allocDataProtobuf(info);
     p->to = dest;
-    p->decoded.want_response = wantResponse;
     p->priority = meshtastic_MeshPacket_Priority_BACKGROUND;
 
     service->sendToMesh(p);
@@ -422,7 +435,7 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     // Active nodes: process all SR broadcasts for full topology
     if (!isActiveRoutingRole()) {
         // Passive node: check if SR broadcast is from direct sender
-        if (p->hop_start != p->hop_limit) {
+        if (!isDirectPacket(*p)) {
             LOG_DEBUG("[SR] Passive role: Ignoring SR broadcast from 0x%08x (not direct, hopStart=%d, hopLimit=%d)",
                      p->from, p->hop_start, p->hop_limit);
             return;
@@ -486,8 +499,19 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     char senderNameForTopo[48];
     getNodeDisplayName(p->from, senderNameForTopo, sizeof(senderNameForTopo));
     LOG_INFO("[SR] Processing topology from %s: %d neighbors (version %u, %s, relay=0x%02x)",
-              senderNameForTopo, info.neighbors_count, receivedVersion, 
+              senderNameForTopo, info.neighbors_count, receivedVersion,
               isNewVersion ? "new version" : "continuation", p->relay_node);
+
+    // Empty SR broadcast from a direct SR neighbor = bootstrap request.
+    // Trigger an early broadcast so they can learn our topology quickly.
+    if (info.neighbors_count == 0 && isDirectPacket(*p) && info.signal_routing_active) {
+        uint32_t now = millis();
+        if (now - lastBroadcast > 60 * 1000) {
+            LOG_INFO("[SR] Empty broadcast from direct SR neighbor %s — triggering early topology broadcast",
+                     senderNameForTopo);
+            setIntervalFromNow(EARLY_BROADCAST_DELAY_MS);
+        }
+    }
 
     // For new topology versions, clear only topology-learned (Mirrored) edges
     // Preserve direct radio (Reported) edges which represent actual connectivity
@@ -567,19 +591,12 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
 }
 meshtastic_MeshPacket *SignalRoutingModule::allocReply()
 {
-    // Throttle topology replies to avoid flooding
-    uint32_t now = millis();
-    if (lastTopologyReplyMs != 0 && (now - lastTopologyReplyMs) < TOPOLOGY_REPLY_THROTTLE_MS) {
-        LOG_DEBUG("[SR] Throttling topology reply (last sent %us ago)", (now - lastTopologyReplyMs) / 1000);
-        ignoreRequest = true;
-        return nullptr;
-    }
-    lastTopologyReplyMs = now;
-
-    meshtastic_SignalRoutingInfo info;
-    buildSignalRoutingInfo(info);
-    LOG_INFO("[SR] Sending topology reply to resolve placeholders");
-    return allocDataProtobuf(info);
+    // Never send unicast replies to SR broadcasts — they cause stock nodes
+    // to generate NO_RESPONSE NAKs (portnum=5) that flood the mesh.
+    // Instead, SR nodes respond to empty broadcasts by triggering an early
+    // broadcast of their own topology.
+    ignoreRequest = true;
+    return nullptr;
 }
 
 bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshtastic_SignalRoutingInfo *p)
@@ -1302,18 +1319,9 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
     bool hasSignalData = (mp.rx_rssi != 0 || mp.rx_snr != 0);
     bool notViaMqtt = !mp.via_mqtt;
     
-    // Check if packet has been relayed by comparing hopStart to hopLimit
-    // If they match, the sender transmitted directly (not relayed yet)
-    // However, stock nodes may not decrement hop_limit when relaying, so also
-    // check relay_node: if relay_node differs from the sender's last byte,
-    // the packet was relayed by a different node and is NOT direct.
+    bool isDirectFromSender = isDirectPacket(mp);
     uint8_t fromLastByte = mp.from & 0xFF;
-    bool isDirectFromSender = (mp.hop_start == mp.hop_limit);
-    if (isDirectFromSender && mp.relay_node != 0 && mp.relay_node != fromLastByte) {
-        // relay_node indicates a different node relayed this — not a direct reception
-        isDirectFromSender = false;
-    }
-    
+
     // Debug logging to understand packet reception and relay state
     if (hasSignalData && notViaMqtt) {
         LOG_DEBUG("[SR] Packet from 0x%08x: relay=0x%02x, hopStart=%d, hopLimit=%d, direct=%d",
@@ -1405,9 +1413,8 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
             LOG_DEBUG("[SR] Created placeholder %08x for unknown relay 0x%02x",
                      inferredRelayer, mp.relay_node);
 
-            // Flag that we need to send a topology request to resolve placeholders.
-            // Deferred to runOnce() (60s after boot) to let the node settle first.
-            needsNodeInfoBroadcast = true;
+            // Placeholders will be resolved when we hear the real node directly,
+            // or through topology broadcasts from SR neighbors.
         }
 
         if (inferredRelayer != 0 && inferredRelayer != mp.from) {
@@ -2675,7 +2682,7 @@ void SignalRoutingModule::handleRoutingControlPacket(const meshtastic_MeshPacket
     getNodeDisplayName(mp.from, senderName, sizeof(senderName));
     
     // Only resolve placeholders if the routing packet itself is from a direct sender
-    bool isDirectRoutingPacket = (mp.hop_start == mp.hop_limit);
+    bool isDirectRoutingPacket = isDirectPacket(mp);
 
     switch (routing.which_variant) {
     case meshtastic_Routing_route_request_tag:
