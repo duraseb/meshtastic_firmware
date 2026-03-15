@@ -195,7 +195,9 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, ...) {
     for each direct neighbor:
         if (neighbor == destination) return destination; // Direct route
 
-    // 2. Find multi-hop routes using Dijkstra on the NeighborGraph
+    // 2. Find multi-hop routes using Dijkstra over the full edge graph
+    //    Traverses all known edges (direct + topology-learned) for optimal path
+    //    Falls back to downstream table only for nodes not in edge graph
     Route route = routingGraph->calculateRoute(destination, currentTime);
     if (route.nextHop != 0) {
         return route.nextHop; // Multi-hop route found
@@ -442,7 +444,7 @@ The `NeighborGraph` class uses fixed-size arrays (~24 KB heap) and runs on all p
 **Memory Structure:**
 ```cpp
 class NeighborGraph {
-    NodeEdges neighbors[24];              // Direct neighbor slots (24 nodes × 16 edges each)
+    NodeEdges neighbors[24];              // Direct neighbor slots (24 nodes × 24 edges each)
     DownstreamEntry downstream[1100];     // Remote node routing table
     RelayState relayStates[32];           // Transmission tracking for contention
     Route routeCache[32];                 // Cached Dijkstra results
@@ -466,7 +468,7 @@ class NeighborGraph {
 | Parameter | Default | Purpose |
 |-----------|---------|---------|
 | `NEIGHBOR_GRAPH_MAX_NEIGHBORS` | 24 | Direct neighbor slots |
-| `NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE` | 16 | Max edges per neighbor |
+| `NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE` | 24 | Max edges per neighbor |
 | `NEIGHBOR_GRAPH_MAX_DOWNSTREAM` | 1100 | Remote node routing entries |
 | `NEIGHBOR_GRAPH_MAX_RELAY_STATES` | 32 | Transmission tracking slots |
 | `NEIGHBOR_GRAPH_MAX_CACHED_ROUTES` | 32 | Dijkstra result cache |
@@ -493,7 +495,7 @@ struct DownstreamEntry {
 
 - Updated when SR topology broadcasts report neighbor lists from relay nodes
 - Supports multiple relays per destination (entries with different relay fields)
-- Used by `getNextHop()` to find routes beyond direct neighbors
+- Used as **fallback only** when Dijkstra over the edge graph cannot reach the destination (e.g., non-SR nodes without topology edges). Dijkstra routes always take priority over downstream estimates.
 - During placeholder resolution, entries are transferred to the real node via `transferDownstream()`
 
 ### Placeholder System
@@ -503,7 +505,7 @@ When a relayed packet arrives from an unknown node (identified only by its 8-bit
 1. **Creation**: When we directly hear a packet relayed by an unknown node
 2. **Resolution**: When we later hear that same relay byte from a node whose full ID we now know (via direct contact)
 3. **Transfer**: On resolution, all downstream entries are transferred from the placeholder to the real node via `transferDownstream()`, preserving routing continuity
-4. **TTL**: Placeholders age out after 5 minutes if never resolved
+4. **TTL**: Placeholders age out with normal node TTL (90 min) if never resolved
 
 Placeholders are only created for nodes **we** hear directly — not for nodes reported by others in SR broadcasts.
 
@@ -542,23 +544,22 @@ This prevents issues with RTC updates that could cause time jumps, ensuring reli
 
 ```cpp
 // Broadcast interval for topology updates
-#define SIGNAL_ROUTING_BROADCAST_SECS 180     // 3 minutes
+#define SIGNAL_ROUTING_BROADCAST_SECS 300     // 5 minutes
 
 // Maximum neighbors tracked per broadcast payload
-#define MAX_SIGNAL_ROUTING_NEIGHBORS 14       // Fits 14 in 233 byte payload
+#define MAX_SIGNAL_ROUTING_NEIGHBORS 11       // Fits 11 in 233 byte payload
 ```
 
 ### Timeout Values
 
 | Parameter | Value | Purpose |
 |-----------|-------|---------|
-| SR broadcast interval | 180s (3 min) | Topology update frequency |
-| SR node TTL | 1800s (30 min) | How long active SR nodes stay in graph |
-| Legacy/stock node TTL | 3600s (1 hr) | How long legacy nodes stay in graph |
-| Edge aging timeout | 1800s (30 min) | Default edge expiration (matches SR node TTL) |
-| Placeholder TTL | 300s (5 min) | How long unresolved placeholders survive |
+| SR broadcast interval | 300s (5 min) | Topology update frequency (event-driven on neighbor add/remove) |
+| Node TTL | 5400s (90 min) | How long all nodes stay in graph |
+| Edge aging timeout | 5400s (90 min) | Unified edge expiration for all node types |
+| Placeholder TTL | 5400s (90 min) | How long unresolved placeholders survive (same as node TTL) |
 | Relay ID cache TTL | 600s (10 min) | Relay byte → NodeNum mapping cache |
-| Capability cache TTL | 1800s (30 min) | Node capability status cache |
+| Capability cache TTL | 910s (~15 min) | Node capability status cache (3× broadcast interval + 10s) |
 | Route cache timeout | 300s (5 min) | Dijkstra result cache validity |
 | ETX change threshold | 0.50 | Minimum ETX change to trigger update |
 
@@ -568,9 +569,9 @@ SR tracks each node's capability status to make informed routing decisions:
 
 | Status | Description | TTL |
 |--------|-------------|-----|
-| `SRactive` | Node runs SR and actively participates | 30 min |
-| `Passive` | Node runs SR but in passive mode (TRACKER, SENSOR, etc.) | 30 min |
-| `Legacy` | Stock firmware node, no SR participation | 1 hr |
+| `SRactive` | Node runs SR and actively participates | ~15 min |
+| `Passive` | Node runs SR but in passive mode (TRACKER, SENSOR, etc.) | ~15 min |
+| `Legacy` | Stock firmware node, no SR participation | ~15 min |
 | `Unknown` | Not yet classified | — |
 
 ### Topology Health Assessment
@@ -761,12 +762,12 @@ Large buffers are stored in the heap-allocated NeighborGraph class, not on the s
 
 **"Unresolved placeholder nodes (ff0000XX)"**
 - Placeholder created for unknown relay byte, not yet resolved via direct contact
-- Placeholders age out after 5 minutes if never resolved
+- Placeholders age out with normal node TTL (90 min) if never resolved
 - Only created for directly-heard relay nodes, not nodes reported by others
 
 **"Nodes disappearing from topology"**
 - Check if nodes are being evicted from NodeDB (100 node limit)
 - Verify `last_heard` is being updated (uses `rx_time` or `getTime()` when no NTP/GPS)
-- Check edge aging timeouts: SR nodes expire after 30 min, legacy after 1 hr
+- Check edge aging timeout: all nodes expire after 90 min (NODE_TTL_SECS=5400)
 
 SignalRouting provides an alternative to traditional flooding-based mesh networking, offering basic coordination for packet relay decisions. It works alongside existing routing approaches and provides benefits in networks with sufficient SignalRouting-capable nodes, while maintaining compatibility with legacy devices through prioritized relay handling.
