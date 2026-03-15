@@ -12,8 +12,8 @@
 // Maximum neighbors we track/broadcast (optimized to fit 14 in 233 byte payload)
 #define MAX_SIGNAL_ROUTING_NEIGHBORS 14
 
-// Broadcast interval for signal routing info (3 minutes)
-#define SIGNAL_ROUTING_BROADCAST_SECS 180
+// Broadcast interval for signal routing info (5 minutes)
+#define SIGNAL_ROUTING_BROADCAST_SECS 300
 
 class SignalRoutingModule : public ProtobufModule<meshtastic_SignalRoutingInfo>, private concurrency::OSThread
 {

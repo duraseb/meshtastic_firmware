@@ -1551,6 +1551,12 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
 
             if (nodeCountBefore != nodeCountAfter) {
                 LOG_INFO("[SR] Graph aged: %u -> %u nodes", nodeCountBefore, nodeCountAfter);
+                topologyDirty = true;
+                // Trigger early broadcast so neighbors learn about the removal
+                uint32_t now = millis();
+                if (now - lastBroadcast > 60 * 1000) {
+                    setIntervalFromNow(EARLY_BROADCAST_DELAY_MS);
+                }
             } else {
                 LOG_DEBUG("[SR] Graph aged (no node count change)");
             }
