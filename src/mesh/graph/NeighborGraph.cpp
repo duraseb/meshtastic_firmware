@@ -379,59 +379,125 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, s
         return result;
     }
 
-    // 1. Direct neighbor check (1-hop)
-    const NodeEdges *myEdges = findNeighbor(myNode);
-    if (myEdges) {
-        for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
-            if (myEdges->edges[i].to == destination) {
-                result.nextHop = destination;
-                result.costFixed = myEdges->edges[i].etxFixed;
-                if (routeCacheCount < NEIGHBOR_GRAPH_MAX_CACHED_ROUTES) {
-                    routeCache[routeCacheCount++] = result;
-                } else {
-                    routeCache[0] = result;
-                }
-                return result;
+    // Dijkstra over the full edge graph.
+    // Uses fixed-size arrays sized to NEIGHBOR_GRAPH_MAX_NEIGHBORS (max nodes in graph).
+    // Each entry tracks: node, best cost, previous node (for next-hop backtrack).
+    static constexpr uint8_t MAX_DIJKSTRA = NEIGHBOR_GRAPH_MAX_NEIGHBORS;
+
+    struct DNode {
+        NodeNum id;
+        uint16_t cost;
+        NodeNum prev; // previous node in shortest path
+        bool visited;
+    };
+    DNode nodes[MAX_DIJKSTRA];
+    uint8_t nodeCount = 0;
+
+    // Helper: find index for a node, or add it
+    auto findOrAdd = [&](NodeNum id) -> int8_t {
+        for (uint8_t i = 0; i < nodeCount; i++) {
+            if (nodes[i].id == id) return i;
+        }
+        if (nodeCount >= MAX_DIJKSTRA) return -1;
+        DNode &n = nodes[nodeCount];
+        n.id = id;
+        n.cost = 0xFFFF;
+        n.prev = 0;
+        n.visited = false;
+        return nodeCount++;
+    };
+
+    // Seed with our node at cost 0
+    int8_t srcIdx = findOrAdd(myNode);
+    if (srcIdx < 0) return result;
+    nodes[srcIdx].cost = 0;
+
+    // Ensure destination is in the set
+    findOrAdd(destination);
+
+    // Pre-populate all nodes that have edges in the graph so Dijkstra can explore them
+    for (uint8_t i = 0; i < neighborCount; i++) {
+        if (neighbors[i].nodeId != 0) {
+            findOrAdd(neighbors[i].nodeId);
+        }
+    }
+
+    // Run Dijkstra
+    for (;;) {
+        // Pick unvisited node with lowest cost
+        int8_t uIdx = -1;
+        uint16_t uCost = 0xFFFF;
+        for (uint8_t i = 0; i < nodeCount; i++) {
+            if (!nodes[i].visited && nodes[i].cost < uCost) {
+                uCost = nodes[i].cost;
+                uIdx = i;
             }
         }
+        if (uIdx < 0 || uCost == 0xFFFF) break; // No more reachable nodes
 
-        // 2. Neighbor's neighbor check (2-hop)
-        for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
-            NodeNum neighbor = myEdges->edges[i].to;
+        NodeNum u = nodes[uIdx].id;
+        nodes[uIdx].visited = true;
 
-            if (nodeFilter && !nodeFilter(neighbor)) {
-                continue;
-            }
+        // Early exit if we've settled the destination
+        if (u == destination) break;
 
-            uint16_t costToNeighbor = myEdges->edges[i].etxFixed;
+        // Skip filtered nodes (except source)
+        if (u != myNode && nodeFilter && !nodeFilter(u)) continue;
 
-            const NodeEdges *neighborEdges = findNeighbor(neighbor);
-            if (neighborEdges) {
-                for (uint8_t j = 0; j < neighborEdges->edgeCount; j++) {
-                    if (neighborEdges->edges[j].to == destination) {
-                        uint16_t totalCost = costToNeighbor + neighborEdges->edges[j].etxFixed;
-                        if (totalCost < result.costFixed) {
-                            result.nextHop = neighbor;
-                            result.costFixed = totalCost;
-                        }
-                    }
-                }
+        // Relax edges from u
+        const NodeEdges *uEdges = findNeighbor(u);
+        if (!uEdges) continue;
+
+        for (uint8_t e = 0; e < uEdges->edgeCount; e++) {
+            NodeNum v = uEdges->edges[e].to;
+            uint16_t edgeCost = uEdges->edges[e].etxFixed;
+
+            int8_t vIdx = findOrAdd(v);
+            if (vIdx < 0 || nodes[vIdx].visited) continue;
+
+            uint32_t newCost = (uint32_t)uCost + edgeCost;
+            if (newCost > 0xFFFE) newCost = 0xFFFE;
+
+            if ((uint16_t)newCost < nodes[vIdx].cost) {
+                nodes[vIdx].cost = (uint16_t)newCost;
+                nodes[vIdx].prev = u;
             }
         }
     }
 
-    // 3. Downstream table lookup (if no route found yet or found route is expensive)
+    // Find destination in settled nodes
+    for (uint8_t i = 0; i < nodeCount; i++) {
+        if (nodes[i].id == destination && nodes[i].cost < 0xFFFF) {
+            result.costFixed = nodes[i].cost;
+
+            // Backtrack to find the first hop after myNode
+            NodeNum cur = destination;
+            NodeNum prev = nodes[i].prev;
+            while (prev != myNode && prev != 0) {
+                cur = prev;
+                // Find prev's entry
+                for (uint8_t j = 0; j < nodeCount; j++) {
+                    if (nodes[j].id == prev) {
+                        prev = nodes[j].prev;
+                        break;
+                    }
+                }
+            }
+            result.nextHop = cur;
+            break;
+        }
+    }
+
+    // Fallback: downstream table only when Dijkstra found no route at all.
+    // Never let the downstream estimate compete with a Dijkstra-computed cost,
+    // since the edge graph gives us verified per-link costs.
     if (result.nextHop == 0) {
+        const NodeEdges *myEdges = findNeighbor(myNode);
         for (uint16_t i = 0; i < downstreamCount; i++) {
             if (downstream[i].destination == destination) {
-                // Verify the relay is still our neighbor and passes filter
-                if (nodeFilter && !nodeFilter(downstream[i].relay)) {
-                    continue;
-                }
-                if (!findNeighbor(downstream[i].relay)) {
-                    continue;
-                }
-                // Find cost to relay from our edges
+                if (nodeFilter && !nodeFilter(downstream[i].relay)) continue;
+                if (!findNeighbor(downstream[i].relay)) continue;
+
                 uint16_t costToRelay = 0xFFFF;
                 if (myEdges) {
                     for (uint8_t j = 0; j < myEdges->edgeCount; j++) {

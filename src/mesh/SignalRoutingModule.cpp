@@ -1244,7 +1244,14 @@ void SignalRoutingModule::logNetworkTopology()
                         bool dsLast = (printed + 1 == totalDsCount);
                         const char* dsBranch = dsLast ? "\\-" : "+-";
                         float dsCost = dsCosts[d] / 100.0f;
-                        LOG_INFO("[SR]   %s    %s [downstream] %s%s (ETX=%.1f)", cont, dsBranch, dsprefix, nameBuf, dsCost);
+                        // Show Dijkstra route cost if available (more accurate than flat downstream cost)
+                        Route dsRoute = routingGraph->calculateRoute(dsBuf[d], millis() / 1000);
+                        if (dsRoute.nextHop != 0 && dsRoute.costFixed < 0xFFFF) {
+                            float routeCost = dsRoute.getCost();
+                            LOG_INFO("[SR]   %s    %s [downstream] %s%s (routeETX=%.1f, dsETX=%.1f)", cont, dsBranch, dsprefix, nameBuf, routeCost, dsCost);
+                        } else {
+                            LOG_INFO("[SR]   %s    %s [downstream] %s%s (dsETX=%.1f)", cont, dsBranch, dsprefix, nameBuf, dsCost);
+                        }
                         printed++;
                     }
                 }
@@ -3453,6 +3460,10 @@ void SignalRoutingModule::processContentionWindows(uint32_t nowMs)
                 if (shouldRelayNow && check.hopLimit > 0 && check.packetCopy) {
                     meshtastic_MeshPacket *tosend = check.packetCopy;
                     check.packetCopy = nullptr;
+                    // Decrement hop limit for the relay, clamped at 1 for SR routing
+                    if (tosend->hop_limit > 1) {
+                        tosend->hop_limit--;
+                    }
                     routingGraph->recordNodeTransmission(myNode, check.packetId, nowMs / 1000);
                     commitRelay(check.packetId, check.heardFrom);
                     router->send(tosend);
