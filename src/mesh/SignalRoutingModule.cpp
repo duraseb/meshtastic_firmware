@@ -513,12 +513,7 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
         }
     }
 
-    // For new topology versions, clear only topology-learned (Mirrored) edges
-    // Preserve direct radio (Reported) edges which represent actual connectivity
-    if (isNewVersion && routingGraph) {
-        routingGraph->clearEdgesForNode(p->from);
-        LOG_DEBUG("[SR] Cleared topology-learned edges for node %08x (new version)", p->from);
-    }
+    // Mirrored edges are not cleared on new topology versions — they age out naturally.
 
     // Process each neighbor directly from the received info - memory efficient
     for (pb_size_t i = 0; i < info.neighbors_count; i++) {
@@ -663,11 +658,7 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
     bool alreadyPreProcessed = (preProcessedVer != 0 && preProcessedVer == p->routing_version);
 
     if (!alreadyPreProcessed) {
-        // Clear all existing edges for this node before adding the new ones from the broadcast
-        // This ensures our view of the sender's connectivity matches exactly what it reported
-        routingGraph->clearEdgesForNode(mp.from);
-        // Also clear any inferred connectivity edges pointing TO this node that were created
-        // before we knew it was SR-capable
+        // Clear inferred edges pointing TO this node that were created before we knew it was SR-capable
         routingGraph->clearInferredEdgesToNode(mp.from);
 
         // Add edges from each neighbor TO the sender
