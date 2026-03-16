@@ -211,17 +211,20 @@ class NeighborGraph {
     // --- Relay decisions ---
 
     bool shouldRelayEnhanced(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom, uint32_t currentTime, uint32_t packetId,
-                             uint32_t packetRxTime = 0) const;
+                             uint32_t packetRxTime = 0, const NodeNum *coListeners = nullptr,
+                             uint8_t coListenerCount = 0) const;
 
     bool shouldRelayEnhancedConservative(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom, uint32_t currentTime,
-                                         uint32_t packetId, uint32_t packetRxTime = 0) const;
+                                         uint32_t packetId, uint32_t packetRxTime = 0,
+                                         const NodeNum *coListeners = nullptr, uint8_t coListenerCount = 0) const;
 
     bool shouldRelaySimple(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom, uint32_t currentTime) const;
 
     bool shouldRelaySimpleConservative(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom, uint32_t currentTime) const;
 
     RelayCandidate findBestRelayCandidate(const NodeSet &candidates, const NodeSet &alreadyCovered,
-                                          uint32_t currentTime, uint32_t packetId) const;
+                                          uint32_t currentTime, uint32_t packetId,
+                                          bool preferHighNodeId = false) const;
 
     size_t getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, size_t maxNodes, const NodeNum *alreadyCovered,
                                size_t alreadyCoveredCount) const;

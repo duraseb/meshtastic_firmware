@@ -1023,9 +1023,9 @@ size_t NeighborGraph::getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, 
     return coveredCount;
 }
 
-RelayCandidate NeighborGraph::findBestRelayCandidate(const NodeSet &candidates,
-                                                          const NodeSet &alreadyCovered,
-                                                          uint32_t currentTime, uint32_t packetId) const
+RelayCandidate NeighborGraph::findBestRelayCandidate(const NodeSet &candidates, const NodeSet &alreadyCovered,
+                                                          uint32_t currentTime, uint32_t packetId,
+                                                          bool preferHighNodeId) const
 {
     RelayCandidate bestCandidate(0, 0, 0, 0);
 
@@ -1069,8 +1069,15 @@ RelayCandidate NeighborGraph::findBestRelayCandidate(const NodeSet &candidates,
         float avgCost = totalCost / validCosts;
         uint16_t avgCostFixed = static_cast<uint16_t>(avgCost * 100);
 
-        if (uniqueCoverageCount > bestCandidate.coverageCount ||
-            (uniqueCoverageCount == bestCandidate.coverageCount && avgCostFixed < bestCandidate.avgCostFixed)) {
+        bool isBetter = uniqueCoverageCount > bestCandidate.coverageCount ||
+                        (uniqueCoverageCount == bestCandidate.coverageCount && avgCostFixed < bestCandidate.avgCostFixed);
+        // Deterministic tiebreak on node ID when coverage and cost are equal
+        if (!isBetter && uniqueCoverageCount == bestCandidate.coverageCount &&
+            avgCostFixed == bestCandidate.avgCostFixed && bestCandidate.nodeId != 0) {
+            isBetter = preferHighNodeId ? (candidate > bestCandidate.nodeId)
+                                        : (candidate < bestCandidate.nodeId);
+        }
+        if (isBetter) {
             bestCandidate = RelayCandidate(candidate, uniqueCoverageCount, avgCostFixed, 0);
         }
     }
@@ -1162,7 +1169,8 @@ bool NeighborGraph::isGatewayNode(NodeNum nodeId, NodeNum sourceNode) const
 }
 
 bool NeighborGraph::shouldRelayEnhanced(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom, uint32_t currentTime,
-                                         uint32_t packetId, uint32_t packetRxTime) const
+                                         uint32_t packetId, uint32_t packetRxTime,
+                                         const NodeNum *coListeners, uint8_t coListenerCount) const
 {
     NodeSet alreadyCovered;
     alreadyCovered.insert(sourceNode);
@@ -1182,8 +1190,24 @@ bool NeighborGraph::shouldRelayEnhanced(NodeNum myNode, NodeNum sourceNode, Node
         }
     }
 
+    // When heardFrom has no edges in the graph (stock node), SR neighbors that
+    // also heard the packet won't appear as candidates. Add them so the relay
+    // selection can coordinate and pick a single relay.
+    if (coListeners && coListenerCount > 0) {
+        for (uint8_t i = 0; i < coListenerCount; i++) {
+            if (coListeners[i] != myNode && coListeners[i] != heardFrom) {
+                candidates.insert(coListeners[i]);
+            }
+        }
+        // Also add ourselves so findBestRelayCandidate can pick us
+        candidates.insert(myNode);
+    }
+
+    bool preferHighNodeId = (packetId & 1) != 0;
+
     while (!candidates.empty()) {
-        RelayCandidate bestCandidate = findBestRelayCandidate(candidates, alreadyCovered, currentTime, packetId);
+        RelayCandidate bestCandidate = findBestRelayCandidate(candidates, alreadyCovered, currentTime, packetId,
+                                                               preferHighNodeId);
 
         if (bestCandidate.nodeId == 0) {
             break;
@@ -1259,7 +1283,8 @@ bool NeighborGraph::shouldRelayEnhanced(NodeNum myNode, NodeNum sourceNode, Node
 
 bool NeighborGraph::shouldRelayEnhancedConservative(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom,
                                                      uint32_t currentTime, uint32_t packetId,
-                                                     uint32_t packetRxTime) const
+                                                     uint32_t packetRxTime,
+                                                     const NodeNum *coListeners, uint8_t coListenerCount) const
 {
     const NodeEdges *myEdges = findNeighbor(myNode);
     if (!myEdges)
@@ -1278,7 +1303,8 @@ bool NeighborGraph::shouldRelayEnhancedConservative(NodeNum myNode, NodeNum sour
         return shouldRelaySimpleConservative(myNode, sourceNode, heardFrom, currentTime);
     }
 
-    return shouldRelayEnhanced(myNode, sourceNode, heardFrom, currentTime, packetId, packetRxTime);
+    return shouldRelayEnhanced(myNode, sourceNode, heardFrom, currentTime, packetId, packetRxTime,
+                               coListeners, coListenerCount);
 }
 
 bool NeighborGraph::shouldRelaySimple(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom, uint32_t currentTime) const

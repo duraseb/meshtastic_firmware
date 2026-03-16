@@ -2082,12 +2082,41 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         }
     }
 
-    bool shouldRelay = routingGraph->shouldRelayEnhanced(myNode, sourceNode, heardFrom, relayDecisionTime, p->id, packetReceivedTimestamp);
+    // Build co-listener list: SR-active direct neighbors that also heard heardFrom.
+    // This lets shouldRelayEnhanced coordinate when heardFrom is a stock node with
+    // no edges in the graph (both SR neighbors would otherwise both decide to relay).
+    NodeNum coListeners[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
+    uint8_t coListenerCount = 0;
+    const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
+    if (myEdges) {
+        for (uint8_t i = 0; i < myEdges->edgeCount && coListenerCount < NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE; i++) {
+            NodeNum neighbor = myEdges->edges[i].to;
+            if (neighbor == heardFrom || neighbor == sourceNode)
+                continue;
+            if (getCapabilityStatus(neighbor) != CapabilityStatus::SRactive)
+                continue;
+            // Check if this SR neighbor can also hear heardFrom
+            const NodeEdges *neighborEdges = routingGraph->getEdgesFrom(neighbor);
+            if (neighborEdges) {
+                for (uint8_t j = 0; j < neighborEdges->edgeCount; j++) {
+                    if (neighborEdges->edges[j].to == heardFrom) {
+                        coListeners[coListenerCount++] = neighbor;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    bool shouldRelay = routingGraph->shouldRelayEnhanced(myNode, sourceNode, heardFrom, relayDecisionTime, p->id,
+                                                          packetReceivedTimestamp, coListeners, coListenerCount);
 
     // Apply conservative logic only when NOT required for branch coverage
     if (shouldRelay && hasStockGateways && !mustRelayForBranchCoverage) {
         LOG_DEBUG("[SR] Applying conservative relay logic (stock gateways present, not from gateway)");
-        shouldRelay = routingGraph->shouldRelayEnhancedConservative(myNode, sourceNode, heardFrom, relayDecisionTime, p->id, packetReceivedTimestamp);
+        shouldRelay = routingGraph->shouldRelayEnhancedConservative(myNode, sourceNode, heardFrom, relayDecisionTime,
+                                                                    p->id, packetReceivedTimestamp,
+                                                                    coListeners, coListenerCount);
         if (!shouldRelay) {
             LOG_DEBUG("[SR] Suppressed SR relay - stock gateway can handle external transmission");
         } else {
