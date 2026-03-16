@@ -13,6 +13,15 @@
 
 #include "Throttle.h"
 
+#if defined(USE_EBYTE_E22P) && defined(SX126X_RXEN) && !defined(SX126X_POWER_EN) && (SX126X_RXEN != RADIOLIB_NC)
+// Some E22 variants expose only one RF switch control in this path:
+// mirror RXEN into POWER_EN and disable MCU-side RXEN usage.
+static constexpr RADIOLIB_PIN_TYPE __ebyte_e22p_power_en_pin = SX126X_RXEN;
+#define SX126X_POWER_EN __ebyte_e22p_power_en_pin
+#undef SX126X_RXEN
+#define SX126X_RXEN RADIOLIB_NC
+#endif
+
 // Particular boards might define a different max power based on what their hardware can do, default to max power output if not
 // specified (may be dangerous if using external PA and SX126x power config forgotten)
 #if ARCH_PORTDUINO
