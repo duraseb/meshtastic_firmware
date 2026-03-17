@@ -14,7 +14,7 @@ SignalRouting (SR) is an advanced mesh networking protocol for Meshtastic that f
 **SignalRouting Behavior:**
 - **Broadcasts**: Intelligent relay coordination to prevent redundant transmissions while ensuring coverage
 - **Unicasts**: Graph-based multi-hop routing with ETX optimization, plus coordinated relay selection through overhearing
-- **Coordination**: Distributed algorithm where nodes compete for relay responsibilities based on network position
+- **Coordination**: Deterministic slot-based algorithm where nodes independently compute relay ordering and schedule transmissions
 
 ### SR's Dual Nature
 
@@ -36,10 +36,10 @@ This dual approach provides the reliability of coordinated networking with the e
 - **No Learning**: Static behavior regardless of network conditions
 
 **SignalRouting Solution:**
-- **Coordination**: Distributed algorithm determines optimal relay nodes based on coverage analysis
+- **Coordination**: Deterministic slot-based scheduling assigns relay order based on coverage analysis
 - **Topology Awareness**: Uses ETX metrics and graph knowledge to select best relay candidates
-- **Iterative Selection**: Nodes compete for relay responsibilities with timeout-based fallback
-- **Legacy Integration**: Prioritizes existing ROUTER/REPEATER nodes for compatibility
+- **Slot Scheduling**: Nodes independently compute identical relay ordering, eliminating collision between SR nodes
+- **Legacy Integration**: Stock ROUTER/REPEATER nodes get earliest slots for compatibility
 
 **Key Advantage**: Transforms chaotic flooding into orchestrated relay selection, significantly reducing redundant transmissions while maintaining reliable coverage.
 
@@ -103,7 +103,7 @@ Passive SR nodes (TRACKER, SENSOR, TAK, or non-active-routing configured nodes) 
 |-------------|-----------------|---------------|
 | **FloodingRouter** | SNR-based delays (poorer SNR = shorter delay) | Immediate send |
 | **NextHopRouter** | SNR-based delays + next hop preference | iface->getRetransmissionMsec() timing |
-| **SignalRouting** | Backup relay contention windows (1-2s based on LoRa preset) | ETX-based route selection + speculative retransmit |
+| **SignalRouting** | Slot-based: half-airtime per slot + hash-based unique coverage delay | ETX-based route selection + speculative retransmit |
 
 ## Direct Neighbor Detection
 
@@ -234,161 +234,123 @@ When deciding whether to use SR coordination for unicast packets:
 
 ### Speculative Retransmission
 
-For unicast packets, SignalRouting coordinates relay decisions on overhearing nodes:
-- Intermediate nodes that overhear unicast transmissions participate in relay coordination
-- Determines optimal relay candidates based on coverage analysis and ETX metrics
-- Prevents redundant transmissions through distributed candidate selection
+For unicast packets, SR coordinates relay decisions on overhearing nodes using the same slot-based algorithm as broadcasts:
+- Overhearing nodes independently compute candidate ranking by ETX-to-destination
+- The best-positioned node transmits first; others cancel on hearing the dupe
 - Originating node retransmission handled by standard Router mechanisms
 
-**Unlike broadcast coordination**, unicast relay failures rely on end-to-end retransmission rather than immediate fallback to alternative relays. In multi-hop unicast scenarios, relay failures are only detected when the original sender doesn't receive an ACK from the final destination.
+Unicast relay failures are detected end-to-end: the original sender retransmits if it doesn't receive an ACK, rather than SR immediately trying an alternative relay.
 
 ### Unicast Relay Coordination
 
-SignalRouting fundamentally differs from stock routing in its approach to unicast packets. While stock firmware simply forwards unicasts to the calculated next hop, SR enables intelligent relay coordination through iterative next-hop selection with fallback strategies.
-
-**Iterative Unicast Route Selection:**
-SR tries multiple routing strategies in order of increasing permissiveness, similar to broadcast candidate selection:
-
-1. **Calculated Route**: Best ETX-based route with restrictive opportunistic forwarding
-2. **Opportunistic Route**: Best route with opportunistic forwarding enabled
-3. **Gateway Delegation**: If destination has designated gateway, delegate to traditional routing
-4. **Traditional Fallback**: Allow standard Router/flooding when all SR strategies fail
+SignalRouting uses the same slot-based scheduling algorithm for unicasts as for broadcasts. Nodes that overhear a unicast packet independently compute a relay candidate ranking and schedule their TX at the assigned slot delay. If the higher-priority node transmits before our slot fires, the dupe cancels our queued relay.
 
 **Coordination Through Overhearing:**
-When a unicast packet is transmitted, nodes that overhear the transmission (even if they can't decrypt the payload) can participate in relay coordination:
+When a unicast packet is transmitted, nodes that overhear it can participate in relay coordination:
 
-1. **Overhearing Mechanism**: Unicast packets are transmitted normally with unencrypted headers
-2. **Intermediate Participation**: Non-destination nodes that overhear the unicast can run coordination logic
-3. **Distributed Decision**: Each overhearing node independently calculates if it should relay to the destination
-4. **Optimal Selection**: Best-positioned relays are chosen based on route quality and network topology
+1. **Overhearing Mechanism**: Unicast packets are transmitted with unencrypted headers visible to all nodes
+2. **Intermediate Participation**: Non-destination nodes that overhear can run the slot scheduling logic
+3. **Distributed Decision**: Each node independently computes the same candidate ordering
+4. **Optimal Selection**: Best-positioned relay (lowest ETX to destination) gets the earliest slot
 
-**When SR Enables Coordination:**
-SR allows unicast coordination when:
-- ANY route exists to the destination (regardless of cost)
-- Network topology is healthy and destination is known
-- Gateway preferences and designated gateway logic don't override
-- Next hop is SR-capable or legacy router
+**Candidate Cost Metric:**
+For each candidate (self + SR-active direct neighbors):
+- Direct edge to destination → raw `etxFixed` (range ~100–32767)
+- Edge to the shared next hop (indirect) → `etxFixed | 0x8000` — always sorts after direct-edge candidates
+- No usable path → excluded
 
-This allows SR's coordinated delivery algorithm to select the best relay candidates even for challenging routes.
+This ensures last-hop delivery nodes (direct edge to destination) are always scheduled before intermediate relays, and within each group the lower ETX wins.
 
-**Overhearing Node Optimization:**
-When nodes overhear a unicast transmission, they check if the original transmitter has direct connectivity to the optimal next hop or destination. If so, the transmitter should have handled the transmission directly rather than relying on coordination. This prevents unnecessary relay coordination when direct paths exist.
+**Quick Suppression Checks (before slot scheduling):**
+- Source and destination both downstream of the same relay → suppress
+- `heardFrom` already has a direct edge or downstream relay path to destination → suppress
+- An SR neighbor that covers `heardFrom` can reach destination → suppress
 
-```cpp
-bool shouldUseSignalBasedRouting(const meshtastic_MeshPacket *p) {
-    // Complex logic including:
-    // - Check if we have ANY route to destination (regardless of cost)
-    // - Verify topology health for destination
-    // - Apply gateway preferences and designated gateway logic
-    // - Ensure next hop is SR-capable or legacy router
-    // Returns true when SR coordination should be used for unicast relay
-}
-```
-
-This conservative approach prevents network flooding by only coordinating delivery for destinations that are already known in the network topology. Unknown nodes are discovered through multiple mechanisms:
-
-- **Broadcast topology announcements**: Nodes periodically broadcast their neighbor information
-- **Direct packet reception**: When receiving packets directly from unknown nodes with signal data
-- **Relayed packet inference**: Inferring gateway relationships and direct connectivity between senders and Legacy relay nodes from relayed packets
-- **Placeholder resolution**: Unknown relays are tracked as placeholders until real node identities are discovered
-
-Unicast coordination can occur once a destination is known through any of these discovery methods. Additionally, unicast relay coordination includes optimizations to prevent unnecessary transmissions:
-
-- **Direct Connectivity Optimization**: If the broadcasting node (that initiated coordination) has direct connectivity to the optimal next hop or destination, other nodes won't relay since the broadcasting node should have handled the transmission directly
-- **Sender-Destination Direct Check**: If the original sender has a direct connection to the destination, no coordination occurs as the destination already received the packet directly
+**Dupe Cancellation:**
+When a dupe arrives for a committed unicast relay, `isDupeRelayRedundant` checks whether the dupe relayer has a direct edge (or is the recorded downstream relay) for the destination. If yes, our relay is redundant and `cancelSending` fires.
 
 ## Broadcast Routing
 
-### Iterative Relay Coordination Algorithm
+### Slot-Based Relay Coordination
 
-SignalRouting uses an iterative algorithm to coordinate broadcast relays, ensuring coverage while minimizing redundancy. The algorithm prioritizes legacy routers/repeaters and uses timeout-based candidate selection. **Note**: This iterative approach is used only for broadcast coordination, not for unicast relay coordination.
+SignalRouting uses a deterministic slot-based algorithm to coordinate broadcast relays. Each node independently computes the same candidate ordering and assigns time slots spaced by half the packet airtime. Nodes schedule their TX at their assigned slot and rely on existing dupe suppression: if a node hears the packet relayed before its slot fires, it cancels its queued transmission.
 
-```cpp
-bool NeighborGraph::shouldRelayEnhanced(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom, uint32_t currentTime, uint32_t packetId) {
-    // Start with all nodes that can hear the transmitter
-    std::unordered_set<NodeNum> candidates = getNodesThatHeardTransmitter(heardFrom);
+**Algorithm phases:**
 
-    // Iterative loop: keep trying candidates until we decide to relay or run out of candidates
-    while (!candidates.empty()) {
-        // Find best candidate from current candidate list (prioritizing legacy routers)
-        RelayCandidate bestCandidate = findBestRelayCandidate(candidates, alreadyCovered, currentTime, packetId);
+1. **Stock routers first**: Legacy ROUTER/REPEATER neighbors get the earliest slots since they transmit regardless of SR decisions. If they already transmitted, their coverage is absorbed.
 
-        if (bestCandidate.nodeId == myNode) {
-            return true; // We're the best candidate - relay immediately
-        }
+2. **SR candidate ranking**: Remaining candidates are iteratively ranked by `findBestRelayCandidate` (most unique coverage, lowest ETX, deterministic node ID tiebreak based on packet ID parity). Each candidate gets the next slot. If it's us, we schedule TX and stop. If a candidate already transmitted, we absorb its coverage without consuming a slot.
 
-        // Wait for best candidate to relay within contention window
-        if (hasNodeTransmitted(bestCandidate.nodeId, packetId, currentTime)) {
-            // Best candidate relayed - check if we have unique coverage
-            if (hasUniqueCoverage(myNode, bestCandidate.nodeId, alreadyCovered)) {
-                return true; // Relay for unique coverage
-            }
-            // Remove best candidate and try next best
-            candidates.erase(bestCandidate.nodeId);
-        } else {
-            // Best candidate hasn't relayed yet - wait or timeout
-            return false; // Wait for best candidate
-        }
-    }
+3. **Unique coverage**: If we weren't assigned a slot, we check for neighbors not covered by any assigned candidate. If found, we relay with a hash-based delay: `slotDelay + (hash(nodeId, packetId) % 100) * 20` ms (0-2000ms range).
 
-    // No candidates left - check if we have uncovered neighbors
-    if (hasUncoveredNeighbors(myNode, alreadyCovered)) {
-        return true; // Relay to reach uncovered neighbors
-    }
+4. **Overrides**: Downstream relay obligations and stock coverage needs can force a relay.
 
-    return false; // Don't relay
-}
 ```
+Slot timing example (150ms half-airtime):
+
+  Slot 0 (0ms):    Stock router R1
+  Slot 1 (150ms):  Stock router R2
+  Slot 2 (300ms):  Best SR candidate (most unique coverage)
+  Slot 3 (450ms):  Next SR candidate
+  ...
+  Unique (600ms+): Hash-based delay for nodes with uncovered neighbors
+```
+
+**Deterministic tiebreak**: When two candidates have identical coverage and cost, the winner is determined by node ID direction based on packet ID parity (even → lowest ID, odd → highest ID). This distributes relay duty evenly across nodes.
+
+### How Slot Spacing Works
+
+Slots are spaced by half the packet airtime. When slot 0 starts transmitting, slot 1's radio detects the ongoing reception (`busyRx`) and holds. After slot 0's packet is received, dupe detection cancels slot 1's queued relay if the coverage is redundant. Half-airtime spacing provides enough margin for preamble detection while keeping propagation fast.
+
+### Topology Edge Persistence
+
+Mirrored edges (learned from topology broadcasts) are not cleared when a new topology version arrives. They age out naturally. This prevents valid neighbor knowledge from being lost between broadcasts — for example, a stock node that both SR neighbors can hear would otherwise be forgotten each time they exchange topology, causing false "unique coverage" decisions.
 
 ### Relay Decision Factors
 
-1. **Candidate Selection**: Only nodes that can hear the transmitter are considered
-2. **Legacy Priority**: Legacy routers/repeaters are prioritized as they are designed to always rebroadcast
-3. **Iterative Refinement**: Candidate list shrinks with each non-relaying node, ensuring optimal selection
-4. **Unique Coverage**: After other nodes relay, check if we cover areas they don't reach
-5. **Timeout Handling**: Non-relaying candidates are excluded, forcing re-calculation with remaining nodes
-6. **Fallback Logic**: Relay if no candidates remain but neighbors haven't been covered
+1. **Stock Router Priority**: Legacy routers/repeaters get earliest slots as they always rebroadcast
+2. **Deterministic Ordering**: All nodes compute the same candidate ranking for consistent slot assignment
+3. **Coverage-Based Selection**: Candidates ranked by unique coverage count, then ETX quality
+4. **Dupe Suppression**: Existing packet deduplication cancels queued relays when earlier slots transmit
+5. **Unique Coverage Fallback**: Nodes covering areas no candidate reaches relay with hash-based delay
+6. **Downstream Override**: Nodes recorded as relay for source/destination are forced to relay
 
 ### Broadcast Coordination Example
 
 ```
-Network: A ── B ── C
-           │    │
-           D ── E
+Network: A ── B(SR) ── C
+           │     │
+           D(SR) ── E
 
-Packet from A to BROADCAST:
+Packet from A to BROADCAST (halfAirtime = 150ms):
 
-1. A transmits first
-2. B, D, and E hear it (assuming they can all hear A)
-3. Candidate list: [B, D, E]
-4. Find best candidate: assume B provides most coverage (C,E)
-5. B is not best candidate - wait for best candidate (B) to relay
-6. B relays, covering C and E
-7. After B relays, check for unique coverage:
-   - D: covers E (already covered by B) - no unique coverage
-   - E: covers no additional nodes - no unique coverage
-8. No nodes have unique coverage - no additional relays needed
-9. Result: Full coverage with 1 relay
+1. A transmits
+2. B and D both hear it, build identical candidate lists
+3. B has more unique coverage (covers C and E) → B gets slot 0 (0ms)
+4. D gets slot 1 (150ms)
+5. B transmits at slot 0, D's radio detects busyRx and holds
+6. D receives B's relay as dupe → checks coverage → B covered everything → cancels
+7. Result: 1 relay, 0 redundant transmissions
 ```
 
-**With Legacy Router Priority:**
+**With stock router:**
 
 ```
-Network: A ── B(legacy) ── C
-           │        │
-           D ─────── E
+Network: A ── R(stock router) ── C
+           │         │
+           B(SR) ─── D(SR)
 
-Packet from A to BROADCAST:
+Packet from A to BROADCAST (halfAirtime = 150ms):
 
-1. A transmits first
-2. B (legacy router), D, and E hear it
-3. Candidate list: [B, D, E]
-4. Find best candidate: B prioritized as legacy router
-5. B relays immediately (legacy behavior)
-6. After B relays, check for unique coverage:
-   - D: covers areas not reached by B - may relay if unique coverage exists
-   - E: covers areas not reached by B - may relay if unique coverage exists
-7. Result: Legacy router relays first, then additional relays only for unique coverage
+1. A transmits
+2. R, B, D all hear it
+3. R gets slot 0 (0ms) — stock router priority
+4. B ranked best SR candidate → slot 1 (150ms)
+5. D gets slot 2 (300ms)
+6. R transmits at slot 0 (stock behavior)
+7. B receives R's relay, checks unique coverage — none → cancels
+8. D receives R's relay, checks unique coverage — none → cancels
+9. Result: 1 relay from stock router, SR nodes suppressed
 ```
 
 ## Benefits for Mesh Network Reliability
@@ -396,7 +358,7 @@ Packet from A to BROADCAST:
 ### Improved Deliverability
 
 **Dense Node Scenarios:**
-SignalRouting transforms chaotic broadcast flooding into orchestrated relay selection. In dense networks where multiple nodes hear the same transmissions, SR's iterative coordination algorithm identifies optimal relay nodes based on coverage analysis and ETX metrics. This significantly reduces redundant transmissions compared to traditional SNR-based flooding, while maintaining reliable delivery. Coordination effectiveness depends on topology accuracy, with graceful fallback to contention-based approaches when graph information is incomplete.
+SignalRouting transforms chaotic broadcast flooding into deterministic relay scheduling. In dense networks where multiple nodes hear the same transmissions, SR's slot-based algorithm assigns ordered time slots to relay candidates based on coverage analysis and ETX metrics. Half-airtime slot spacing ensures that when the highest-priority node transmits, others detect the ongoing reception and suppress their own relay. This significantly reduces redundant transmissions compared to traditional SNR-based flooding, while maintaining reliable delivery. Coordination effectiveness depends on topology accuracy, with graceful fallback when graph information is incomplete.
 
 ### Mesh Branch Handling
 
@@ -427,13 +389,13 @@ SignalRouting considerations:
 
 **Failure Recovery:**
 - Speculative retransmission provides basic recovery for unicast packet loss
-- Falls back to contention-based flooding when topology information is incomplete
+- Slot-based scheduling provides natural fallback: if a higher-priority node fails to transmit, the next slot's node simply doesn't hear a dupe and transmits on schedule
 - Limited adaptation to sudden link failures without immediate topology updates
 
 **Congestion Control:**
-- Attempts to reduce redundant broadcasts through coordination
-- Uses timeout-based relay selection to allow backup relays when primary relays fail
-- Coordination effectiveness depends on network topology knowledge and node participation
+- Deterministic slot scheduling minimizes redundant broadcasts
+- Half-airtime spacing between slots ensures physical separation of transmissions
+- Unique coverage relays use hash-based delays (0-2000ms) to spread out remaining transmissions
 
 ## NeighborGraph Implementation
 
@@ -461,7 +423,7 @@ class NeighborGraph {
 | `DownstreamEntry` | Remote node routing: (destination, relay, cost, lastUpdate) |
 | `Route` | Cached route result: (destination, nextHop, cost, timestamp) |
 | `RelayCandidate` | Relay selection: (nodeId, coverageCount, avgCost, tier) |
-| `RelayState` | Tracks which nodes transmitted which packets for contention windows |
+| `RelayState` | Tracks which nodes transmitted which packets for dupe detection |
 
 **Graph Limits (compile-time configurable):**
 
@@ -644,60 +606,55 @@ Farm House ── Barn ── Equipment Shed
 
 ## Algorithm Details
 
-### Iterative Relay Selection
+### Slot-Based Relay Selection
 
-SignalRouting uses an iterative algorithm for relay coordination:
+SignalRouting uses a deterministic slot-based algorithm for relay coordination:
 
-1. **Initial Candidate Selection**: All nodes that can hear the transmitter
-2. **Best Candidate Identification**: Select node with best coverage/cost ratio (prioritizing legacy routers)
-3. **Immediate Relay**: If selected node relays immediately
-4. **Wait/Timeout**: Wait for best candidate to relay within contention window
-5. **Unique Coverage Check**: After relay, other nodes check if they cover additional areas
-6. **Candidate Exclusion**: Remove non-relaying candidates and repeat with remaining nodes
-7. **Fallback**: If no candidates remain, relay if neighbors haven't been covered
+1. **Candidate Building**: Direct neighbors (excluding heardFrom and source) plus SR-active co-listeners that can hear the same transmitter
+2. **Stock Router Slots**: Legacy routers/repeaters assigned first slots (they transmit regardless)
+3. **SR Candidate Ranking**: Iteratively pick best candidate (most unique coverage, lowest ETX, packet-ID-parity node ID tiebreak), assign next slot, remove from candidates
+4. **Self-Assignment**: When we're picked as best candidate, schedule TX at that slot's delay
+5. **Already-Transmitted Absorption**: Candidates that already transmitted have their coverage absorbed without consuming a slot
+6. **Unique Coverage**: If not assigned a slot, check for uncovered neighbors and relay with hash-based delay
+7. **Dupe Suppression**: If a relay arrives before our slot fires, existing deduplication cancels our queued TX
 
-This iterative approach ensures optimal relay selection while handling timeouts and network dynamics.
+Slot spacing is half the packet airtime, ensuring the next-slot node detects ongoing reception (`busyRx`) and holds its transmission.
 
 ### Unicast Relay Logic
 
-SignalRouting implements sophisticated unicast relay coordination to optimize packet delivery:
+`shouldRelayUnicastForCoordination` mirrors the broadcast slot scheduler:
 
-1. **Gateway Override**: If we are the designated gateway for the destination, always relay to ensure downstream connectivity
-2. **Transmitter Direct Connectivity**: If the original transmitter has direct connectivity to our calculated next hop or the destination, don't relay - the transmitter should have used that direct path instead of relying on coordination
-3. **Sender Direct Connectivity**: If the original sender has direct connection to the destination, don't relay (destination already received directly)
-4. **Downstream Relay Coordination**: If destination is downstream of relays we can hear, coordinate delivery through broadcasting
-5. **Legacy Router Priority**: Give priority to legacy routers/repeaters that can reach the destination (they are designed to always relay)
-6. **Route Cost Comparison**: Compare our route quality against other nodes that heard the transmission to determine best relay positioning
-7. **Better Direct Connection Check**: If another node has a significantly better direct connection to the destination, defer to them
+1. **Quick suppression**: src+dst same downstream relay, heardFrom can reach dst, SR neighbor covering heardFrom can reach dst
+2. **No route → suppress**: `getNextHop(destination)` returns 0
+3. **Phase 1 — stock routers**: legacy router neighbors with a path to destination get sequential slots first (same as broadcasts)
+4. **Phase 2 — SR candidates**: self + SR-active neighbors sorted ascending by cost-to-destination; first unassigned candidate gets the next slot
+5. **Slot assignment**: if it's our slot, `pendingRelayDelayMs` is set and we return true; otherwise suppress
+6. **Dupe cancellation**: if a dupe arrives before our TX fires, `isDupeRelayRedundant` checks the relayer's connectivity to destination and cancels if redundant
 
-**Note**: Unlike broadcast coordination which uses overhearing and contention windows, unicast route selection uses iterative strategy fallback with dynamic contention windows on the originating node to provide robustness when primary routes fail.
+```
+Slot timing example (150ms half-airtime, 2 nodes with direct edge to FCM6):
 
-```cpp
-bool shouldRelayUnicastForCoordination(const meshtastic_MeshPacket *p) {
-    // Complex coordination logic including all the above checks
-    // Plus relay byte deduplication: if the designated relay for the destination
-    // has already transmitted (detected via relay_node byte match against direct
-    // edges only), don't duplicate the relay
-}
+  Slot 0 (0ms):    Stock router (if any)
+  Slot 1 (150ms):  SR node with lower ETX to destination (e.g. MB9c, ETX=1.2)
+  Slot 2 (300ms):  SR node with higher ETX to destination (e.g. MBe4, ETX=1.8)
+
+MB9c transmits at slot 1. MBe4 hears it → isDupeRelayRedundant: MB9c has direct edge to destination → redundant → cancelSending.
 ```
 
 ### Performance Characteristics
 
 **Broadcast Coordination:**
-- Uses iterative candidate selection with dynamic contention windows (based on radio factors) and timeout-based fallback
-- Attempts to minimize redundant transmissions through coverage analysis
-- May still have some redundant relays in dynamic network conditions
-- Effectiveness depends on topology knowledge and node participation
+- Deterministic slot-based scheduling with half-airtime spacing eliminates most SR-to-SR collisions
+- Stock routers get earliest slots for compatibility; SR nodes fill subsequent slots
+- Dupe suppression via existing packet deduplication cancels redundant relays
+- Hash-based delay for unique coverage prevents collision between independently-deciding nodes
+- Effectiveness depends on topology knowledge accuracy (consistent candidate ordering requires consistent topology views)
 
 **Unicast Coordination:**
-- Uses static relay decisions based on current topology knowledge
-- Does not implement iterative candidate selection or contention windows
-- Enables intelligent relay selection through overhearing unicast transmissions
-- Includes transmitter direct connectivity optimization to prevent unnecessary coordination
-- Relies on speculative retransmission (600ms timeout) for relay failure recovery
-- Falls back to opportunistic forwarding when routes are unknown
-
-**Key Difference**: Broadcasts use dynamic, iterative coordination with immediate fallback; unicasts use static decisions with end-to-end retransmission recovery.
+- Uses the same slot-based scheduling as broadcasts, with ETX-to-destination as the ranking metric
+- Stock router neighbors get earliest slots; SR candidates sorted by cost follow
+- Dupe suppression cancels queued unicast relays when the relayer is confirmed to reach the destination
+- Falls back to broadcast-style relay when destination is in NodeDB but not in SR topology
 
 **Network Adaptation:**
 - Assesses topology health but may not detect sudden changes immediately

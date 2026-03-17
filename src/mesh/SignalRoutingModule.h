@@ -79,11 +79,6 @@ private:
     uint8_t getTopologyVersion(const TopologyVersionEntry *table, uint8_t count, NodeNum nodeId) const;
     void setTopologyVersion(TopologyVersionEntry *table, uint8_t &count, NodeNum nodeId, uint8_t version);
 
-    bool hasNodeBeenExcludedFromRelay(NodeNum nodeId, PacketId packetId);
-    void processContentionWindows(uint32_t nowMs);
-    void scheduleContentionWindowCheck(NodeNum expectedRelay, PacketId packetId, NodeNum destination, const meshtastic_MeshPacket *packet);
-    void excludeNodeFromRelay(NodeNum nodeId, PacketId packetId);
-    void clearRelayExclusionsForPacket(PacketId packetId);
     bool isSignalBasedCapable(NodeNum nodeId) const;
     float getDirectNeighborsSignalActivePercentage() const;
     void collectNeighborsForBroadcast(meshtastic_SignalNeighbor *outNeighbors, uint8_t &outCount, uint8_t maxCount);
@@ -125,28 +120,6 @@ private:
     RelayIdentityCacheEntry relayIdentityCache[MAX_RELAY_IDENTITY_ENTRIES];
     uint8_t relayIdentityCacheCount = 0;
 
-    struct RelayExclusion {
-        uint64_t packetKey;
-        NodeNum excludedNodes[4];
-        uint8_t exclusionCount;
-    };
-    RelayExclusion relayExclusions[4];
-    uint8_t relayExclusionCount = 0;
-
-    struct ContentionCheck {
-        NodeNum expectedRelay;
-        PacketId packetId;
-        NodeNum destination;
-        NodeNum sourceNode;
-        NodeNum heardFrom;
-        uint8_t hopLimit;
-        uint8_t hopStart;
-        uint32_t expiryMs;
-        bool needsRelay;
-        meshtastic_MeshPacket *packetCopy; // Pool copy retained for deferred relay
-    };
-    ContentionCheck contentionChecks[4];
-    uint8_t contentionCheckCount = 0;
 
     void trackNodeCapability(NodeNum nodeId, CapabilityStatus status);
     void pruneCapabilityCache(uint32_t nowSecs);
@@ -160,7 +133,6 @@ private:
 public:
     NodeNum resolveHeardFrom(const meshtastic_MeshPacket *p, NodeNum sourceNode) const;
 private:
-    static uint64_t makeSpeculativeKey(NodeNum origin, uint32_t packetId);
     uint32_t getNodeLastActivityTime(NodeNum nodeId) const;
     bool isActiveRoutingRole() const;
     bool canSendTopology() const;
@@ -182,8 +154,6 @@ private:
     bool isDownstreamOfHeardRelay(NodeNum destination, NodeNum myNode);
     bool isNodeRoutable(NodeNum nodeId) const;
     void logNetworkTopology();
-    bool evaluateContentionExpiry(const ContentionCheck& check, NodeNum myNode);
-    void queueUnicastRelay(ContentionCheck& check);
 
     bool isNonRelayingLegacyRole(NodeNum nodeId) const;
     void markStockNodeRelayedOurPacket(NodeNum stockNode);
