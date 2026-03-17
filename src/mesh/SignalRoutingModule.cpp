@@ -297,92 +297,6 @@ void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const meshtastic_Sign
     }
 }
 
-void SignalRoutingModule::buildSignalRoutingInfo(meshtastic_SignalRoutingInfo &info)
-{
-    info.signal_routing_active = isActiveRoutingRole();
-    info.routing_version = SIGNAL_ROUTING_VERSION;
-    info.topology_version = currentTopologyVersion++;  // Increment version (0-255, wraps)
-    info.neighbors_count = 0;
-
-    if (!routingGraph || !nodeDB) return;
-
-    const NodeEdges* nodeEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
-    if (!nodeEdges || nodeEdges->edgeCount == 0) {
-        return;
-    }
-
-    // Prefer reported edges (peer perspective) over mirrored estimates, then order by ETX
-    const Edge* reported[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
-    const Edge* mirrored[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
-    uint8_t reportedCount = 0;
-    uint8_t mirroredCount = 0;
-
-    for (uint8_t i = 0; i < nodeEdges->edgeCount; i++) {
-        const Edge* e = &nodeEdges->edges[i];
-        if (e->source == Edge::Source::Reported) {
-            reported[reportedCount++] = e;
-        } else {
-            mirrored[mirroredCount++] = e;
-        }
-    }
-
-    auto sortByEtxLite = [](const Edge* a, const Edge* b) { return a->getEtx() < b->getEtx(); };
-    std::sort(reported, reported + reportedCount, sortByEtxLite);
-    std::sort(mirrored, mirrored + mirroredCount, sortByEtxLite);
-
-    const Edge* selected[MAX_SIGNAL_ROUTING_NEIGHBORS];
-    size_t selectedCount = 0;
-
-    // For non-active nodes, only broadcast directly heard neighbors (Reported edges)
-    // Active routing nodes can broadcast full topology including relayed connections
-    bool isActive = isActiveRoutingRole();
-
-    for (uint8_t i = 0; i < reportedCount && selectedCount < MAX_SIGNAL_ROUTING_NEIGHBORS; i++) {
-        selected[selectedCount++] = reported[i];
-    }
-
-    // Only include mirrored edges for active nodes
-    if (isActive) {
-        for (uint8_t i = 0; i < mirroredCount && selectedCount < MAX_SIGNAL_ROUTING_NEIGHBORS; i++) {
-            selected[selectedCount++] = mirrored[i];
-        }
-    }
-
-    // Filter out placeholders before assigning to neighbors array
-    const Edge* filteredSelected[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
-    size_t filteredCount = 0;
-    size_t placeholdersFiltered = 0;
-
-    for (size_t i = 0; i < selectedCount; i++) {
-        if (!isPlaceholderNode(selected[i]->to)) {
-            filteredSelected[filteredCount++] = selected[i];
-        } else {
-            placeholdersFiltered++;
-        }
-    }
-
-    if (placeholdersFiltered > 0) {
-        LOG_DEBUG("[SR] Filtered %u placeholder nodes from topology broadcast", placeholdersFiltered);
-    }
-
-    info.neighbors_count = filteredCount;
-
-    for (size_t i = 0; i < filteredCount; i++) {
-        const Edge& edge = *filteredSelected[i];
-        meshtastic_SignalNeighbor& neighbor = info.neighbors[i];
-
-        neighbor.node_id = edge.to;
-        neighbor.position_variance = edge.variance; // Already uint8, 0-255 scaled
-        // Mark neighbor based on local knowledge of their SR capability
-        CapabilityStatus neighborStatus = getCapabilityStatus(edge.to);
-        neighbor.signal_routing_active = (neighborStatus == CapabilityStatus::SRactive);
-
-        int32_t rssi32, snr32;
-        NeighborGraph::etxToSignal(edge.getEtx(), rssi32, snr32);
-        neighbor.rssi = static_cast<int8_t>(std::max((int32_t)-128, std::min((int32_t)127, rssi32)));
-        neighbor.snr = static_cast<int8_t>(std::max((int32_t)-128, std::min((int32_t)127, snr32)));
-    }
-}
 
 void SignalRoutingModule::updateGraphWithNeighbor(NodeNum sender, const meshtastic_SignalNeighbor &neighbor)
 {
@@ -1100,29 +1014,6 @@ bool SignalRoutingModule::shouldRelayForStockNeighbors(NodeNum myNode, NodeNum s
     return false;
 }
 
-bool SignalRoutingModule::isDownstreamOfHeardRelay(NodeNum destination, NodeNum myNode)
-{
-    if (!routingGraph) {
-        return false;
-    }
-
-    // Check if destination is downstream of any relay we can hear directly
-    NodeNum relay = routingGraph->getDownstreamRelay(destination);
-    if (relay != 0) {
-        // Check if we have a direct connection to this relay
-        const NodeEdges* myEdges = routingGraph->getEdgesFrom(myNode);
-        if (myEdges) {
-            for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
-                if (myEdges->edges[i].to == relay) {
-                    LOG_INFO("[SR] Found downstream: %08x is downstream of relay %08x (direct neighbor)", destination, relay);
-                    return true;
-                }
-            }
-        }
-    }
-
-    return false;
-}
 
 
 void SignalRoutingModule::logNetworkTopology()
@@ -2558,34 +2449,6 @@ void SignalRoutingModule::updateNodeActivityForPacketAndRelay(const meshtastic_M
 }
 
 
-float SignalRoutingModule::getDirectNeighborsSignalActivePercentage() const
-{
-    if (!routingGraph || !nodeDB) {
-        return 0.0f;
-    }
-
-    // Get our direct neighbors from the graph
-    size_t totalNeighbors = 0;
-    size_t activeNeighbors = 0;
-
-    const NodeEdges* edges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
-    if (edges) {
-        totalNeighbors = edges->edgeCount;
-        for (uint8_t i = 0; i < edges->edgeCount; i++) {
-            if (getCapabilityStatus(edges->edges[i].to) == CapabilityStatus::SRactive) {
-                activeNeighbors++;
-            }
-        }
-    }
-
-    if (totalNeighbors == 0) {
-        return 0.0f;
-    }
-
-    float percentage = (static_cast<float>(activeNeighbors) * 100.0f) / static_cast<float>(totalNeighbors);
-    LOG_DEBUG("[SR] Direct neighbor capability: %d/%d = %.1f%%", activeNeighbors, totalNeighbors, percentage);
-    return percentage;
-}
 
 void SignalRoutingModule::handleNodeInfoPacket(const meshtastic_MeshPacket &mp)
 {
@@ -3238,21 +3101,6 @@ NodeNum SignalRoutingModule::resolveRelayIdentity(uint8_t relayId) const
 }
 
 
-uint32_t SignalRoutingModule::getNodeLastActivityTime(NodeNum nodeId) const
-{
-    uint32_t now = millis() / 1000;  // Use monotonic time for TTL calculations
-
-    // Lite mode: linear search
-    for (uint8_t i = 0; i < capabilityRecordCount; i++) {
-        if (capabilityRecords[i].nodeId == nodeId) {
-            if ((now - capabilityRecords[i].record.lastUpdated) > CAPABILITY_TTL_SECS) {
-                return 0; // Too old, consider inactive
-            }
-            return capabilityRecords[i].record.lastUpdated;
-        }
-    }
-    return 0;
-}
 
 NodeNum SignalRoutingModule::resolveHeardFrom(const meshtastic_MeshPacket *p, NodeNum sourceNode) const
 {

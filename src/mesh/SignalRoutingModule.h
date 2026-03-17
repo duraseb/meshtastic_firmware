@@ -80,10 +80,8 @@ private:
     void setTopologyVersion(TopologyVersionEntry *table, uint8_t &count, NodeNum nodeId, uint8_t version);
 
     bool isSignalBasedCapable(NodeNum nodeId) const;
-    float getDirectNeighborsSignalActivePercentage() const;
     void collectNeighborsForBroadcast(meshtastic_SignalNeighbor *outNeighbors, uint8_t &outCount, uint8_t maxCount);
     void sendTopologyPacket(NodeNum dest, const meshtastic_SignalNeighbor *neighbors, uint8_t count, uint8_t topologyVersion = 0);
-    void buildSignalRoutingInfo(meshtastic_SignalRoutingInfo &info);
 
     enum class CapabilityStatus : uint8_t {
         Unknown = 0,
@@ -133,7 +131,6 @@ private:
 public:
     NodeNum resolveHeardFrom(const meshtastic_MeshPacket *p, NodeNum sourceNode) const;
 private:
-    uint32_t getNodeLastActivityTime(NodeNum nodeId) const;
     bool isActiveRoutingRole() const;
     bool canSendTopology() const;
     void handleNodeInfoPacket(const meshtastic_MeshPacket &mp);
@@ -151,7 +148,6 @@ private:
     bool isPlaceholderConnectedToUs(NodeNum placeholderId) const;
     bool shouldRelayForStockNeighbors(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom, uint32_t currentTime);
     bool hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum heardFrom, NodeNum destination = 0);
-    bool isDownstreamOfHeardRelay(NodeNum destination, NodeNum myNode);
     bool isNodeRoutable(NodeNum nodeId) const;
     void logNetworkTopology();
 
