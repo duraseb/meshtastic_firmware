@@ -156,17 +156,19 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                         }
                         // Mark this packet as committed so dupe arrivals don't cancel our relay
                         NodeNum heardFrom = signalRoutingModule->resolveHeardFrom(p, p->from);
-                        signalRoutingModule->commitRelay(p->id, heardFrom);
+                        uint32_t relayDelay = signalRoutingModule->pendingRelayDelayMs;
+                        signalRoutingModule->pendingRelayDelayMs = 0;
+                        signalRoutingModule->commitRelay(p->id, heardFrom, relayDelay);
                     }
 
                     meshtastic_MeshPacket *tosend = packetPool.allocCopy(*p); // keep a copy because we will be sending it
 
-                    // Deterministic jitter for SR relays so co-located SR nodes pick
-                    // different TX slots for the same packet, reducing collisions.
+                    // Apply slot-based TX delay for SR relays
                     if (signalRoutingModule && signalRoutingModule->isCommittedRelay(tosend->id)) {
-                        uint32_t nodeId = nodeDB ? nodeDB->getNodeNum() : 0;
-                        uint32_t hash = nodeId ^ tosend->id ^ (nodeId >> 16) ^ (tosend->id >> 16);
-                        tosend->tx_after = millis() + (hash % 50);
+                        uint32_t delay = signalRoutingModule->getCommittedRelayDelay(tosend->id);
+                        if (delay > 0) {
+                            tosend->tx_after = millis() + delay;
+                        }
                     }
                     LOG_INFO("Rebroadcast received message coming from %x", p->relay_node);
 

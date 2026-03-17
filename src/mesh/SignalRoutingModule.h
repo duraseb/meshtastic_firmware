@@ -55,7 +55,6 @@ private:
     NeighborGraph *routingGraph = nullptr;
     uint32_t lastGraphUpdate = 0;
     static constexpr uint32_t GRAPH_UPDATE_INTERVAL_SECS = 60;
-    static constexpr uint32_t EARLY_BROADCAST_DELAY_MS = 15 * 1000;
     static constexpr uint32_t NODE_TTL_SECS = 5400;    // 90 min for all nodes in the graph
     static constexpr uint32_t CAPABILITY_TTL_SECS = SIGNAL_ROUTING_BROADCAST_SECS * 3 + 10;  // detect when SR node stops being SR
     static constexpr uint32_t RELAY_ID_CACHE_TTL_MS = 600 * 1000;  // 10 min
@@ -108,8 +107,7 @@ private:
         uint32_t lastHeardMs = 0;
     };
 
-    // Fixed-size arrays (unified, no #ifdefs)
-    static constexpr size_t MAX_CAPABILITY_RECORDS = 24;
+    static constexpr size_t MAX_CAPABILITY_RECORDS = 64;
     static constexpr size_t MAX_RELAY_IDENTITY_ENTRIES = 16;
 
     struct CapabilityRecordEntry {
@@ -195,13 +193,16 @@ private:
     struct CommittedRelay {
         PacketId packetId = 0;
         NodeNum originalHeardFrom = 0;
+        uint32_t txDelayMs = 0;
     };
     CommittedRelay committedRelays[MAX_COMMITTED_RELAYS];
     uint8_t committedRelayCount = 0;
-
 public:
-    void commitRelay(PacketId packetId, NodeNum originalHeardFrom);
+    uint32_t pendingRelayDelayMs = 0; // Set by shouldRelayBroadcast, consumed by commitRelay
+
+    void commitRelay(PacketId packetId, NodeNum originalHeardFrom, uint32_t txDelayMs = 0);
     bool isCommittedRelay(PacketId packetId) const;
+    uint32_t getCommittedRelayDelay(PacketId packetId) const;
     void clearCommittedRelay(PacketId packetId);
     bool isDupeRelayRedundant(const meshtastic_MeshPacket *p);
 };

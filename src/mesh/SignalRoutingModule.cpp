@@ -153,6 +153,10 @@ int32_t SignalRoutingModule::runOnce()
             lastBroadcast = nowMs;
         } else if (nowMs - lastBroadcast >= SIGNAL_ROUTING_BROADCAST_SECS * 1000) {
             sendSignalRoutingInfo();
+        } else if (topologyDirty && nowMs - lastBroadcast >= 60 * 1000) {
+            LOG_INFO("[SR] Topology dirty — sending early broadcast");
+            sendSignalRoutingInfo();
+            topologyDirty = false;
         }
 
         // Topology logging: periodic (every 60s) or when topology changed
@@ -164,10 +168,9 @@ int32_t SignalRoutingModule::runOnce()
         }
     }
 
-    uint32_t timeToBroadcast = SIGNAL_ROUTING_BROADCAST_SECS * 1000;
-    if (nowMs - lastBroadcast < SIGNAL_ROUTING_BROADCAST_SECS * 1000) {
-        timeToBroadcast = (SIGNAL_ROUTING_BROADCAST_SECS * 1000) - (nowMs - lastBroadcast);
-    }
+    uint32_t broadcastCycle = topologyDirty ? 60 * 1000 : SIGNAL_ROUTING_BROADCAST_SECS * 1000;
+    uint32_t elapsed = nowMs - lastBroadcast;
+    uint32_t timeToBroadcast = (elapsed < broadcastCycle) ? (broadcastCycle - elapsed) : 0;
 
     // Process relay contention windows (unicast and broadcast)
     processContentionWindows(nowMs);
@@ -503,14 +506,12 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
               isNewVersion ? "new version" : "continuation", p->relay_node);
 
     // Empty SR broadcast from a direct SR neighbor = bootstrap request.
-    // Trigger an early broadcast so they can learn our topology quickly.
+    // Mark topology dirty so we broadcast our topology at the next opportunity
+    // (immediately if last broadcast was >60s ago, otherwise at the 60s mark).
     if (info.neighbors_count == 0 && isDirectPacket(*p) && info.signal_routing_active) {
-        uint32_t now = millis();
-        if (now - lastBroadcast > 60 * 1000) {
-            LOG_INFO("[SR] Empty broadcast from direct SR neighbor %s — triggering early topology broadcast",
-                     senderNameForTopo);
-            setIntervalFromNow(EARLY_BROADCAST_DELAY_MS);
-        }
+        LOG_INFO("[SR] Empty broadcast from direct SR neighbor %s — marking topology dirty",
+                 senderNameForTopo);
+        topologyDirty = true;
     }
 
     // Mirrored edges are not cleared on new topology versions — they age out naturally.
@@ -636,6 +637,14 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
         // Clear downstream entries for SR-capable nodes with no neighbors - they can't be relays
         if (p->signal_routing_active) {
             routingGraph->clearDownstreamForRelay(mp.from);
+        }
+
+        // Bootstrap: if preProcessSignalRoutingPacket didn't run (topology not yet healthy),
+        // mark dirty here so we send our topology at the next opportunity.
+        if (p->signal_routing_active && isDirectPacket(mp)) {
+            LOG_INFO("[SR] Empty broadcast from direct SR neighbor %s — marking topology dirty",
+                     senderName);
+            topologyDirty = true;
         }
 
         return false;
@@ -1550,11 +1559,6 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
             if (nodeCountBefore != nodeCountAfter) {
                 LOG_INFO("[SR] Graph aged: %u -> %u nodes", nodeCountBefore, nodeCountAfter);
                 topologyDirty = true;
-                // Trigger early broadcast so neighbors learn about the removal
-                uint32_t now = millis();
-                if (now - lastBroadcast > 60 * 1000) {
-                    setIntervalFromNow(EARLY_BROADCAST_DELAY_MS);
-                }
             } else {
                 LOG_DEBUG("[SR] Graph aged (no node count change)");
             }
@@ -1825,7 +1829,7 @@ bool SignalRoutingModule::shouldUseSignalBasedRouting(const meshtastic_MeshPacke
     return topologyHealthyForBroadcast();
 }
 
-void SignalRoutingModule::commitRelay(PacketId packetId, NodeNum originalHeardFrom)
+void SignalRoutingModule::commitRelay(PacketId packetId, NodeNum originalHeardFrom, uint32_t txDelayMs)
 {
     // Don't add duplicates
     for (uint8_t i = 0; i < committedRelayCount; i++) {
@@ -1835,6 +1839,7 @@ void SignalRoutingModule::commitRelay(PacketId packetId, NodeNum originalHeardFr
     CommittedRelay entry;
     entry.packetId = packetId;
     entry.originalHeardFrom = originalHeardFrom;
+    entry.txDelayMs = txDelayMs;
     if (committedRelayCount < MAX_COMMITTED_RELAYS) {
         committedRelays[committedRelayCount++] = entry;
     } else {
@@ -1842,7 +1847,7 @@ void SignalRoutingModule::commitRelay(PacketId packetId, NodeNum originalHeardFr
         memmove(committedRelays, committedRelays + 1, (MAX_COMMITTED_RELAYS - 1) * sizeof(CommittedRelay));
         committedRelays[MAX_COMMITTED_RELAYS - 1] = entry;
     }
-    LOG_DEBUG("[SR] Committed relay for packet 0x%08x (heardFrom 0x%08x)", packetId, originalHeardFrom);
+    LOG_DEBUG("[SR] Committed relay for packet 0x%08x (heardFrom 0x%08x, delay %ums)", packetId, originalHeardFrom, txDelayMs);
 }
 
 bool SignalRoutingModule::isCommittedRelay(PacketId packetId) const
@@ -1852,6 +1857,15 @@ bool SignalRoutingModule::isCommittedRelay(PacketId packetId) const
             return true;
     }
     return false;
+}
+
+uint32_t SignalRoutingModule::getCommittedRelayDelay(PacketId packetId) const
+{
+    for (uint8_t i = 0; i < committedRelayCount; i++) {
+        if (committedRelays[i].packetId == packetId)
+            return committedRelays[i].txDelayMs;
+    }
+    return 0;
 }
 
 void SignalRoutingModule::clearCommittedRelay(PacketId packetId)
@@ -2082,25 +2096,57 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         }
     }
 
-    // Build co-listener list: SR-active direct neighbors that also heard heardFrom.
-    // This lets shouldRelayEnhanced coordinate when heardFrom is a stock node with
-    // no edges in the graph (both SR neighbors would otherwise both decide to relay).
-    NodeNum coListeners[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
-    uint8_t coListenerCount = 0;
+    // === Slot-based relay coordination ===
+    // Rank all relay candidates and assign time slots spaced by half the packet
+    // airtime.  Each node independently computes the same ordering, picks its
+    // own slot, and schedules TX.  If it hears a relay (dupe) before its slot
+    // fires, existing dupe suppression cancels the queued TX.
+
+    // Half-airtime slot spacing: long enough for busyRx detection, short enough
+    // for fast propagation.
+    uint32_t halfAirtime = 150; // safe default
+    if (router && router->getRadioInterface()) {
+        uint32_t airtime = router->getRadioInterface()->getPacketTime(p);
+        halfAirtime = std::max(airtime / 2, (uint32_t)50);
+    }
+
+    // Build coverage sets
+    NodeSet alreadyCovered;
+    alreadyCovered.insert(sourceNode);
+    alreadyCovered.insert(heardFrom);
+    const NodeEdges *heardFromEdges = routingGraph->getEdgesFrom(heardFrom);
+    if (heardFromEdges) {
+        for (uint8_t i = 0; i < heardFromEdges->edgeCount; i++)
+            alreadyCovered.insert(heardFromEdges->edges[i].to);
+    }
+
+    // Build candidates: our direct neighbors that might relay
+    NodeSet candidates;
     const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
     if (myEdges) {
-        for (uint8_t i = 0; i < myEdges->edgeCount && coListenerCount < NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE; i++) {
+        for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+            NodeNum neighbor = myEdges->edges[i].to;
+            if (neighbor == heardFrom || neighbor == sourceNode)
+                continue;
+            candidates.insert(neighbor);
+        }
+    }
+    // Add ourselves
+    candidates.insert(myNode);
+
+    // Also add SR-active co-listeners that can hear heardFrom (for stock gateway case)
+    if (myEdges) {
+        for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
             NodeNum neighbor = myEdges->edges[i].to;
             if (neighbor == heardFrom || neighbor == sourceNode)
                 continue;
             if (getCapabilityStatus(neighbor) != CapabilityStatus::SRactive)
                 continue;
-            // Check if this SR neighbor can also hear heardFrom
             const NodeEdges *neighborEdges = routingGraph->getEdgesFrom(neighbor);
             if (neighborEdges) {
                 for (uint8_t j = 0; j < neighborEdges->edgeCount; j++) {
                     if (neighborEdges->edges[j].to == heardFrom) {
-                        coListeners[coListenerCount++] = neighbor;
+                        candidates.insert(neighbor);
                         break;
                     }
                 }
@@ -2108,83 +2154,120 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         }
     }
 
-    bool shouldRelay = routingGraph->shouldRelayEnhanced(myNode, sourceNode, heardFrom, relayDecisionTime, p->id,
-                                                          packetReceivedTimestamp, coListeners, coListenerCount);
+    bool preferHighNodeId = (p->id & 1) != 0;
+    uint32_t slotDelay = 0;
+    bool shouldRelay = false;
+    uint32_t myDelay = 0;
+    const char *decisionReason = "no unique coverage";
 
-    // Apply conservative logic only when NOT required for branch coverage
-    if (shouldRelay && hasStockGateways && !mustRelayForBranchCoverage) {
-        LOG_DEBUG("[SR] Applying conservative relay logic (stock gateways present, not from gateway)");
-        shouldRelay = routingGraph->shouldRelayEnhancedConservative(myNode, sourceNode, heardFrom, relayDecisionTime,
-                                                                    p->id, packetReceivedTimestamp,
-                                                                    coListeners, coListenerCount);
-        if (!shouldRelay) {
-            LOG_DEBUG("[SR] Suppressed SR relay - stock gateway can handle external transmission");
-        } else {
-            LOG_DEBUG("[SR] SR relay proceeding despite conservative logic");
+    LOG_DEBUG("[SR] Slot scheduling for pkt 0x%08x: halfAirtime=%ums, %u candidates", p->id, halfAirtime, candidates.count);
+
+    // Phase 1: Assign first slots to stock routers (they transmit regardless)
+    if (myEdges) {
+        for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+            NodeNum neighbor = myEdges->edges[i].to;
+            if (neighbor == heardFrom || neighbor == sourceNode)
+                continue;
+            if (!isLegacyRouter(neighbor))
+                continue;
+
+            candidates.erase(neighbor);
+
+            if (routingGraph->hasNodeTransmitted(neighbor, p->id, currentTime)) {
+                const NodeEdges *ne = routingGraph->getEdgesFrom(neighbor);
+                if (ne) {
+                    for (uint8_t j = 0; j < ne->edgeCount; j++)
+                        alreadyCovered.insert(ne->edges[j].to);
+                }
+                alreadyCovered.insert(neighbor);
+                LOG_DEBUG("[SR] Slot %ums: stock router %08x (already transmitted)", slotDelay, neighbor);
+            } else {
+                LOG_DEBUG("[SR] Slot %ums: stock router %08x (expected)", slotDelay, neighbor);
+            }
+
+            slotDelay += halfAirtime;
         }
     }
 
-    // Relay override: force relay if we are the recorded relay for source OR destination
+    // Phase 2: Iteratively pick best SR candidate, assign slots
+    while (!candidates.empty()) {
+        RelayCandidate best = routingGraph->findBestRelayCandidate(candidates, alreadyCovered,
+                                                                    currentTime, p->id, preferHighNodeId);
+        if (best.nodeId == 0)
+            break;
+
+        candidates.erase(best.nodeId);
+
+        if (routingGraph->hasNodeTransmitted(best.nodeId, p->id, currentTime)) {
+            const NodeEdges *ne = routingGraph->getEdgesFrom(best.nodeId);
+            if (ne) {
+                for (uint8_t j = 0; j < ne->edgeCount; j++)
+                    alreadyCovered.insert(ne->edges[j].to);
+            }
+            alreadyCovered.insert(best.nodeId);
+            LOG_DEBUG("[SR] Slot --: SR node %08x (already transmitted, coverage absorbed)", best.nodeId);
+            continue;
+        }
+
+        if (best.nodeId == myNode) {
+            shouldRelay = true;
+            myDelay = slotDelay;
+            decisionReason = "SR slot assignment";
+            LOG_DEBUG("[SR] Slot %ums: US (%08x) — assigned", slotDelay, myNode);
+            break;
+        }
+
+        LOG_DEBUG("[SR] Slot %ums: SR node %08x (coverage=%u, cost=%.2f)", slotDelay, best.nodeId,
+                  best.coverageCount, best.getAvgCost());
+        slotDelay += halfAirtime;
+    }
+
+    // Phase 3: If we weren't assigned a slot, check unique coverage
+    if (!shouldRelay && myEdges) {
+        for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+            NodeNum neighbor = myEdges->edges[i].to;
+            if (!alreadyCovered.contains(neighbor)) {
+                shouldRelay = true;
+                // Hash-based delay for unique coverage relays
+                uint32_t hash = myNode ^ p->id ^ (myNode >> 16) ^ (p->id >> 16);
+                myDelay = slotDelay + (hash % 100) * 20;
+                decisionReason = "unique coverage";
+                LOG_DEBUG("[SR] Unique coverage: neighbor %08x uncovered, hash delay %ums", neighbor, myDelay);
+                break;
+            }
+        }
+    }
+
+    // Phase 4: Force relay if we are the recorded downstream relay for source
     if (!shouldRelay && (weAreRelayForSource || weAreRelayForDest)) {
         NodeNum forcedFor = weAreRelayForSource ? sourceNode : p->to;
-        LOG_INFO("[SR-DECISION] BROADCAST RELAY (forced): we are relay for %08x (downstream=%u)", forcedFor, static_cast<unsigned int>(downstreamCount));
+        LOG_INFO("[SR-DECISION] BROADCAST RELAY (forced): we are relay for %08x (downstream=%u)",
+                 forcedFor, static_cast<unsigned int>(downstreamCount));
         shouldRelay = true;
+        myDelay = slotDelay;
+        decisionReason = "downstream relay override";
     }
 
-    // Unified Coverage Logic: Ensure both SR coordination and stock coverage requirements are met
-    // SR coordination provides efficient unique coverage between SR nodes
-    // Stock coverage provides guaranteed coverage for stock firmware nodes
-
-    bool srCoordinationRequiresRelay = shouldRelay;
-
-    if (!srCoordinationRequiresRelay) {
-        // Check if stock nodes need guaranteed coverage
+    // Phase 5: Check stock coverage needs
+    if (!shouldRelay) {
         bool stockCoverageNeeded = shouldRelayForStockNeighbors(myNode, sourceNode, heardFrom, relayDecisionTime);
         if (stockCoverageNeeded) {
-            LOG_INFO("[SR-DECISION] BROADCAST RELAY: SR declined but stock nodes need guaranteed coverage");
             shouldRelay = true;
-        } else {
-            LOG_DEBUG("[SR] Rationale: SR coordination satisfied and stock nodes covered");
+            myDelay = slotDelay;
+            decisionReason = "stock coverage";
         }
-    } else {
-        LOG_DEBUG("[SR] Rationale: SR coordination requires relay");
     }
 
-    char myName[64], sourceName[64], heardFromName[64];
-    getNodeDisplayName(myNode, myName, sizeof(myName));
+    char sourceName[64], heardFromName[64];
     getNodeDisplayName(sourceNode, sourceName, sizeof(sourceName));
     getNodeDisplayName(heardFrom, heardFromName, sizeof(heardFromName));
 
-    const char* decisionReason = srCoordinationRequiresRelay ?
-        "SR coordination requires relay" :
-        "Stock coverage requires relay";
-
-    LOG_INFO("[SR-DECISION] BROADCAST %s: from %s via %s (%s)",
+    LOG_INFO("[SR-DECISION] BROADCAST %s: from %s via %s (%s, delay=%ums)",
              shouldRelay ? "RELAY" : "SUPPRESS", sourceName, heardFromName,
-             shouldRelay ? decisionReason : "no unique coverage");
+             decisionReason, myDelay);
 
     if (shouldRelay) {
-        // Check if we have stock router direct neighbors that might relay faster
-        // If so, defer our relay to let them go first, then re-evaluate coverage
-        NodeNum stockRouterRelay = 0;
-        const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
-        if (myEdges) {
-            for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
-                NodeNum neighbor = myEdges->edges[i].to;
-                if (neighbor != heardFrom && neighbor != sourceNode && isLegacyRouter(neighbor)) {
-                    stockRouterRelay = neighbor;
-                    break;
-                }
-            }
-        }
-
-        if (stockRouterRelay != 0) {
-            // Defer relay: wait for stock router's CW, then re-evaluate coverage
-            LOG_INFO("[SR-DECISION] BROADCAST DEFER: pkt %08x, waiting for stock router %08x CW", p->id, stockRouterRelay);
-            scheduleContentionWindowCheck(stockRouterRelay, p->id, NODENUM_BROADCAST, p);
-            return false;
-        }
-
+        pendingRelayDelayMs = myDelay;
         routingGraph->recordNodeTransmission(myNode, p->id, currentTime);
     }
 
@@ -2487,11 +2570,6 @@ void SignalRoutingModule::updateNeighborInfo(NodeNum nodeId, int32_t rssi, float
             topologyDirty = true;
         }
 
-        // Trigger early broadcast if we haven't sent recently (rate limit: 60s)
-        uint32_t now = millis();
-        if (now - lastBroadcast > 60 * 1000) {
-            setIntervalFromNow(EARLY_BROADCAST_DELAY_MS); // Send update soon (configurable)
-        }
     }
 }
 
