@@ -124,6 +124,7 @@ private:
     CapabilityStatus getCapabilityStatus(NodeNum nodeId) const;
     bool topologyHealthyForBroadcast() const;
     bool topologyHealthyForUnicast(NodeNum destination) const;
+    bool isImmediateRelayRouter(NodeNum nodeId) const;
     bool isLegacyRouter(NodeNum nodeId) const;
     void rememberRelayIdentity(NodeNum nodeId, uint8_t relayId);
     void pruneRelayIdentityCache(uint32_t nowMs);

@@ -1543,7 +1543,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
             NodeNum nb = myEdges->edges[i].to;
             if (nb == heardFrom || nb == sourceNode) continue;
-            if (!isLegacyRouter(nb)) continue;
+            if (!isImmediateRelayRouter(nb)) continue;
             if (getCandidateCost(nb) == UINT16_MAX) continue;
             if (routingGraph->hasNodeTransmitted(nb, p->id, currentTime)) {
                 LOG_DEBUG("[SR] Unicast slot %ums: stock router %08x (already transmitted)", slotDelay, nb);
@@ -2003,7 +2003,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
             NodeNum neighbor = myEdges->edges[i].to;
             if (neighbor == heardFrom || neighbor == sourceNode)
                 continue;
-            if (!isLegacyRouter(neighbor))
+            if (!isImmediateRelayRouter(neighbor))
                 continue;
 
             candidates.erase(neighbor);
@@ -2830,6 +2830,20 @@ SignalRoutingModule::CapabilityStatus SignalRoutingModule::getCapabilityStatus(N
         }
     }
     return CapabilityStatus::Unknown;
+}
+
+// Returns true for nodes that relay immediately with no added delay (ROUTER and REPEATER).
+// Used for Phase 1 slot scheduling — we give these an early slot and assume they'll transmit.
+// ROUTER_LATE is excluded: it deliberately delays, so waiting for it would slow SR relays.
+bool SignalRoutingModule::isImmediateRelayRouter(NodeNum nodeId) const
+{
+    if (!nodeDB) return false;
+    const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(nodeId);
+    if (!node || !node->has_user) return false;
+    auto role = node->user.role;
+    return role == meshtastic_Config_DeviceConfig_Role_ROUTER ||
+           role == meshtastic_Config_DeviceConfig_Role_REPEATER ||
+           role == meshtastic_Config_DeviceConfig_Role_ROUTER_CLIENT;
 }
 
 bool SignalRoutingModule::isLegacyRouter(NodeNum nodeId) const
