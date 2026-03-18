@@ -81,7 +81,7 @@ private:
 
     bool isSignalBasedCapable(NodeNum nodeId) const;
     void collectNeighborsForBroadcast(meshtastic_SignalNeighbor *outNeighbors, uint8_t &outCount, uint8_t maxCount);
-    void sendTopologyPacket(NodeNum dest, const meshtastic_SignalNeighbor *neighbors, uint8_t count, uint8_t topologyVersion = 0);
+    void sendTopologyPacket(NodeNum dest, const meshtastic_SignalNeighbor *neighbors, uint8_t count, uint8_t topologyVersion = 0, uint32_t txAfterMs = 0);
 
     enum class CapabilityStatus : uint8_t {
         Unknown = 0,

@@ -212,10 +212,26 @@ void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
     LOG_INFO("[SR] SENDING: Broadcasting %u neighbors in %u packet(s) from %s (version %u)",
              totalNeighbors, packetsNeeded, ourName, topologyVersion);
 
+    // Space multi-packet broadcasts by 2× the packet airtime so relaying nodes
+    // finish transmitting packet N before packet N+1 arrives.
+    uint32_t packetSpacingMs = 300; // conservative fallback
+    if (router && router->getRadioInterface()) {
+        // Build a full-sized dummy packet to get an accurate airtime estimate
+        meshtastic_SignalRoutingInfo dummyInfo = meshtastic_SignalRoutingInfo_init_zero;
+        dummyInfo.neighbors_count = std::min((uint8_t)MAX_SIGNAL_ROUTING_NEIGHBORS, totalNeighbors);
+        for (uint8_t i = 0; i < dummyInfo.neighbors_count; i++) {
+            dummyInfo.neighbors[i] = allNeighbors[i];
+        }
+        meshtastic_MeshPacket *dummy = allocDataProtobuf(dummyInfo);
+        packetSpacingMs = 2 * router->getRadioInterface()->getPacketTime(dummy);
+        packetPool.release(dummy);
+    }
+
     for (uint8_t packetIndex = 0; packetIndex < packetsNeeded; packetIndex++) {
         uint8_t startIdx = packetIndex * MAX_SIGNAL_ROUTING_NEIGHBORS;
         uint8_t count = std::min((uint8_t)MAX_SIGNAL_ROUTING_NEIGHBORS, (uint8_t)(totalNeighbors - startIdx));
-        sendTopologyPacket(dest, &allNeighbors[startIdx], count, topologyVersion);
+        uint32_t txAfter = packetIndex > 0 ? millis() + packetIndex * packetSpacingMs : 0;
+        sendTopologyPacket(dest, &allNeighbors[startIdx], count, topologyVersion, txAfter);
     }
 
     // Update our own capability after sending
@@ -270,7 +286,7 @@ void SignalRoutingModule::collectNeighborsForBroadcast(meshtastic_SignalNeighbor
     }
 }
 
-void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const meshtastic_SignalNeighbor *neighbors, uint8_t count, uint8_t topologyVersion)
+void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const meshtastic_SignalNeighbor *neighbors, uint8_t count, uint8_t topologyVersion, uint32_t txAfterMs)
 {
     meshtastic_SignalRoutingInfo info = meshtastic_SignalRoutingInfo_init_zero;
     info.signal_routing_active = isActiveRoutingRole();
@@ -286,6 +302,9 @@ void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const meshtastic_Sign
     meshtastic_MeshPacket *p = allocDataProtobuf(info);
     p->to = dest;
     p->priority = meshtastic_MeshPacket_Priority_BACKGROUND;
+    if (txAfterMs) {
+        p->tx_after = txAfterMs;
+    }
 
     service->sendToMesh(p);
     lastBroadcast = millis();
