@@ -302,7 +302,9 @@ void SignalRoutingModule::updateGraphWithNeighbor(NodeNum sender, const meshtast
 {
     // Add/update edge from sender to this neighbor
     if (routingGraph) {
-        float etx = 1.0f; // Default ETX, will be updated with real measurements
+        float etx = (neighbor.rssi != 0 || neighbor.snr != 0)
+                        ? NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr)
+                        : 1.0f;
         uint32_t currentTime = millis() / 1000;
 
         routingGraph->updateEdge(sender, neighbor.node_id, etx, currentTime);
@@ -1215,8 +1217,9 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
     // Passive nodes: only track directly-heard nodes (don't relay, so no point in tracking relayed nodes)
     if (routingGraph && notViaMqtt) {
         if (hasSignalData && isDirectFromSender) {
-            // Direct reception - always add to graph
+            // Direct reception - add to graph and clear any stale downstream relationship
             updateNeighborInfo(mp.from, mp.rx_rssi, mp.rx_snr, mp.rx_time);
+            routingGraph->clearDownstreamForDestination(mp.from);
         } else if (isActiveRoutingRole() && !isDirectFromSender && mp.relay_node != 0) {
             // Relayed packet from active routing node - update activity for topology
             routingGraph->updateNodeActivity(mp.from, millis() / 1000);
@@ -1316,27 +1319,23 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
             // 3. We haven't already seen this source recently via a different relay
             //    (prevents inflated downstream counts when SR cluster nodes re-relay the same traffic)
             bool hasDirectConnectionToRelay = false;
-            bool hasDirectConnectionToSender = false;
             const NodeEdges* edges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
             if (edges) {
                 for (uint8_t i = 0; i < edges->edgeCount; i++) {
                     if (edges->edges[i].to == inferredRelayer &&
                         edges->edges[i].source == Edge::Source::Reported) {
                         hasDirectConnectionToRelay = true;
-                    }
-                    if (edges->edges[i].to == mp.from &&
-                        edges->edges[i].source == Edge::Source::Reported) {
-                        hasDirectConnectionToSender = true;
+                        break;
                     }
                 }
             }
 
-            if (hasDirectConnectionToRelay && !hasDirectConnectionToSender) {
+            if (hasDirectConnectionToRelay) {
                 float inferredEtx = NeighborGraph::calculateETX(-70, 5.0f); // Default for inferred
-                // Update downstream, replacing any existing relay for this source.
-                // This ensures each source is tracked via exactly one relay at a time,
-                // preventing inflated downstream counts from SR cluster re-relaying,
-                // while still adapting when a node moves to a different relay path.
+                // Packet arrived via relay — sender is downstream of the relay, unconditionally.
+                // This correctly handles nodes that moved: a stale direct edge no longer blocks
+                // the downstream update. When the sender is heard directly again, the direct
+                // packet path clears this downstream relationship.
                 routingGraph->updateDownstreamExclusive(mp.from, inferredRelayer, inferredEtx, millis() / 1000);
             }
 
@@ -1904,32 +1903,6 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     size_t downstreamCount = (weAreRelayForSource || weAreRelayForDest) ? routingGraph->getDownstreamCountForRelay(myNode) : 0;
 
     uint32_t relayDecisionTime = packetReceivedTimestamp; // Use the packet received timestamp computed above
-
-    // Check for stock gateway nodes that can be heard directly
-    // If we have stock nodes that could serve as gateways, be conservative with SR relaying
-    bool hasStockGateways = false;
-    bool heardFromStockGateway = false;
-    if (routingGraph && nodeDB) {
-        // In lite mode, check capability records for legacy nodes
-        for (uint8_t i = 0; i < capabilityRecordCount; i++) {
-            if (capabilityRecords[i].record.status == CapabilityStatus::Legacy) {
-                hasStockGateways = true;
-                if (capabilityRecords[i].nodeId == heardFrom) {
-                    heardFromStockGateway = true;
-                }
-            }
-        }
-    }
-
-    bool mustRelayForBranchCoverage = false;
-
-    if (heardFromStockGateway) {
-        LOG_DEBUG("[SR] Packet from stock gateway %08x - checking if SR neighbors also heard it", heardFrom);
-        if (!hasBetterPositionedSRNeighbor(myNode, heardFrom)) {
-            mustRelayForBranchCoverage = true;
-            LOG_DEBUG("[SR] No better-positioned SR neighbor for stock gateway %08x - must relay", heardFrom);
-        }
-    }
 
     // === Slot-based relay coordination ===
     // Rank all relay candidates and assign time slots spaced by half the packet
@@ -3090,6 +3063,20 @@ NodeNum SignalRoutingModule::resolveRelayIdentity(uint8_t relayId) const
     uint32_t nowMs = millis();
     NodeNum bestNode = 0;
     uint32_t newest = 0;
+    NodeNum bestDirectNode = 0;
+    uint32_t newestDirect = 0;
+
+    // Determine our direct neighbors for tiebreaking
+    NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
+    const NodeEdges *myEdges = (routingGraph && myNode) ? routingGraph->getEdgesFrom(myNode) : nullptr;
+
+    auto isDirectNeighbor = [&](NodeNum nodeId) -> bool {
+        if (!myEdges) return false;
+        for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+            if (myEdges->edges[i].to == nodeId) return true;
+        }
+        return false;
+    };
 
     for (uint8_t b = 0; b < relayIdentityCacheCount; b++) {
         if (relayIdentityCache[b].relayId == relayId) {
@@ -3098,20 +3085,26 @@ NodeNum SignalRoutingModule::resolveRelayIdentity(uint8_t relayId) const
                 if ((nowMs - bucket->entries[i].lastHeardMs) > RELAY_ID_CACHE_TTL_MS) {
                     continue;
                 }
-                if (bucket->entries[i].lastHeardMs >= newest) {
-                    newest = bucket->entries[i].lastHeardMs;
-                    bestNode = bucket->entries[i].nodeId;
+                uint32_t t = bucket->entries[i].lastHeardMs;
+                NodeNum n = bucket->entries[i].nodeId;
+                if (isDirectNeighbor(n)) {
+                    if (t >= newestDirect) { newestDirect = t; bestDirectNode = n; }
+                } else {
+                    if (t >= newest) { newest = t; bestNode = n; }
                 }
             }
             break;
         }
     }
 
+    // Prefer direct neighbor over non-neighbor when there's a collision
+    NodeNum result = bestDirectNode ? bestDirectNode : bestNode;
+
     // Don't return placeholders - they should be resolved to real nodes
-    if (isPlaceholderNode(bestNode)) {
+    if (isPlaceholderNode(result)) {
         return 0;
     }
-    return bestNode;
+    return result;
 }
 
 
@@ -3123,10 +3116,6 @@ NodeNum SignalRoutingModule::resolveHeardFrom(const meshtastic_MeshPacket *p, No
     }
 
     if (p->relay_node == 0) {
-        return sourceNode;
-    }
-
-    if ((sourceNode & 0xFF) == p->relay_node) {
         return sourceNode;
     }
 
