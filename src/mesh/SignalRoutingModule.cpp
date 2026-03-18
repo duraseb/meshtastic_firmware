@@ -188,8 +188,8 @@ void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
         return;
     }
 
-    // Collect all neighbors into fixed-size array (max 2 packets worth = 22 neighbors)
-    static constexpr uint8_t MAX_BROADCAST_NEIGHBORS = MAX_SIGNAL_ROUTING_NEIGHBORS * 2;
+    // Collect all neighbors into fixed-size array
+    static constexpr uint8_t MAX_BROADCAST_NEIGHBORS = MAX_SIGNAL_ROUTING_NEIGHBORS * 6;
     meshtastic_SignalNeighbor allNeighbors[MAX_BROADCAST_NEIGHBORS];
     uint8_t totalNeighbors = 0;
     collectNeighborsForBroadcast(allNeighbors, totalNeighbors, MAX_BROADCAST_NEIGHBORS);
