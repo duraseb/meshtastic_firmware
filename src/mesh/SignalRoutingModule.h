@@ -157,10 +157,16 @@ private:
 
     // Committed relay tracking — prevents dupe cancellation of SR relay decisions
     static constexpr size_t MAX_COMMITTED_RELAYS = 8;
+    static constexpr size_t MAX_HEARD_TRANSMITTERS = 6;
     struct CommittedRelay {
         PacketId packetId = 0;
         NodeNum originalHeardFrom = 0;
         uint32_t txDelayMs = 0;
+        NodeNum heardTransmitters[MAX_HEARD_TRANSMITTERS];
+        uint8_t heardTransmitterCount = 0;
+        CommittedRelay() : packetId(0), originalHeardFrom(0), txDelayMs(0), heardTransmitterCount(0) {
+            memset(heardTransmitters, 0, sizeof(heardTransmitters));
+        }
     };
     CommittedRelay committedRelays[MAX_COMMITTED_RELAYS];
     uint8_t committedRelayCount = 0;
@@ -171,7 +177,7 @@ public:
     bool isCommittedRelay(PacketId packetId) const;
     uint32_t getCommittedRelayDelay(PacketId packetId) const;
     void clearCommittedRelay(PacketId packetId);
-    bool isDupeRelayRedundant(const meshtastic_MeshPacket *p);
+    bool areAllNeighborsCovered(const meshtastic_MeshPacket *p);
 };
 
 extern SignalRoutingModule *signalRoutingModule;

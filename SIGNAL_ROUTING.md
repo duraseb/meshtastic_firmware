@@ -243,7 +243,7 @@ Unicast relay failures are detected end-to-end: the original sender retransmits 
 
 ### Unicast Relay Coordination
 
-SignalRouting uses the same slot-based scheduling algorithm for unicasts as for broadcasts. Nodes that overhear a unicast packet independently compute a relay candidate ranking and schedule their TX at the assigned slot delay. If the higher-priority node transmits before our slot fires, the dupe cancels our queued relay.
+SignalRouting uses the same slot-based scheduling algorithm for unicasts as for broadcasts. Nodes that overhear a unicast packet independently compute a relay candidate ranking and schedule their TX at the assigned slot delay. If any node transmits before our slot fires, we cancel our queued relay unconditionally.
 
 **Coordination Through Overhearing:**
 When a unicast packet is transmitted, nodes that overhear it can participate in relay coordination:
@@ -253,7 +253,10 @@ When a unicast packet is transmitted, nodes that overhear it can participate in 
 3. **Distributed Decision**: Each node independently computes the same candidate ordering
 4. **Optimal Selection**: Best-positioned relay (lowest ETX to destination) gets the earliest slot
 
-**Candidate Cost Metric:**
+**Slot 0 — Designated Next Hop:**
+If the packet carries a `next_hop` field (set by stock NextHopRouter), slot 0 is reserved for that designated node. Any SR node whose last-byte matches `p->next_hop` relays immediately at slot 0. All other SR nodes start their candidate ranking from slot 1. If `next_hop` is not set (`NO_NEXT_HOP_PREFERENCE`), SR candidates start from slot 0.
+
+**Candidate Cost Metric (SR candidates, slot 1+):**
 For each candidate (self + SR-active direct neighbors):
 - Direct edge to destination → raw `etxFixed` (range ~100–32767)
 - Edge to the shared next hop (indirect) → `etxFixed | 0x8000` — always sorts after direct-edge candidates
@@ -267,7 +270,7 @@ This ensures last-hop delivery nodes (direct edge to destination) are always sch
 - An SR neighbor that covers `heardFrom` can reach destination → suppress
 
 **Dupe Cancellation:**
-When a dupe arrives for a committed unicast relay, `isDupeRelayRedundant` checks whether the dupe relayer has a direct edge (or is the recorded downstream relay) for the destination. If yes, our relay is redundant and `cancelSending` fires.
+When any dupe arrives for a committed unicast relay, `isDupeRelayRedundant` unconditionally cancels our queued TX. The slot-based ordering guarantees that earlier transmitters are better positioned, so once they relay there is no need for later slots to retransmit.
 
 ## Broadcast Routing
 
@@ -281,9 +284,10 @@ SignalRouting uses a deterministic slot-based algorithm to coordinate broadcast 
 
 2. **SR candidate ranking**: Remaining candidates are iteratively ranked by `findBestRelayCandidate` (most unique coverage, lowest ETX, deterministic node ID tiebreak based on packet ID parity). Each candidate gets the next slot. If it's us, we schedule TX and stop. If a candidate already transmitted, we absorb its coverage without consuming a slot.
 
-3. **Unique coverage**: If we weren't assigned a slot, we check for neighbors not covered by any assigned candidate. If found, we relay with a hash-based delay: `slotDelay + (hash(nodeId, packetId) % 100) * 20` ms (0-2000ms range).
+3. **Overrides**: Downstream relay obligations and stock coverage needs can force a relay.
 
-4. **Overrides**: Downstream relay obligations and stock coverage needs can force a relay.
+**Post-cancellation — unique coverage re-evaluation:**
+When a dupe arrives and `isDupeRelayRedundant` is called, it checks whether we still have neighbors not reachable by any transmitter heard so far (original `heardFrom` + all subsequent dupe relayers). Transmitters are accumulated across all dupes for the same packet. If we have unique coverage, `isDupeRelayRedundant` returns false (keep our scheduled relay). If all our neighbors are already covered, it returns true (cancel). Because Phase 2 assigns each SR candidate a unique sequential slot, two nodes with unique coverage will never collide when both keep their relays.
 
 ```
 Slot timing example (150ms half-airtime):
@@ -626,19 +630,26 @@ Slot spacing is half the packet airtime, ensuring the next-slot node detects ong
 
 1. **Quick suppression**: src+dst same downstream relay, heardFrom can reach dst, SR neighbor covering heardFrom can reach dst
 2. **No route → suppress**: `getNextHop(destination)` returns 0
-3. **Phase 1 — stock routers**: legacy router neighbors with a path to destination get sequential slots first (same as broadcasts)
+3. **Phase 1 — designated next_hop**: if `p->next_hop` is set, slot 0 belongs to it; if we ARE that node, relay at slot 0 immediately; otherwise advance slotDelay to slot 1
 4. **Phase 2 — SR candidates**: self + SR-active neighbors sorted ascending by cost-to-destination; first unassigned candidate gets the next slot
 5. **Slot assignment**: if it's our slot, `pendingRelayDelayMs` is set and we return true; otherwise suppress
-6. **Dupe cancellation**: if a dupe arrives before our TX fires, `isDupeRelayRedundant` checks the relayer's connectivity to destination and cancels if redundant
+6. **Dupe cancellation**: if any dupe arrives before our TX fires, `isDupeRelayRedundant` unconditionally cancels our queued relay
 
 ```
-Slot timing example (150ms half-airtime, 2 nodes with direct edge to FCM6):
+Slot timing example (150ms half-airtime, next_hop set, 2 SR nodes with direct edge to FCM6):
 
-  Slot 0 (0ms):    Stock router (if any)
-  Slot 1 (150ms):  SR node with lower ETX to destination (e.g. MB9c, ETX=1.2)
-  Slot 2 (300ms):  SR node with higher ETX to destination (e.g. MBe4, ETX=1.8)
+  Slot 0 (0ms):    Designated next_hop node (e.g. MB9c, set in p->next_hop)
+  Slot 1 (150ms):  SR node with lower ETX to destination (e.g. MBe4, ETX=1.2)
+  Slot 2 (300ms):  SR node with higher ETX to destination (e.g. MBf1, ETX=1.8)
 
-MB9c transmits at slot 1. MBe4 hears it → isDupeRelayRedundant: MB9c has direct edge to destination → redundant → cancelSending.
+MB9c transmits at slot 0. MBe4 hears it → isDupeRelayRedundant: any dupe → redundant → cancelSending. MBf1 also cancels.
+
+Slot timing example (150ms half-airtime, next_hop NOT set):
+
+  Slot 0 (0ms):    SR node with lower ETX to destination (e.g. MB9c, ETX=1.2)
+  Slot 1 (150ms):  SR node with higher ETX to destination (e.g. MBe4, ETX=1.8)
+
+MB9c transmits at slot 0. MBe4 hears it → cancels.
 ```
 
 ### Performance Characteristics
@@ -652,8 +663,8 @@ MB9c transmits at slot 1. MBe4 hears it → isDupeRelayRedundant: MB9c has direc
 
 **Unicast Coordination:**
 - Uses the same slot-based scheduling as broadcasts, with ETX-to-destination as the ranking metric
-- Stock router neighbors get earliest slots; SR candidates sorted by cost follow
-- Dupe suppression cancels queued unicast relays when the relayer is confirmed to reach the destination
+- Designated next_hop (from `p->next_hop`) gets slot 0; SR candidates sorted by cost start from slot 1 (or slot 0 if no next_hop)
+- Any dupe unconditionally cancels queued unicast relays — the slot ordering guarantees earlier transmitters are better positioned
 - Falls back to broadcast-style relay when destination is in NodeDB but not in SR topology
 
 **Network Adaptation:**
