@@ -45,6 +45,7 @@
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
 #include "mesh/SignalRoutingModule.h"
 #endif
+#include "mesh/NodeRateLimiter.h"
 #if !MESHTASTIC_EXCLUDE_TRACEROUTE
 #include "modules/TraceRouteModule.h"
 #endif
@@ -122,6 +123,8 @@ void setupModules()
         buzzerFeedbackThread = new BuzzerFeedbackThread();
     }
 #endif
+    // Rate limiter must be up before any packet can be received
+    nodeRateLimiter = new NodeRateLimiter();
     statusLEDModule = new StatusLEDModule();
 #if !MESHTASTIC_EXCLUDE_REPLYBOT
     new ReplyBotModule();
