@@ -151,6 +151,13 @@ bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
         return false;
     }
 
+    if (nodeDB) {
+        const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(p->from);
+        if (node && node->is_favorite) {
+            return false;
+        }
+    }
+
     uint8_t hops = hopsAway(p);
 
     Bucket bucket;
