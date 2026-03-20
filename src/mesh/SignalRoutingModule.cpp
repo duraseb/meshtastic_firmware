@@ -1478,9 +1478,10 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     NodeNum heardFrom = resolveHeardFrom(p, sourceNode);
     uint32_t currentTime = millis() / 1000;
 
-    char destName[64], heardFromName[64];
+    char destName[64], heardFromName[64], srcName[64];
     getNodeDisplayName(destination, destName, sizeof(destName));
     getNodeDisplayName(heardFrom, heardFromName, sizeof(heardFromName));
+    getNodeDisplayName(sourceNode, srcName, sizeof(srcName));
 
     // If src and dst are both downstream of the same relay, that relay handles delivery.
     NodeNum sourceRelay = routingGraph->getDownstreamRelay(sourceNode);
@@ -1488,7 +1489,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     if (sourceRelay != 0 && sourceRelay == destRelay && sourceRelay != myNode) {
         char relayName[64];
         getNodeDisplayName(sourceRelay, relayName, sizeof(relayName));
-        LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: to %s, src and dst both downstream of %s", p->id, destName, relayName);
+        LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: from %s to %s, src and dst both downstream of %s", p->id, srcName, destName, relayName);
         return false;
     }
 
@@ -1498,11 +1499,11 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
                                      (routingGraph->isDownstream(destination) &&
                                       routingGraph->getDownstreamRelay(destination) == heardFrom);
         if (heardFromCanReachDest) {
-            LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: to %s, heardFrom %s can reach dst directly", p->id, destName, heardFromName);
+            LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: from %s to %s, heardFrom %s can reach dst directly", p->id, srcName, destName, heardFromName);
             return false;
         }
         if (hasBetterPositionedSRNeighbor(myNode, heardFrom, destination)) {
-            LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: to %s, SR neighbor covering %s can reach dst", p->id, destName, heardFromName);
+            LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: from %s to %s, SR neighbor covering %s can reach dst", p->id, srcName, destName, heardFromName);
             return false;
         }
     }
@@ -1510,7 +1511,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     // No route → can't relay.
     NodeNum myNextHop = getNextHop(destination, sourceNode, heardFrom, false);
     if (myNextHop == 0) {
-        LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: to %s, no route via SR topology", p->id, destName);
+        LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: from %s to %s, no route via SR topology", p->id, srcName, destName);
         return false;
     }
 
@@ -1568,7 +1569,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     if (p->next_hop != NO_NEXT_HOP_PREFERENCE) {
         uint8_t ourLastByte = nodeDB->getLastByteOfNodeNum(myNode);
         if (ourLastByte == p->next_hop) {
-            LOG_INFO("[SR-DECISION] UNICAST RELAY pkt=0x%08x: to %s, we are designated next_hop (slot 0)", p->id, destName);
+            LOG_INFO("[SR-DECISION] UNICAST RELAY pkt=0x%08x: from %s to %s, we are designated next_hop (slot 0)", p->id, srcName, destName);
             pendingRelayDelayMs = 0;
             routingGraph->recordNodeTransmission(myNode, p->id, currentTime);
             return true;
@@ -1664,8 +1665,8 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         slotDelay += halfAirtime;
     }
 
-    LOG_INFO("[SR-DECISION] UNICAST %s pkt=0x%08x: to %s via %s (delay=%ums)",
-             shouldRelay ? "RELAY" : "SUPPRESS", p->id, destName, heardFromName, shouldRelay ? myDelay : 0u);
+    LOG_INFO("[SR-DECISION] UNICAST %s pkt=0x%08x: from %s to %s via %s (delay=%ums)",
+             shouldRelay ? "RELAY" : "SUPPRESS", p->id, srcName, destName, heardFromName, shouldRelay ? myDelay : 0u);
 
     if (shouldRelay) {
         pendingRelayDelayMs = myDelay;
@@ -1893,10 +1894,10 @@ bool SignalRoutingModule::shouldRelay(const meshtastic_MeshPacket *p)
         // If the node exists in NodeDB, fall back to broadcast-style relay
         // This handles legacy/stock nodes not in the SR graph
         if (nodeDB->getMeshNode(p->to)) {
-            LOG_INFO("[SR-DECISION] UNICAST RELAY pkt=0x%08x: to %s, not routable via SR but known in NodeDB", p->id, destName);
+            LOG_INFO("[SR-DECISION] UNICAST RELAY pkt=0x%08x: from %s to %s, not routable via SR but known in NodeDB", p->id, senderName, destName);
             return true;
         }
-        LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: to %s, unknown destination", p->id, destName);
+        LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: from %s to %s, unknown destination", p->id, senderName, destName);
         return false;
     }
 
@@ -1932,8 +1933,8 @@ bool SignalRoutingModule::shouldRelay(const meshtastic_MeshPacket *p)
             if (nextHopHeardFromSource) {
                 char nextHopName[64];
                 getNodeDisplayName(nextHop, nextHopName, sizeof(nextHopName));
-                LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: to %s, next hop %s already heard source %s",
-                         p->id, destName, nextHopName, senderName);
+                LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: from %s to %s, next hop %s already heard source",
+                         p->id, senderName, destName, nextHopName);
                 return false;
             }
         }
