@@ -63,26 +63,49 @@ NodeRateLimiter::RateLimitEntry *NodeRateLimiter::findEntry(NodeNum nodeId)
 
 int NodeRateLimiter::findEvictionCandidate() const
 {
-    // Evict the entry with the greatest hop distance.
-    // Ties broken by oldest window start across all buckets.
-    int candidate = 0;
-    for (int i = 1; i < entryCount; i++) {
+    // Never evict an entry that is currently rate-limited — doing so would reset its ban and let the
+    // node bypass the limit.  Among non-limited entries evict the farthest (highest maxHopSeen),
+    // breaking ties by oldest window start.  If every entry is limited, fall back to oldest window
+    // start across all entries so we at least evict the stalest one.
+    auto isLimited = [](const RateLimitEntry &e) {
+        return e.text.limited || e.routing.limited || e.other.limited;
+    };
+    auto oldestWindowStart = [](const RateLimitEntry &e) {
+        return std::min(e.text.windowStart, std::min(e.routing.windowStart, e.other.windowStart));
+    };
+
+    // Check if any non-limited entry exists.
+    int candidate = -1;
+    for (int i = 0; i < entryCount; i++) {
+        if (isLimited(entries[i])) {
+            continue;
+        }
+        if (candidate == -1) {
+            candidate = i;
+            continue;
+        }
         if (entries[i].maxHopSeen > entries[candidate].maxHopSeen) {
             candidate = i;
-        } else if (entries[i].maxHopSeen == entries[candidate].maxHopSeen) {
-            uint32_t iOldest = std::min(entries[i].text.windowStart,
-                                std::min(entries[i].routing.windowStart, entries[i].other.windowStart));
-            uint32_t cOldest = std::min(entries[candidate].text.windowStart,
-                                std::min(entries[candidate].routing.windowStart, entries[candidate].other.windowStart));
-            if (iOldest < cOldest) {
-                candidate = i;
-            }
+        } else if (entries[i].maxHopSeen == entries[candidate].maxHopSeen &&
+                   oldestWindowStart(entries[i]) < oldestWindowStart(entries[candidate])) {
+            candidate = i;
+        }
+    }
+    if (candidate != -1) {
+        return candidate;
+    }
+
+    // All entries are limited — evict the one with the oldest window start.
+    candidate = 0;
+    for (int i = 1; i < entryCount; i++) {
+        if (oldestWindowStart(entries[i]) < oldestWindowStart(entries[candidate])) {
+            candidate = i;
         }
     }
     return candidate;
 }
 
-NodeRateLimiter::RateLimitEntry *NodeRateLimiter::getOrCreateEntry(NodeNum nodeId, uint8_t hops)
+NodeRateLimiter::RateLimitEntry *NodeRateLimiter::getOrCreateEntry(NodeNum nodeId, uint8_t hops, uint32_t nowMs)
 {
     RateLimitEntry *existing = findEntry(nodeId);
     if (existing) {
@@ -100,8 +123,11 @@ NodeRateLimiter::RateLimitEntry *NodeRateLimiter::getOrCreateEntry(NodeNum nodeI
     }
 
     memset(slot, 0, sizeof(RateLimitEntry));
-    slot->nodeId     = nodeId;
+    slot->nodeId = nodeId;
     slot->maxHopSeen = hops;
+    slot->text.windowStart = nowMs;
+    slot->routing.windowStart = nowMs;
+    slot->other.windowStart = nowMs;
     return slot;
 }
 
@@ -111,8 +137,12 @@ bool NodeRateLimiter::checkAndUpdateBucket(BucketState &b, uint8_t threshold, No
     char nodeName[48];
     getNodeDisplayName(nodeId, nodeName, sizeof(nodeName));
 
+    uint32_t windowAge = nowMs - b.windowStart;
+    LOG_DEBUG("[RateLimit] %s %s bucket: count=%u/%u limited=%d windowAge=%ums/%ums",
+              nodeName, bucketName, b.count, threshold, (int)b.limited, windowAge, WINDOW_MS);
+
     if (b.limited) {
-        if (nowMs - b.windowStart >= WINDOW_MS) {
+        if (windowAge >= WINDOW_MS) {
             // Node went quiet for a full window — lift the limit
             LOG_INFO("[RateLimit] %s %s bucket unlimited after quiet window", nodeName, bucketName);
             b.limited     = false;
@@ -167,11 +197,11 @@ bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
         bucket = Bucket::OTHER;
     }
 
-    uint32_t        nowMs = millis();
-    RateLimitEntry *entry = getOrCreateEntry(p->from, hops);
+    uint32_t nowMs = millis();
+    RateLimitEntry *entry = getOrCreateEntry(p->from, hops, nowMs);
 
     BucketState *b;
-    uint8_t      threshold;
+    uint8_t threshold;
     switch (bucket) {
         case Bucket::TEXT:    b = &entry->text;    threshold = TEXT_THRESHOLD;    break;
         case Bucket::ROUTING: b = &entry->routing; threshold = ROUTING_THRESHOLD; break;

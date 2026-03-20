@@ -42,7 +42,7 @@ class NodeRateLimiter
 
     static constexpr uint8_t TEXT_THRESHOLD    = 30; // packets per window before limiting
     static constexpr uint8_t ROUTING_THRESHOLD = 10;
-    static constexpr uint8_t OTHER_THRESHOLD   = 7;
+    static constexpr uint8_t OTHER_THRESHOLD   = 5;
 
     enum class Bucket : uint8_t { TEXT, ROUTING, OTHER };
 
@@ -69,7 +69,7 @@ class NodeRateLimiter
     static uint8_t hopsAway(const meshtastic_MeshPacket *p);
 
     RateLimitEntry *findEntry(NodeNum nodeId);
-    RateLimitEntry *getOrCreateEntry(NodeNum nodeId, uint8_t hops);
+    RateLimitEntry *getOrCreateEntry(NodeNum nodeId, uint8_t hops, uint32_t nowMs);
     int             findEvictionCandidate() const;
 
     // Returns true (drop) if the bucket is or becomes rate-limited.
