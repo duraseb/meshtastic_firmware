@@ -42,7 +42,7 @@ class NodeRateLimiter
 
     static constexpr uint8_t TEXT_THRESHOLD    = 30; // packets per window before limiting
     static constexpr uint8_t ROUTING_THRESHOLD = 10;
-    static constexpr uint8_t OTHER_THRESHOLD   = 5;
+    static constexpr uint8_t OTHER_THRESHOLD   = 8;
 
     enum class Bucket : uint8_t { TEXT, ROUTING, OTHER };
 
