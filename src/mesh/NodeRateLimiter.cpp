@@ -37,6 +37,7 @@ NodeRateLimiter::Bucket NodeRateLimiter::classifyBucket(meshtastic_PortNum portn
             return Bucket::TEXT;
         case meshtastic_PortNum_ROUTING_APP:
         case meshtastic_PortNum_SIGNAL_ROUTING_APP:
+        case meshtastic_PortNum_TRACEROUTE_APP:
             return Bucket::ROUTING;
         default:
             return Bucket::OTHER;

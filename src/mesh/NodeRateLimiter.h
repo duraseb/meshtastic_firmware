@@ -9,7 +9,7 @@
  * Tracks up to MAX_ENTRIES nodes using a fixed-size array (no heap allocation).
  * Each node has three independent buckets:
  *   - TEXT    : TEXT_MESSAGE_APP and TEXT_MESSAGE_COMPRESSED_APP
- *   - ROUTING : ROUTING_APP and SIGNAL_ROUTING_APP
+ *   - ROUTING : ROUTING_APP, SIGNAL_ROUTING_APP and TRACEROUTE_APP
  *   - OTHER   : everything else
  *
  * When a bucket receives >= threshold packets within WINDOW_MS, the node is
