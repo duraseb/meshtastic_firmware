@@ -1363,27 +1363,25 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                 routingGraph->updateDownstreamExclusive(mp.from, inferredRelayer, inferredEtx, millis() / 1000);
             }
 
-            // Infer direct connectivity between relayer and sender only for stock firmware nodes
-            // SR-aware nodes broadcast their topology, so we don't need to infer connectivity for them
-            if (getCapabilityStatus(inferredRelayer) == CapabilityStatus::Legacy) {
-                // Since the relayer successfully relayed a packet from the sender,
-                // we can assume they have direct connectivity
-                LOG_DEBUG("[SR] Inferred direct connectivity: legacy node %08x can hear %08x directly",
+            // Infer directed connectivity from relayer to sender when the relayer is a stock node.
+            // SR-aware nodes broadcast their topology, so we don't need to infer connectivity for them.
+            // Observing a relay proves only one direction: relayer → sender. The reverse is not assumed.
+            bool relayerIsLegacy = getCapabilityStatus(inferredRelayer) == CapabilityStatus::Legacy;
+            if (relayerIsLegacy) {
+                // Since the stock relayer successfully relayed a packet from the sender,
+                // we know the relayer can hear the sender (inferredRelayer → mp.from).
+                LOG_DEBUG("[SR] Inferred connectivity: stock node %08x can hear %08x (observed relay)",
                          inferredRelayer, mp.from);
 
-                // Add edge between inferredRelayer and mp.from with default signal quality
-                // Use Mirrored source since this is inferred, not directly measured
                 uint32_t monotonicTimestamp = millis() / 1000;
                 int32_t defaultRssi = -70; // default RSSI for inferred connectivity
                 float defaultSnr = 5.0f;  // default SNR for inferred connectivity
 
-                routingGraph->updateEdge(mp.from, inferredRelayer, NeighborGraph::calculateETX(defaultRssi, defaultSnr),
-                                         monotonicTimestamp, 0, Edge::Source::Mirrored);
                 routingGraph->updateEdge(inferredRelayer, mp.from, NeighborGraph::calculateETX(defaultRssi, defaultSnr),
                                          monotonicTimestamp, 0, Edge::Source::Mirrored);
             } else {
-                LOG_DEBUG("[SR] Skipping direct connectivity inference for SR-aware node %08x (capability: %d)",
-                         inferredRelayer, (int)getCapabilityStatus(inferredRelayer));
+                LOG_DEBUG("[SR] Skipping direct connectivity inference: relayer %08x is SR-aware, topology self-reported",
+                         inferredRelayer);
             }
 
             // Update relay node's edge in the graph since it's actively relaying

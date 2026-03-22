@@ -157,7 +157,7 @@ All discovery mechanisms are used to maintain comprehensive network topology:
 
 2. **Topology Broadcasts**: Periodically broadcast their complete neighbor list for comprehensive topology learning from other nodes' perspectives
 
-3. **Relayed Packet Inference**: When receiving relayed packets from Legacy (stock firmware) nodes, gateway relationships and direct connectivity are inferred between original sender and relay node
+3. **Relayed Packet Inference**: When receiving a relayed packet, gateway relationships are inferred between the original sender and the relay node. If the relay node is a stock (Legacy) firmware node, a directed edge is also recorded from the relay to the sender — observing a successful relay proves the relay can hear the sender, regardless of the sender's firmware type. The reverse edge is not assumed.
 
 4. **Placeholder System**: Unknown relay nodes are tracked as placeholders until their real identities are discovered through direct contact
 
