@@ -1600,6 +1600,15 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     uint8_t srCount = 0;
 
     uint16_t myCost = getCandidateCost(myNode);
+
+    // When getNextHop() returns myNode, the route exists but has no coordinated SR next hop.
+    // getCandidateCost() returns UINT16_MAX in this case (no self-loop edge), so use a
+    // best-effort sentinel cost (0xFFFE) to add self as the sole relay candidate.
+    if (myCost == UINT16_MAX && myNextHop == myNode) {
+        myCost = 0xFFFEu;
+        LOG_INFO("[SR] Best-effort self relay: no coordinated next hop, relaying as sole candidate");
+    }
+
     if (myCost != UINT16_MAX && srCount < 8) {
         srCandidates[srCount++] = {myNode, myCost};
     }
@@ -1902,6 +1911,20 @@ bool SignalRoutingModule::shouldRelay(const meshtastic_MeshPacket *p)
     }
 
     NodeNum sourceNode = p->from;
+
+    // Resolve placeholder for the direct sender before the relay decision so connectivity
+    // checks have accurate node identity. handleReceived() also does this, but runs after shouldRelay().
+    if (isDirectPacket(*p) && p->relay_node != 0) {
+        uint8_t relayByte = p->relay_node;
+        NodeNum placeholderId = getPlaceholderForRelay(relayByte);
+        if (isPlaceholderNode(placeholderId)) {
+            if (resolvePlaceholder(placeholderId, sourceNode)) {
+                LOG_INFO("[SR] Pre-decision placeholder resolved: %08x -> %08x", placeholderId, sourceNode);
+            }
+        }
+        rememberRelayIdentity(sourceNode, relayByte);
+    }
+
     NodeNum heardFrom = resolveHeardFrom(p, sourceNode);
 
     // If we heard directly from source, check if next hop already has the packet
@@ -2198,30 +2221,26 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
                     destName, routeCost);
         }
 
-        // CRITICAL: Verify the next hop can hear the transmitting node (heardFrom)
-        // If heardFrom is known and next hop didn't hear the transmission, it can't relay
-        bool nextHopCanHearTransmitter = true;  // Assume true if we can't verify
+        // Verify the next hop can hear the transmitting node (heardFrom). If not, we check
+        // whether hearsUs allows us to forward anyway (see below), then fall back to
+        // opportunistic routing or best-effort self relay.
+        bool nextHopCanHearTransmitter = true;
         bool connectivityUnknown = false;
-        
+
         if (heardFrom != 0 && route.nextHop != heardFrom) {
-            // Use enhanced connectivity check that handles stock firmware nodes
             nextHopCanHearTransmitter = hasVerifiedConnectivity(heardFrom, route.nextHop, &connectivityUnknown);
-            
+
             if (!nextHopCanHearTransmitter) {
                 char heardFromName[64];
                 getNodeDisplayName(heardFrom, heardFromName, sizeof(heardFromName));
-                
+
                 if (connectivityUnknown) {
-                    // Stock node involved - we can't verify connectivity
-                    // Be conservative: don't trust unverified relays, relay ourselves
                     LOG_DEBUG("[SR] Route via %s rejected - cannot verify connectivity to %s (stock/unknown node)",
                              nextHopName, heardFromName);
                 } else {
-                    // Both are SR-active but no edge exists - they likely can't hear each other
                     LOG_DEBUG("[SR] Route via %s rejected - no connectivity to transmitter %s",
                              nextHopName, heardFromName);
                 }
-                // Don't return this next hop - fall through to try alternatives
             }
         }
 
@@ -2238,9 +2257,26 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
             return route.nextHop;
         }
         
+        // If the next hop has confirmed it hears us (hearsUs), forwarding to it will work
+        // regardless of whether the original sender's connectivity can be verified — we are
+        // the one retransmitting.
+        NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
+        if (myNode != 0) {
+            const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
+            if (myEdges) {
+                for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+                    if (myEdges->edges[i].to == route.nextHop && myEdges->edges[i].hearsUs) {
+                        LOG_INFO("[SR] Route via %s approved despite unverified sender connectivity — hearsUs confirmed",
+                                 nextHopName);
+                        return route.nextHop;
+                    }
+                }
+            }
+        }
+
         // Next hop can't hear transmitter - try to find alternative through opportunistic routing
         if (allowOpportunistic) {
-            NodeNum betterNeighbor = findBetterPositionedNeighbor(destination, sourceNode, heardFrom, 
+            NodeNum betterNeighbor = findBetterPositionedNeighbor(destination, sourceNode, heardFrom,
                                                                   std::numeric_limits<float>::infinity(), currentTime);
             if (betterNeighbor != 0) {
                 char altName[64];
@@ -2249,12 +2285,10 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
                 return betterNeighbor;
             }
         }
-        
-        // No alternative found - indicate we should relay ourselves
-        // by returning our own node number
-        NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
+
+        // No usable next hop — signal best-effort self relay by returning our own node ID.
         if (myNode != 0) {
-            LOG_DEBUG("[SR] No next hop can hear transmitter - we should relay ourselves");
+            LOG_DEBUG("[SR] No verified next hop and no hearsUs — best-effort self relay");
             return myNode;
         }
     }
