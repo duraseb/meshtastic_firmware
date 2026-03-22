@@ -369,8 +369,14 @@ ErrorCode Router::send(meshtastic_MeshPacket *p)
 
     p->relay_node = nodeDB->getLastByteOfNodeNum(getNodeNum()); // set the relayer to us
     // If we are the original transmitter, set the hop limit with which we start
-    if (isFromUs(p))
+    if (isFromUs(p)) {
         p->hop_start = p->hop_limit;
+        // Reset SR broadcast keepalive: any originated packet makes us visible to neighbors,
+        // so there is no need to send a topology broadcast just to prove we are alive.
+        if (signalRoutingModule) {
+            signalRoutingModule->notifyOriginatedPacketSent();
+        }
+    }
 
     // If the packet hasn't yet been encrypted, do so now (it might already be encrypted if we are just forwarding it)
 

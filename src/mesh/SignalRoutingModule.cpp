@@ -150,7 +150,6 @@ int32_t SignalRoutingModule::runOnce()
             needsBootBroadcast = false;
             LOG_INFO("[SR] Sending empty boot broadcast to bootstrap topology");
             sendTopologyPacket(NODENUM_BROADCAST, nullptr, 0, 0);
-            lastBroadcast = nowMs;
         } else if (nowMs - lastBroadcast >= SIGNAL_ROUTING_BROADCAST_SECS * 1000) {
             sendSignalRoutingInfo();
         } else if (topologyDirty && nowMs - lastBroadcast >= 60 * 1000) {
@@ -237,6 +236,13 @@ void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
     // Update our own capability after sending
     trackNodeCapability(nodeDB->getNodeNum(), isActiveRoutingRole() ? CapabilityStatus::SRactive : CapabilityStatus::Passive);
 }
+
+void SignalRoutingModule::notifyOriginatedPacketSent()
+{
+    LOG_DEBUG("[SR] Originated packet sent — resetting topology broadcast timer");
+    lastBroadcast = millis();
+}
+
 void SignalRoutingModule::collectNeighborsForBroadcast(meshtastic_SignalNeighbor *outNeighbors, uint8_t &outCount, uint8_t maxCount)
 {
     outCount = 0;
@@ -307,7 +313,6 @@ void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const meshtastic_Sign
     }
 
     service->sendToMesh(p);
-    lastBroadcast = millis();
 
     // Record our transmission for contention window tracking
     if (routingGraph) {

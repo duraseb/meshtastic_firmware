@@ -12,8 +12,8 @@
 // Maximum neighbors per SR broadcast packet (11 fit in 233 byte payload)
 #define MAX_SIGNAL_ROUTING_NEIGHBORS 11
 
-// Broadcast interval for signal routing info (5 minutes)
-#define SIGNAL_ROUTING_BROADCAST_SECS 300
+// Broadcast interval for signal routing info (6 minutes)
+#define SIGNAL_ROUTING_BROADCAST_SECS 360
 
 class SignalRoutingModule : public ProtobufModule<meshtastic_SignalRoutingInfo>, private concurrency::OSThread
 {
@@ -37,6 +37,10 @@ public:
     bool hasVerifiedConnectivity(NodeNum transmitter, NodeNum receiver, bool* unknownOut = nullptr);
     void updateNeighborInfo(NodeNum nodeId, int32_t rssi, float snr, uint32_t lastRxTime, uint32_t variance = 0);
     void sendSignalRoutingInfo(NodeNum dest = NODENUM_BROADCAST);
+    // Call when this node originates and sends any packet (not a relay).
+    // Resets the topology-broadcast keepalive timer so we don't send redundant broadcasts
+    // while we are already visible to neighbors due to recent transmissions.
+    void notifyOriginatedPacketSent();
 
     // Returns true if the packet was received directly from the sender (not relayed).
     // Checks both hop_start==hop_limit and relay_node matching the sender's last byte.
