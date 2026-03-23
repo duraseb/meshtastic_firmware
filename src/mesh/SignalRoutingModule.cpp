@@ -2046,14 +2046,20 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         halfAirtime = std::max(airtime / 2, (uint32_t)50);
     }
 
-    // Build coverage sets
+    // Build coverage sets.
+    // Only mark heardFrom's neighbors as already-covered if the link is good.
+    // Poor-quality links (high ETX) should NOT be pre-covered: if our link to
+    // that node is much better, we should still relay and get an earlier slot.
+    static constexpr float POOR_LINK_ETX_THRESHOLD = 2.5f;
     NodeSet alreadyCovered;
     alreadyCovered.insert(sourceNode);
     alreadyCovered.insert(heardFrom);
     const NodeEdges *heardFromEdges = routingGraph->getEdgesFrom(heardFrom);
     if (heardFromEdges) {
         for (uint8_t i = 0; i < heardFromEdges->edgeCount; i++) {
-            alreadyCovered.insert(heardFromEdges->edges[i].to);
+            if (heardFromEdges->edges[i].getEtx() < POOR_LINK_ETX_THRESHOLD) {
+                alreadyCovered.insert(heardFromEdges->edges[i].to);
+            }
         }
     }
 
