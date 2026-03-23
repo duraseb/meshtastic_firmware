@@ -1909,6 +1909,14 @@ bool SignalRoutingModule::shouldRelay(const meshtastic_MeshPacket *p)
             LOG_INFO("[SR-DECISION] UNICAST RELAY pkt=0x%08x: from %s to %s, not routable via SR but known in NodeDB", p->id, senderName, destName);
             return true;
         }
+        // If the destination is known as a downstream node in the topology (e.g. reachable via a
+        // neighbour's neighbour), fall back to SR relay rather than suppressing. This covers cases
+        // where the direct relay chain is missing a Dijkstra edge (destination only appears in
+        // downstream table entries whose relay is not our direct neighbour).
+        if (routingGraph->isDownstream(p->to)) {
+            LOG_INFO("[SR-DECISION] UNICAST RELAY pkt=0x%08x: from %s to %s, not routable via SR but known as downstream", p->id, senderName, destName);
+            return true;
+        }
         LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: from %s to %s, unknown destination", p->id, senderName, destName);
         return false;
     }
