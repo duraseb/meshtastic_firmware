@@ -336,7 +336,6 @@ void SignalRoutingModule::updateGraphWithNeighbor(NodeNum sender, const meshtast
         // Propagate the bidirectional link flag from the authoritative sender
         routingGraph->setEdgeHearsUs(sender, neighbor.node_id, neighbor.hears_us);
 
-        LOG_DEBUG("[SR] Added edge %08x -> %08x from topology", sender, neighbor.node_id);
     }
 }
 
@@ -2050,15 +2049,17 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     // Only mark heardFrom's neighbors as already-covered if the link is good.
     // Poor-quality links (high ETX) should NOT be pre-covered: if our link to
     // that node is much better, we should still relay and get an earlier slot.
-    static constexpr float POOR_LINK_ETX_THRESHOLD = 2.5f;
+    static constexpr float POOR_LINK_ETX_THRESHOLD = 7.0f;
     NodeSet alreadyCovered;
     alreadyCovered.insert(sourceNode);
     alreadyCovered.insert(heardFrom);
     const NodeEdges *heardFromEdges = routingGraph->getEdgesFrom(heardFrom);
     if (heardFromEdges) {
         for (uint8_t i = 0; i < heardFromEdges->edgeCount; i++) {
-            if (heardFromEdges->edges[i].getEtx() < POOR_LINK_ETX_THRESHOLD) {
-                alreadyCovered.insert(heardFromEdges->edges[i].to);
+            float etx = heardFromEdges->edges[i].getEtx();
+            NodeNum neighbor = heardFromEdges->edges[i].to;
+            if (etx < POOR_LINK_ETX_THRESHOLD) {
+                alreadyCovered.insert(neighbor);
             }
         }
     }
@@ -2066,6 +2067,25 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     // Build candidates: our direct SR-active neighbors (plus stock routers handled in Phase 1)
     NodeSet candidates;
     const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
+
+    // Log any of our own neighbors excluded from pre-coverage due to poor heardFrom link
+    if (myEdges && heardFromEdges) {
+        for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+            NodeNum myNeighbor = myEdges->edges[i].to;
+            if (alreadyCovered.contains(myNeighbor) || myNeighbor == heardFrom || myNeighbor == sourceNode) {
+                continue;
+            }
+            for (uint8_t j = 0; j < heardFromEdges->edgeCount; j++) {
+                if (heardFromEdges->edges[j].to == myNeighbor) {
+                    char neighborName[32];
+                    getNodeDisplayName(myNeighbor, neighborName, sizeof(neighborName));
+                    LOG_DEBUG("[SR] Pre-coverage: our neighbor %s excluded from heardFrom coverage (ETX=%.1f >= %.1f)",
+                              neighborName, heardFromEdges->edges[j].getEtx(), POOR_LINK_ETX_THRESHOLD);
+                    break;
+                }
+            }
+        }
+    }
     if (myEdges) {
         for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
             NodeNum neighbor = myEdges->edges[i].to;
