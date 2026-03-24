@@ -2063,13 +2063,17 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         }
     }
 
-    // Build candidates: our direct neighbors that might relay
+    // Build candidates: our direct SR-active neighbors (plus stock routers handled in Phase 1)
     NodeSet candidates;
     const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
     if (myEdges) {
         for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
             NodeNum neighbor = myEdges->edges[i].to;
             if (neighbor == heardFrom || neighbor == sourceNode) {
+                continue;
+            }
+            // Only include SR-active nodes and stock routers (stock routers are handled/removed in Phase 1)
+            if (getCapabilityStatus(neighbor) != CapabilityStatus::SRactive && !isImmediateRelayRouter(neighbor)) {
                 continue;
             }
             candidates.insert(neighbor);
