@@ -69,7 +69,6 @@ private:
     uint32_t lastBroadcast = 0;
     uint8_t currentTopologyVersion = 0;
 
-    // Fixed-size topology version cache — replaces std::unordered_map to avoid heap fragmentation
     static constexpr size_t MAX_TOPOLOGY_VERSION_ENTRIES = 24;
     struct TopologyVersionEntry {
         NodeNum nodeId = 0;
