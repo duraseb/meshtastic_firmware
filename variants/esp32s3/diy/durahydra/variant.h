@@ -25,6 +25,8 @@
 // Before powering off, set TXEN、RXEN as low level.
 #define LORA_RXEN 11 // Input - RF switch RX control, connecting external MCU IO, valid in high level
 #define LORA_TXEN 12   // Input - RF switch TX control, connecting external MCU IO or DIO2, valid in high level
+// #define LORA_RXEN 12
+// #define LORA_TXEN RADIOLIB_NC
 
 #define LORA_SCK 10
 #define LORA_MISO 6
