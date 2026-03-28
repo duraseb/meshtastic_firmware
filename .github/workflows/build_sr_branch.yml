@@ -1,0 +1,121 @@
+name: Build SR Branch
+
+on:
+  push:
+    branches:
+      - signal_based_routing
+    paths-ignore:
+      - "**.md"
+
+permissions: read-all
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Get version
+        id: version
+        env:
+          BUILD_LOCATION: local
+        run: echo "long=$(./bin/buildinfo.py long)" >> $GITHUB_OUTPUT
+    outputs:
+      long: ${{ steps.version.outputs.long }}
+
+  build:
+    needs: [version]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { pio_env: heltec-v3,               platform: esp32s3  }
+          - { pio_env: heltec-v4,               platform: esp32s3  }
+          - { pio_env: nrf52_promicro_diy_tcxo, platform: nrf52840 }
+          - { pio_env: seeed_xiao_nrf52840_kit, platform: nrf52840 }
+          - { pio_env: seeed-xiao-s3,           platform: esp32s3  }
+          - { pio_env: rak4631,                  platform: nrf52840 }
+          - { pio_env: meshtastic-diy-v1,        platform: esp32    }
+          - { pio_env: heltec-wsl-v3,            platform: esp32s3  }
+          - { pio_env: tlora-v2-1-1_6,           platform: esp32    }
+          - { pio_env: tbeam,                    platform: esp32    }
+          - { pio_env: t-echo,                   platform: nrf52840 }
+          - { pio_env: tlora-t3s3-v1,            platform: esp32s3  }
+          - { pio_env: tracker-t1000-e,          platform: nrf52840 }
+          - { pio_env: heltec-mesh-node-t114,    platform: nrf52840 }
+          - { pio_env: heltec-v2_0,              platform: esp32    }
+          - { pio_env: heltec-mesh-pocket-5000,  platform: nrf52840 }
+          - { pio_env: seeed_wio_tracker_L1,     platform: nrf52840 }
+          - { pio_env: rp2040-lora,              platform: rp2040   }
+          - { pio_env: heltec-wireless-paper,    platform: esp32s3  }
+          - { pio_env: tbeam-s3-core,            platform: esp32s3  }
+          - { pio_env: kapico,                   platform: rp2040   }
+          - { pio_env: durahydra,                platform: esp32s3  }
+
+    name: build-${{ matrix.pio_env }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: false
+
+      - name: Override protobufs submodule to fork
+        run: |
+          git submodule init
+          git config submodule.protobufs.url https://github.com/duraseb/protobufs.git
+          git submodule update --remote protobufs
+          cd protobufs && git checkout signal_based_routing
+          cd ..
+          git submodule update --init --recursive -- meshtestic
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get -y update --fix-missing
+          sudo apt-get install -y cppcheck libbluetooth-dev libgpiod-dev libyaml-cpp-dev lsb-release
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: 3.x
+          cache: pip
+          cache-dependency-path: |
+            .github/actions/**
+            **.ini
+
+      - name: Upgrade python tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -U --no-build-isolation --no-cache-dir "setuptools<72"
+          pip install -U platformio adafruit-nrfutil --no-build-isolation
+          pip install -U poetry --no-build-isolation
+          pip install -U meshtastic --pre --no-build-isolation
+          pio upgrade
+
+      - name: PlatformIO cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.platformio/.cache
+          key: pio-cache-${{ matrix.platform }}-${{ hashFiles('.github/actions/**', '**.ini') }}
+
+      - name: Build ${{ matrix.pio_env }}
+        uses: meshtastic/gh-action-firmware@main
+        with:
+          pio_platform: ${{ matrix.platform }}
+          pio_env: ${{ matrix.pio_env }}
+          pio_target: build
+
+      - name: Store binaries as artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: firmware-${{ matrix.platform }}-${{ matrix.pio_env }}-${{ needs.version.outputs.long }}
+          overwrite: true
+          path: |
+            release/*.mt.json
+            release/*.bin
+            release/*.elf
+            release/*.uf2
+            release/*.hex
+            release/*.zip
+            release/device-*.sh
+            release/device-*.bat
+          retention-days: 30
