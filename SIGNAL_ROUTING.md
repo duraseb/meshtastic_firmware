@@ -291,7 +291,14 @@ SignalRouting uses a deterministic slot-based algorithm to coordinate broadcast 
 4. **Overrides**: Downstream relay obligations and stock coverage needs can force a relay.
 
 **Post-cancellation — unique coverage re-evaluation:**
-When a dupe arrives and `isDupeRelayRedundant` is called, it checks whether we still have neighbors not reachable by any transmitter heard so far (original `heardFrom` + all subsequent dupe relayers). Transmitters are accumulated across all dupes for the same packet. If we have unique coverage, `isDupeRelayRedundant` returns false (keep our scheduled relay). If all our neighbors are already covered, it returns true (cancel). Because Phase 2 assigns each SR candidate a unique sequential slot, two nodes with unique coverage will never collide when both keep their relays.
+When a dupe arrives, `FloodingRouter::perhapsCancelDupe` is called. For SR committed relays, it first checks whether the packet is still in the TX queue (`findInTxQueue`):
+
+- **Already transmitted** (not in TX queue): the packet has already been sent; nothing to cancel. Log "Already relayed — ignoring dupe" and return immediately. Coverage computation is skipped entirely since it would be wasted work.
+- **Still pending** (in TX queue): call `areAllNeighborsCovered(p)` to evaluate whether the dupe relayer now covers all our neighbors. Transmitters are accumulated across all dupes for the same packet (original `heardFrom` + all subsequent dupe relayers). If all neighbors are covered → cancel and clear the committed relay. If we still have unique coverage → keep our scheduled relay.
+
+Note: a packet is removed from the TX queue at `dequeue()`, which happens immediately before `startSend()` — not after transmission completes. So `findInTxQueue` returns false as soon as the packet starts transmitting.
+
+Because Phase 2 assigns each SR candidate a unique sequential slot, two nodes with unique coverage will never collide when both keep their relays.
 
 ```
 Slot timing example (150ms half-airtime):
