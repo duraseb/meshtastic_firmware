@@ -1,4 +1,7 @@
 #include "SignalRoutingModule.h"
+
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+
 #include "graph/NeighborGraph.h"
 #include "MeshService.h"
 #include "MeshTypes.h"
@@ -3399,7 +3402,9 @@ bool SignalRoutingModule::hasVerifiedConnectivity(NodeNum transmitter, NodeNum r
         // Both are SR-active and no edge exists - they likely can't hear each other
         if (unknownOut) *unknownOut = false;
     }
-    
+
     return false;
 }
+
+#endif // !MESHTASTIC_EXCLUDE_SIGNALROUTING
 

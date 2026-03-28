@@ -1,5 +1,8 @@
 #include "NeighborGraph.h"
 #include "configuration.h"
+
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+
 #include <algorithm>
 #include <cmath>
 
@@ -1509,3 +1512,5 @@ bool NeighborGraph::hasNodeTransmitted(NodeNum nodeId, uint32_t packetId, uint32
     }
     return false;
 }
+
+#endif // !MESHTASTIC_EXCLUDE_SIGNALROUTING

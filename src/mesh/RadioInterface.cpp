@@ -17,7 +17,9 @@
 #include "detect/LoRaRadioType.h"
 #include "main.h"
 #include "meshUtils.h" // for pow_of_2
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
 #include "SignalRoutingModule.h"
+#endif
 #include "sleep.h"
 #include <assert.h>
 #include <pb_decode.h>
@@ -613,10 +615,12 @@ bool RadioInterface::shouldRebroadcastEarlyLikeRouter(meshtastic_MeshPacket *p)
     }
 
     // SR nodes that committed to relay should use router-like timing
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
     if (signalRoutingModule && signalRoutingModule->isCommittedRelay(p->id)) {
         LOG_DEBUG("[SR] Committed relay for 0x%08x - using router-like TX delay", p->id);
         return true;
     }
+#endif
 
     return false;
 }

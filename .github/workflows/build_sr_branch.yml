@@ -37,7 +37,6 @@ jobs:
           - { pio_env: meshtastic-diy-v1,        platform: esp32    }
           - { pio_env: heltec-wsl-v3,            platform: esp32s3  }
           - { pio_env: tlora-v2-1-1_6,           platform: esp32    }
-          - { pio_env: tbeam,                    platform: esp32    }
           - { pio_env: t-echo,                   platform: nrf52840 }
           - { pio_env: tlora-t3s3-v1,            platform: esp32s3  }
           - { pio_env: tracker-t1000-e,          platform: nrf52840 }
@@ -110,12 +109,6 @@ jobs:
           name: firmware-${{ matrix.platform }}-${{ matrix.pio_env }}-${{ needs.version.outputs.long }}
           overwrite: true
           path: |
-            release/*.mt.json
-            release/*.bin
-            release/*.elf
-            release/*.uf2
-            release/*.hex
-            release/*.zip
-            release/device-*.sh
-            release/device-*.bat
+            release/firmware-*.factory.bin
+            release/firmware-*.uf2
           retention-days: 30

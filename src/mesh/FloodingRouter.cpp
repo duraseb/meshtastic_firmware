@@ -5,7 +5,9 @@
 #include "mesh-pb-constants.h"
 #include "meshUtils.h"
 #include "modules/TextMessageModule.h"
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
 #include "SignalRoutingModule.h"
+#endif
 #if !MESHTASTIC_EXCLUDE_TRACEROUTE
 #include "modules/TraceRouteModule.h"
 #endif
@@ -50,9 +52,11 @@ bool FloodingRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
         bool isRepeated = p->hop_start > 0 && p->hop_start == p->hop_limit;
 
         // Don't treat signal-routed packets as "repeated" - they preserve hop_limit by design
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
         if (isRepeated && signalRoutingModule && signalRoutingModule->shouldUseSignalBasedRouting(p)) {
             isRepeated = false;
         }
+#endif
 
         if (isRepeated) {
             LOG_DEBUG("Repeated reliable tx");
@@ -145,6 +149,7 @@ bool FloodingRouter::roleAllowsCancelingDupe(const meshtastic_MeshPacket *p)
 void FloodingRouter::perhapsCancelDupe(const meshtastic_MeshPacket *p)
 {
     // If SR committed to relay this packet, check if the dupe relayer already covers our nodes
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
     if (signalRoutingModule && signalRoutingModule->isCommittedRelay(p->id)) {
         if (!findInTxQueue(p->from, p->id)) {
             // Already transmitted — nothing to cancel, skip coverage computation
@@ -160,6 +165,7 @@ void FloodingRouter::perhapsCancelDupe(const meshtastic_MeshPacket *p)
             return;
         }
     }
+#endif
 
     if (p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA && roleAllowsCancelingDupe(p)) {
         // cancel rebroadcast of this message *if* there was already one, unless we're a router!

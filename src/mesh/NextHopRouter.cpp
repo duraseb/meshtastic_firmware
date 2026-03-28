@@ -8,7 +8,9 @@
 #include "modules/TrafficManagementModule.h"
 #endif
 #include "NodeDB.h"
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
 #include "SignalRoutingModule.h"
+#endif
 
 NextHopRouter::NextHopRouter() {}
 
@@ -70,9 +72,11 @@ bool NextHopRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
         } else {
             bool isRepeated = getHopsAway(*p) == 0;
             // Don't treat signal-routed packets as "repeated" - they preserve hop_limit by design
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
             if (isRepeated && signalRoutingModule && signalRoutingModule->shouldUseSignalBasedRouting(p)) {
                 isRepeated = false;
             }
+#endif
             // If repeated and not in Tx queue anymore, try relaying again, or if we are the destination, send the ACK again
             if (isRepeated) {
                 if (!findInTxQueue(p->from, p->id)) {
@@ -149,6 +153,7 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                 if (p->next_hop == NO_NEXT_HOP_PREFERENCE || p->next_hop == nodeDB->getLastByteOfNodeNum(getNodeNum())) {
 
                     // Signal-based routing: check if we should relay (broadcasts and unicasts)
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
                     if (signalRoutingModule && signalRoutingModule->shouldUseSignalBasedRouting(p)) {
                         if (!signalRoutingModule->shouldRelay(p)) {
                             LOG_INFO("[SR] Not relaying 0x%08x", p->id);
@@ -160,9 +165,11 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                         signalRoutingModule->pendingRelayDelayMs = 0;
                         signalRoutingModule->commitRelay(p->id, heardFrom, relayDelay);
                     }
+#endif
 
                     meshtastic_MeshPacket *tosend = packetPool.allocCopy(*p); // keep a copy because we will be sending it
 
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
                     // Apply slot-based TX delay for SR relays
                     if (signalRoutingModule && signalRoutingModule->isCommittedRelay(tosend->id)) {
                         uint32_t delay = signalRoutingModule->getCommittedRelayDelay(tosend->id);
@@ -170,6 +177,7 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                             tosend->tx_after = millis() + delay;
                         }
                     }
+#endif
                     LOG_INFO("Rebroadcast received message coming from %x", p->relay_node);
 
                     // If exhausting hops, force hop_limit = 0 regardless of other logic

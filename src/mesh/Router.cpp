@@ -5,7 +5,9 @@
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "RTC.h"
+#if !MESHTASTIC_EXCLUDE_NODE_RATE_LIMITER
 #include "NodeRateLimiter.h"
+#endif
 #include "SignalRoutingModule.h"
 
 #include "configuration.h"
@@ -89,6 +91,7 @@ bool Router::shouldDecrementHopLimit(const meshtastic_MeshPacket *p)
     // Nodes configured with hop_start >= 7 want full-mesh reach; SR keeps them alive at 1
     // so stock nodes see it going down while SR nodes can keep routing beyond the limit.
     // Packets with hop_start < 7 follow stock decrement behavior (reaching their intended range).
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
     if (signalRoutingModule && signalRoutingModule->shouldUseSignalBasedRouting(p)) {
         if (p->hop_start >= 7 && p->hop_limit <= 1) {
             LOG_DEBUG("Signal-based routing: preserving hop_limit=1 for packet 0x%08x (hop_start=%d)", p->id, p->hop_start);
@@ -96,6 +99,7 @@ bool Router::shouldDecrementHopLimit(const meshtastic_MeshPacket *p)
         }
         // hop_start < 7: fall through to normal decrement logic (stock behavior)
     }
+#endif
 
     // First hop MUST always decrement to prevent retry issues
     if (getHopsAway(*p) == 0) {
@@ -374,9 +378,11 @@ ErrorCode Router::send(meshtastic_MeshPacket *p)
         p->hop_start = p->hop_limit;
         // Reset SR broadcast keepalive: any originated packet makes us visible to neighbors,
         // so there is no need to send a topology broadcast just to prove we are alive.
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
         if (signalRoutingModule) {
             signalRoutingModule->notifyOriginatedPacketSent();
         }
+#endif
     }
 
     // If the packet hasn't yet been encrypted, do so now (it might already be encrypted if we are just forwarding it)
@@ -811,6 +817,7 @@ void Router::handleReceived(meshtastic_MeshPacket *p, RxSource src)
     // but undecoded (wrong PSK / decode failure) packets are also counted in
     // the OTHER bucket — they still consume airtime and relay CPU.
     // DECODE_FATAL already sets skipHandle=true so those are skipped here.
+#if !MESHTASTIC_EXCLUDE_NODE_RATE_LIMITER
     if (!skipHandle && nodeRateLimiter && nodeRateLimiter->shouldDrop(p)) {
         if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag) {
             LOG_WARN("[RateLimit] Dropping packet 0x%08x from 0x%08x portnum=%d hops=%d",
@@ -824,6 +831,7 @@ void Router::handleReceived(meshtastic_MeshPacket *p, RxSource src)
         cancelSending(p->from, p->id);
         skipHandle = true;
     }
+#endif
 
     // call modules here
     // If this could be a spoofed packet, don't let the modules see it.

@@ -76,4 +76,6 @@ class NodeRateLimiter
     bool checkAndUpdateBucket(BucketState &b, uint8_t threshold, NodeNum nodeId, Bucket bucket, uint32_t nowMs);
 };
 
+#if !MESHTASTIC_EXCLUDE_NODE_RATE_LIMITER
 extern NodeRateLimiter *nodeRateLimiter;
+#endif

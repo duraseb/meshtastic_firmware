@@ -701,18 +701,6 @@ SignalRouting gracefully degrades when coordination isn't possible:
 - **Gateway Integration**: Special handling for nodes bridging network segments
 - **Mute Node Intelligence**: CLIENT_MUTE nodes contribute topology information without relay participation
 
-## Implementation Notes
-
-### NodeDB Integration
-
-SR relies on NodeDB for node existence checks (e.g., unicast fallback decisions). When NodeDB is full (100 nodes), the least-recently-heard node is evicted. The `last_heard` field is set from `rx_time` when available, or from `getTime()` when `rx_time` is 0 (no NTP/GPS), ensuring active nodes are not evicted as stale.
-
-### Stack Safety
-
-Large buffers are stored in the heap-allocated NeighborGraph class, not on the stack. Stack-allocated display buffers are capped to small sizes:
-- `transferDownstream()` operates directly on the private downstream array
-- `logNetworkTopology()` caps display buffers to 64 entries with "... and N more" truncation
-
 ## Troubleshooting
 
 ### Common Issues
