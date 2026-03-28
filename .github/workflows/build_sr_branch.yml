@@ -10,20 +10,7 @@ on:
 permissions: read-all
 
 jobs:
-  version:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Get version
-        id: version
-        env:
-          BUILD_LOCATION: local
-        run: echo "long=$(./bin/buildinfo.py long)" >> $GITHUB_OUTPUT
-    outputs:
-      long: ${{ steps.version.outputs.long }}
-
   build:
-    needs: [version]
     strategy:
       fail-fast: false
       matrix:
@@ -106,7 +93,7 @@ jobs:
       - name: Store binaries as artifact
         uses: actions/upload-artifact@v7
         with:
-          name: firmware-${{ matrix.platform }}-${{ matrix.pio_env }}-${{ needs.version.outputs.long }}
+          name: firmware-${{ matrix.platform }}-${{ matrix.pio_env }}
           overwrite: true
           path: |
             release/firmware-*.factory.bin
