@@ -38,6 +38,8 @@ jobs:
           - { pio_env: durahydra, platform: esp32s3  }
           - { pio_env: birbmesh_one, platform: nrf52840 }
           - { pio_env: birbmesh_one_e22p, platform: nrf52840 }
+          - { pio_env: hydra-e22p, platform: esp32 }
+          - { pio_env: hydra, platform: esp32 }
 
     name: build-${{ matrix.pio_env }}
     runs-on: ubuntu-latest
