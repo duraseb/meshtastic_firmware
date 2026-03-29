@@ -34,8 +34,10 @@ jobs:
           - { pio_env: rp2040-lora,              platform: rp2040   }
           - { pio_env: heltec-wireless-paper,    platform: esp32s3  }
           - { pio_env: tbeam-s3-core,            platform: esp32s3  }
-          - { pio_env: kapico,                   platform: rp2040   }
-          - { pio_env: durahydra,                platform: esp32s3  }
+          - { pio_env: kapico, platform: rp2040   }
+          - { pio_env: durahydra, platform: esp32s3  }
+          - { pio_env: birbmesh_one, platform: nrf52840 }
+          - { pio_env: birbmesh_one_e22p, platform: nrf52840 }
 
     name: build-${{ matrix.pio_env }}
     runs-on: ubuntu-latest
