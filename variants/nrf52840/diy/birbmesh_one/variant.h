@@ -45,15 +45,12 @@
 #ifdef USE_EBYTE_E22P
 
 #undef USE_LLCC68
-#undef USE_SX1262
+// #undef USE_SX1262
 #undef USE_RF95
 #undef USE_LR1121
 #undef LR11X0_DIO_AS_RF_SWITCH
 /* Internally, a DIO3 is used to power a 32MHz TCXO crystal oscillator(the DIO3 is configured to output 1.8V) . */
 #undef TCXO_OPTIONAL
-
-// set this if using a high-power board!
-#define SX126X_MAX_POWER 8
 
 #endif
 
