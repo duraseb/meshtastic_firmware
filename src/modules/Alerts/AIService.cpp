@@ -35,10 +35,8 @@ AIService::~AIService()
 
 void AIService::initializeProviders()
 {
-    // AI provider fallback chain (Gemini → GPT-4o mini → Mistral → Groq → Gemini-Fallback)
-
-    aiProviders[0].name = "Gemini-2.5";
-    aiProviders[0].endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent";
+    aiProviders[0].name = "Gemini-1.5";
+    aiProviders[0].endpoint = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent";
     #ifdef GEMINI_API_KEY
     aiProviders[0].apiKey = GEMINI_API_KEY;
     #else
@@ -46,15 +44,14 @@ void AIService::initializeProviders()
     #endif
     aiProviders[0].requestFormat = "gemini";
 
-    aiProviders[1].name = "GPT-4o mini";
-    aiProviders[1].endpoint = "https://api.openai.com/v1/chat/completions";
-    aiProviders[1].model = "gpt-4o-mini";
-    #ifdef OPENAI_API_KEY
-    aiProviders[1].apiKey = OPENAI_API_KEY;
+    aiProviders[1].name = "Gemini-2.5-Fallback";
+    aiProviders[1].endpoint = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash-lite:generateContent";
+    #ifdef GEMINI_API_KEY
+    aiProviders[1].apiKey = GEMINI_API_KEY;
     #else
     aiProviders[1].apiKey = "";
     #endif
-    aiProviders[1].requestFormat = "openai";
+    aiProviders[1].requestFormat = "gemini";
 
     aiProviders[2].name = "Mistral-7B";
     aiProviders[2].endpoint = "https://api.mistral.ai/v1/chat/completions";
@@ -76,14 +73,15 @@ void AIService::initializeProviders()
     #endif
     aiProviders[3].requestFormat = "groq";
 
-    aiProviders[4].name = "Gemini-2.5-Fallback";
-    aiProviders[4].endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
-    #ifdef GEMINI_API_KEY
-    aiProviders[4].apiKey = GEMINI_API_KEY;
+    aiProviders[4].name = "GPT-4o mini";
+    aiProviders[4].endpoint = "https://api.openai.com/v1/chat/completions";
+    aiProviders[4].model = "gpt-4o-mini";
+    #ifdef OPENAI_API_KEY
+    aiProviders[4].apiKey = OPENAI_API_KEY;
     #else
     aiProviders[4].apiKey = "";
     #endif
-    aiProviders[4].requestFormat = "gemini";
+    aiProviders[4].requestFormat = "openai";
 
     LOG_INFO("[AIService] Initialized with %d AI providers", MAX_AI_PROVIDERS);
 }
