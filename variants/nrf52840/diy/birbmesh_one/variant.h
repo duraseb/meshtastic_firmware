@@ -45,7 +45,6 @@
 #ifdef USE_EBYTE_E22P
 
 #undef USE_LLCC68
-// #undef USE_SX1262
 #undef USE_RF95
 #undef USE_LR1121
 #undef LR11X0_DIO_AS_RF_SWITCH
