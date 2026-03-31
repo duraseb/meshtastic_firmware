@@ -15,6 +15,9 @@
 // Broadcast interval for signal routing info (6 minutes)
 #define SIGNAL_ROUTING_BROADCAST_SECS 360
 
+// Maximum hops for SR topology broadcasts; capped at min(user config, this value)
+#define SR_BROADCAST_MAX_HOPS 5
+
 class SignalRoutingModule : public ProtobufModule<meshtastic_SignalRoutingInfo>, private concurrency::OSThread
 {
 public:

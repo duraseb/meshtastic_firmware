@@ -310,6 +310,7 @@ void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const meshtastic_Sign
 
     meshtastic_MeshPacket *p = allocDataProtobuf(info);
     p->to = dest;
+    p->hop_limit = std::min(p->hop_limit, (uint8_t)SR_BROADCAST_MAX_HOPS);
     p->priority = meshtastic_MeshPacket_Priority_BACKGROUND;
     if (txAfterMs) {
         p->tx_after = txAfterMs;
