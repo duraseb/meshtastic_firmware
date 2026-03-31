@@ -181,6 +181,7 @@ public:
     uint32_t getCommittedRelayDelay(PacketId packetId) const;
     void clearCommittedRelay(PacketId packetId);
     bool areAllNeighborsCovered(const meshtastic_MeshPacket *p);
+    bool shouldZeroHopLimitForUnicastRelay(const meshtastic_MeshPacket *p);
 };
 
 extern SignalRoutingModule *signalRoutingModule;

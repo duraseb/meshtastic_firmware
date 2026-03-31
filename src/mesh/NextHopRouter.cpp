@@ -184,6 +184,15 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
 		    if (exhaustHops) {
                         tosend->hop_limit = 0;
                         LOG_INFO("Traffic management: exhausting hops for 0x%08x, setting hop_limit=0", getFrom(p));
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+                    } else if (signalRoutingModule && signalRoutingModule->shouldZeroHopLimitForUnicastRelay(p)) {
+                        // Destination is a direct neighbor that hears us and at least one other direct
+                        // neighbor runs stock firmware — zero hop_limit so stock nodes don't relay further.
+                        // Adjust hop_start so hopsAway (hop_start - hop_limit) stays correct for receivers.
+                        tosend->hop_start = tosend->hop_start - tosend->hop_limit + 1;
+                        tosend->hop_limit = 0;
+                        LOG_INFO("[SR] Zeroing hop_limit for unicast relay 0x%08x: dest is direct hearsUs neighbor, stock neighbors present", p->id);
+#endif
                     } else if (shouldDecrementHopLimit(p)) {
                         // Use shared logic to determine if hop_limit should be decremented
                         tosend->hop_limit--; // bump down the hop count

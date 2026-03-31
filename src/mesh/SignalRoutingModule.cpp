@@ -1689,6 +1689,52 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
 
     return shouldRelay;
 }
+
+bool SignalRoutingModule::shouldZeroHopLimitForUnicastRelay(const meshtastic_MeshPacket *p)
+{
+    if (!routingGraph || !nodeDB) {
+        return false;
+    }
+    if (isBroadcast(p->to)) {
+        return false;
+    }
+
+    NodeNum myNode = nodeDB->getNodeNum();
+    NodeNum destination = p->to;
+
+    const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
+    if (!myEdges) {
+        return false;
+    }
+
+    // Destination must be a direct neighbor confirmed to hear us
+    bool destIsDirectAndHearsUs = false;
+    for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+        if (myEdges->edges[i].to == destination && myEdges->edges[i].hearsUs) {
+            destIsDirectAndHearsUs = true;
+            break;
+        }
+    }
+    if (!destIsDirectAndHearsUs) {
+        return false;
+    }
+
+    // If any other direct neighbor is not SR-active (stock firmware), zeroing hop_limit
+    // prevents them from relaying a packet that will be delivered directly.
+    for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+        NodeNum nb = myEdges->edges[i].to;
+        if (nb == destination) {
+            continue;
+        }
+        if (getCapabilityStatus(nb) != CapabilityStatus::SRactive) {
+            return true;
+        }
+    }
+
+    // All other direct neighbors are SR — they will suppress the relay themselves
+    return false;
+}
+
 bool SignalRoutingModule::shouldUseSignalBasedRouting(const meshtastic_MeshPacket *p)
 {
     // This function only checks if SR is available and operational.
