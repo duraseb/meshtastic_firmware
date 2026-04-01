@@ -605,7 +605,13 @@ bool topologyHealthy = nodeDB->getMeshNode(destination) != nullptr;
 
 ### Unicast Fallback for Unknown Routes
 
-When a unicast packet targets a node not reachable through the SR topology graph, SR checks whether the node exists in NodeDB. If it does (e.g., a legacy node not participating in SR), the packet falls back to broadcast-style relay to give it a chance to reach its destination. Truly unknown nodes (not in NodeDB at all) are dropped to prevent flooding.
+When a unicast packet targets a node not reachable through the SR topology graph, SR applies a three-tier fallback inside `shouldRelay()`, after the `!topologyHealthyForUnicast()` guard:
+
+1. **Known in NodeDB** (e.g., a legacy node not participating in SR) → fall back to broadcast-style relay.
+2. **Known as downstream** (reachable via the downstream routing table but not in the edge graph) → fall back to broadcast-style relay.
+3. **Completely unknown** (not in graph, not in NodeDB, not in downstream table) → fall back to broadcast-style relay.
+
+All three cases relay broadcast-style, giving every destination a chance to be reached while retaining SR coordination for packets with a known route.
 
 ## Real-World Examples
 
@@ -717,7 +723,7 @@ MB9c transmits at slot 0. MBe4 hears it → cancels.
 - Uses the same slot-based scheduling as broadcasts, with ETX-to-destination as the ranking metric
 - Designated next_hop (from `p->next_hop`) gets slot 0; SR candidates sorted by cost start from slot 1 (or slot 0 if no next_hop)
 - Any dupe unconditionally cancels queued unicast relays — the slot ordering guarantees earlier transmitters are better positioned
-- Falls back to broadcast-style relay when destination is in NodeDB but not in SR topology
+- Falls back to broadcast-style relay for all destinations not reachable via SR topology
 
 **Network Adaptation:**
 - Assesses topology health but may not detect sudden changes immediately
@@ -728,7 +734,7 @@ MB9c transmits at slot 0. MBe4 hears it → cancels.
 
 SignalRouting gracefully degrades when coordination isn't possible:
 
-1. **Unknown Destinations**: Unicasts to nodes in NodeDB but not in SR topology fall back to broadcast-style relay; truly unknown nodes are dropped
+1. **Unknown Destinations**: Unicasts to nodes not reachable via SR topology fall back to broadcast-style relay, regardless of whether the destination is known in NodeDB, the downstream table, or neither
 2. **Topology Incomplete**: Uses traditional unicast routing for known but poorly connected destinations
 3. **Legacy Node Priority**: Gives priority to legacy routers/repeaters for compatibility
 4. **Memory/CPU Constraints**: Automatic feature disabling for constrained devices
@@ -755,7 +761,7 @@ SignalRouting gracefully degrades when coordination isn't possible:
 
 **"No route found for unicast"**
 - Destination not in topology graph
-- If node exists in NodeDB, SR will fall back to broadcast-style relay
+- SR falls back to broadcast-style relay for all unroutable destinations
 - Wait for topology convergence or use opportunistic forwarding
 
 **"Packet not relayed despite good coverage"**
