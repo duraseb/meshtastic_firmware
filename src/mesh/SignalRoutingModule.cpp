@@ -138,6 +138,17 @@ SignalRoutingModule::SignalRoutingModule()
     LOG_INFO("[SR] Module initialized (version %d)", SIGNAL_ROUTING_VERSION);
 }
 
+void SignalRoutingModule::markTopologyDirty()
+{
+    if (!topologyDirty) {
+        topologyDirty = true;
+        topologyDirtyAt = millis();
+        // Wake runOnce() within 60s so the early broadcast and topology dump fire promptly,
+        // regardless of how long the thread was sleeping for the periodic broadcast cycle.
+        setIntervalFromNow(60 * 1000);
+    }
+}
+
 int32_t SignalRoutingModule::runOnce()
 {
     uint32_t nowMs = millis();
@@ -155,23 +166,29 @@ int32_t SignalRoutingModule::runOnce()
             sendTopologyPacket(NODENUM_BROADCAST, nullptr, 0, 0);
         } else if (nowMs - lastBroadcast >= SIGNAL_ROUTING_BROADCAST_SECS * 1000) {
             sendSignalRoutingInfo();
-        } else if (topologyDirty && nowMs - lastBroadcast >= 60 * 1000) {
+            topologyDirty = false;
+            topologyDirtyAt = 0;
+        } else if (topologyDirty && topologyDirtyAt > 0 && nowMs - topologyDirtyAt >= 60 * 1000) {
+            // 60s have elapsed since the topology change — send early broadcast.
+            // Gated on topologyDirtyAt (not lastBroadcast) so originated packets don't delay it.
             LOG_INFO("[SR] Topology dirty — sending early broadcast");
             sendSignalRoutingInfo();
             topologyDirty = false;
+            topologyDirtyAt = 0;
         }
 
-        // Topology logging: periodic (every 60s) or when topology changed
+        // Topology logging: when topology changed or every 60s.
+        // topologyDirty is intentionally NOT cleared here so the return calculation below
+        // uses it to schedule a 60s wakeup if the broadcast hasn't fired yet.
         static uint32_t lastTopologyLog = 0;
         if (topologyDirty || nowMs - lastTopologyLog >= 60 * 1000) {
             logNetworkTopology();
             lastTopologyLog = nowMs;
-            topologyDirty = false;
         }
     }
 
     uint32_t broadcastCycle = topologyDirty ? 60 * 1000 : SIGNAL_ROUTING_BROADCAST_SECS * 1000;
-    uint32_t elapsed = nowMs - lastBroadcast;
+    uint32_t elapsed = topologyDirty ? (nowMs - topologyDirtyAt) : (nowMs - lastBroadcast);
     uint32_t timeToBroadcast = (elapsed < broadcastCycle) ? (broadcastCycle - elapsed) : 0;
 
     uint32_t nextDelay = timeToBroadcast;
@@ -444,7 +461,7 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     if (info.neighbors_count == 0 && isDirectPacket(*p) && info.signal_routing_active) {
         LOG_INFO("[SR] Empty broadcast from direct SR neighbor %s — marking topology dirty",
                  senderNameForTopo);
-        topologyDirty = true;
+        markTopologyDirty();
     }
 
     // Mirrored edges are not cleared on new topology versions — they age out naturally.
@@ -577,7 +594,7 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
         if (p->signal_routing_active && isDirectPacket(mp)) {
             LOG_INFO("[SR] Empty broadcast from direct SR neighbor %s — marking topology dirty",
                      senderName);
-            topologyDirty = true;
+            markTopologyDirty();
         }
 
         return false;
@@ -707,10 +724,13 @@ bool SignalRoutingModule::resolvePlaceholder(NodeNum placeholderId, NodeNum real
         return false; // Can't resolve to another placeholder
     }
 
-    // Check if this placeholder is already resolved to a different node
+    // Check if this placeholder is already resolved
     uint8_t relayId = placeholderId & 0xFF;
     NodeNum alreadyResolved = resolveRelayIdentity(relayId);
-    if (alreadyResolved != 0 && alreadyResolved != realNodeId) {
+    if (alreadyResolved != 0) {
+        if (alreadyResolved == realNodeId) {
+            return false; // Already resolved to this node, nothing to do
+        }
         LOG_WARN("[SR] Placeholder %08x already resolved to %08x, refusing to resolve to %08x",
                 placeholderId, alreadyResolved, realNodeId);
         return false; // Already resolved to a different node
@@ -1457,7 +1477,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
 
             if (nodeCountBefore != nodeCountAfter) {
                 LOG_INFO("[SR] Graph aged: %u -> %u nodes", nodeCountBefore, nodeCountAfter);
-                topologyDirty = true;
+                markTopologyDirty();
             } else {
                 LOG_DEBUG("[SR] Graph aged (no node count change)");
             }
@@ -2584,10 +2604,10 @@ void SignalRoutingModule::updateNeighborInfo(NodeNum nodeId, int32_t rssi, float
             routingGraph->clearDownstreamForDestination(nodeId);
 
             LOG_INFO("[SR] Topology changed: new neighbor %s (total nodes: %u)", neighborName, static_cast<unsigned int>(routingGraph->getNodeCount()));
-            topologyDirty = true;
+            markTopologyDirty();
         } else if (changeType == EDGE_SIGNIFICANT_CHANGE) {
             LOG_INFO("[SR] Topology changed: ETX change for %s (total nodes: %u)", neighborName, static_cast<unsigned int>(routingGraph->getNodeCount()));
-            topologyDirty = true;
+            markTopologyDirty();
         }
 
     }

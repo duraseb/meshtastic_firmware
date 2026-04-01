@@ -68,7 +68,8 @@ private:
 
     bool signalBasedRoutingEnabled = true;
     bool needsBootBroadcast = false;
-    bool topologyDirty = false; // Set when topology changes; log dump deferred to runOnce
+    bool topologyDirty = false; // Set when topology changes; triggers early broadcast via runOnce
+    uint32_t topologyDirtyAt = 0; // millis() when topologyDirty first became true
     uint32_t lastBroadcast = 0;
     uint8_t currentTopologyVersion = 0;
 
@@ -158,6 +159,7 @@ private:
     bool isNodeRoutable(NodeNum nodeId) const;
     void logNetworkTopology();
 
+    void markTopologyDirty();
     bool isNonRelayingLegacyRole(NodeNum nodeId) const;
     void markStockNodeRelayedOurPacket(NodeNum stockNode);
 

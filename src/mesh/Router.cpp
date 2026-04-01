@@ -375,6 +375,14 @@ ErrorCode Router::send(meshtastic_MeshPacket *p)
     p->relay_node = nodeDB->getLastByteOfNodeNum(getNodeNum()); // set the relayer to us
     // If we are the original transmitter, set the hop limit with which we start
     if (isFromUs(p)) {
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+        // If destination is a direct hearsUs neighbor and stock neighbors are present,
+        // zero hop_limit so they don't relay a packet we're delivering in one hop.
+        if (signalRoutingModule && signalRoutingModule->shouldZeroHopLimitForUnicastRelay(p)) {
+            p->hop_limit = 0;
+            LOG_INFO("[SR] Zeroing hop_limit for originated unicast 0x%08x: dest is direct hearsUs neighbor, stock neighbors present", p->id);
+        }
+#endif
         p->hop_start = p->hop_limit;
         // Reset SR broadcast keepalive: any originated packet makes us visible to neighbors,
         // so there is no need to send a topology broadcast just to prove we are alive.
