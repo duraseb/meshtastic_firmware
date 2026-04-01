@@ -155,7 +155,7 @@ All discovery mechanisms are used to maintain comprehensive network topology:
 
 1. **Direct Neighbor Detection**: When receiving packets directly with signal data (RSSI/SNR), immediate neighbor relationships are established with calculated ETX values
 
-2. **Topology Broadcasts**: Periodically broadcast their complete neighbor list for comprehensive topology learning from other nodes' perspectives
+2. **Topology Broadcasts**: Periodically broadcast their complete neighbor list for comprehensive topology learning from other nodes' perspectives. The `hop_limit` of every SR topology packet is capped at `SR_BROADCAST_MAX_HOPS = 5`, even if the user has configured a higher limit, to bound topology gossip propagation in large networks.
 
 3. **Relayed Packet Inference**: When receiving a relayed packet, gateway relationships are inferred between the original sender and the relay node. If the relay node is a stock (Legacy) firmware node, a directed edge is also recorded from the relay to the sender — observing a successful relay proves the relay can hear the sender, regardless of the sender's firmware type. The reverse edge is not assumed.
 
@@ -231,6 +231,28 @@ When deciding whether to use SR coordination for unicast packets:
 4. **Next Hop Capability**: Ensure next hop is SR-capable or legacy router
 5. **Designated Gateway Check**: Defer to designated gateways when applicable
 6. **Opportunistic Forwarding**: Use when topology is unhealthy or routes unavailable
+
+### Last-Hop Unicast Hop Limit Zeroing
+
+`shouldZeroHopLimitForUnicastRelay()` prevents stock nodes from relaying a unicast that will be delivered in one hop. It fires when **all** of the following are true:
+
+1. The packet is a unicast (not broadcast)
+2. The destination is a **direct neighbor** with `hearsUs = true` (we have a confirmed two-way link)
+3. At least one other direct neighbor is **not SR-active** (stock firmware)
+
+When these conditions hold, `hop_limit` is set to 0 and `hop_start` is adjusted to match before the packet is sent. Stock neighbors that overhear the transmission will see `hop_limit == 0` and will not relay — the destination will receive it directly from us.
+
+When **all** other direct neighbors are SR-active, this zeroing is skipped: SR nodes will suppress the relay themselves via the slot-based algorithm, so the extra airtime of a zeroed packet is unnecessary.
+
+The check is applied in two places:
+- **`NextHopRouter::perhapsRebroadcast()`** — when relaying a unicast we received from another node
+- **`Router::send()`** — when originating a unicast ourselves
+
+Log line emitted in both cases:
+```
+[SR] Zeroing hop_limit for unicast relay 0x<id>: dest is direct hearsUs neighbor, stock neighbors present
+[SR] Zeroing hop_limit for originated unicast 0x<id>: dest is direct hearsUs neighbor, stock neighbors present
+```
 
 ### Speculative Retransmission
 
@@ -484,6 +506,8 @@ When a relayed packet arrives from an unknown node (identified only by its 8-bit
 3. **Transfer**: On resolution, all downstream entries are transferred from the placeholder to the real node via `transferDownstream()`, preserving routing continuity
 4. **TTL**: Placeholders age out with normal node TTL (90 min) if never resolved
 
+**Duplicate resolution guard**: `resolvePlaceholder()` checks the relay-identity cache before doing any work. If the placeholder's relay byte is already mapped to the same `realNodeId`, the function returns `false` immediately with no log message and no graph operations. Previously the function would fall through and re-execute all transfers and re-log "Resolved placeholder" on every subsequent observation of the same relay, causing spurious log spam and redundant graph writes.
+
 Placeholders are only created for nodes **we** hear directly — not for nodes reported by others in SR broadcasts.
 
 ### Relay Byte Matching
@@ -525,13 +549,16 @@ This prevents issues with RTC updates that could cause time jumps, ensuring reli
 
 // Maximum neighbors tracked per broadcast payload
 #define MAX_SIGNAL_ROUTING_NEIGHBORS 11       // Fits 11 in 233 byte payload
+
+// Hard cap on hop_limit for SR topology broadcasts
+#define SR_BROADCAST_MAX_HOPS 5               // Applied in sendTopologyPacket()
 ```
 
 ### Timeout Values
 
 | Parameter | Value | Purpose |
 |-----------|-------|---------|
-| SR broadcast interval | 300s (5 min) | Topology update frequency (event-driven on neighbor add/remove) |
+| SR broadcast interval | 300s (5 min) | Periodic topology update; early broadcast fires 60s after any topology change |
 | Node TTL | 5400s (90 min) | How long all nodes stay in graph |
 | Edge aging timeout | 5400s (90 min) | Unified edge expiration for all node types |
 | Placeholder TTL | 5400s (90 min) | How long unresolved placeholders survive (same as node TTL) |
@@ -539,6 +566,19 @@ This prevents issues with RTC updates that could cause time jumps, ensuring reli
 | Capability cache TTL | 910s (~15 min) | Node capability status cache (3× broadcast interval + 10s) |
 | Route cache timeout | 300s (5 min) | Dijkstra result cache validity |
 | ETX change threshold | 0.50 | Minimum ETX change to trigger update |
+
+### Prompt Dirty-Topology Rebroadcast (`markTopologyDirty()`)
+
+All topology change sites (new neighbor added, neighbor removed, placeholder resolved, topology received from a direct SR neighbor, etc.) call `markTopologyDirty()` instead of setting `topologyDirty = true` directly. `markTopologyDirty()` does two things atomically:
+
+1. Sets `topologyDirty = true` and records `topologyDirtyAt = millis()`
+2. Calls `setIntervalFromNow(60 * 1000)` to wake `runOnce()` within 60 seconds
+
+This ensures topology changes are broadcast promptly rather than waiting up to 300s for the next periodic cycle.
+
+**Early broadcast gate** — the 60-second early broadcast is gated on `topologyDirtyAt` (when the change was first detected), **not** on `lastBroadcast`. This matters because `notifyOriginatedPacketSent()` resets `lastBroadcast` every time the node sends a packet, which could otherwise delay the early broadcast indefinitely in active nodes.
+
+**Topology log does not clear the dirty flag** — the topology dump in `runOnce()` intentionally leaves `topologyDirty` set after logging. This allows the return value calculation at the bottom of `runOnce()` to correctly see the dirty flag and return a 60s wakeup interval (rather than the full 300s broadcast cycle) until the early broadcast has actually fired.
 
 ### Node Capability Tracking
 
