@@ -142,10 +142,11 @@ void SignalRoutingModule::markTopologyDirty()
 {
     if (!topologyDirty) {
         topologyDirty = true;
-        topologyDirtyAt = millis();
-        // Wake runOnce() within 60s so the early broadcast and topology dump fire promptly,
-        // regardless of how long the thread was sleeping for the periodic broadcast cycle.
-        setIntervalFromNow(60 * 1000);
+        // Wake runOnce() to fire the early broadcast as soon as the minimum inter-broadcast
+        // delay has elapsed since the last broadcast. If it already has, wake immediately.
+        uint32_t sinceLastBroadcast = millis() - lastBroadcast;
+        uint32_t wakeIn = (sinceLastBroadcast >= SIGNAL_ROUTING_DIRTY_BROADCAST_SECS * 1000) ? 0 : (SIGNAL_ROUTING_DIRTY_BROADCAST_SECS * 1000 - sinceLastBroadcast);
+        setIntervalFromNow(wakeIn);
     }
 }
 
@@ -167,28 +168,26 @@ int32_t SignalRoutingModule::runOnce()
         } else if (nowMs - lastBroadcast >= SIGNAL_ROUTING_BROADCAST_SECS * 1000) {
             sendSignalRoutingInfo();
             topologyDirty = false;
-            topologyDirtyAt = 0;
-        } else if (topologyDirty && topologyDirtyAt > 0 && nowMs - topologyDirtyAt >= 60 * 1000) {
-            // 60s have elapsed since the topology change — send early broadcast.
-            // Gated on topologyDirtyAt (not lastBroadcast) so originated packets don't delay it.
+        } else if (topologyDirty && nowMs - lastBroadcast >= SIGNAL_ROUTING_DIRTY_BROADCAST_SECS * 1000) {
+            // Topology changed and the minimum inter-broadcast interval has elapsed
+            // since the last broadcast — send the early broadcast now.
             LOG_INFO("[SR] Topology dirty — sending early broadcast");
             sendSignalRoutingInfo();
             topologyDirty = false;
-            topologyDirtyAt = 0;
         }
 
-        // Topology logging: when topology changed or every 60s.
-        // topologyDirty is intentionally NOT cleared here so the return calculation below
-        // uses it to schedule a 60s wakeup if the broadcast hasn't fired yet.
+        // Topology logging: log on every dirty wakeup and at least every GRAPH_UPDATE_INTERVAL_SECS.
+        // topologyDirty is intentionally NOT cleared before this point so that if the broadcast
+        // was deferred (min interval not yet elapsed), we still log the pending change.
         static uint32_t lastTopologyLog = 0;
-        if (topologyDirty || nowMs - lastTopologyLog >= 60 * 1000) {
+        if (topologyDirty || nowMs - lastTopologyLog >= GRAPH_UPDATE_INTERVAL_SECS * 1000) {
             logNetworkTopology();
             lastTopologyLog = nowMs;
         }
     }
 
-    uint32_t broadcastCycle = topologyDirty ? 60 * 1000 : SIGNAL_ROUTING_BROADCAST_SECS * 1000;
-    uint32_t elapsed = topologyDirty ? (nowMs - topologyDirtyAt) : (nowMs - lastBroadcast);
+    uint32_t broadcastCycle = topologyDirty ? SIGNAL_ROUTING_DIRTY_BROADCAST_SECS * 1000 : SIGNAL_ROUTING_BROADCAST_SECS * 1000;
+    uint32_t elapsed = nowMs - lastBroadcast;
     uint32_t timeToBroadcast = (elapsed < broadcastCycle) ? (broadcastCycle - elapsed) : 0;
 
     uint32_t nextDelay = timeToBroadcast;
@@ -457,7 +456,7 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
 
     // Empty SR broadcast from a direct SR neighbor = bootstrap request.
     // Mark topology dirty so we broadcast our topology at the next opportunity
-    // (immediately if last broadcast was >60s ago, otherwise at the 60s mark).
+    // (immediately if the min inter-broadcast interval has elapsed, otherwise when it does).
     if (info.neighbors_count == 0 && isDirectPacket(*p) && info.signal_routing_active) {
         LOG_INFO("[SR] Empty broadcast from direct SR neighbor %s — marking topology dirty",
                  senderNameForTopo);

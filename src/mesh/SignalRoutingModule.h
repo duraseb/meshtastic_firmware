@@ -15,6 +15,10 @@
 // Broadcast interval for signal routing info (6 minutes)
 #define SIGNAL_ROUTING_BROADCAST_SECS 360
 
+// Minimum inter-broadcast interval: dirty topology triggers an early broadcast only after this
+// many seconds have elapsed since the last broadcast.
+#define SIGNAL_ROUTING_DIRTY_BROADCAST_SECS 120
+
 // Maximum hops for SR topology broadcasts; capped at min(user config, this value)
 #define SR_BROADCAST_MAX_HOPS 5
 
@@ -69,7 +73,6 @@ private:
     bool signalBasedRoutingEnabled = true;
     bool needsBootBroadcast = false;
     bool topologyDirty = false; // Set when topology changes; triggers early broadcast via runOnce
-    uint32_t topologyDirtyAt = 0; // millis() when topologyDirty first became true
     uint32_t lastBroadcast = 0;
     uint8_t currentTopologyVersion = 0;
 
