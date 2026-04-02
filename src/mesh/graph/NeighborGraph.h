@@ -172,6 +172,10 @@ class NeighborGraph {
 
     void ageEdges(uint32_t currentTimeSecs, uint32_t ttlSecs);
 
+    // Returns the count of nodes that have a Reported edge pointing to our node
+    // (i.e., direct neighbors we have directly received a signal from).
+    uint8_t countDirectNeighbors() const;
+
     Route calculateRoute(NodeNum destination, uint32_t currentTime, std::function<bool(NodeNum)> nodeFilter = nullptr);
 
     Route getCachedRoute(NodeNum destination, uint32_t currentTime);

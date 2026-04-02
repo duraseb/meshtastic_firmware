@@ -351,11 +351,16 @@ void SignalRoutingModule::updateGraphWithNeighbor(NodeNum sender, const meshtast
                         : 1.0f;
         uint32_t currentTime = millis() / 1000;
 
-        routingGraph->updateEdge(sender, neighbor.node_id, etx, currentTime);
+        // Do NOT refresh the edge timestamp from topology broadcasts: the timestamp must reflect
+        // when the edge was last directly observed, not when we received someone's topology report.
+        // Refreshing it here would create phantom references — a dead node stays in the graph
+        // as long as any neighbor keeps mentioning it, potentially chaining across multiple hops.
+        // New edges (first creation) still receive currentTime from the new-edge path in updateEdge.
+        routingGraph->updateEdge(sender, neighbor.node_id, etx, currentTime,
+                                 /*variance=*/0, Edge::Source::Mirrored, /*updateTimestamp=*/false);
 
         // Propagate the bidirectional link flag from the authoritative sender
         routingGraph->setEdgeHearsUs(sender, neighbor.node_id, neighbor.hears_us);
-
     }
 }
 
@@ -484,20 +489,19 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
         // but nodes we can hear directly are not incorrectly marked as downstream
         bool hasDirectConnection = false;
         NodeNum ourNode = nodeDB ? nodeDB->getNodeNum() : 0;
-        
+
         // Never mark ourselves as downstream of anyone
         if (neighbor.node_id == ourNode) {
             hasDirectConnection = true;
         } else if (routingGraph) {
-            // Check if we have a direct radio connection to this neighbor
-            // A direct connection exists if we have a Reported edge FROM us TO the neighbor
-            // This represents our actual reception of their signal with RSSI/SNR data
-            // Check edges FROM us TO neighbor with Reported source (actual direct radio connection)
-            const NodeEdges* ourEdges = routingGraph->getEdgesFrom(ourNode);
-            if (ourEdges) {
-                for (uint8_t j = 0; j < ourEdges->edgeCount; j++) {
-                    if (ourEdges->edges[j].to == neighbor.node_id &&
-                        ourEdges->edges[j].source == Edge::Source::Reported) {
+            // A direct connection is confirmed if the neighbor has a Reported edge TO us —
+            // meaning we have received their signal directly (updateNeighborInfo stores
+            // Reported edges as neighbor→us, not us→neighbor).
+            const NodeEdges* neighborEdges = routingGraph->getEdgesFrom(neighbor.node_id);
+            if (neighborEdges) {
+                for (uint8_t j = 0; j < neighborEdges->edgeCount; j++) {
+                    if (neighborEdges->edges[j].to == ourNode &&
+                        neighborEdges->edges[j].source == Edge::Source::Reported) {
                         hasDirectConnection = true;
                         break;
                     }
@@ -708,9 +712,7 @@ bool SignalRoutingModule::isPlaceholderNode(NodeNum nodeId) const
 
 NodeNum SignalRoutingModule::createPlaceholderNode(uint8_t relayId)
 {
-    NodeNum placeholderId = PLACEHOLDER_BASE | relayId;
-    LOG_INFO("[SR] Created placeholder node %08x for unknown relay 0x%02x", placeholderId, relayId);
-    return placeholderId;
+    return PLACEHOLDER_BASE | relayId;
 }
 
 bool SignalRoutingModule::resolvePlaceholder(NodeNum placeholderId, NodeNum realNodeId)
@@ -1292,9 +1294,13 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
         float etx =
             NeighborGraph::calculateETX(mp.rx_rssi, mp.rx_snr);
 
-        // NOTE: We used to clear downstream relationships when a node becomes directly reachable,
-        // but this is wrong. A node can be both a direct neighbor AND a gateway for other nodes.
-        // Only clear downstream relationships through aging or when relationships become invalid.
+        // When a node is confirmed as a direct neighbor, clear any downstream entries that
+        // listed it as a destination reachable via some other relay — those are now obsolete.
+        // Note: clearDownstreamForDestination (what we want here) is different from
+        // clearDownstreamForRelay (which would incorrectly remove MB9c as a relay for others).
+        if (routingGraph) {
+            routingGraph->clearDownstreamForDestination(mp.from);
+        }
 
         LOG_INFO("[SR] Direct neighbor %s: RSSI=%d, SNR=%.1f, ETX=%.2f",
                  senderName, mp.rx_rssi, mp.rx_snr, etx);
@@ -1334,11 +1340,12 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
         // If we still can't resolve the relay identity, create a placeholder node
         if (inferredRelayer == 0) {
             inferredRelayer = createPlaceholderNode(mp.relay_node);
-            LOG_INFO("[SR] Created placeholder %08x for unknown relay 0x%02x",
-                     inferredRelayer, mp.relay_node);
-
-            // Placeholders will be resolved when we hear the real node directly,
-            // or through topology broadcasts from SR neighbors.
+            // Only log on first encounter — placeholder IDs are deterministic so
+            // the same ID is returned on every unresolved packet for this relay byte.
+            if (!routingGraph->getEdgesFrom(inferredRelayer)) {
+                LOG_INFO("[SR] Created placeholder %08x for unknown relay 0x%02x",
+                         inferredRelayer, mp.relay_node);
+            }
         }
 
         if (inferredRelayer != 0 && inferredRelayer != mp.from) {
@@ -1418,8 +1425,8 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                 routingGraph->updateEdge(inferredRelayer, mp.from, NeighborGraph::calculateETX(defaultRssi, defaultSnr),
                                          monotonicTimestamp, 0, Edge::Source::Mirrored);
             } else {
-                LOG_INFO("[SR] Skipping direct connectivity inference: relayer %08x is SR-aware, topology self-reported",
-                         inferredRelayer);
+                LOG_INFO("[SR] Skipping direct connectivity inference: relayer %08x is not confirmed Legacy (status=%d)",
+                         inferredRelayer, (int)getCapabilityStatus(inferredRelayer));
             }
 
             // Update relay node's edge in the graph since it's actively relaying
@@ -1485,14 +1492,19 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
             uint32_t nodeCountBefore = routingGraph->getNodeCount();
             
             // Single TTL for all nodes in the graph; SR capability expiry handles coverage separately
+            uint8_t directBefore = routingGraph->countDirectNeighbors();
             routingGraph->ageEdges(currentTime, NODE_TTL_SECS);
-            
+
             uint32_t nodeCountAfter = routingGraph->getNodeCount();
             lastGraphUpdate = currentTime;
 
             if (nodeCountBefore != nodeCountAfter) {
                 LOG_INFO("[SR] Graph aged: %u -> %u nodes", nodeCountBefore, nodeCountAfter);
-                markTopologyDirty();
+                uint8_t directAfter = routingGraph->countDirectNeighbors();
+                if (directAfter < directBefore) {
+                    LOG_INFO("[SR] Direct neighbor lost during aging — marking topology dirty");
+                    markTopologyDirty();
+                }
             } else {
                 LOG_INFO("[SR] Graph aged (no node count change)");
             }

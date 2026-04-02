@@ -378,6 +378,25 @@ void NeighborGraph::ageEdges(uint32_t currentTimeSecs, uint32_t ttlSecs)
     }
 }
 
+uint8_t NeighborGraph::countDirectNeighbors() const
+{
+    NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
+    uint8_t count = 0;
+    for (uint8_t n = 0; n < neighborCount; n++) {
+        if (neighbors[n].nodeId == myNode) {
+            continue;
+        }
+        for (uint8_t e = 0; e < neighbors[n].edgeCount; e++) {
+            if (neighbors[n].edges[e].to == myNode &&
+                neighbors[n].edges[e].source == Edge::Source::Reported) {
+                count++;
+                break;
+            }
+        }
+    }
+    return count;
+}
+
 Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, std::function<bool(NodeNum)> nodeFilter)
 {
     // Check cache first
