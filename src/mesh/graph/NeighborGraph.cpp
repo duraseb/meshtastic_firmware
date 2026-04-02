@@ -559,11 +559,6 @@ void NeighborGraph::updateDownstream(NodeNum destination, NodeNum relay, float t
     if (destination == myNode)
         return;
 
-    // Skip if the relay already has this destination as a topology edge — no need to duplicate
-    const NodeEdges *relayNode = findNeighbor(relay);
-    if (relayNode && findEdge(relayNode, destination))
-        return;
-
     uint16_t costFixed = static_cast<uint16_t>(std::min(totalCost * 100.0f, 65535.0f));
 
     // Update existing entry for the same (destination, relay) pair
@@ -606,11 +601,6 @@ void NeighborGraph::updateDownstreamExclusive(NodeNum destination, NodeNum relay
 
     NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
     if (destination == myNode)
-        return;
-
-    // Skip if the relay already has this destination as a topology edge — no need to duplicate
-    const NodeEdges *relayNode = findNeighbor(relay);
-    if (relayNode && findEdge(relayNode, destination))
         return;
 
     uint16_t costFixed = static_cast<uint16_t>(std::min(totalCost * 100.0f, 65535.0f));
