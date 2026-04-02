@@ -1882,11 +1882,24 @@ bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p)
     char relayerName[64];
     getNodeDisplayName(dupeRelayer, relayerName, sizeof(relayerName));
 
-    // Unicast: cancel on any dupe — the slot-based ordering ensures earlier transmitters
-    // are better positioned, so our later slot is no longer needed.
+    // Unicast: cancel only if the dupe relayer can actually reach the destination.
+    // If it cannot but we can (direct edge or destination is our downstream), keep our relay
+    // to ensure delivery — otherwise the message is lost even though we hold the best path.
     if (!isBroadcast(p->to)) {
         char destName[64];
         getNodeDisplayName(p->to, destName, sizeof(destName));
+
+        bool dupeCanReachDest = hasDirectConnectivity(dupeRelayer, p->to) ||
+                                 routingGraph->getDownstreamRelay(p->to) == dupeRelayer;
+        bool weCanReachDest   = hasDirectConnectivity(myNode, p->to) ||
+                                 routingGraph->getDownstreamRelay(p->to) == myNode;
+
+        if (!dupeCanReachDest && weCanReachDest) {
+            LOG_INFO("[SR] Unicast dupe pkt=0x%08x to %s from %s — keeping relay (dupe cannot reach dest, we can)",
+                     p->id, destName, relayerName);
+            return false;
+        }
+
         LOG_INFO("[SR] Unicast dupe pkt=0x%08x to %s from %s — canceling relay (slot-based)", p->id, destName, relayerName);
         return true;
     }
