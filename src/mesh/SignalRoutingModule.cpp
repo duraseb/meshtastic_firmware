@@ -1377,13 +1377,21 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                 }
             }
 
-            if (hasDirectConnectionToRelay) {
+            // Only infer downstream relationship when exactly one relay hop has occurred.
+            // If hop_start - hop_limit == 1, the packet went: sender → inferredRelayer → us.
+            // If more hops occurred, inferredRelayer is just the last forwarder and may not
+            // directly hear the sender (e.g. piko→MB9c→a4d0→FCM6: a4d0 never heard piko).
+            bool singleHopRelay = (mp.hop_start - mp.hop_limit) == 1;
+            if (hasDirectConnectionToRelay && singleHopRelay) {
                 float inferredEtx = NeighborGraph::calculateETX(-70, 5.0f); // Default for inferred
-                // Packet arrived via relay — sender is downstream of the relay, unconditionally.
+                // Packet arrived via a single relay — sender is downstream of that relay.
                 // This correctly handles nodes that moved: a stale direct edge no longer blocks
                 // the downstream update. When the sender is heard directly again, the direct
                 // packet path clears this downstream relationship.
                 routingGraph->updateDownstreamExclusive(mp.from, inferredRelayer, inferredEtx, millis() / 1000);
+            } else if (hasDirectConnectionToRelay && !singleHopRelay) {
+                LOG_DEBUG("[SR] Skipping downstream inference for %08x via %08x: %d hops taken (not a single-hop relay)",
+                         mp.from, inferredRelayer, mp.hop_start - mp.hop_limit);
             }
 
             // Infer directed connectivity from relayer to sender when the relayer is a stock node.
