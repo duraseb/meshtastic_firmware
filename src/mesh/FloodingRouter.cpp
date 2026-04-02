@@ -153,7 +153,7 @@ void FloodingRouter::perhapsCancelDupe(const meshtastic_MeshPacket *p)
     if (signalRoutingModule && signalRoutingModule->isCommittedRelay(p->id)) {
         if (!findInTxQueue(p->from, p->id)) {
             // Already transmitted — nothing to cancel, skip coverage computation
-            LOG_DEBUG("[SR] Already relayed 0x%08x - ignoring dupe", p->id);
+            LOG_INFO("[SR] Already relayed 0x%08x - ignoring dupe", p->id);
             return;
         }
         if (signalRoutingModule->areAllNeighborsCovered(p)) {
@@ -161,7 +161,7 @@ void FloodingRouter::perhapsCancelDupe(const meshtastic_MeshPacket *p)
             signalRoutingModule->clearCommittedRelay(p->id);
             // Fall through to normal cancel logic
         } else {
-            LOG_DEBUG("[SR] Not canceling committed relay for 0x%08x - we have unique coverage", p->id);
+            LOG_INFO("[SR] Not canceling committed relay for 0x%08x - we have unique coverage", p->id);
             return;
         }
     }

@@ -258,7 +258,7 @@ void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
 
 void SignalRoutingModule::notifyOriginatedPacketSent()
 {
-    LOG_DEBUG("[SR] Originated packet sent — resetting topology broadcast timer");
+    LOG_INFO("[SR] Originated packet sent — resetting topology broadcast timer");
     lastBroadcast = millis();
 }
 
@@ -368,18 +368,18 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     NodeNum ourNode = nodeDB ? nodeDB->getNodeNum() : 0;
     uint32_t currentTime = millis() / 1000;
     if (routingGraph->hasNodeTransmitted(ourNode, p->id, currentTime)) {
-        LOG_DEBUG("[SR] Skipping topology processing for rebroadcast of our packet %08x", p->id);
+        LOG_INFO("[SR] Skipping topology processing for rebroadcast of our packet %08x", p->id);
         return;
     }
 
     // Only process SignalRoutingInfo packets
     if (p->decoded.portnum != meshtastic_PortNum_SIGNAL_ROUTING_APP) {
-        LOG_DEBUG("[SR] Skipping non-SR packet in preProcessSignalRoutingPacket (portnum=%d)", p->decoded.portnum);
+        LOG_INFO("[SR] Skipping non-SR packet in preProcessSignalRoutingPacket (portnum=%d)", p->decoded.portnum);
         return;
     }
     // Reject packets from invalid node IDs (0 is invalid)
     if (p->from == 0) {
-        LOG_DEBUG("[SR] Ignoring SR broadcast from invalid node ID 0");
+        LOG_WARN("[SR] Ignoring SR broadcast from invalid node ID 0");
         return;
     }
     
@@ -388,7 +388,7 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     if (!isActiveRoutingRole()) {
         // Passive node: check if SR broadcast is from direct sender
         if (!isDirectPacket(*p)) {
-            LOG_DEBUG("[SR] Passive role: Ignoring SR broadcast from 0x%08x (not direct, hopStart=%d, hopLimit=%d)",
+            LOG_INFO("[SR] Passive role: Ignoring SR broadcast from 0x%08x (not direct, hopStart=%d, hopLimit=%d)",
                      p->from, p->hop_start, p->hop_limit);
             return;
         }
@@ -424,7 +424,7 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     }
 
     if (!accept) {
-        LOG_DEBUG("[SR] Ignoring stale topology broadcast from %08x (version %u, last processed %u)",
+        LOG_INFO("[SR] Ignoring stale topology broadcast from %08x (version %u, last processed %u)",
                  p->from, receivedVersion, lastProcessedVersion);
         return;
     }
@@ -471,7 +471,7 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
 
         // Reject neighbors with invalid node IDs (0 or placeholders)
         if (neighbor.node_id == 0 || isPlaceholderNode(neighbor.node_id)) {
-            LOG_DEBUG("[SR] Skipping invalid neighbor node ID: %08x", neighbor.node_id);
+            LOG_WARN("[SR] Skipping invalid neighbor node ID: %08x", neighbor.node_id);
             continue;
         }
 
@@ -522,7 +522,7 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
             float etxForDownstream = NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr);
             routingGraph->updateDownstream(neighbor.node_id, p->from, etxForDownstream, millis() / 1000);
         } else {
-            LOG_DEBUG("[SR]   -> %s: HAS direct connection, sender confirms reachability",
+            LOG_INFO("[SR]   -> %s: HAS direct connection, sender confirms reachability",
                     neighborName);
         }
     }
@@ -573,7 +573,7 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
     // Inactive SR roles don't participate in routing decisions - skip topology learning from broadcasts
     // But they still tracked the sender's capability above
     if (!isActiveRoutingRole()) {
-        LOG_DEBUG("[SR] Passive role: Tracking capability from %s but not processing topology (node count %d)",
+        LOG_INFO("[SR] Passive role: Tracking capability from %s but not processing topology (node count %d)",
                   senderName, p->neighbors_count);
         return false;
     }
@@ -607,7 +607,7 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
     // Active nodes use these edges to determine if a passive SR node has direct connections to destinations
     // However, routing algorithms must not consider paths through passive SR nodes since they don't relay
     if (!p->signal_routing_active) {
-        LOG_DEBUG("[SR] Received topology from passive SR node %08x - storing edges for direct connection detection", mp.from);
+        LOG_INFO("[SR] Received topology from passive SR node %08x - storing edges for direct connection detection", mp.from);
     }
 
     // Check if preProcessSignalRoutingPacket already handled edge clearing and rebuilding
@@ -642,7 +642,7 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
             routingGraph->setEdgeHearsUs(mp.from, neighbor.node_id, neighbor.hears_us);
         }
     } else {
-        LOG_DEBUG("[SR] Skipping redundant edge rebuild for %s (already pre-processed version %u)",
+        LOG_INFO("[SR] Skipping redundant edge rebuild for %s (already pre-processed version %u)",
                  senderName, p->routing_version);
     }
 
@@ -687,7 +687,7 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
     }
 
     // Log network topology summary
-    LOG_DEBUG("[SR] Network topology updated - %s now connected to %d neighbors",
+    LOG_INFO("[SR] Network topology updated - %s now connected to %d neighbors",
              senderName, p->neighbors_count);
 
     // Allow others to see this packet too
@@ -772,7 +772,7 @@ bool SignalRoutingModule::resolvePlaceholder(NodeNum placeholderId, NodeNum real
         routingGraph->removeEdgesTo(placeholderId);
 
         LOG_INFO("[SR] Resolved placeholder %08x -> real node %08x", placeholderId, realNodeId);
-        LOG_DEBUG("[SR] Removed placeholder node %08x from graph", placeholderId);
+        LOG_INFO("[SR] Removed placeholder node %08x from graph", placeholderId);
     }
 
     return true;
@@ -790,7 +790,7 @@ void SignalRoutingModule::replaceGatewayNode(NodeNum oldNode, NodeNum newNode)
     // Transfer downstream entries from old relay to new relay
     size_t transferred = routingGraph->transferDownstream(oldNode, newNode);
     if (transferred > 0) {
-        LOG_DEBUG("[SR] Transferred %u downstream entries from %08x to %08x",
+        LOG_INFO("[SR] Transferred %u downstream entries from %08x to %08x",
                  (unsigned)transferred, oldNode, newNode);
     }
     routingGraph->clearDownstreamForDestination(oldNode);
@@ -899,7 +899,7 @@ bool SignalRoutingModule::hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum 
         if (destination != 0) {
             char neighborName[64];
             getNodeDisplayName(neighbor, neighborName, sizeof(neighborName));
-            LOG_DEBUG("[SR] SR neighbor %s hears %08x and can reach destination - no relay needed",
+            LOG_INFO("[SR] SR neighbor %s hears %08x and can reach destination - no relay needed",
                      neighborName, heardFrom);
             return true;
         }
@@ -935,7 +935,7 @@ bool SignalRoutingModule::hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum 
         if (!pikoHasUniqueCoverage) {
             char neighborName[64];
             getNodeDisplayName(neighbor, neighborName, sizeof(neighborName));
-            LOG_DEBUG("[SR] SR neighbor %s also hears %08x and covers all our unique neighbors",
+            LOG_INFO("[SR] SR neighbor %s also hears %08x and covers all our unique neighbors",
                      neighborName, heardFrom);
             return true;
         }
@@ -969,7 +969,7 @@ bool SignalRoutingModule::shouldRelayForStockNeighbors(NodeNum myNode, NodeNum s
                     // Active stock node: only cover if it has relayed our packets (bidirectional)
                     stockNeighbors[stockCount++] = neighbor;
                 } else {
-                    LOG_DEBUG("[SR] Skipping active stock neighbor %08x — no confirmed bidirectional link (hearsUs=false)",
+                    LOG_INFO("[SR] Skipping active stock neighbor %08x — no confirmed bidirectional link (hearsUs=false)",
                              neighbor);
                 }
             }
@@ -1020,7 +1020,7 @@ bool SignalRoutingModule::shouldRelayForStockNeighbors(NodeNum myNode, NodeNum s
                 for (uint8_t i = 0; i < heardFromEdges->edgeCount; i++) {
                     if (heardFromEdges->edges[i].to == stockNeighbor) {
                         heardDirectly = true;
-                        LOG_DEBUG("[SR] Stock neighbor %08x already covered by relaying SR node %08x",
+                        LOG_INFO("[SR] Stock neighbor %08x already covered by relaying SR node %08x",
                                  stockNeighbor, heardFrom);
                         break;
                     }
@@ -1030,7 +1030,7 @@ bool SignalRoutingModule::shouldRelayForStockNeighbors(NodeNum myNode, NodeNum s
 
         if (!heardDirectly) {
             hasUncoveredStockNeighbor = true;
-            LOG_DEBUG("[SR] Stock neighbor %08x did not hear transmission directly", stockNeighbor);
+            LOG_INFO("[SR] Stock neighbor %08x did not hear transmission directly", stockNeighbor);
 
             // Check if we're the best positioned to reach this stock neighbor
             const NodeEdges* myEdges = routingGraph->getEdgesFrom(myNode);
@@ -1056,7 +1056,7 @@ bool SignalRoutingModule::shouldRelayForStockNeighbors(NodeNum myNode, NodeNum s
     }
 
     if (hasUncoveredStockNeighbor) {
-        LOG_DEBUG("[SR] STOCK COVERAGE: Found %u uncovered stock neighbors but no valid relay path from this node", stockCount);
+        LOG_INFO("[SR] STOCK COVERAGE: Found %u uncovered stock neighbors but no valid relay path from this node", stockCount);
     }
 
     return false;
@@ -1207,7 +1207,7 @@ void SignalRoutingModule::logNetworkTopology()
 
     // Add legend explaining ETX to signal quality mapping
     LOG_INFO("[SR] ETX to signal mapping: ETX=1.0~RSSI=-60dB/SNR=10dB, ETX=2.0~RSSI=-90dB/SNR=0dB, ETX=4.0~RSSI=-110dB/SNR=-5dB");
-    LOG_DEBUG("[SR] Topology logging complete");
+    LOG_INFO("[SR] Topology logging complete");
 }
 
 ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &mp)
@@ -1247,7 +1247,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
 
     // Debug logging to understand packet reception and relay state
     if (hasSignalData && notViaMqtt) {
-        LOG_DEBUG("[SR] Packet from 0x%08x: relay=0x%02x, hopStart=%d, hopLimit=%d, direct=%d",
+        LOG_INFO("[SR] Packet from 0x%08x: relay=0x%02x, hopStart=%d, hopLimit=%d, direct=%d",
                   mp.from, mp.relay_node, mp.hop_start, mp.hop_limit, isDirectFromSender);
     }
     
@@ -1307,7 +1307,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
     } else if (notViaMqtt && !isDirectFromSender && mp.relay_node != 0) {
         // Process relayed packets to infer network topology (skip for inactive roles - they only track direct neighbors)
         if (!isActiveRoutingRole()) {
-            LOG_DEBUG("[SR] Inactive role: Skipping relayed packet topology inference");
+            LOG_INFO("[SR] Inactive role: Skipping relayed packet topology inference");
         } else {
             NodeNum inferredRelayer = resolveRelayIdentity(mp.relay_node);
 
@@ -1323,7 +1323,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                         inferredRelayer = neighbor;
                         // Remember this mapping for future use
                         rememberRelayIdentity(neighbor, mp.relay_node);
-                        LOG_DEBUG("[SR] Resolved relay 0x%02x to known node %08x",
+                        LOG_INFO("[SR] Resolved relay 0x%02x to known node %08x",
                                  mp.relay_node, neighbor);
                         break;
                     }
@@ -1334,7 +1334,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
         // If we still can't resolve the relay identity, create a placeholder node
         if (inferredRelayer == 0) {
             inferredRelayer = createPlaceholderNode(mp.relay_node);
-            LOG_DEBUG("[SR] Created placeholder %08x for unknown relay 0x%02x",
+            LOG_INFO("[SR] Created placeholder %08x for unknown relay 0x%02x",
                      inferredRelayer, mp.relay_node);
 
             // Placeholders will be resolved when we hear the real node directly,
@@ -1349,7 +1349,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
 
             // We know that inferredRelayer relayed a packet from mp.from
             // This establishes both a gateway relationship and direct connectivity inference
-            LOG_DEBUG("[SR] Inferred gateway relationship: %08x relayed by %08x",
+            LOG_INFO("[SR] Inferred gateway relationship: %08x relayed by %08x",
                      mp.from, inferredRelayer);
 
             // Track that both the original sender and relayer are active
@@ -1393,11 +1393,11 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                 float inferredEtx = NeighborGraph::calculateETX(-70, 5.0f); // Default for inferred
                 routingGraph->updateDownstreamExclusive(mp.from, inferredRelayer, inferredEtx, millis() / 1000);
                 if (!singleHopRelay) {
-                    LOG_DEBUG("[SR] Multi-hop downstream inference: %08x via %08x (%d hops, stock node)",
+                    LOG_INFO("[SR] Multi-hop downstream inference: %08x via %08x (%d hops, stock node)",
                              mp.from, inferredRelayer, mp.hop_start - mp.hop_limit);
                 }
             } else if (hasDirectConnectionToRelay && !singleHopRelay) {
-                LOG_DEBUG("[SR] Skipping downstream inference for %08x via %08x: %d hops taken (SR-aware source, topology self-reported)",
+                LOG_INFO("[SR] Skipping downstream inference for %08x via %08x: %d hops taken (SR-aware source, topology self-reported)",
                          mp.from, inferredRelayer, mp.hop_start - mp.hop_limit);
             }
 
@@ -1408,7 +1408,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
             if (relayerIsLegacy) {
                 // Since the stock relayer successfully relayed a packet from the sender,
                 // we know the relayer can hear the sender (inferredRelayer → mp.from).
-                LOG_DEBUG("[SR] Inferred connectivity: stock node %08x can hear %08x (observed relay)",
+                LOG_INFO("[SR] Inferred connectivity: stock node %08x can hear %08x (observed relay)",
                          inferredRelayer, mp.from);
 
                 uint32_t monotonicTimestamp = millis() / 1000;
@@ -1418,7 +1418,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                 routingGraph->updateEdge(inferredRelayer, mp.from, NeighborGraph::calculateETX(defaultRssi, defaultSnr),
                                          monotonicTimestamp, 0, Edge::Source::Mirrored);
             } else {
-                LOG_DEBUG("[SR] Skipping direct connectivity inference: relayer %08x is SR-aware, topology self-reported",
+                LOG_INFO("[SR] Skipping direct connectivity inference: relayer %08x is SR-aware, topology self-reported",
                          inferredRelayer);
             }
 
@@ -1447,9 +1447,9 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                 }
 
                 if (hasExistingEdge) {
-                    LOG_DEBUG("[SR] Preserving existing signal data for relay node 0x%08x", inferredRelayer);
+                    LOG_INFO("[SR] Preserving existing signal data for relay node 0x%08x", inferredRelayer);
                 } else {
-                    LOG_DEBUG("[SR] Using default signal data for new relay node 0x%08x", inferredRelayer);
+                    LOG_INFO("[SR] Using default signal data for new relay node 0x%08x", inferredRelayer);
                 }
 
                 updateNeighborInfo(inferredRelayer, existingRssi, existingSnr, mp.rx_time);
@@ -1494,7 +1494,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                 LOG_INFO("[SR] Graph aged: %u -> %u nodes", nodeCountBefore, nodeCountAfter);
                 markTopologyDirty();
             } else {
-                LOG_DEBUG("[SR] Graph aged (no node count change)");
+                LOG_INFO("[SR] Graph aged (no node count change)");
             }
 
             // Safety check: ensure we still have our own node
@@ -1624,14 +1624,14 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         bool nextHopIsSR = (nextHopNode != 0 && getCapabilityStatus(nextHopNode) == CapabilityStatus::SRactive);
         if (nextHopIsSR) {
             slotDelay += halfAirtime;
-            LOG_DEBUG("[SR] Unicast slot 0ms: SR next_hop %08x (halfAirtime=%ums reserved)", nextHopNode, halfAirtime);
+            LOG_INFO("[SR] Unicast slot 0ms: SR next_hop %08x (halfAirtime=%ums reserved)", nextHopNode, halfAirtime);
         } else {
             uint32_t stockWorstCase = halfAirtime; // fallback if no radio interface
             if (router && router->getRadioInterface()) {
                 stockWorstCase = router->getRadioInterface()->getTxDelayMsecWeightedWorst(p->rx_snr);
             }
             slotDelay += stockWorstCase;
-            LOG_DEBUG("[SR] Unicast slot 0ms: stock/unknown next_hop 0x%02x (stockWorstCase=%ums reserved)", p->next_hop, stockWorstCase);
+            LOG_INFO("[SR] Unicast slot 0ms: stock/unknown next_hop 0x%02x (stockWorstCase=%ums reserved)", p->next_hop, stockWorstCase);
         }
     }
 
@@ -1661,11 +1661,11 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
                 continue;
             }
             if (isLegacyRouter(nb)) {
-                LOG_DEBUG("[SR] Unicast candidate %08x skipped (legacy router)", nb);
+                LOG_INFO("[SR] Unicast candidate %08x skipped (legacy router)", nb);
                 continue;
             }
             if (getCapabilityStatus(nb) != CapabilityStatus::SRactive) {
-                LOG_DEBUG("[SR] Unicast candidate %08x skipped (not SR-active)", nb);
+                LOG_INFO("[SR] Unicast candidate %08x skipped (not SR-active)", nb);
                 continue;
             }
             uint16_t cost = getCandidateCost(nb);
@@ -1695,22 +1695,22 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         srCandidates[j + 1] = key;
     }
 
-    LOG_DEBUG("[SR] Unicast slot scheduling for pkt 0x%08x to %s: halfAirtime=%ums, %u SR candidates",
+    LOG_INFO("[SR] Unicast slot scheduling for pkt 0x%08x to %s: halfAirtime=%ums, %u SR candidates",
               p->id, destName, halfAirtime, srCount);
 
     for (uint8_t i = 0; i < srCount; i++) {
         NodeNum candidate = srCandidates[i].nodeId;
         if (routingGraph->hasNodeTransmitted(candidate, p->id, currentTime)) {
-            LOG_DEBUG("[SR] Unicast slot --: SR node %08x (already transmitted)", candidate);
+            LOG_INFO("[SR] Unicast slot --: SR node %08x (already transmitted)", candidate);
             continue;
         }
         if (candidate == myNode) {
             shouldRelay = true;
             myDelay = slotDelay;
-            LOG_DEBUG("[SR] Unicast slot %ums: US (%08x) — assigned", slotDelay, myNode);
+            LOG_INFO("[SR] Unicast slot %ums: US (%08x) — assigned", slotDelay, myNode);
             break;
         }
-        LOG_DEBUG("[SR] Unicast slot %ums: SR node %08x (cost=%.2f)", slotDelay, candidate,
+        LOG_INFO("[SR] Unicast slot %ums: SR node %08x (cost=%.2f)", slotDelay, candidate,
                   srCandidates[i].cost / 100.0f);
         slotDelay += halfAirtime;
     }
@@ -1826,7 +1826,7 @@ void SignalRoutingModule::commitRelay(PacketId packetId, NodeNum originalHeardFr
         memmove(committedRelays, committedRelays + 1, (MAX_COMMITTED_RELAYS - 1) * sizeof(CommittedRelay));
         committedRelays[MAX_COMMITTED_RELAYS - 1] = entry;
     }
-    LOG_DEBUG("[SR] Committed relay for packet 0x%08x (heardFrom 0x%08x, delay %ums)", packetId, originalHeardFrom, txDelayMs);
+    LOG_INFO("[SR] Committed relay for packet 0x%08x (heardFrom 0x%08x, delay %ums)", packetId, originalHeardFrom, txDelayMs);
 }
 
 bool SignalRoutingModule::isCommittedRelay(PacketId packetId) const
@@ -1886,11 +1886,11 @@ bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p)
     NodeNum myNode = nodeDB->getNodeNum();
 
     if (dupeRelayer == 0) {
-        LOG_DEBUG("[SR] areAllNeighborsCovered pkt=0x%08x: relay_node=0x%02x unresolved — keeping relay", p->id, p->relay_node);
+        LOG_INFO("[SR] areAllNeighborsCovered pkt=0x%08x: relay_node=0x%02x unresolved — keeping relay", p->id, p->relay_node);
         return false;
     }
     if (dupeRelayer == myNode) {
-        LOG_DEBUG("[SR] areAllNeighborsCovered pkt=0x%08x: dupe is our own — keeping relay", p->id);
+        LOG_INFO("[SR] areAllNeighborsCovered pkt=0x%08x: dupe is our own — keeping relay", p->id);
         return false;
     }
 
@@ -1942,10 +1942,10 @@ bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p)
         }
         if (!alreadyTracked && relay->heardTransmitterCount < MAX_HEARD_TRANSMITTERS) {
             relay->heardTransmitters[relay->heardTransmitterCount++] = dupeRelayer;
-            LOG_DEBUG("[SR] pkt=0x%08x: accumulated transmitter %s (%u total)",
+            LOG_INFO("[SR] pkt=0x%08x: accumulated transmitter %s (%u total)",
                       p->id, relayerName, relay->heardTransmitterCount);
         } else if (!alreadyTracked) {
-            LOG_DEBUG("[SR] pkt=0x%08x: transmitter table full (%u), cannot add %s",
+            LOG_INFO("[SR] pkt=0x%08x: transmitter table full (%u), cannot add %s",
                       p->id, relay->heardTransmitterCount, relayerName);
         }
     }
@@ -1968,7 +1968,7 @@ bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p)
     bool unique = routingGraph->hasUniqueCoverage(myNode, coveredBy, coveredByCount);
 
     if (unique) {
-        LOG_DEBUG("[SR] Broadcast dupe pkt=0x%08x from %s — %u transmitters, coverage incomplete — keeping relay",
+        LOG_INFO("[SR] Broadcast dupe pkt=0x%08x from %s — %u transmitters, coverage incomplete — keeping relay",
                   p->id, relayerName, coveredByCount);
     } else {
         LOG_INFO("[SR] Broadcast dupe pkt=0x%08x from %s — %u transmitters cover all neighbors — canceling relay",
@@ -1995,7 +1995,7 @@ bool SignalRoutingModule::shouldRelay(const meshtastic_MeshPacket *p)
     char destName[64], senderName[64];
     getNodeDisplayName(p->to, destName, sizeof(destName));
     getNodeDisplayName(p->from, senderName, sizeof(senderName));
-    LOG_DEBUG("[SR] Considering unicast relay pkt=0x%08x from %s to %s (hop_limit=%d)",
+    LOG_INFO("[SR] Considering unicast relay pkt=0x%08x from %s to %s (hop_limit=%d)",
              p->id, senderName, destName, p->hop_limit);
 
     // Check if destination is reachable through SR topology
@@ -2086,7 +2086,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     NodeNum ourNode = nodeDB->getNodeNum();
     uint32_t currentTime = millis() / 1000;
     if (routingGraph->hasNodeTransmitted(ourNode, p->id, currentTime)) {
-        LOG_DEBUG("[SR] Skipping relay decision for rebroadcast of our packet %08x", p->id);
+        LOG_INFO("[SR] Skipping relay decision for rebroadcast of our packet %08x", p->id);
         return false; // Don't relay our own rebroadcasted packets
     }
 
@@ -2177,7 +2177,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
                 if (heardFromEdges->edges[j].to == myNeighbor) {
                     char neighborName[32];
                     getNodeDisplayName(myNeighbor, neighborName, sizeof(neighborName));
-                    LOG_DEBUG("[SR] Pre-coverage: our neighbor %s excluded from heardFrom coverage (ETX=%.1f >= %.1f)",
+                    LOG_INFO("[SR] Pre-coverage: our neighbor %s excluded from heardFrom coverage (ETX=%.1f >= %.1f)",
                               neighborName, heardFromEdges->edges[j].getEtx(), POOR_LINK_ETX_THRESHOLD);
                     break;
                 }
@@ -2228,7 +2228,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     uint32_t myDelay = 0;
     const char *decisionReason = "no unique coverage";
 
-    LOG_DEBUG("[SR] Slot scheduling for pkt 0x%08x: halfAirtime=%ums, %u candidates", p->id, halfAirtime, candidates.count);
+    LOG_INFO("[SR] Slot scheduling for pkt 0x%08x: halfAirtime=%ums, %u candidates", p->id, halfAirtime, candidates.count);
 
     // Phase 1: Assign first slots to stock routers (they transmit regardless)
     if (myEdges) {
@@ -2251,9 +2251,9 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
                     }
                 }
                 alreadyCovered.insert(neighbor);
-                LOG_DEBUG("[SR] Slot %ums: stock router %08x (already transmitted)", slotDelay, neighbor);
+                LOG_INFO("[SR] Slot %ums: stock router %08x (already transmitted)", slotDelay, neighbor);
             } else {
-                LOG_DEBUG("[SR] Slot %ums: stock router %08x (expected)", slotDelay, neighbor);
+                LOG_INFO("[SR] Slot %ums: stock router %08x (expected)", slotDelay, neighbor);
             }
 
             slotDelay += halfAirtime;
@@ -2278,7 +2278,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
                 }
             }
             alreadyCovered.insert(best.nodeId);
-            LOG_DEBUG("[SR] Slot --: SR node %08x (already transmitted, coverage absorbed)", best.nodeId);
+            LOG_INFO("[SR] Slot --: SR node %08x (already transmitted, coverage absorbed)", best.nodeId);
             continue;
         }
 
@@ -2286,11 +2286,11 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
             shouldRelay = true;
             myDelay = slotDelay;
             decisionReason = "SR slot assignment";
-            LOG_DEBUG("[SR] Slot %ums: US (%08x) — assigned", slotDelay, myNode);
+            LOG_INFO("[SR] Slot %ums: US (%08x) — assigned", slotDelay, myNode);
             break;
         }
 
-        LOG_DEBUG("[SR] Slot %ums: SR node %08x (coverage=%u, cost=%.2f)", slotDelay, best.nodeId,
+        LOG_INFO("[SR] Slot %ums: SR node %08x (coverage=%u, cost=%.2f)", slotDelay, best.nodeId,
                   best.coverageCount, best.getAvgCost());
         slotDelay += halfAirtime;
     }
@@ -2334,7 +2334,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
 NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode, NodeNum heardFrom, bool allowOpportunistic)
 {
     if (!routingGraph) {
-        LOG_DEBUG("[SR] No graph available for routing");
+        LOG_WARN("[SR] No graph available for routing");
         return 0;
     }
 
@@ -2352,7 +2352,7 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
         char nextHopName[64];
         getNodeDisplayName(route.nextHop, nextHopName, sizeof(nextHopName));
 
-        LOG_DEBUG("[SR] Route to %s via %s (cost: %.2f)",
+        LOG_INFO("[SR] Route to %s via %s (cost: %.2f)",
                  destName, nextHopName, routeCost);
 
         if (routeCost > 10.0f) {
@@ -2374,10 +2374,10 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
                 getNodeDisplayName(heardFrom, heardFromName, sizeof(heardFromName));
 
                 if (connectivityUnknown) {
-                    LOG_DEBUG("[SR] Route via %s rejected - cannot verify connectivity to %s (stock/unknown node)",
+                    LOG_INFO("[SR] Route via %s rejected - cannot verify connectivity to %s (stock/unknown node)",
                              nextHopName, heardFromName);
                 } else {
-                    LOG_DEBUG("[SR] Route via %s rejected - no connectivity to transmitter %s",
+                    LOG_INFO("[SR] Route via %s rejected - no connectivity to transmitter %s",
                              nextHopName, heardFromName);
                 }
             }
@@ -2420,14 +2420,14 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
             if (betterNeighbor != 0) {
                 char altName[64];
                 getNodeDisplayName(betterNeighbor, altName, sizeof(altName));
-                LOG_DEBUG("[SR] Using alternative next hop %s (can hear transmitter)", altName);
+                LOG_INFO("[SR] Using alternative next hop %s (can hear transmitter)", altName);
                 return betterNeighbor;
             }
         }
 
         // No usable next hop — signal best-effort self relay by returning our own node ID.
         if (myNode != 0) {
-            LOG_DEBUG("[SR] No verified next hop and no hearsUs — best-effort self relay");
+            LOG_INFO("[SR] No verified next hop and no hearsUs — best-effort self relay");
             return myNode;
         }
     }
@@ -2451,7 +2451,7 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
                     if (myEdges->edges[i].to == relayForDest) {
                         char gwName[64];
                         getNodeDisplayName(relayForDest, gwName, sizeof(gwName));
-                        LOG_DEBUG("[SR] No direct route to %s, but forwarding to relay %s", destName, gwName);
+                        LOG_INFO("[SR] No direct route to %s, but forwarding to relay %s", destName, gwName);
                         return relayForDest;
                     }
                 }
@@ -2461,9 +2461,9 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
             getNodeDisplayName(relayForDest, gwName, sizeof(gwName));
             getNodeDisplayName(heardFrom, heardFromName, sizeof(heardFromName));
             if (connectivityUnknown) {
-                LOG_DEBUG("[SR] Relay %s connectivity to %s unknown (stock node) - skipping", gwName, heardFromName);
+                LOG_INFO("[SR] Relay %s connectivity to %s unknown (stock node) - skipping", gwName, heardFromName);
             } else {
-                LOG_DEBUG("[SR] Relay %s cannot hear transmitter %s - skipping", gwName, heardFromName);
+                LOG_INFO("[SR] Relay %s cannot hear transmitter %s - skipping", gwName, heardFromName);
             }
         }
     }
@@ -2498,7 +2498,7 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
         }
 
         if (isDirectNeighbor) {
-            LOG_DEBUG("[SR] Delivering unicast to direct neighbor %s (ETX=%.2f) since destination didn't hear transmission",
+            LOG_INFO("[SR] Delivering unicast to direct neighbor %s (ETX=%.2f) since destination didn't hear transmission",
                      destName, directEtx);
             return destination; // Deliver directly to our neighbor
         }
@@ -2526,7 +2526,7 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
         }
     }
 
-    LOG_DEBUG("[SR] No route found to %s", destName);
+    LOG_INFO("[SR] No route found to %s", destName);
     return 0;
 }
 
@@ -2586,7 +2586,7 @@ NodeNum SignalRoutingModule::findBetterPositionedNeighbor(NodeNum destination, N
         char nhName[64], destName[64];
         getNodeDisplayName(bestNeighbor, nhName, sizeof(nhName));
         getNodeDisplayName(destination, destName, sizeof(destName));
-        LOG_DEBUG("[SR] Found better positioned neighbor %s for %s (our cost: %.2f, neighbor direct ETX: %.2f)",
+        LOG_INFO("[SR] Found better positioned neighbor %s for %s (our cost: %.2f, neighbor direct ETX: %.2f)",
                  nhName, destName, ourRouteCost, bestNeighborRouteCost);
     }
 
@@ -2740,7 +2740,7 @@ void SignalRoutingModule::handlePositionPacket(const meshtastic_MeshPacket &mp, 
     uint32_t dop = position.PDOP;
     uint32_t speed = position.has_ground_speed ? position.ground_speed : 0;
 
-    LOG_DEBUG("[SR] Position packet from %s (direct=%s) lat=%.5f lon=%.5f speed=%u m/s PDOP=%u "
+    LOG_INFO("[SR] Position packet from %s (direct=%s) lat=%.5f lon=%.5f speed=%u m/s PDOP=%u "
               "rssi=%d snr=%.1f",
               senderName, isDirectNeighbor ? "true" : "false", latitude, longitude, speed, dop, mp.rx_rssi, mp.rx_snr);
 
@@ -2775,14 +2775,14 @@ void SignalRoutingModule::handleTelemetryPacket(const meshtastic_MeshPacket &mp)
         int battery = metrics.has_battery_level ? static_cast<int>(metrics.battery_level) : 0;
         float voltage = metrics.has_voltage ? metrics.voltage : 0.0f;
         float air = metrics.has_air_util_tx ? metrics.air_util_tx : 0.0f;
-        LOG_DEBUG("[SR] Device metrics from %s batt=%s%d%% volt=%s%.2fV airUtil=%s%.1f%%",
+        LOG_INFO("[SR] Device metrics from %s batt=%s%d%% volt=%s%.2fV airUtil=%s%.1f%%",
                   senderName, metrics.has_battery_level ? "" : "~", battery, metrics.has_voltage ? "" : "~", voltage,
                   metrics.has_air_util_tx ? "" : "~", air);
         break;
     }
     case meshtastic_Telemetry_environment_metrics_tag: {
         const meshtastic_EnvironmentMetrics &env = telemetry.variant.environment_metrics;
-        LOG_DEBUG("[SR] Environment metrics from %s temp=%s%.1fC humidity=%s%.1f%% pressure=%s%.1fhPa",
+        LOG_INFO("[SR] Environment metrics from %s temp=%s%.1fC humidity=%s%.1f%% pressure=%s%.1fhPa",
                   senderName, env.has_temperature ? "" : "~",
                   env.has_temperature ? env.temperature : 0.0f, env.has_relative_humidity ? "" : "~",
                   env.has_relative_humidity ? env.relative_humidity : 0.0f, env.has_barometric_pressure ? "" : "~",
@@ -2794,10 +2794,10 @@ void SignalRoutingModule::handleTelemetryPacket(const meshtastic_MeshPacket &mp)
     case meshtastic_Telemetry_local_stats_tag:
     case meshtastic_Telemetry_health_metrics_tag:
     case meshtastic_Telemetry_host_metrics_tag:
-        LOG_DEBUG("[SR] Telemetry variant %u from %s", telemetry.which_variant, senderName);
+        LOG_INFO("[SR] Telemetry variant %u from %s", telemetry.which_variant, senderName);
         break;
     default:
-        LOG_DEBUG("[SR] Unknown telemetry variant %u from %s", telemetry.which_variant, senderName);
+        LOG_WARN("[SR] Unknown telemetry variant %u from %s", telemetry.which_variant, senderName);
         break;
     }
 
@@ -2824,7 +2824,7 @@ void SignalRoutingModule::handleRoutingControlPacket(const meshtastic_MeshPacket
 
     switch (routing.which_variant) {
     case meshtastic_Routing_route_request_tag:
-        LOG_DEBUG("[SR] Routing request from %s with %u hops recorded", senderName,
+        LOG_INFO("[SR] Routing request from %s with %u hops recorded", senderName,
                   routing.route_request.route_count);
 
         // Check for placeholder resolution in route_request hops
@@ -2851,16 +2851,16 @@ void SignalRoutingModule::handleRoutingControlPacket(const meshtastic_MeshPacket
                         LOG_INFO("[SR] Traceroute resolution: placeholder %08x -> %08x (direct neighbor in route_request)", placeholderId, hopNode);
                         resolvePlaceholder(placeholderId, hopNode);
                     } else {
-                        LOG_DEBUG("[SR] Skipping traceroute resolution: %08x is not a direct neighbor", hopNode);
+                        LOG_INFO("[SR] Skipping traceroute resolution: %08x is not a direct neighbor", hopNode);
                     }
                 }
             }
         } else {
-            LOG_DEBUG("[SR] Skipping placeholder resolution for route_request: packet is relayed (not from direct sender)");
+            LOG_INFO("[SR] Skipping placeholder resolution for route_request: packet is relayed (not from direct sender)");
         }
         break;
     case meshtastic_Routing_route_reply_tag:
-        LOG_DEBUG("[SR] Routing reply from %s for %u hops", senderName, routing.route_reply.route_back_count);
+        LOG_INFO("[SR] Routing reply from %s for %u hops", senderName, routing.route_reply.route_back_count);
 
         // Check for placeholder resolution in route_reply hops
         // Only resolve if: 1) routing packet is from direct sender, and 2) hop node is direct neighbor of ours
@@ -2886,23 +2886,23 @@ void SignalRoutingModule::handleRoutingControlPacket(const meshtastic_MeshPacket
                         LOG_INFO("[SR] Traceroute resolution: placeholder %08x -> %08x (direct neighbor in route_reply)", placeholderId, hopNode);
                         resolvePlaceholder(placeholderId, hopNode);
                     } else {
-                        LOG_DEBUG("[SR] Skipping traceroute resolution: %08x is not a direct neighbor", hopNode);
+                        LOG_INFO("[SR] Skipping traceroute resolution: %08x is not a direct neighbor", hopNode);
                     }
                 }
             }
         } else {
-            LOG_DEBUG("[SR] Skipping placeholder resolution for route_reply: packet is relayed (not from direct sender)");
+            LOG_INFO("[SR] Skipping placeholder resolution for route_reply: packet is relayed (not from direct sender)");
         }
         break;
     case meshtastic_Routing_error_reason_tag:
         if (routing.error_reason == meshtastic_Routing_Error_NONE) {
-            LOG_DEBUG("[SR] Routing status from %s (no error)", senderName);
+            LOG_INFO("[SR] Routing status from %s (no error)", senderName);
         } else {
             LOG_WARN("[SR] Routing error from %s reason=%u", senderName, routing.error_reason);
         }
         break;
     default:
-        LOG_DEBUG("[SR] Routing control variant %u from %s", routing.which_variant, senderName);
+        LOG_INFO("[SR] Routing control variant %u from %s", routing.which_variant, senderName);
         break;
     }
 }
@@ -3172,18 +3172,18 @@ bool SignalRoutingModule::isNodeRoutable(NodeNum nodeId) const {
 
 bool SignalRoutingModule::topologyHealthyForBroadcast() const
 {
-    LOG_DEBUG("[SR] Topology healthy for broadcast");
+    LOG_INFO("[SR] Topology healthy for broadcast");
     if (!routingGraph || !nodeDB) {
-        LOG_DEBUG("[SR] routingGraph or nodeDB is null, returning false");
+        LOG_WARN("[SR] routingGraph or nodeDB is null, returning false");
         return false;
     }
 
     // Check if we have direct SR-capable neighbors for intelligent broadcast routing
-    LOG_DEBUG("[SR] Checking direct neighbors");
+    LOG_INFO("[SR] Checking direct neighbors");
 
     const NodeEdges* nodeEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
     if (!nodeEdges || nodeEdges->edgeCount == 0) {
-        LOG_DEBUG("[SR] No edges found, returning false");
+        LOG_INFO("[SR] No edges found, returning false");
         return false;
     }
 
@@ -3221,7 +3221,7 @@ bool SignalRoutingModule::topologyHealthyForUnicast(NodeNum destination) const
         [this](NodeNum nodeId) { return isNodeRoutable(nodeId); });
 
     if (route.nextHop != 0) {
-        LOG_DEBUG("[SR] Node %08x is reachable through topology (nextHop=%08x, cost=%.2f)",
+        LOG_INFO("[SR] Node %08x is reachable through topology (nextHop=%08x, cost=%.2f)",
                  destination, route.nextHop, route.getCost());
         return true;
     }
@@ -3233,7 +3233,7 @@ bool SignalRoutingModule::topologyHealthyForUnicast(NodeNum destination) const
         Route relayRoute = routingGraph->calculateRoute(relay, millis() / 1000,
             [this](NodeNum nodeId) { return isNodeRoutable(nodeId); });
         if (relayRoute.nextHop != 0) {
-            LOG_DEBUG("[SR] Node %08x is reachable via relay %08x (nextHop=%08x, cost=%.2f)",
+            LOG_INFO("[SR] Node %08x is reachable via relay %08x (nextHop=%08x, cost=%.2f)",
                      destination, relay, relayRoute.nextHop, relayRoute.getCost());
             return true;
         }

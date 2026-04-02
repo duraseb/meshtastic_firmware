@@ -1144,7 +1144,7 @@ bool NeighborGraph::hasUniqueCoverage(NodeNum myNode, const NodeNum *coveredBy, 
         }
 
         if (!covered) {
-            LOG_DEBUG("[SR] Unique coverage: neighbor %08x not covered by any coveredBy node", neighbor);
+            LOG_INFO("[SR] Unique coverage: neighbor %08x not covered by any coveredBy node", neighbor);
             return true; // Found a neighbor not covered by anyone
         }
     }
@@ -1274,7 +1274,7 @@ bool NeighborGraph::shouldRelayEnhanced(NodeNum myNode, NodeNum sourceNode, Node
                 NodeNum neighbor = myEdges->edges[i].to;
                 if (!alreadyCovered.contains(neighbor) &&
                     !relayCoverage.contains(neighbor)) {
-                    LOG_DEBUG("[SR] Unique coverage in relay decision: neighbor %08x uncovered", neighbor);
+                    LOG_INFO("[SR] Unique coverage in relay decision: neighbor %08x uncovered", neighbor);
                     haveUniqueCoverage = true;
                     break;
                 }
@@ -1293,7 +1293,7 @@ bool NeighborGraph::shouldRelayEnhanced(NodeNum myNode, NodeNum sourceNode, Node
     if (myEdges) {
         for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
             if (!alreadyCovered.contains(myEdges->edges[i].to)) {
-                LOG_DEBUG("[SR] Unique coverage fallthrough: neighbor %08x uncovered", myEdges->edges[i].to);
+                LOG_INFO("[SR] Unique coverage fallthrough: neighbor %08x uncovered", myEdges->edges[i].to);
                 return true;
             }
         }
@@ -1371,7 +1371,7 @@ bool NeighborGraph::shouldRelaySimpleConservative(NodeNum myNode, NodeNum source
     }
 
     if (!transmittingEdges) {
-        LOG_DEBUG("NeighborGraph: No topology for transmitting node %08x - fallback relay", heardFrom);
+        LOG_INFO("NeighborGraph: No topology for transmitting node %08x - fallback relay", heardFrom);
         return true;
     }
 
@@ -1415,7 +1415,7 @@ bool NeighborGraph::shouldRelaySimpleConservative(NodeNum myNode, NodeNum source
             if (offset >= (int)sizeof(nodeList) - 1)
                 break;
         }
-        LOG_DEBUG("NeighborGraph: Conservative fallback - have %u uncovered neighbors [%s], relaying", totalNeighborsNotCovered, nodeList);
+        LOG_INFO("NeighborGraph: Conservative fallback - have %u uncovered neighbors [%s], relaying", totalNeighborsNotCovered, nodeList);
         return true;
     }
 
