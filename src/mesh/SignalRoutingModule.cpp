@@ -176,11 +176,11 @@ int32_t SignalRoutingModule::runOnce()
             topologyDirty = false;
         }
 
-        // Topology logging: log on every dirty wakeup and at least every GRAPH_UPDATE_INTERVAL_SECS.
+        // Topology logging: log on every dirty wakeup and at least every GRAPH_MAINTENANCE_INTERVAL_SECS seconds.
         // topologyDirty is intentionally NOT cleared before this point so that if the broadcast
         // was deferred (min interval not yet elapsed), we still log the pending change.
         static uint32_t lastTopologyLog = 0;
-        if (topologyDirty || nowMs - lastTopologyLog >= GRAPH_UPDATE_INTERVAL_SECS * 1000) {
+        if (topologyDirty || nowMs - lastTopologyLog >= GRAPH_MAINTENANCE_INTERVAL_SECS * 1000) {
             logNetworkTopology();
             lastTopologyLog = nowMs;
         }
@@ -1376,20 +1376,28 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                 }
             }
 
-            // Only infer downstream relationship when exactly one relay hop has occurred.
-            // If hop_start - hop_limit == 1, the packet went: sender → inferredRelayer → us.
-            // If more hops occurred, inferredRelayer is just the last forwarder and may not
-            // directly hear the sender (e.g. piko→MB9c→a4d0→FCM6: a4d0 never heard piko).
+            // Infer downstream relationship based on hop count and source capability:
+            // - Single-hop (hop_start - hop_limit == 1): always infer — sender went directly through
+            //   inferredRelayer to reach us, so sender is definitively downstream of that relay.
+            // - Multi-hop, non-SR-aware source (Unknown/Legacy): also infer — stock nodes never
+            //   advertise their own topology, so relay observation is the only signal we have.
+            //   Even if inferredRelayer doesn't hear the sender directly (some intermediate relay
+            //   exists), from piko's routing perspective the path still goes through inferredRelayer.
+            // - Multi-hop, SR-aware source: skip — the source broadcasts its own topology, which
+            //   captures relationships more accurately than hop-count inference.
             bool singleHopRelay = (mp.hop_start - mp.hop_limit) == 1;
-            if (hasDirectConnectionToRelay && singleHopRelay) {
+            CapabilityStatus sourceStatus = getCapabilityStatus(mp.from);
+            bool sourceIsSRAware = (sourceStatus == CapabilityStatus::SRactive ||
+                                    sourceStatus == CapabilityStatus::Passive);
+            if (hasDirectConnectionToRelay && (singleHopRelay || !sourceIsSRAware)) {
                 float inferredEtx = NeighborGraph::calculateETX(-70, 5.0f); // Default for inferred
-                // Packet arrived via a single relay — sender is downstream of that relay.
-                // This correctly handles nodes that moved: a stale direct edge no longer blocks
-                // the downstream update. When the sender is heard directly again, the direct
-                // packet path clears this downstream relationship.
                 routingGraph->updateDownstreamExclusive(mp.from, inferredRelayer, inferredEtx, millis() / 1000);
+                if (!singleHopRelay) {
+                    LOG_DEBUG("[SR] Multi-hop downstream inference: %08x via %08x (%d hops, stock node)",
+                             mp.from, inferredRelayer, mp.hop_start - mp.hop_limit);
+                }
             } else if (hasDirectConnectionToRelay && !singleHopRelay) {
-                LOG_DEBUG("[SR] Skipping downstream inference for %08x via %08x: %d hops taken (not a single-hop relay)",
+                LOG_DEBUG("[SR] Skipping downstream inference for %08x via %08x: %d hops taken (SR-aware source, topology self-reported)",
                          mp.from, inferredRelayer, mp.hop_start - mp.hop_limit);
             }
 
@@ -1473,7 +1481,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
     if (routingGraph && canSendTopology()) {
         // Use monotonic time (seconds since boot) for aging to avoid RTC sync issues
         uint32_t currentTime = millis() / 1000;
-        if (currentTime - lastGraphUpdate > GRAPH_UPDATE_INTERVAL_SECS) {
+        if (currentTime - lastGraphUpdate > GRAPH_MAINTENANCE_INTERVAL_SECS) {
             uint32_t nodeCountBefore = routingGraph->getNodeCount();
             
             // Single TTL for all nodes in the graph; SR capability expiry handles coverage separately

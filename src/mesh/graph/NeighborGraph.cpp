@@ -146,7 +146,22 @@ int NeighborGraph::updateEdge(NodeNum from, NodeNum to, float etx, uint32_t time
     if (!existing && !isOurNode) {
         // Check if 'from' is one of our direct neighbors (has an edge from us)
         if (!isOurDirectNeighbor(from)) {
-            return EDGE_NO_CHANGE; // Remote node, not our neighbor - ignore
+            // Also allow if 'from' appears as a destination in an existing neighbor's edge list
+            // (i.e., reachable one hop through a known direct neighbor — an SR gateway node).
+            // This lets us store topology data from SR nodes behind our direct neighbors so
+            // Dijkstra can route through them rather than falling back to broadcast-style relay.
+            bool reachableViaNeighbor = false;
+            for (uint8_t i = 0; i < neighborCount && !reachableViaNeighbor; i++) {
+                for (uint8_t e = 0; e < neighbors[i].edgeCount; e++) {
+                    if (neighbors[i].edges[e].to == from) {
+                        reachableViaNeighbor = true;
+                        break;
+                    }
+                }
+            }
+            if (!reachableViaNeighbor) {
+                return EDGE_NO_CHANGE; // Remote node, not reachable via our graph - ignore
+            }
         }
     }
 
@@ -559,6 +574,11 @@ void NeighborGraph::updateDownstream(NodeNum destination, NodeNum relay, float t
     if (destination == myNode)
         return;
 
+    // Skip if the relay already has this destination as a direct edge — it's a neighbor, not downstream
+    const NodeEdges *relayNode = findNeighbor(relay);
+    if (relayNode && findEdge(relayNode, destination))
+        return;
+
     uint16_t costFixed = static_cast<uint16_t>(std::min(totalCost * 100.0f, 65535.0f));
 
     // Update existing entry for the same (destination, relay) pair
@@ -603,15 +623,20 @@ void NeighborGraph::updateDownstreamExclusive(NodeNum destination, NodeNum relay
     if (destination == myNode)
         return;
 
+    // Skip if the relay already has this destination as a direct edge — it's a neighbor, not downstream
+    const NodeEdges *relayNode = findNeighbor(relay);
+    if (relayNode && findEdge(relayNode, destination))
+        return;
+
     uint16_t costFixed = static_cast<uint16_t>(std::min(totalCost * 100.0f, 65535.0f));
 
-    // Find and update/replace any existing entry for this destination (regardless of relay)
-    for (uint16_t i = 0; i < downstreamCount; i++) {
+    // Remove all existing entries for this destination (regardless of relay) to avoid
+    // duplicates when mixing with updateDownstream() calls on the same destination.
+    for (uint16_t i = 0; i < downstreamCount; ) {
         if (downstream[i].destination == destination) {
-            downstream[i].relay = relay;
-            downstream[i].costFixed = costFixed;
-            downstream[i].lastUpdate = timestamp;
-            return;
+            downstream[i] = downstream[--downstreamCount];
+        } else {
+            i++;
         }
     }
 

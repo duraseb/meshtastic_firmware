@@ -17,7 +17,7 @@
 
 // Minimum inter-broadcast interval: dirty topology triggers an early broadcast only after this
 // many seconds have elapsed since the last broadcast.
-#define SIGNAL_ROUTING_DIRTY_BROADCAST_SECS 120
+#define SIGNAL_ROUTING_DIRTY_BROADCAST_SECS 180
 
 // Maximum hops for SR topology broadcasts; capped at min(user config, this value)
 #define SR_BROADCAST_MAX_HOPS 5
@@ -65,7 +65,7 @@ protected:
 private:
     NeighborGraph *routingGraph = nullptr;
     uint32_t lastGraphUpdate = 0;
-    static constexpr uint32_t GRAPH_UPDATE_INTERVAL_SECS = 60;
+    static constexpr uint32_t GRAPH_MAINTENANCE_INTERVAL_SECS = 60;
     static constexpr uint32_t NODE_TTL_SECS = 5400;    // 90 min for all nodes in the graph
     static constexpr uint32_t CAPABILITY_TTL_SECS = SIGNAL_ROUTING_BROADCAST_SECS * 3 + 10;  // detect when SR node stops being SR
     static constexpr uint32_t RELAY_ID_CACHE_TTL_MS = 600 * 1000;  // 10 min
