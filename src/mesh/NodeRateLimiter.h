@@ -38,11 +38,13 @@ class NodeRateLimiter
   private:
     static constexpr uint8_t MAX_ENTRIES = 16;
 
-    static constexpr uint32_t WINDOW_MS = 90u * 1000u;
-
-    static constexpr uint8_t TEXT_THRESHOLD    = 30; // packets per window before limiting
-    static constexpr uint8_t ROUTING_THRESHOLD = 10;
-    static constexpr uint8_t OTHER_THRESHOLD   = 4;
+    // Runtime-configurable values loaded from moduleConfig.node_rate_limiter at construction.
+    // All default to the compile-time constants; overridden when has_node_rate_limiter is set.
+    bool     cfgEnabled          = true;
+    uint32_t cfgWindowMs         = 90u * 1000u;
+    uint8_t  cfgTextThreshold    = 30; // packets per window before limiting
+    uint8_t  cfgRoutingThreshold = 10;
+    uint8_t  cfgOtherThreshold   = 4;
 
     enum class Bucket : uint8_t { TEXT, ROUTING, OTHER };
 

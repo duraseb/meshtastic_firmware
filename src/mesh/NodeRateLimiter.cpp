@@ -24,9 +24,29 @@ NodeRateLimiter *nodeRateLimiter = nullptr;
 NodeRateLimiter::NodeRateLimiter() : entryCount(0)
 {
     memset(entries, 0, sizeof(entries));
-    LOG_INFO("[RateLimit] Initialized: slots=%u window=%us thresholds=text:%u routing:%u other:%u",
-             MAX_ENTRIES, WINDOW_MS / 1000u,
-             TEXT_THRESHOLD, ROUTING_THRESHOLD, OTHER_THRESHOLD);
+
+    // Load config overrides. Numeric fields: 0 means "use firmware default". Bool fields: if the
+    // message exists, the value is used as-is (proto3 default false = disabled).
+    if (moduleConfig.has_node_rate_limiter) {
+        const auto &cfg = moduleConfig.node_rate_limiter;
+        cfgEnabled = cfg.enabled;
+        if (cfg.window_secs != 0) {
+            cfgWindowMs = cfg.window_secs * 1000u;
+        }
+        if (cfg.text_threshold != 0) {
+            cfgTextThreshold = (uint8_t)std::min<uint32_t>(cfg.text_threshold, 255);
+        }
+        if (cfg.routing_threshold != 0) {
+            cfgRoutingThreshold = (uint8_t)std::min<uint32_t>(cfg.routing_threshold, 255);
+        }
+        if (cfg.other_threshold != 0) {
+            cfgOtherThreshold = (uint8_t)std::min<uint32_t>(cfg.other_threshold, 255);
+        }
+    }
+
+    LOG_INFO("[RateLimit] Initialized: enabled=%d slots=%u window=%us thresholds=text:%u routing:%u other:%u",
+             cfgEnabled, MAX_ENTRIES, cfgWindowMs / 1000u,
+             cfgTextThreshold, cfgRoutingThreshold, cfgOtherThreshold);
 }
 
 NodeRateLimiter::Bucket NodeRateLimiter::classifyBucket(meshtastic_PortNum portnum)
@@ -140,10 +160,10 @@ bool NodeRateLimiter::checkAndUpdateBucket(BucketState &b, uint8_t threshold, No
 
     uint32_t windowAge = nowMs - b.windowStart;
     LOG_DEBUG("[RateLimit] %s %s bucket: count=%u/%u limited=%d windowAge=%ums/%ums",
-              nodeName, bucketName, b.count, threshold, (int)b.limited, windowAge, WINDOW_MS);
+              nodeName, bucketName, b.count, threshold, (int)b.limited, windowAge, cfgWindowMs);
 
     if (b.limited) {
-        if (windowAge >= WINDOW_MS) {
+        if (windowAge >= cfgWindowMs) {
             // Node went quiet for a full window — lift the limit
             LOG_INFO("[RateLimit] %s %s bucket unlimited after quiet window", nodeName, bucketName);
             b.limited     = false;
@@ -159,7 +179,7 @@ bool NodeRateLimiter::checkAndUpdateBucket(BucketState &b, uint8_t threshold, No
     }
 
     // Window expired naturally — start fresh
-    if (nowMs - b.windowStart >= WINDOW_MS) {
+    if (nowMs - b.windowStart >= cfgWindowMs) {
         b.windowStart = nowMs;
         b.count       = 0;
     }
@@ -178,6 +198,9 @@ bool NodeRateLimiter::checkAndUpdateBucket(BucketState &b, uint8_t threshold, No
 
 bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
 {
+    if (!cfgEnabled) {
+        return false;
+    }
     if (p->from == 0 || isFromUs(p)) {
         return false;
     }
@@ -204,9 +227,9 @@ bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
     BucketState *b;
     uint8_t threshold;
     switch (bucket) {
-        case Bucket::TEXT:    b = &entry->text;    threshold = TEXT_THRESHOLD;    break;
-        case Bucket::ROUTING: b = &entry->routing; threshold = ROUTING_THRESHOLD; break;
-        default:              b = &entry->other;   threshold = OTHER_THRESHOLD;   break;
+        case Bucket::TEXT:    b = &entry->text;    threshold = cfgTextThreshold;    break;
+        case Bucket::ROUTING: b = &entry->routing; threshold = cfgRoutingThreshold; break;
+        default:              b = &entry->other;   threshold = cfgOtherThreshold;   break;
     }
 
     return checkAndUpdateBucket(*b, threshold, entry->nodeId, bucket, nowMs);

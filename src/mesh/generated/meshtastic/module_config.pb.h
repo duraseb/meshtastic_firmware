@@ -459,6 +459,29 @@ typedef struct _meshtastic_ModuleConfig_TAKConfig {
     meshtastic_MemberRole role;
 } meshtastic_ModuleConfig_TAKConfig;
 
+/* Configuration for the NodeRateLimiter module (per-node inbound packet rate limiting).
+ All numeric fields default to 0, which means "use firmware default". */
+typedef struct _meshtastic_ModuleConfig_NodeRateLimiterConfig {
+    /* Master enable/disable for per-node rate limiting.
+ When false (and has_node_rate_limiter is set), rate limiting is disabled entirely.
+ Default (no config): rate limiting is always enabled. */
+    bool enabled;
+    /* Rate limit window in seconds.
+ Packets received above the threshold within this window trigger rate limiting.
+ The node must then go quiet for a full window before the limit is lifted.
+ 0 = use firmware default (90 s). */
+    uint32_t window_secs;
+    /* Packet threshold for the TEXT bucket (TEXT_MESSAGE_APP / TEXT_MESSAGE_COMPRESSED_APP).
+ 0 = use firmware default (30 packets per window). */
+    uint32_t text_threshold;
+    /* Packet threshold for the ROUTING bucket (ROUTING_APP, SIGNAL_ROUTING_APP, TRACEROUTE_APP).
+ 0 = use firmware default (10 packets per window). */
+    uint32_t routing_threshold;
+    /* Packet threshold for the OTHER bucket (all other portnums, including undecoded packets).
+ 0 = use firmware default (4 packets per window). */
+    uint32_t other_threshold;
+} meshtastic_ModuleConfig_NodeRateLimiterConfig;
+
 /* Configuration for the SignalRouting module (signal-based coordinated relay selection).
  All numeric fields default to 0, which means "use firmware default". */
 typedef struct _meshtastic_ModuleConfig_SignalRoutingConfig {
@@ -550,6 +573,8 @@ typedef struct _meshtastic_ModuleConfig {
         meshtastic_ModuleConfig_TAKConfig tak;
         /* SignalRouting module configuration */
         meshtastic_ModuleConfig_SignalRoutingConfig signal_routing;
+        /* NodeRateLimiter configuration */
+        meshtastic_ModuleConfig_NodeRateLimiterConfig node_rate_limiter;
     } payload_variant;
 } meshtastic_ModuleConfig;
 
@@ -611,6 +636,7 @@ extern "C" {
 #define meshtastic_ModuleConfig_TAKConfig_role_ENUMTYPE meshtastic_MemberRole
 
 
+
 #define meshtastic_RemoteHardwarePin_type_ENUMTYPE meshtastic_RemoteHardwarePinType
 
 
@@ -633,6 +659,7 @@ extern "C" {
 #define meshtastic_ModuleConfig_AmbientLightingConfig_init_default {0, 0, 0, 0, 0}
 #define meshtastic_ModuleConfig_StatusMessageConfig_init_default {""}
 #define meshtastic_ModuleConfig_TAKConfig_init_default {_meshtastic_Team_MIN, _meshtastic_MemberRole_MIN}
+#define meshtastic_ModuleConfig_NodeRateLimiterConfig_init_default {0, 0, 0, 0, 0}
 #define meshtastic_ModuleConfig_SignalRoutingConfig_init_default {0, 0, 0, 0, 0, 0, 0, 0}
 #define meshtastic_RemoteHardwarePin_init_default {0, "", _meshtastic_RemoteHardwarePinType_MIN}
 #define meshtastic_ModuleConfig_init_zero        {0, {meshtastic_ModuleConfig_MQTTConfig_init_zero}}
@@ -653,6 +680,7 @@ extern "C" {
 #define meshtastic_ModuleConfig_AmbientLightingConfig_init_zero {0, 0, 0, 0, 0}
 #define meshtastic_ModuleConfig_StatusMessageConfig_init_zero {""}
 #define meshtastic_ModuleConfig_TAKConfig_init_zero {_meshtastic_Team_MIN, _meshtastic_MemberRole_MIN}
+#define meshtastic_ModuleConfig_NodeRateLimiterConfig_init_zero {0, 0, 0, 0, 0}
 #define meshtastic_ModuleConfig_SignalRoutingConfig_init_zero {0, 0, 0, 0, 0, 0, 0, 0}
 #define meshtastic_RemoteHardwarePin_init_zero   {0, "", _meshtastic_RemoteHardwarePinType_MIN}
 
@@ -774,6 +802,11 @@ extern "C" {
 #define meshtastic_ModuleConfig_StatusMessageConfig_node_status_tag 1
 #define meshtastic_ModuleConfig_TAKConfig_team_tag 1
 #define meshtastic_ModuleConfig_TAKConfig_role_tag 2
+#define meshtastic_ModuleConfig_NodeRateLimiterConfig_enabled_tag 1
+#define meshtastic_ModuleConfig_NodeRateLimiterConfig_window_secs_tag 2
+#define meshtastic_ModuleConfig_NodeRateLimiterConfig_text_threshold_tag 3
+#define meshtastic_ModuleConfig_NodeRateLimiterConfig_routing_threshold_tag 4
+#define meshtastic_ModuleConfig_NodeRateLimiterConfig_other_threshold_tag 5
 #define meshtastic_ModuleConfig_SignalRoutingConfig_enabled_tag 1
 #define meshtastic_ModuleConfig_SignalRoutingConfig_t1_retransmit_enabled_tag 2
 #define meshtastic_ModuleConfig_SignalRoutingConfig_topology_broadcast_secs_tag 3
@@ -805,6 +838,7 @@ extern "C" {
 #define meshtastic_ModuleConfig_traffic_management_tag 15
 #define meshtastic_ModuleConfig_tak_tag          16
 #define meshtastic_ModuleConfig_signal_routing_tag 17
+#define meshtastic_ModuleConfig_node_rate_limiter_tag 18
 
 /* Struct field encoding specification for nanopb */
 #define meshtastic_ModuleConfig_FIELDLIST(X, a) \
@@ -824,7 +858,8 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,paxcounter,payload_variant.p
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,statusmessage,payload_variant.statusmessage),  14) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,traffic_management,payload_variant.traffic_management),  15) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,tak,payload_variant.tak),  16) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,signal_routing,payload_variant.signal_routing),  17)
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,signal_routing,payload_variant.signal_routing),  17) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,node_rate_limiter,payload_variant.node_rate_limiter),  18)
 #define meshtastic_ModuleConfig_CALLBACK NULL
 #define meshtastic_ModuleConfig_DEFAULT NULL
 #define meshtastic_ModuleConfig_payload_variant_mqtt_MSGTYPE meshtastic_ModuleConfig_MQTTConfig
@@ -844,6 +879,7 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,signal_routing,payload_varia
 #define meshtastic_ModuleConfig_payload_variant_traffic_management_MSGTYPE meshtastic_ModuleConfig_TrafficManagementConfig
 #define meshtastic_ModuleConfig_payload_variant_tak_MSGTYPE meshtastic_ModuleConfig_TAKConfig
 #define meshtastic_ModuleConfig_payload_variant_signal_routing_MSGTYPE meshtastic_ModuleConfig_SignalRoutingConfig
+#define meshtastic_ModuleConfig_payload_variant_node_rate_limiter_MSGTYPE meshtastic_ModuleConfig_NodeRateLimiterConfig
 
 #define meshtastic_ModuleConfig_MQTTConfig_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, BOOL,     enabled,           1) \
@@ -1035,6 +1071,15 @@ X(a, STATIC,   SINGULAR, UENUM,    role,              2)
 #define meshtastic_ModuleConfig_TAKConfig_CALLBACK NULL
 #define meshtastic_ModuleConfig_TAKConfig_DEFAULT NULL
 
+#define meshtastic_ModuleConfig_NodeRateLimiterConfig_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, BOOL,     enabled,           1) \
+X(a, STATIC,   SINGULAR, UINT32,   window_secs,       2) \
+X(a, STATIC,   SINGULAR, UINT32,   text_threshold,    3) \
+X(a, STATIC,   SINGULAR, UINT32,   routing_threshold,   4) \
+X(a, STATIC,   SINGULAR, UINT32,   other_threshold,   5)
+#define meshtastic_ModuleConfig_NodeRateLimiterConfig_CALLBACK NULL
+#define meshtastic_ModuleConfig_NodeRateLimiterConfig_DEFAULT NULL
+
 #define meshtastic_ModuleConfig_SignalRoutingConfig_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, BOOL,     enabled,           1) \
 X(a, STATIC,   SINGULAR, BOOL,     t1_retransmit_enabled,   2) \
@@ -1072,6 +1117,7 @@ extern const pb_msgdesc_t meshtastic_ModuleConfig_CannedMessageConfig_msg;
 extern const pb_msgdesc_t meshtastic_ModuleConfig_AmbientLightingConfig_msg;
 extern const pb_msgdesc_t meshtastic_ModuleConfig_StatusMessageConfig_msg;
 extern const pb_msgdesc_t meshtastic_ModuleConfig_TAKConfig_msg;
+extern const pb_msgdesc_t meshtastic_ModuleConfig_NodeRateLimiterConfig_msg;
 extern const pb_msgdesc_t meshtastic_ModuleConfig_SignalRoutingConfig_msg;
 extern const pb_msgdesc_t meshtastic_RemoteHardwarePin_msg;
 
@@ -1094,6 +1140,7 @@ extern const pb_msgdesc_t meshtastic_RemoteHardwarePin_msg;
 #define meshtastic_ModuleConfig_AmbientLightingConfig_fields &meshtastic_ModuleConfig_AmbientLightingConfig_msg
 #define meshtastic_ModuleConfig_StatusMessageConfig_fields &meshtastic_ModuleConfig_StatusMessageConfig_msg
 #define meshtastic_ModuleConfig_TAKConfig_fields &meshtastic_ModuleConfig_TAKConfig_msg
+#define meshtastic_ModuleConfig_NodeRateLimiterConfig_fields &meshtastic_ModuleConfig_NodeRateLimiterConfig_msg
 #define meshtastic_ModuleConfig_SignalRoutingConfig_fields &meshtastic_ModuleConfig_SignalRoutingConfig_msg
 #define meshtastic_RemoteHardwarePin_fields &meshtastic_RemoteHardwarePin_msg
 
@@ -1107,6 +1154,7 @@ extern const pb_msgdesc_t meshtastic_RemoteHardwarePin_msg;
 #define meshtastic_ModuleConfig_MQTTConfig_size  224
 #define meshtastic_ModuleConfig_MapReportSettings_size 14
 #define meshtastic_ModuleConfig_NeighborInfoConfig_size 10
+#define meshtastic_ModuleConfig_NodeRateLimiterConfig_size 26
 #define meshtastic_ModuleConfig_PaxcounterConfig_size 30
 #define meshtastic_ModuleConfig_RangeTestConfig_size 12
 #define meshtastic_ModuleConfig_RemoteHardwareConfig_size 96
