@@ -194,6 +194,15 @@ private:
     PendingRetransmit pendingRetransmits[MAX_PENDING_RETRANSMITS];
     bool isRetransmitting = false; // Guard: prevents T2 scheduling when T1 is being fired
 
+    // Runtime-configurable values loaded from moduleConfig.signal_routing at construction.
+    // All default to the compile-time constants; overridden when has_signal_routing is set.
+    uint32_t cfgBroadcastSecs = SIGNAL_ROUTING_BROADCAST_SECS;
+    uint32_t cfgDirtyBroadcastSecs = SIGNAL_ROUTING_DIRTY_BROADCAST_SECS;
+    uint32_t cfgNodeTtlSecs = NODE_TTL_SECS;
+    uint32_t cfgBroadcastMaxHops = SR_BROADCAST_MAX_HOPS;
+    float cfgPoorLinkEtxThreshold = 7.0f;
+    bool t1RetransmitEnabled = true;
+
     bool hasAnyHearsUsNeighbor() const;
 
 public:

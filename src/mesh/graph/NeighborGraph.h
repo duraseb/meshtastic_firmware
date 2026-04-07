@@ -76,9 +76,6 @@ static constexpr int EDGE_NO_CHANGE = 0;
 static constexpr int EDGE_NEW = 1;
 static constexpr int EDGE_SIGNIFICANT_CHANGE = 2;
 
-// Threshold for significant ETX change
-static constexpr float ETX_CHANGE_THRESHOLD = 0.50f;
-
 struct Edge {
     enum class Source : uint8_t { Mirrored = 0, Reported = 1 };
 
@@ -264,7 +261,11 @@ class NeighborGraph {
 
     static constexpr size_t getMemoryUsage() { return sizeof(NeighborGraph); }
 
+    void setEtxChangeThreshold(float v) { etxChangeThreshold = v; }
+    float getEtxChangeThreshold() const { return etxChangeThreshold; }
+
   private:
+    float etxChangeThreshold = 0.50f; // Minimum ETX delta to register an edge change as significant
     NodeEdges neighbors[NEIGHBOR_GRAPH_MAX_NEIGHBORS];
     uint8_t neighborCount;
 

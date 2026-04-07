@@ -82,6 +82,7 @@ This dual approach provides the reliability of coordinated networking with the e
 | **ReliableRouter** | Up to 3 retransmissions | For want_ack packets only |
 | **NextHopRouter** | 2 for intermediate hops, 3 for origin | Route reset on final failure |
 | **SignalRouting** | Iterative unicast route selection with fallback strategies | For SR-selected unicast routes |
+| **SignalRouting broadcast** | One T1 retransmit if no relay heard within ROUTER_LATE window | Guards against interference/CRC loss at receivers; see T1 Retransmit Insurance |
 
 ### Passive Node Behavior
 
@@ -155,7 +156,7 @@ All discovery mechanisms are used to maintain comprehensive network topology:
 
 1. **Direct Neighbor Detection**: When receiving packets directly with signal data (RSSI/SNR), immediate neighbor relationships are established with calculated ETX values
 
-2. **Topology Broadcasts**: Periodically broadcast their complete neighbor list for comprehensive topology learning from other nodes' perspectives. The `hop_limit` of every SR topology packet is capped at `SR_BROADCAST_MAX_HOPS = 5`, even if the user has configured a higher limit, to bound topology gossip propagation in large networks.
+2. **Topology Broadcasts**: Periodically broadcast their complete neighbor list for comprehensive topology learning from other nodes' perspectives. The `hop_limit` of every SR topology packet is capped at `cfgBroadcastMaxHops` (default `SR_BROADCAST_MAX_HOPS`), even if the user has configured a higher limit, to bound topology gossip propagation in large networks.
 
 3. **Relayed Packet Inference**: When receiving a relayed packet, gateway relationships are inferred between the original sender and the relay node. If the relay node is a stock (Legacy) firmware node, a directed edge is also recorded from the relay to the sender — observing a successful relay proves the relay can hear the sender, regardless of the sender's firmware type. The reverse edge is not assumed.
 
@@ -390,6 +391,25 @@ Packet from A to BROADCAST (halfAirtime = 150ms):
 9. Result: 1 relay from stock router, SR nodes suppressed
 ```
 
+### T1 Retransmit Insurance
+
+LoRa is half-duplex: a transmitting node cannot hear its own channel while sending, so it has no way to know whether nearby receivers successfully decoded the packet. Radio interference, overlapping transmissions, or transient noise can corrupt a packet's CRC at any receiver — including a neighbor that would have relayed it. T1 retransmit insurance guards against this by scheduling one additional transmission after the initial send, fired only if no relay is heard within the worst-case relay window.
+
+**When T1 fires:**
+- T1 is scheduled immediately when `FloodingRouter::send()` forwards a broadcast (originator path) or when `commitRelay()` records a committed SR relay.
+- The delay is `getTxDelayMsecWeightedWorst(SNR=+10) + one-packet-airtime` — this covers the longest possible ROUTER_LATE window, so any node that successfully received T0 has already had its full opportunity to relay before T1 goes out.
+- T1 only fires if no dupe relay is heard before the timer expires. If at least one neighbor relayed T0 cleanly, T1 is canceled and no extra airtime is used.
+
+**Conditions for T1 to be scheduled:**
+1. The packet is a broadcast.
+2. The node originated the packet or SR committed it to relay.
+3. At least one direct neighbor with `hearsUs=true` exists — confirms we have a known neighbor before spending airtime on the retransmit.
+4. T1 retransmit is not disabled via config (`t1_retransmit_enabled`).
+
+**Cancellation:** Any incoming dupe triggers `cancelBroadcastRetransmit()` via `perhapsCancelDupe()`. This covers all paths: committed relay that decides to cancel, already-relayed detection, and non-SR originator dupes.
+
+**Guard against T2:** When T1 fires, `isRetransmitting = true` is set before calling `router->send()`. This prevents `maybeScheduleBroadcastRetransmit()` from scheduling a second retransmit when T1 re-enters the send path.
+
 ## Benefits for Mesh Network Reliability
 
 ### Improved Deliverability
@@ -504,7 +524,7 @@ When a relayed packet arrives from an unknown node (identified only by its 8-bit
 1. **Creation**: When we directly hear a packet relayed by an unknown node
 2. **Resolution**: When we later hear that same relay byte from a node whose full ID we now know (via direct contact)
 3. **Transfer**: On resolution, all downstream entries are transferred from the placeholder to the real node via `transferDownstream()`, preserving routing continuity
-4. **TTL**: Placeholders age out with normal node TTL (90 min) if never resolved
+4. **TTL**: Placeholders age out with `cfgNodeTtlSecs` if never resolved
 
 **Duplicate resolution guard**: `resolvePlaceholder()` checks the relay-identity cache before doing any work. If the placeholder's relay byte is already mapped to the same `realNodeId`, the function returns `false` immediately with no log message and no graph operations. Previously the function would fall through and re-execute all transfers and re-log "Resolved placeholder" on every subsequent observation of the same relay, causing spurious log spam and redundant graph writes.
 
@@ -528,7 +548,7 @@ if (relayForDest != 0 && (relayForDest & 0xFF) == p->relay_node &&
 SignalRouting uses **monotonic time** (time since boot) for all graph operations to ensure consistency:
 
 - **Graph aging**: Edge expiration and node cleanup
-- **Route caching**: Cache validity and expiration (5 min)
+- **Route caching**: Cache validity and expiration (`ROUTE_CACHE_TIMEOUT_SECS` — not runtime-configurable)
 - **Transmission tracking**: Contention window timing
 - **Edge timestamps**: Connection update times
 
@@ -541,44 +561,54 @@ This prevents issues with RTC updates that could cause time jumps, ensuring reli
 
 ## Configuration and Tuning
 
-### Key Parameters
+### Runtime Config (`ModuleConfig.SignalRoutingConfig`)
+
+All SR tuning parameters can be set at runtime via the Meshtastic admin interface or CLI without recompiling. Numeric fields use `0` / `0.0` to mean "use firmware default" (the compile-time constant). Bool fields follow proto3 conventions — see the note below.
+
+| Protobuf field | Type | Firmware default (constant) | Description |
+|----------------|------|----------------------------|-------------|
+| `enabled` | bool | `true`* | Master enable/disable for SR |
+| `t1_retransmit_enabled` | bool | `true`* | Enable T1 retransmit insurance (interference protection) |
+| `topology_broadcast_secs` | uint32 | `SIGNAL_ROUTING_BROADCAST_SECS` | Topology broadcast interval |
+| `dirty_broadcast_secs` | uint32 | `SIGNAL_ROUTING_DIRTY_BROADCAST_SECS` | Minimum interval before a dirty-topology early broadcast |
+| `node_ttl_secs` | uint32 | `NODE_TTL_SECS` | Node aging TTL — nodes not heard within this window are removed from the graph |
+| `broadcast_max_hops` | uint32 | `SR_BROADCAST_MAX_HOPS` | `hop_limit` cap applied to SR topology broadcast packets |
+| `poor_link_etx_threshold` | float | `7.0` | ETX above which a link is excluded from pre-coverage marking in relay decisions |
+| `etx_change_threshold` | float | `NeighborGraph::etxChangeThreshold` (default `0.50`) | Minimum ETX delta to register an edge update as significant and trigger a dirty broadcast |
+
+\* proto3 booleans default to `false` on the wire. When writing any SR config, always set `enabled=true` and `t1_retransmit_enabled=true` unless you explicitly want those features off. If no SR config is stored (`has_signal_routing=false`), firmware defaults apply (both features on).
+
+### Compile-Time Constants
+
+The default values for the configurable parameters above are defined in `SignalRoutingModule.h` and `NeighborGraph.h`:
 
 ```cpp
-// Broadcast interval for topology updates
-#define SIGNAL_ROUTING_BROADCAST_SECS 300     // 5 minutes
+// SignalRoutingModule.h
+#define SIGNAL_ROUTING_BROADCAST_SECS        360   // periodic topology broadcast interval
+#define SIGNAL_ROUTING_DIRTY_BROADCAST_SECS  180   // minimum gap before early dirty broadcast
+#define SR_BROADCAST_MAX_HOPS                  5   // hop_limit cap for topology packets
+#define MAX_SIGNAL_ROUTING_NEIGHBORS          11   // neighbors per broadcast payload (fits 233-byte limit)
 
-// Maximum neighbors tracked per broadcast payload
-#define MAX_SIGNAL_ROUTING_NEIGHBORS 11       // Fits 11 in 233 byte payload
+// SignalRoutingModule.h (private, class scope)
+static constexpr uint32_t NODE_TTL_SECS = 5400;   // 90 min — graph aging TTL for all nodes
+static constexpr uint32_t RELAY_ID_CACHE_TTL_MS = 600 * 1000;  // relay byte → NodeNum cache
+static constexpr uint32_t ROUTE_CACHE_TIMEOUT_SECS = 300;      // Dijkstra result cache validity
+static constexpr uint32_t CAPABILITY_TTL_SECS = SIGNAL_ROUTING_BROADCAST_SECS * 3 + 10;  // node capability cache
 
-// Hard cap on hop_limit for SR topology broadcasts
-#define SR_BROADCAST_MAX_HOPS 5               // Applied in sendTopologyPacket()
+// NeighborGraph.h (private instance variable)
+float etxChangeThreshold = 0.50f;  // minimum ETX delta for a significant edge change
 ```
-
-### Timeout Values
-
-| Parameter | Value | Purpose |
-|-----------|-------|---------|
-| SR broadcast interval | 300s (5 min) | Periodic topology update; early broadcast fires 60s after any topology change |
-| Node TTL | 5400s (90 min) | How long all nodes stay in graph |
-| Edge aging timeout | 5400s (90 min) | Unified edge expiration for all node types |
-| Placeholder TTL | 5400s (90 min) | How long unresolved placeholders survive (same as node TTL) |
-| Relay ID cache TTL | 600s (10 min) | Relay byte → NodeNum mapping cache |
-| Capability cache TTL | 910s (~15 min) | Node capability status cache (3× broadcast interval + 10s) |
-| Route cache timeout | 300s (5 min) | Dijkstra result cache validity |
-| ETX change threshold | 0.50 | Minimum ETX change to trigger update |
 
 ### Prompt Dirty-Topology Rebroadcast (`markTopologyDirty()`)
 
 All topology change sites (new neighbor added, neighbor removed, placeholder resolved, topology received from a direct SR neighbor, etc.) call `markTopologyDirty()` instead of setting `topologyDirty = true` directly. `markTopologyDirty()` does two things atomically:
 
-1. Sets `topologyDirty = true` and records `topologyDirtyAt = millis()`
-2. Calls `setIntervalFromNow(60 * 1000)` to wake `runOnce()` within 60 seconds
+1. Sets `topologyDirty = true`
+2. Calls `setIntervalFromNow(wakeIn)` to wake `runOnce()` as soon as `cfgDirtyBroadcastSecs` has elapsed since the last broadcast (immediately if it already has)
 
-This ensures topology changes are broadcast promptly rather than waiting up to 300s for the next periodic cycle.
+This ensures topology changes are broadcast promptly rather than waiting a full `cfgBroadcastSecs` cycle, while the `cfgDirtyBroadcastSecs` minimum gap prevents broadcast storms from rapid successive changes.
 
-**Early broadcast gate** — the 60-second early broadcast is gated on `topologyDirtyAt` (when the change was first detected), **not** on `lastBroadcast`. This matters because `notifyOriginatedPacketSent()` resets `lastBroadcast` every time the node sends a packet, which could otherwise delay the early broadcast indefinitely in active nodes.
-
-**Topology log does not clear the dirty flag** — the topology dump in `runOnce()` intentionally leaves `topologyDirty` set after logging. This allows the return value calculation at the bottom of `runOnce()` to correctly see the dirty flag and return a 60s wakeup interval (rather than the full 300s broadcast cycle) until the early broadcast has actually fired.
+**Topology log does not clear the dirty flag** — the topology dump in `runOnce()` intentionally leaves `topologyDirty` set after logging. This allows the return value calculation at the bottom of `runOnce()` to correctly return the dirty-cycle wakeup interval rather than the full broadcast cycle until the early broadcast has actually fired.
 
 ### Node Capability Tracking
 
@@ -586,9 +616,9 @@ SR tracks each node's capability status to make informed routing decisions:
 
 | Status | Description | TTL |
 |--------|-------------|-----|
-| `SRactive` | Node runs SR and actively participates | ~15 min |
-| `Passive` | Node runs SR but in passive mode (TRACKER, SENSOR, etc.) | ~15 min |
-| `Legacy` | Stock firmware node, no SR participation | ~15 min |
+| `SRactive` | Node runs SR and actively participates | `CAPABILITY_TTL_SECS` (not configurable) |
+| `Passive` | Node runs SR but in passive mode (TRACKER, SENSOR, etc.) | `CAPABILITY_TTL_SECS` (not configurable) |
+| `Legacy` | Stock firmware node, no SR participation | `CAPABILITY_TTL_SECS` (not configurable) |
 | `Unknown` | Not yet classified | — |
 
 ### Topology Health Assessment
@@ -776,12 +806,12 @@ SignalRouting gracefully degrades when coordination isn't possible:
 
 **"Unresolved placeholder nodes (ff0000XX)"**
 - Placeholder created for unknown relay byte, not yet resolved via direct contact
-- Placeholders age out with normal node TTL (90 min) if never resolved
+- Placeholders age out with `cfgNodeTtlSecs` if never resolved
 - Only created for directly-heard relay nodes, not nodes reported by others
 
 **"Nodes disappearing from topology"**
 - Check if nodes are being evicted from NodeDB (100 node limit)
 - Verify `last_heard` is being updated (uses `rx_time` or `getTime()` when no NTP/GPS)
-- Check edge aging timeout: all nodes expire after 90 min (NODE_TTL_SECS=5400)
+- Check edge aging timeout: all nodes expire after `cfgNodeTtlSecs` (configurable via `node_ttl_secs`)
 
 SignalRouting provides an alternative to traditional flooding-based mesh networking, offering basic coordination for packet relay decisions. It works alongside existing routing approaches and provides benefits in networks with sufficient SignalRouting-capable nodes, while maintaining compatibility with legacy devices through prioritized relay handling.

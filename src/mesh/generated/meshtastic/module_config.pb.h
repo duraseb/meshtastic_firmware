@@ -459,6 +459,38 @@ typedef struct _meshtastic_ModuleConfig_TAKConfig {
     meshtastic_MemberRole role;
 } meshtastic_ModuleConfig_TAKConfig;
 
+/* Configuration for the SignalRouting module (signal-based coordinated relay selection).
+ All numeric fields default to 0, which means "use firmware default". */
+typedef struct _meshtastic_ModuleConfig_SignalRoutingConfig {
+    /* Master enable/disable for signal-based routing.
+ When false, SR falls back to standard flooding. */
+    bool enabled;
+    /* Enable T1 retransmit insurance: retransmit once if no relay heard within
+ the worst-case ROUTER_LATE window.  Only fires if a hearsUs neighbor exists. */
+    bool t1_retransmit_enabled;
+    /* Topology broadcast interval in seconds.
+ 0 = use firmware default (360 s). */
+    uint32_t topology_broadcast_secs;
+    /* Minimum interval before a dirty-topology early broadcast in seconds.
+ 0 = use firmware default (180 s). */
+    uint32_t dirty_broadcast_secs;
+    /* Node aging TTL in seconds — nodes not heard within this window are
+ removed from the routing graph.
+ 0 = use firmware default (5400 s = 90 min). */
+    uint32_t node_ttl_secs;
+    /* ETX threshold above which a link is treated as too poor for pre-coverage
+ marking in relay decisions.
+ 0.0 = use firmware default (7.0). */
+    float poor_link_etx_threshold;
+    /* Minimum ETX delta required to register a graph edge update as significant
+ (and thus trigger a topology-dirty broadcast).
+ 0.0 = use firmware default (0.5). */
+    float etx_change_threshold;
+    /* Maximum hop limit applied to SR topology broadcast packets.
+ 0 = use firmware default (5). */
+    uint32_t broadcast_max_hops;
+} meshtastic_ModuleConfig_SignalRoutingConfig;
+
 /* A GPIO pin definition for remote hardware module */
 typedef struct _meshtastic_RemoteHardwarePin {
     /* GPIO Pin number (must match Arduino) */
@@ -516,6 +548,8 @@ typedef struct _meshtastic_ModuleConfig {
         meshtastic_ModuleConfig_TrafficManagementConfig traffic_management;
         /* TAK team/role configuration for TAK_TRACKER */
         meshtastic_ModuleConfig_TAKConfig tak;
+        /* SignalRouting module configuration */
+        meshtastic_ModuleConfig_SignalRoutingConfig signal_routing;
     } payload_variant;
 } meshtastic_ModuleConfig;
 
@@ -576,6 +610,7 @@ extern "C" {
 #define meshtastic_ModuleConfig_TAKConfig_team_ENUMTYPE meshtastic_Team
 #define meshtastic_ModuleConfig_TAKConfig_role_ENUMTYPE meshtastic_MemberRole
 
+
 #define meshtastic_RemoteHardwarePin_type_ENUMTYPE meshtastic_RemoteHardwarePinType
 
 
@@ -598,6 +633,7 @@ extern "C" {
 #define meshtastic_ModuleConfig_AmbientLightingConfig_init_default {0, 0, 0, 0, 0}
 #define meshtastic_ModuleConfig_StatusMessageConfig_init_default {""}
 #define meshtastic_ModuleConfig_TAKConfig_init_default {_meshtastic_Team_MIN, _meshtastic_MemberRole_MIN}
+#define meshtastic_ModuleConfig_SignalRoutingConfig_init_default {0, 0, 0, 0, 0, 0, 0, 0}
 #define meshtastic_RemoteHardwarePin_init_default {0, "", _meshtastic_RemoteHardwarePinType_MIN}
 #define meshtastic_ModuleConfig_init_zero        {0, {meshtastic_ModuleConfig_MQTTConfig_init_zero}}
 #define meshtastic_ModuleConfig_MQTTConfig_init_zero {0, "", "", "", 0, 0, 0, "", 0, 0, false, meshtastic_ModuleConfig_MapReportSettings_init_zero}
@@ -617,6 +653,7 @@ extern "C" {
 #define meshtastic_ModuleConfig_AmbientLightingConfig_init_zero {0, 0, 0, 0, 0}
 #define meshtastic_ModuleConfig_StatusMessageConfig_init_zero {""}
 #define meshtastic_ModuleConfig_TAKConfig_init_zero {_meshtastic_Team_MIN, _meshtastic_MemberRole_MIN}
+#define meshtastic_ModuleConfig_SignalRoutingConfig_init_zero {0, 0, 0, 0, 0, 0, 0, 0}
 #define meshtastic_RemoteHardwarePin_init_zero   {0, "", _meshtastic_RemoteHardwarePinType_MIN}
 
 /* Field tags (for use in manual encoding/decoding) */
@@ -737,6 +774,14 @@ extern "C" {
 #define meshtastic_ModuleConfig_StatusMessageConfig_node_status_tag 1
 #define meshtastic_ModuleConfig_TAKConfig_team_tag 1
 #define meshtastic_ModuleConfig_TAKConfig_role_tag 2
+#define meshtastic_ModuleConfig_SignalRoutingConfig_enabled_tag 1
+#define meshtastic_ModuleConfig_SignalRoutingConfig_t1_retransmit_enabled_tag 2
+#define meshtastic_ModuleConfig_SignalRoutingConfig_topology_broadcast_secs_tag 3
+#define meshtastic_ModuleConfig_SignalRoutingConfig_dirty_broadcast_secs_tag 4
+#define meshtastic_ModuleConfig_SignalRoutingConfig_node_ttl_secs_tag 5
+#define meshtastic_ModuleConfig_SignalRoutingConfig_poor_link_etx_threshold_tag 6
+#define meshtastic_ModuleConfig_SignalRoutingConfig_etx_change_threshold_tag 7
+#define meshtastic_ModuleConfig_SignalRoutingConfig_broadcast_max_hops_tag 8
 #define meshtastic_RemoteHardwarePin_gpio_pin_tag 1
 #define meshtastic_RemoteHardwarePin_name_tag    2
 #define meshtastic_RemoteHardwarePin_type_tag    3
@@ -759,6 +804,7 @@ extern "C" {
 #define meshtastic_ModuleConfig_statusmessage_tag 14
 #define meshtastic_ModuleConfig_traffic_management_tag 15
 #define meshtastic_ModuleConfig_tak_tag          16
+#define meshtastic_ModuleConfig_signal_routing_tag 17
 
 /* Struct field encoding specification for nanopb */
 #define meshtastic_ModuleConfig_FIELDLIST(X, a) \
@@ -777,7 +823,8 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,detection_sensor,payload_var
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,paxcounter,payload_variant.paxcounter),  13) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,statusmessage,payload_variant.statusmessage),  14) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,traffic_management,payload_variant.traffic_management),  15) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,tak,payload_variant.tak),  16)
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,tak,payload_variant.tak),  16) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,signal_routing,payload_variant.signal_routing),  17)
 #define meshtastic_ModuleConfig_CALLBACK NULL
 #define meshtastic_ModuleConfig_DEFAULT NULL
 #define meshtastic_ModuleConfig_payload_variant_mqtt_MSGTYPE meshtastic_ModuleConfig_MQTTConfig
@@ -796,6 +843,7 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,tak,payload_variant.tak),  1
 #define meshtastic_ModuleConfig_payload_variant_statusmessage_MSGTYPE meshtastic_ModuleConfig_StatusMessageConfig
 #define meshtastic_ModuleConfig_payload_variant_traffic_management_MSGTYPE meshtastic_ModuleConfig_TrafficManagementConfig
 #define meshtastic_ModuleConfig_payload_variant_tak_MSGTYPE meshtastic_ModuleConfig_TAKConfig
+#define meshtastic_ModuleConfig_payload_variant_signal_routing_MSGTYPE meshtastic_ModuleConfig_SignalRoutingConfig
 
 #define meshtastic_ModuleConfig_MQTTConfig_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, BOOL,     enabled,           1) \
@@ -987,6 +1035,18 @@ X(a, STATIC,   SINGULAR, UENUM,    role,              2)
 #define meshtastic_ModuleConfig_TAKConfig_CALLBACK NULL
 #define meshtastic_ModuleConfig_TAKConfig_DEFAULT NULL
 
+#define meshtastic_ModuleConfig_SignalRoutingConfig_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, BOOL,     enabled,           1) \
+X(a, STATIC,   SINGULAR, BOOL,     t1_retransmit_enabled,   2) \
+X(a, STATIC,   SINGULAR, UINT32,   topology_broadcast_secs,   3) \
+X(a, STATIC,   SINGULAR, UINT32,   dirty_broadcast_secs,   4) \
+X(a, STATIC,   SINGULAR, UINT32,   node_ttl_secs,     5) \
+X(a, STATIC,   SINGULAR, FLOAT,    poor_link_etx_threshold,   6) \
+X(a, STATIC,   SINGULAR, FLOAT,    etx_change_threshold,   7) \
+X(a, STATIC,   SINGULAR, UINT32,   broadcast_max_hops,   8)
+#define meshtastic_ModuleConfig_SignalRoutingConfig_CALLBACK NULL
+#define meshtastic_ModuleConfig_SignalRoutingConfig_DEFAULT NULL
+
 #define meshtastic_RemoteHardwarePin_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UINT32,   gpio_pin,          1) \
 X(a, STATIC,   SINGULAR, STRING,   name,              2) \
@@ -1012,6 +1072,7 @@ extern const pb_msgdesc_t meshtastic_ModuleConfig_CannedMessageConfig_msg;
 extern const pb_msgdesc_t meshtastic_ModuleConfig_AmbientLightingConfig_msg;
 extern const pb_msgdesc_t meshtastic_ModuleConfig_StatusMessageConfig_msg;
 extern const pb_msgdesc_t meshtastic_ModuleConfig_TAKConfig_msg;
+extern const pb_msgdesc_t meshtastic_ModuleConfig_SignalRoutingConfig_msg;
 extern const pb_msgdesc_t meshtastic_RemoteHardwarePin_msg;
 
 /* Defines for backwards compatibility with code written before nanopb-0.4.0 */
@@ -1033,6 +1094,7 @@ extern const pb_msgdesc_t meshtastic_RemoteHardwarePin_msg;
 #define meshtastic_ModuleConfig_AmbientLightingConfig_fields &meshtastic_ModuleConfig_AmbientLightingConfig_msg
 #define meshtastic_ModuleConfig_StatusMessageConfig_fields &meshtastic_ModuleConfig_StatusMessageConfig_msg
 #define meshtastic_ModuleConfig_TAKConfig_fields &meshtastic_ModuleConfig_TAKConfig_msg
+#define meshtastic_ModuleConfig_SignalRoutingConfig_fields &meshtastic_ModuleConfig_SignalRoutingConfig_msg
 #define meshtastic_RemoteHardwarePin_fields &meshtastic_RemoteHardwarePin_msg
 
 /* Maximum encoded size of messages (where known) */
@@ -1049,6 +1111,7 @@ extern const pb_msgdesc_t meshtastic_RemoteHardwarePin_msg;
 #define meshtastic_ModuleConfig_RangeTestConfig_size 12
 #define meshtastic_ModuleConfig_RemoteHardwareConfig_size 96
 #define meshtastic_ModuleConfig_SerialConfig_size 28
+#define meshtastic_ModuleConfig_SignalRoutingConfig_size 38
 #define meshtastic_ModuleConfig_StatusMessageConfig_size 81
 #define meshtastic_ModuleConfig_StoreForwardConfig_size 24
 #define meshtastic_ModuleConfig_TAKConfig_size   4

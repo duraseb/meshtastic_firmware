@@ -195,7 +195,7 @@ int NeighborGraph::updateEdge(NodeNum from, NodeNum to, float etx, uint32_t time
         edge->variance = ((variance + 6) / 12 > 255) ? 255 : static_cast<uint8_t>((variance + 6) / 12);
         edge->source = source;
 
-        return (change > ETX_CHANGE_THRESHOLD) ? EDGE_SIGNIFICANT_CHANGE : EDGE_NO_CHANGE;
+        return (change > etxChangeThreshold) ? EDGE_SIGNIFICANT_CHANGE : EDGE_NO_CHANGE;
     }
 
     // Add new edge

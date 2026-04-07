@@ -124,6 +124,36 @@ SignalRoutingModule::SignalRoutingModule()
         return;
     }
 
+    // Load config overrides. Numeric fields: 0 means "use firmware default". Bool fields: if the
+    // message exists, the value is used as-is (proto3 default false = disabled).
+    if (moduleConfig.has_signal_routing) {
+        const auto &srCfg = moduleConfig.signal_routing;
+        signalBasedRoutingEnabled = srCfg.enabled;
+        t1RetransmitEnabled = srCfg.t1_retransmit_enabled;
+        if (srCfg.topology_broadcast_secs != 0) {
+            cfgBroadcastSecs = srCfg.topology_broadcast_secs;
+        }
+        if (srCfg.dirty_broadcast_secs != 0) {
+            cfgDirtyBroadcastSecs = srCfg.dirty_broadcast_secs;
+        }
+        if (srCfg.node_ttl_secs != 0) {
+            cfgNodeTtlSecs = srCfg.node_ttl_secs;
+        }
+        if (srCfg.broadcast_max_hops != 0) {
+            cfgBroadcastMaxHops = srCfg.broadcast_max_hops;
+        }
+        if (srCfg.poor_link_etx_threshold != 0.0f) {
+            cfgPoorLinkEtxThreshold = srCfg.poor_link_etx_threshold;
+        }
+        if (srCfg.etx_change_threshold != 0.0f) {
+            routingGraph->setEtxChangeThreshold(srCfg.etx_change_threshold);
+        }
+        LOG_INFO("[SR] Config: enabled=%d t1=%d broadcastSecs=%u dirtyBroadcastSecs=%u nodeTtlSecs=%u maxHops=%u poorLinkEtx=%.1f etxChange=%.2f",
+                 signalBasedRoutingEnabled, t1RetransmitEnabled, cfgBroadcastSecs, cfgDirtyBroadcastSecs,
+                 cfgNodeTtlSecs, cfgBroadcastMaxHops, cfgPoorLinkEtxThreshold,
+                 routingGraph->getEtxChangeThreshold());
+    }
+
     trackNodeCapability(nodeDB->getNodeNum(), CapabilityStatus::SRactive);
 
     // We want to see all packets for signal quality updates
@@ -145,7 +175,7 @@ void SignalRoutingModule::markTopologyDirty()
         // Wake runOnce() to fire the early broadcast as soon as the minimum inter-broadcast
         // delay has elapsed since the last broadcast. If it already has, wake immediately.
         uint32_t sinceLastBroadcast = millis() - lastBroadcast;
-        uint32_t wakeIn = (sinceLastBroadcast >= SIGNAL_ROUTING_DIRTY_BROADCAST_SECS * 1000) ? 0 : (SIGNAL_ROUTING_DIRTY_BROADCAST_SECS * 1000 - sinceLastBroadcast);
+        uint32_t wakeIn = (sinceLastBroadcast >= cfgDirtyBroadcastSecs * 1000) ? 0 : (cfgDirtyBroadcastSecs * 1000 - sinceLastBroadcast);
         setIntervalFromNow(wakeIn);
     }
 }
@@ -182,10 +212,10 @@ int32_t SignalRoutingModule::runOnce()
             needsBootBroadcast = false;
             LOG_INFO("[SR] Sending empty boot broadcast to bootstrap topology");
             sendTopologyPacket(NODENUM_BROADCAST, nullptr, 0, 0);
-        } else if (nowMs - lastBroadcast >= SIGNAL_ROUTING_BROADCAST_SECS * 1000) {
+        } else if (nowMs - lastBroadcast >= cfgBroadcastSecs * 1000) {
             sendSignalRoutingInfo();
             topologyDirty = false;
-        } else if (topologyDirty && nowMs - lastBroadcast >= SIGNAL_ROUTING_DIRTY_BROADCAST_SECS * 1000) {
+        } else if (topologyDirty && nowMs - lastBroadcast >= cfgDirtyBroadcastSecs * 1000) {
             // Topology changed and the minimum inter-broadcast interval has elapsed
             // since the last broadcast — send the early broadcast now.
             LOG_INFO("[SR] Topology dirty — sending early broadcast");
@@ -203,7 +233,7 @@ int32_t SignalRoutingModule::runOnce()
         }
     }
 
-    uint32_t broadcastCycle = topologyDirty ? SIGNAL_ROUTING_DIRTY_BROADCAST_SECS * 1000 : SIGNAL_ROUTING_BROADCAST_SECS * 1000;
+    uint32_t broadcastCycle = topologyDirty ? cfgDirtyBroadcastSecs * 1000 : cfgBroadcastSecs * 1000;
     uint32_t elapsed = nowMs - lastBroadcast;
     uint32_t timeToBroadcast = (elapsed < broadcastCycle) ? (broadcastCycle - elapsed) : 0;
 
@@ -355,7 +385,7 @@ void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const meshtastic_Sign
 
     meshtastic_MeshPacket *p = allocDataProtobuf(info);
     p->to = dest;
-    p->hop_limit = std::min(p->hop_limit, (uint8_t)SR_BROADCAST_MAX_HOPS);
+    p->hop_limit = std::min(p->hop_limit, (uint8_t)cfgBroadcastMaxHops);
     p->priority = meshtastic_MeshPacket_Priority_BACKGROUND;
     if (txAfterMs) {
         p->tx_after = txAfterMs;
@@ -1522,7 +1552,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
             
             // Single TTL for all nodes in the graph; SR capability expiry handles coverage separately
             uint8_t directBefore = routingGraph->countDirectNeighbors();
-            routingGraph->ageEdges(currentTime, NODE_TTL_SECS);
+            routingGraph->ageEdges(currentTime, cfgNodeTtlSecs);
 
             uint32_t nodeCountAfter = routingGraph->getNodeCount();
             lastGraphUpdate = currentTime;
@@ -1924,11 +1954,6 @@ void SignalRoutingModule::maybeScheduleBroadcastRetransmit(const meshtastic_Mesh
     if (!isBroadcast(p->to)) {
         return;
     }
-    // ROUTER and ROUTER_LATE relay unconditionally — a T1 retransmit would be redundant
-    if (config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER ||
-        config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE) {
-        return;
-    }
     // SR topology packets use their own interval-based scheduling; skip them
     if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
         p->decoded.portnum == meshtastic_PortNum_SIGNAL_ROUTING_APP) {
@@ -1943,6 +1968,10 @@ void SignalRoutingModule::maybeScheduleBroadcastRetransmit(const meshtastic_Mesh
     }
     // Guard: when firing T1 we re-enter send(); prevent scheduling T2
     if (isRetransmitting) {
+        return;
+    }
+    // Respect config: T1 retransmit insurance may be disabled
+    if (!t1RetransmitEnabled) {
         return;
     }
     // Require at least one confirmed relay neighbor (hearsUs = true)
@@ -2311,7 +2340,6 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     // Only mark heardFrom's neighbors as already-covered if the link is good.
     // Poor-quality links (high ETX) should NOT be pre-covered: if our link to
     // that node is much better, we should still relay and get an earlier slot.
-    static constexpr float POOR_LINK_ETX_THRESHOLD = 7.0f;
     NodeSet alreadyCovered;
     alreadyCovered.insert(sourceNode);
     alreadyCovered.insert(heardFrom);
@@ -2320,7 +2348,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         for (uint8_t i = 0; i < heardFromEdges->edgeCount; i++) {
             float etx = heardFromEdges->edges[i].getEtx();
             NodeNum neighbor = heardFromEdges->edges[i].to;
-            if (etx < POOR_LINK_ETX_THRESHOLD) {
+            if (etx < cfgPoorLinkEtxThreshold) {
                 alreadyCovered.insert(neighbor);
             }
         }
@@ -2342,7 +2370,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
                     char neighborName[32];
                     getNodeDisplayName(myNeighbor, neighborName, sizeof(neighborName));
                     LOG_INFO("[SR] Pre-coverage: our neighbor %s excluded from heardFrom coverage (ETX=%.1f >= %.1f)",
-                              neighborName, heardFromEdges->edges[j].getEtx(), POOR_LINK_ETX_THRESHOLD);
+                              neighborName, heardFromEdges->edges[j].getEtx(), cfgPoorLinkEtxThreshold);
                     break;
                 }
             }
