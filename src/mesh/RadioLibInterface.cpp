@@ -272,7 +272,10 @@ void RadioLibInterface::onNotify(uint32_t notification)
         // has placed the unit into standby)  FIXME, how will this work if the chipset is in sleep mode?
         if (!txQueue.empty()) {
             if (!canSendImmediately()) {
-                setTransmitDelay(); // currently Rx/Tx-ing: reset random delay
+                // Radio is busy (receiving or transmitting) — don't draw a new random backoff,
+                // just re-check after one slot. tx_after is preserved so we resume from the
+                // original deadline once the radio is free.
+                notifyLater(slotTimeMsec, TRANSMIT_DELAY_COMPLETED, false);
             } else {
                 meshtastic_MeshPacket *txp = txQueue.getFront();
                 assert(txp);
@@ -353,6 +356,10 @@ void RadioLibInterface::startTransmitTimerRebroadcast(meshtastic_MeshPacket *p)
     // If we have work to do and the timer wasn't already scheduled, schedule it now
     if (!txQueue.empty()) {
         uint32_t delay = getTxDelayMsecWeighted(p);
+        // Record the target send time on the packet so that subsequent setTransmitDelay()
+        // calls triggered by ISR_RX or isChannelActive can respect the already-pending
+        // deadline instead of drawing a new random delay from scratch each time.
+        p->tx_after = millis() + delay;
         notifyLater(delay, TRANSMIT_DELAY_COMPLETED, false); // This will implicitly enable
     }
 }

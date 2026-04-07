@@ -617,7 +617,6 @@ bool RadioInterface::shouldRebroadcastEarlyLikeRouter(meshtastic_MeshPacket *p)
     // SR nodes that committed to relay should use router-like timing
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
     if (signalRoutingModule && signalRoutingModule->isCommittedRelay(p->id)) {
-        LOG_INFO("[SR] Committed relay for 0x%08x - using router-like TX delay", p->id);
         return true;
     }
 #endif
@@ -636,6 +635,7 @@ uint32_t RadioInterface::getTxDelayMsecWeighted(meshtastic_MeshPacket *p)
     // LOG_DEBUG("rx_snr of %f so setting CWsize to:%d", snr, CWsize);
     if (shouldRebroadcastEarlyLikeRouter(p)) {
         delay = random(0, 2 * CWsize) * slotTimeMsec;
+        if (delay == 0) delay = slotTimeMsec; // ensure at least one slot — prevents tight busyRx retry loops
         LOG_DEBUG("rx_snr found in packet. Router: setting tx delay:%d", delay);
     } else {
         // offset the maximum delay for routers: (2 * CWmax * slotTimeMsec)
