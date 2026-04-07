@@ -25,6 +25,14 @@ ErrorCode FloodingRouter::send(meshtastic_MeshPacket *p)
     p->relay_node = nodeDB->getLastByteOfNodeNum(getNodeNum()); // First set the relayer to us
     wasSeenRecently(p);                                         // FIXME, move this to a sniffSent method
 
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+    // Schedule a T1 retransmit insurance for SR-managed broadcasts: if no relay is heard
+    // within the worst-case ROUTER_LATE window, we retransmit once to cover packet loss.
+    if (signalRoutingModule && isBroadcast(p->to)) {
+        signalRoutingModule->maybeScheduleBroadcastRetransmit(p);
+    }
+#endif
+
     return Router::send(p);
 }
 
@@ -154,11 +162,13 @@ void FloodingRouter::perhapsCancelDupe(const meshtastic_MeshPacket *p)
         if (!findInTxQueue(p->from, p->id)) {
             // Already transmitted — nothing to cancel, skip coverage computation
             LOG_INFO("[SR] Already relayed 0x%08x - ignoring dupe", p->id);
+            signalRoutingModule->cancelBroadcastRetransmit(p->id);
             return;
         }
         if (signalRoutingModule->areAllNeighborsCovered(p)) {
             LOG_INFO("[SR] Canceling committed relay for 0x%08x - dupe relayer covers our nodes", p->id);
             signalRoutingModule->clearCommittedRelay(p->id);
+            signalRoutingModule->cancelBroadcastRetransmit(p->id);
             // Fall through to normal cancel logic
         } else {
             LOG_INFO("[SR] Not canceling committed relay for 0x%08x - we have unique coverage", p->id);
@@ -173,6 +183,13 @@ void FloodingRouter::perhapsCancelDupe(const meshtastic_MeshPacket *p)
         if (Router::cancelSending(p->from, p->id))
             txRelayCanceled++;
     }
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+    // A relay was confirmed heard — cancel any pending T1 retransmit regardless of our TX role.
+    // (For committed relays that fell through above, this is a harmless idempotent no-op.)
+    if (signalRoutingModule) {
+        signalRoutingModule->cancelBroadcastRetransmit(p->id);
+    }
+#endif
     if (config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE && iface) {
         iface->clampToLateRebroadcastWindow(getFrom(p), p->id);
     }

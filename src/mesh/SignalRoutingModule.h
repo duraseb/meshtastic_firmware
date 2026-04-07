@@ -181,6 +181,21 @@ private:
     };
     CommittedRelay committedRelays[MAX_COMMITTED_RELAYS];
     uint8_t committedRelayCount = 0;
+
+    // Broadcast retransmit insurance: one-shot T1 resend after ROUTER_LATE window if no relay heard
+    static constexpr size_t MAX_PENDING_RETRANSMITS = 4;
+    struct PendingRetransmit {
+        PacketId packetId = 0;
+        meshtastic_MeshPacket *packet = nullptr;
+        uint32_t fireAfterMs = 0;
+        bool canceled = false;
+        PendingRetransmit() : packetId(0), packet(nullptr), fireAfterMs(0), canceled(false) {}
+    };
+    PendingRetransmit pendingRetransmits[MAX_PENDING_RETRANSMITS];
+    bool isRetransmitting = false; // Guard: prevents T2 scheduling when T1 is being fired
+
+    bool hasAnyHearsUsNeighbor() const;
+
 public:
     uint32_t pendingRelayDelayMs = 0; // Set by shouldRelayBroadcast, consumed by commitRelay
 
@@ -190,6 +205,8 @@ public:
     void clearCommittedRelay(PacketId packetId);
     bool areAllNeighborsCovered(const meshtastic_MeshPacket *p);
     bool shouldZeroHopLimitForUnicastRelay(const meshtastic_MeshPacket *p);
+    void maybeScheduleBroadcastRetransmit(const meshtastic_MeshPacket *p);
+    void cancelBroadcastRetransmit(PacketId packetId);
 };
 
 extern SignalRoutingModule *signalRoutingModule;

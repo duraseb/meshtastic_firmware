@@ -158,6 +158,23 @@ int32_t SignalRoutingModule::runOnce()
     pruneCapabilityCache(nowSecs);
     pruneRelayIdentityCache(nowMs);
 
+    // --- Fire pending T1 broadcast retransmits ---
+    for (uint8_t i = 0; i < MAX_PENDING_RETRANSMITS; i++) {
+        PendingRetransmit &pr = pendingRetransmits[i];
+        if (pr.canceled || pr.packet == nullptr || pr.packetId == 0) {
+            continue;
+        }
+        if ((int32_t)(nowMs - pr.fireAfterMs) >= 0) {
+            LOG_INFO("[SR] T1 firing for 0x%08x — no relay heard in window; retransmitting now", pr.packetId);
+            meshtastic_MeshPacket *toSend = pr.packet;
+            pr.packet = nullptr;
+            pr.canceled = true; // Mark done before send to block T2 scheduling
+            isRetransmitting = true;
+            router->send(toSend); // dispatches through FloodingRouter::send()
+            isRetransmitting = false;
+        }
+    }
+
     if (routingGraph && signalBasedRoutingEnabled) {
         // Send empty SR broadcast at boot to announce presence and trigger
         // neighbor topology responses, regardless of whether we have neighbors yet
@@ -191,6 +208,18 @@ int32_t SignalRoutingModule::runOnce()
     uint32_t timeToBroadcast = (elapsed < broadcastCycle) ? (broadcastCycle - elapsed) : 0;
 
     uint32_t nextDelay = timeToBroadcast;
+
+    // Wake up early enough to fire any pending T1 retransmits on time
+    for (uint8_t i = 0; i < MAX_PENDING_RETRANSMITS; i++) {
+        const PendingRetransmit &pr = pendingRetransmits[i];
+        if (pr.canceled || pr.packet == nullptr || pr.packetId == 0) {
+            continue;
+        }
+        int32_t remaining = (int32_t)(pr.fireAfterMs - nowMs);
+        if (remaining > 0 && (uint32_t)remaining < nextDelay) {
+            nextDelay = (uint32_t)remaining;
+        }
+    }
 
     if (nextDelay < 20) {
         nextDelay = 20;
@@ -1865,6 +1894,129 @@ void SignalRoutingModule::clearCommittedRelay(PacketId packetId)
         if (committedRelays[i].packetId == packetId) {
             committedRelays[i] = committedRelays[--committedRelayCount];
             committedRelays[committedRelayCount] = CommittedRelay();
+            return;
+        }
+    }
+}
+
+bool SignalRoutingModule::hasAnyHearsUsNeighbor() const
+{
+    if (!routingGraph || !nodeDB) {
+        return false;
+    }
+    const NodeEdges *myEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
+    if (!myEdges) {
+        return false;
+    }
+    for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+        if (myEdges->edges[i].hearsUs) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void SignalRoutingModule::maybeScheduleBroadcastRetransmit(const meshtastic_MeshPacket *p)
+{
+    if (!routingGraph || !nodeDB || !p) {
+        return;
+    }
+    if (!isBroadcast(p->to)) {
+        return;
+    }
+    // ROUTER and ROUTER_LATE relay unconditionally — a T1 retransmit would be redundant
+    if (config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER ||
+        config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE) {
+        return;
+    }
+    // SR topology packets use their own interval-based scheduling; skip them
+    if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
+        p->decoded.portnum == meshtastic_PortNum_SIGNAL_ROUTING_APP) {
+        return;
+    }
+    // Only schedule for broadcasts we originated or are committed to relay via SR
+    NodeNum myNode = nodeDB->getNodeNum();
+    bool isOriginated = (p->from == 0 || p->from == myNode);
+    bool isSRRelay = !isOriginated && isCommittedRelay(p->id);
+    if (!isOriginated && !isSRRelay) {
+        return;
+    }
+    // Guard: when firing T1 we re-enter send(); prevent scheduling T2
+    if (isRetransmitting) {
+        return;
+    }
+    // Require at least one confirmed relay neighbor (hearsUs = true)
+    if (!hasAnyHearsUsNeighbor()) {
+        LOG_DEBUG("[SR] No confirmed relay neighbors — skipping T1 for 0x%08x", p->id);
+        return;
+    }
+    // Skip if this packet already has a slot (active or canceled) — prevents T2
+    for (uint8_t i = 0; i < MAX_PENDING_RETRANSMITS; i++) {
+        if (pendingRetransmits[i].packetId == p->id) {
+            return;
+        }
+    }
+    // T1 delay = worst-case ROUTER_LATE window (SNR=+10 → CWsize=CWmax) + one packet airtime,
+    // ensuring every ROUTER_LATE node has had time to fire before we retransmit.
+    uint32_t latestRelayWindowMs = 0;
+    uint32_t airtimeMs = 0;
+    if (router && router->getRadioInterface()) {
+        latestRelayWindowMs = router->getRadioInterface()->getTxDelayMsecWeightedWorst(10.0f);
+        airtimeMs = router->getRadioInterface()->getPacketTime(p);
+    } else {
+        latestRelayWindowMs = 10000; // 10 s fallback
+        airtimeMs = 500;
+    }
+    uint32_t fireDelayMs = latestRelayWindowMs + airtimeMs;
+
+    // Allocate the copy before Router::send() encrypts the original in place
+    meshtastic_MeshPacket *copy = packetPool.allocCopy(*p);
+    if (!copy) {
+        LOG_WARN("[SR] Packet pool exhausted — skipping T1 for 0x%08x", p->id);
+        return;
+    }
+
+    // Find a free slot — prefer canceled/empty entries
+    PendingRetransmit *slot = nullptr;
+    for (uint8_t i = 0; i < MAX_PENDING_RETRANSMITS; i++) {
+        if (pendingRetransmits[i].packetId == 0 || pendingRetransmits[i].canceled) {
+            if (pendingRetransmits[i].packet) {
+                packetPool.release(pendingRetransmits[i].packet);
+            }
+            pendingRetransmits[i] = PendingRetransmit();
+            slot = &pendingRetransmits[i];
+            break;
+        }
+    }
+    if (!slot) {
+        // All four slots simultaneously active — extremely rare given MAX_PENDING_RETRANSMITS = 4
+        LOG_WARN("[SR] All retransmit slots occupied — dropping T1 for 0x%08x", p->id);
+        packetPool.release(copy);
+        return;
+    }
+
+    slot->packetId = p->id;
+    slot->packet = copy;
+    slot->fireAfterMs = millis() + fireDelayMs;
+    slot->canceled = false;
+
+    LOG_INFO("[SR] T1 scheduled for 0x%08x (%s) — fires in %ums (ROUTER_LATE window %ums + airtime %ums)",
+             p->id, isOriginated ? "originated" : "SR-relay", fireDelayMs, latestRelayWindowMs, airtimeMs);
+
+    // Ensure runOnce() wakes up in time to fire the retransmit
+    setIntervalFromNow(fireDelayMs);
+}
+
+void SignalRoutingModule::cancelBroadcastRetransmit(PacketId packetId)
+{
+    for (uint8_t i = 0; i < MAX_PENDING_RETRANSMITS; i++) {
+        if (pendingRetransmits[i].packetId == packetId && !pendingRetransmits[i].canceled) {
+            pendingRetransmits[i].canceled = true;
+            if (pendingRetransmits[i].packet) {
+                packetPool.release(pendingRetransmits[i].packet);
+                pendingRetransmits[i].packet = nullptr;
+            }
+            LOG_INFO("[SR] T1 canceled for 0x%08x — relay confirmed heard", packetId);
             return;
         }
     }
