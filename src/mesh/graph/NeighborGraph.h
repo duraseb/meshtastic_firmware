@@ -82,14 +82,23 @@ struct Edge {
     NodeNum to;
     uint16_t etxFixed;   // ETX * 100 (fixed-point, range 1.00-655.35)
     uint32_t lastUpdate; // Full timestamp (seconds since boot)
-    uint8_t variance;    // Position variance (0-255, scaled)
+    uint8_t etxVariance; // EWMA of |ETX change| × 20 (range 0.00–12.75 ETX units)
     Source source;
     bool hearsUs;        // True if this node has relayed our packets (confirmed bidirectional link)
 
-    Edge() : to(0), etxFixed(100), lastUpdate(0), variance(0), source(Source::Mirrored), hearsUs(false) {}
+    Edge() : to(0), etxFixed(100), lastUpdate(0), etxVariance(0), source(Source::Mirrored), hearsUs(false) {}
 
     float getEtx() const { return etxFixed / 100.0f; }
     void setEtx(float etx) { etxFixed = static_cast<uint16_t>(etx * 100.0f); }
+    float getEtxVariance() const { return etxVariance / 20.0f; }
+    void updateEtxVariance(float absChange)
+    {
+        // EWMA: alpha=0.25 for smooth tracking
+        float cur = etxVariance / 20.0f;
+        float updated = 0.75f * cur + 0.25f * absChange;
+        uint16_t scaled = static_cast<uint16_t>(updated * 20.0f + 0.5f);
+        etxVariance = (scaled > 255) ? 255 : static_cast<uint8_t>(scaled);
+    }
 };
 
 struct NodeEdges {
@@ -160,7 +169,7 @@ class NeighborGraph {
 
     // --- Core methods ---
 
-    int updateEdge(NodeNum from, NodeNum to, float etx, uint32_t timestamp, uint32_t variance = 0,
+    int updateEdge(NodeNum from, NodeNum to, float etx, uint32_t timestamp,
                    Edge::Source source = Edge::Source::Mirrored, bool updateTimestamp = true);
 
     const NodeEdges *getEdgesFrom(NodeNum node) const;

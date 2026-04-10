@@ -180,6 +180,16 @@ void SignalRoutingModule::markTopologyDirty()
     }
 }
 
+// Write the 5-byte packed header into buf.
+static inline void writePackedHeader(uint8_t *buf, uint8_t topologyVersion, bool signalRoutingActive)
+{
+    buf[0] = PACKED_NEIGHBOR_FORMAT_VERSION;
+    buf[1] = PACKED_NEIGHBOR_ENTRY_SIZE;
+    buf[2] = SIGNAL_ROUTING_VERSION;
+    buf[3] = topologyVersion;
+    buf[4] = signalRoutingActive ? PACKED_HEADER_FLAG_SR_ACTIVE : 0;
+}
+
 int32_t SignalRoutingModule::runOnce()
 {
     uint32_t nowMs = millis();
@@ -222,7 +232,9 @@ int32_t SignalRoutingModule::runOnce()
         if (needsBootBroadcast) {
             needsBootBroadcast = false;
             LOG_INFO("[SR] Sending empty boot broadcast to bootstrap topology");
-            sendTopologyPacket(NODENUM_BROADCAST, nullptr, 0, 0);
+            uint8_t bootBuf[PACKED_NEIGHBOR_HEADER_SIZE];
+            writePackedHeader(bootBuf, 0, isActiveRoutingRole());
+            sendTopologyPacket(NODENUM_BROADCAST, bootBuf, PACKED_NEIGHBOR_HEADER_SIZE);
         } else if (nowMs - lastBroadcast >= cfgBroadcastSecs * 1000) {
             sendSignalRoutingInfo();
             topologyDirty = false;
@@ -276,22 +288,23 @@ void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
         return;
     }
 
-    // Collect all neighbors into fixed-size array
-    static constexpr uint8_t MAX_BROADCAST_NEIGHBORS = MAX_SIGNAL_ROUTING_NEIGHBORS * 6;
-    meshtastic_SignalNeighbor allNeighbors[MAX_BROADCAST_NEIGHBORS];
-    uint8_t totalNeighbors = 0;
-    collectNeighborsForBroadcast(allNeighbors, totalNeighbors, MAX_BROADCAST_NEIGHBORS);
+    // Pack all neighbors into a large buffer (header placeholder + entries)
+    static constexpr size_t MAX_TOTAL_PACKED = MAX_SIGNAL_ROUTING_NEIGHBORS * 6 * PACKED_NEIGHBOR_ENTRY_SIZE + PACKED_NEIGHBOR_HEADER_SIZE;
+    uint8_t allPacked[MAX_TOTAL_PACKED];
+    uint8_t totalNeighbors = packNeighborsForBroadcast(allPacked, sizeof(allPacked));
+
+    uint8_t topologyVersion = currentTopologyVersion++;
+    bool srActive = isActiveRoutingRole();
 
     if (totalNeighbors == 0) {
         // Send empty broadcast to announce SR capability.
-        // SR nodes that receive this from a direct neighbor will trigger an early
-        // broadcast of their own topology, helping the new node bootstrap.
-        sendTopologyPacket(dest, nullptr, 0, 0);
+        uint8_t emptyBuf[PACKED_NEIGHBOR_HEADER_SIZE];
+        writePackedHeader(emptyBuf, topologyVersion, srActive);
+        sendTopologyPacket(dest, emptyBuf, PACKED_NEIGHBOR_HEADER_SIZE);
         return;
     }
 
     // Split into chunks of MAX_SIGNAL_ROUTING_NEIGHBORS and send multiple packets
-    uint8_t topologyVersion = currentTopologyVersion++;
     uint8_t packetsNeeded = (totalNeighbors + MAX_SIGNAL_ROUTING_NEIGHBORS - 1) / MAX_SIGNAL_ROUTING_NEIGHBORS;
 
     char ourName[48];
@@ -304,22 +317,29 @@ void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
     // finish transmitting packet N before packet N+1 arrives.
     uint32_t packetSpacingMs = 300; // conservative fallback
     if (router && router->getRadioInterface()) {
-        // Build a full-sized dummy packet to get an accurate airtime estimate
         meshtastic_SignalRoutingInfo dummyInfo = meshtastic_SignalRoutingInfo_init_zero;
-        dummyInfo.neighbors_count = std::min((uint8_t)MAX_SIGNAL_ROUTING_NEIGHBORS, totalNeighbors);
-        for (uint8_t i = 0; i < dummyInfo.neighbors_count; i++) {
-            dummyInfo.neighbors[i] = allNeighbors[i];
-        }
+        size_t chunkLen = PACKED_NEIGHBOR_HEADER_SIZE +
+                          std::min((uint8_t)MAX_SIGNAL_ROUTING_NEIGHBORS, totalNeighbors) * PACKED_NEIGHBOR_ENTRY_SIZE;
+        memcpy(dummyInfo.packed_neighbors.bytes, allPacked, std::min(chunkLen, sizeof(dummyInfo.packed_neighbors.bytes)));
+        dummyInfo.packed_neighbors.size = chunkLen;
         meshtastic_MeshPacket *dummy = allocDataProtobuf(dummyInfo);
         packetSpacingMs = 2 * router->getRadioInterface()->getPacketTime(dummy);
         packetPool.release(dummy);
     }
 
     for (uint8_t packetIndex = 0; packetIndex < packetsNeeded; packetIndex++) {
-        uint8_t startIdx = packetIndex * MAX_SIGNAL_ROUTING_NEIGHBORS;
-        uint8_t count = std::min((uint8_t)MAX_SIGNAL_ROUTING_NEIGHBORS, (uint8_t)(totalNeighbors - startIdx));
+        uint8_t startNeighbor = packetIndex * MAX_SIGNAL_ROUTING_NEIGHBORS;
+        uint8_t count = std::min((uint8_t)MAX_SIGNAL_ROUTING_NEIGHBORS, (uint8_t)(totalNeighbors - startNeighbor));
+
+        // Build per-packet packed buffer: 5-byte header + this chunk's entries
+        uint8_t chunkBuf[PACKED_NEIGHBOR_HEADER_SIZE + MAX_SIGNAL_ROUTING_NEIGHBORS * PACKED_NEIGHBOR_ENTRY_SIZE];
+        writePackedHeader(chunkBuf, topologyVersion, srActive);
+        size_t dataOffset = PACKED_NEIGHBOR_HEADER_SIZE + startNeighbor * PACKED_NEIGHBOR_ENTRY_SIZE;
+        memcpy(&chunkBuf[PACKED_NEIGHBOR_HEADER_SIZE], &allPacked[dataOffset], count * PACKED_NEIGHBOR_ENTRY_SIZE);
+        size_t chunkLen = PACKED_NEIGHBOR_HEADER_SIZE + count * PACKED_NEIGHBOR_ENTRY_SIZE;
+
         uint32_t txAfter = packetIndex > 0 ? millis() + packetIndex * packetSpacingMs : 0;
-        sendTopologyPacket(dest, &allNeighbors[startIdx], count, topologyVersion, txAfter);
+        sendTopologyPacket(dest, chunkBuf, chunkLen);
     }
 
     // Update our own capability after sending
@@ -332,18 +352,19 @@ void SignalRoutingModule::notifyOriginatedPacketSent()
     lastBroadcast = millis();
 }
 
-void SignalRoutingModule::collectNeighborsForBroadcast(meshtastic_SignalNeighbor *outNeighbors, uint8_t &outCount, uint8_t maxCount)
+uint8_t SignalRoutingModule::packNeighborsForBroadcast(uint8_t *outBuf, size_t bufSize)
 {
-    outCount = 0;
-    if (!routingGraph || !nodeDB) return;
+    if (!routingGraph || !nodeDB) {
+        return 0;
+    }
 
-    const NodeEdges* nodeEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
+    const NodeEdges *nodeEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
     if (!nodeEdges || nodeEdges->edgeCount == 0) {
-        return;
+        return 0;
     }
 
     // Collect non-placeholder edge pointers into a fixed-size array for sorting
-    const Edge* edgePtrs[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
+    const Edge *edgePtrs[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
     uint8_t edgeCount = 0;
     for (uint8_t i = 0; i < nodeEdges->edgeCount && edgeCount < NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE; i++) {
         if (!isPlaceholderNode(nodeEdges->edges[i].to)) {
@@ -352,46 +373,60 @@ void SignalRoutingModule::collectNeighborsForBroadcast(meshtastic_SignalNeighbor
     }
 
     // Sort by quality (reported first, then by ETX)
-    std::sort(edgePtrs, edgePtrs + edgeCount, [](const Edge* a, const Edge* b) {
+    std::sort(edgePtrs, edgePtrs + edgeCount, [](const Edge *a, const Edge *b) {
         if (a->source != b->source) {
             return a->source == Edge::Source::Reported;
         }
         return a->getEtx() < b->getEtx();
     });
 
-    // Convert to SignalNeighbor format
-    for (uint8_t i = 0; i < edgeCount && outCount < maxCount; i++) {
-        const Edge* edge = edgePtrs[i];
-        meshtastic_SignalNeighbor &neighbor = outNeighbors[outCount];
-        memset(&neighbor, 0, sizeof(neighbor));
+    // Reserve header space (caller fills in the full 5-byte header per chunk via writePackedHeader)
+    memset(outBuf, 0, PACKED_NEIGHBOR_HEADER_SIZE);
 
-        neighbor.node_id = edge->to;
-        neighbor.position_variance = edge->variance;
+    // Pack each neighbor as 8 bytes: [4B node_id LE][1B rssi][1B snr][1B flags][1B etx_variance]
+    uint8_t count = 0;
+    size_t maxEntries = (bufSize - PACKED_NEIGHBOR_HEADER_SIZE) / PACKED_NEIGHBOR_ENTRY_SIZE;
+    for (uint8_t i = 0; i < edgeCount && count < maxEntries; i++) {
+        const Edge *edge = edgePtrs[i];
+        uint8_t *entry = &outBuf[PACKED_NEIGHBOR_HEADER_SIZE + count * PACKED_NEIGHBOR_ENTRY_SIZE];
 
-        CapabilityStatus neighborStatus = getCapabilityStatus(edge->to);
-        neighbor.signal_routing_active = (neighborStatus == CapabilityStatus::SRactive);
-        neighbor.hears_us = edge->hearsUs;
+        // node_id in little-endian
+        uint32_t nodeId = edge->to;
+        entry[0] = (nodeId >> 0) & 0xFF;
+        entry[1] = (nodeId >> 8) & 0xFF;
+        entry[2] = (nodeId >> 16) & 0xFF;
+        entry[3] = (nodeId >> 24) & 0xFF;
 
         int32_t rssi32, snr32;
         NeighborGraph::etxToSignal(edge->getEtx(), rssi32, snr32);
-        neighbor.rssi = static_cast<int8_t>(std::max((int32_t)-128, std::min((int32_t)127, rssi32)));
-        neighbor.snr = static_cast<int8_t>(std::max((int32_t)-128, std::min((int32_t)127, snr32)));
+        entry[4] = static_cast<uint8_t>(static_cast<int8_t>(std::max((int32_t)-128, std::min((int32_t)127, rssi32))));
+        entry[5] = static_cast<uint8_t>(static_cast<int8_t>(std::max((int32_t)-128, std::min((int32_t)127, snr32))));
 
-        outCount++;
+        uint8_t flags = 0;
+        CapabilityStatus neighborStatus = getCapabilityStatus(edge->to);
+        if (neighborStatus == CapabilityStatus::SRactive) {
+            flags |= PACKED_NEIGHBOR_FLAG_SR_ACTIVE;
+        }
+        if (edge->hearsUs) {
+            flags |= PACKED_NEIGHBOR_FLAG_HEARS_US;
+        }
+        entry[6] = flags;
+        entry[7] = edge->etxVariance;
+
+        count++;
     }
+
+    return count;
 }
 
-void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const meshtastic_SignalNeighbor *neighbors, uint8_t count, uint8_t topologyVersion, uint32_t txAfterMs)
+void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const uint8_t *packedData, size_t packedLen, uint8_t /*topologyVersion*/, uint32_t txAfterMs)
 {
     meshtastic_SignalRoutingInfo info = meshtastic_SignalRoutingInfo_init_zero;
-    info.signal_routing_active = isActiveRoutingRole();
-    info.routing_version = SIGNAL_ROUTING_VERSION;
-    info.topology_version = topologyVersion;
-    info.neighbors_count = count;
 
-    // Copy neighbors to info struct
-    for (uint8_t i = 0; i < count && i < MAX_SIGNAL_ROUTING_NEIGHBORS; i++) {
-        info.neighbors[i] = neighbors[i];
+    if (packedData && packedLen > 0) {
+        size_t copyLen = std::min(packedLen, sizeof(info.packed_neighbors.bytes));
+        memcpy(info.packed_neighbors.bytes, packedData, copyLen);
+        info.packed_neighbors.size = copyLen;
     }
 
     meshtastic_MeshPacket *p = allocDataProtobuf(info);
@@ -412,12 +447,12 @@ void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const meshtastic_Sign
 }
 
 
-void SignalRoutingModule::updateGraphWithNeighbor(NodeNum sender, const meshtastic_SignalNeighbor &neighbor)
+void SignalRoutingModule::updateGraphWithNeighbor(NodeNum sender, NodeNum neighborId, int8_t rssi, int8_t snr, bool hearsUs)
 {
     // Add/update edge from sender to this neighbor
     if (routingGraph) {
-        float etx = (neighbor.rssi != 0 || neighbor.snr != 0)
-                        ? NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr)
+        float etx = (rssi != 0 || snr != 0)
+                        ? NeighborGraph::calculateETX(rssi, snr)
                         : 1.0f;
         uint32_t currentTime = millis() / 1000;
 
@@ -426,11 +461,11 @@ void SignalRoutingModule::updateGraphWithNeighbor(NodeNum sender, const meshtast
         // Refreshing it here would create phantom references — a dead node stays in the graph
         // as long as any neighbor keeps mentioning it, potentially chaining across multiple hops.
         // New edges (first creation) still receive currentTime from the new-edge path in updateEdge.
-        routingGraph->updateEdge(sender, neighbor.node_id, etx, currentTime,
-                                 /*variance=*/0, Edge::Source::Mirrored, /*updateTimestamp=*/false);
+        routingGraph->updateEdge(sender, neighborId, etx, currentTime,
+                                 Edge::Source::Mirrored, /*updateTimestamp=*/false);
 
         // Propagate the bidirectional link flag from the authoritative sender
-        routingGraph->setEdgeHearsUs(sender, neighbor.node_id, neighbor.hears_us);
+        routingGraph->setEdgeHearsUs(sender, neighborId, hearsUs);
     }
 }
 
@@ -469,32 +504,39 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
         }
     }
 
-    // Decode the protobuf to get neighbor data
+    // Decode the protobuf to get the packed binary blob
     meshtastic_SignalRoutingInfo info = meshtastic_SignalRoutingInfo_init_zero;
     if (!pb_decode_from_bytes(p->decoded.payload.bytes, p->decoded.payload.size,
                               &meshtastic_SignalRoutingInfo_msg, &info)) {
-        LOG_WARN("[SR] Failed to decode SignalRoutingInfo from %08x (payload size=%u)", 
+        LOG_WARN("[SR] Failed to decode SignalRoutingInfo from %08x (payload size=%u)",
                  p->from, p->decoded.payload.size);
         return;
     }
 
+    // Decode packed neighbors and header
+    PackedHeader hdr = {};
+    PackedNeighborEntry neighbors[MAX_SIGNAL_ROUTING_NEIGHBORS];
+    uint8_t neighborCount = decodePackedNeighbors(info.packed_neighbors.bytes, info.packed_neighbors.size,
+                                                   neighbors, MAX_SIGNAL_ROUTING_NEIGHBORS, &hdr);
+
+    // V2 packets land on field 3 but fail the format_version check — treat as stock node, skip
+    if (hdr.formatVersion != PACKED_NEIGHBOR_FORMAT_VERSION) {
+        return;
+    }
+
     // Check version validity with wraparound logic
-    uint8_t receivedVersion = info.topology_version;
+    uint8_t receivedVersion = hdr.topologyVersion;
     uint8_t lastProcessedVersion = getTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, p->from);
 
     bool accept = false;
     if (receivedVersion > lastProcessedVersion) {
-        // Normal case: received is higher, accept
         accept = true;
     } else if (receivedVersion < lastProcessedVersion) {
-        // Check if received is within 100 of the wraparound point
         uint8_t threshold = (lastProcessedVersion + 256 - 100) % 256;
         if (receivedVersion >= threshold || receivedVersion < 100) {
             accept = true;
         }
     } else if (receivedVersion == lastProcessedVersion) {
-        // Same version - this could be a retransmission or multi-packet
-        // Accept it to handle merging
         accept = true;
     }
 
@@ -504,14 +546,11 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
         return;
     }
 
-    // Check if this is a NEW topology version (not a continuation of multi-packet broadcast)
     bool isNewVersion = (receivedVersion != lastProcessedVersion);
-    
-    // Update version tracking
     setTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, p->from, receivedVersion);
 
-    // Update capability status for the sender (this is normally done in handleReceivedProtobuf)
-    CapabilityStatus newStatus = info.signal_routing_active ? CapabilityStatus::SRactive : CapabilityStatus::Passive;
+    // Update capability status for the sender
+    CapabilityStatus newStatus = hdr.signalRoutingActive ? CapabilityStatus::SRactive : CapabilityStatus::Passive;
     CapabilityStatus oldStatus = getCapabilityStatus(p->from);
     trackNodeCapability(p->from, newStatus);
 
@@ -522,17 +561,14 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
                 senderName, (int)oldStatus, (int)newStatus);
     }
 
-    // Process topology directly from the received packet - no intermediate storage
     char senderNameForTopo[48];
     getNodeDisplayName(p->from, senderNameForTopo, sizeof(senderNameForTopo));
     LOG_INFO("[SR] Processing topology from %s: %d neighbors (version %u, %s, relay=0x%02x)",
-              senderNameForTopo, info.neighbors_count, receivedVersion,
+              senderNameForTopo, neighborCount, receivedVersion,
               isNewVersion ? "new version" : "continuation", p->relay_node);
 
     // Empty SR broadcast from a direct SR neighbor = bootstrap request.
-    // Mark topology dirty so we broadcast our topology at the next opportunity
-    // (immediately if the min inter-broadcast interval has elapsed, otherwise when it does).
-    if (info.neighbors_count == 0 && isDirectPacket(*p) && info.signal_routing_active) {
+    if (neighborCount == 0 && isDirectPacket(*p) && hdr.signalRoutingActive) {
         LOG_INFO("[SR] Empty broadcast from direct SR neighbor %s — marking topology dirty",
                  senderNameForTopo);
         markTopologyDirty();
@@ -540,34 +576,29 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
 
     // Mirrored edges are not cleared on new topology versions — they age out naturally.
 
-    // Process each neighbor directly from the received info - memory efficient
-    for (pb_size_t i = 0; i < info.neighbors_count; i++) {
-        const meshtastic_SignalNeighbor& neighbor = info.neighbors[i];
+    // Process each neighbor from the decoded packed data
+    for (uint8_t i = 0; i < neighborCount; i++) {
+        const PackedNeighborEntry &neighbor = neighbors[i];
 
         // Reject neighbors with invalid node IDs (0 or placeholders)
-        if (neighbor.node_id == 0 || isPlaceholderNode(neighbor.node_id)) {
-            LOG_WARN("[SR] Skipping invalid neighbor node ID: %08x", neighbor.node_id);
+        if (neighbor.nodeId == 0 || isPlaceholderNode(neighbor.nodeId)) {
+            LOG_WARN("[SR] Skipping invalid neighbor node ID: %08x", neighbor.nodeId);
             continue;
         }
 
-        // Process this neighbor directly - no need for protobuf handler since we already validated the main packet
-        // This is just for graph updates, capability status was already handled for the main sender
-        updateGraphWithNeighbor(p->from, neighbor);
+        // Process this neighbor directly - capability status was already handled for the main sender
+        updateGraphWithNeighbor(p->from, neighbor.nodeId, neighbor.rssi, neighbor.snr, neighbor.hearsUs);
 
         // Create gateway relationship ONLY for nodes we cannot hear directly
-        // This ensures remote nodes appear as downstream of the SR broadcaster node,
-        // but nodes we can hear directly are not incorrectly marked as downstream
         bool hasDirectConnection = false;
         NodeNum ourNode = nodeDB ? nodeDB->getNodeNum() : 0;
 
         // Never mark ourselves as downstream of anyone
-        if (neighbor.node_id == ourNode) {
+        if (neighbor.nodeId == ourNode) {
             hasDirectConnection = true;
         } else if (routingGraph) {
-            // A direct connection is confirmed if the neighbor has a Reported edge TO us —
-            // meaning we have received their signal directly (updateNeighborInfo stores
-            // Reported edges as neighbor→us, not us→neighbor).
-            const NodeEdges* neighborEdges = routingGraph->getEdgesFrom(neighbor.node_id);
+            // A direct connection is confirmed if the neighbor has a Reported edge TO us
+            const NodeEdges *neighborEdges = routingGraph->getEdgesFrom(neighbor.nodeId);
             if (neighborEdges) {
                 for (uint8_t j = 0; j < neighborEdges->edgeCount; j++) {
                     if (neighborEdges->edges[j].to == ourNode &&
@@ -578,23 +609,15 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
                 }
             }
         }
-        
-        // Topology broadcasts share graph connectivity (ETX/routing information) and establish hierarchy
-        // Create topology-based gateway relationships for all neighbors in broadcasts. This creates
-        // an information-source hierarchy where nodes appear under the SR node that provided
-        // their topology information, regardless of relaying history.
 
-        // Detailed logging for debugging topology processing
         char neighborName[48];
-        getNodeDisplayName(neighbor.node_id, neighborName, sizeof(neighborName));
+        getNodeDisplayName(neighbor.nodeId, neighborName, sizeof(neighborName));
 
         if (!hasDirectConnection) {
-            // Establish topology-based hierarchy: nodes learned through topology broadcasts
-            // appear as downstream of the broadcasting node, creating a information-source hierarchy
             LOG_INFO("[SR]   -> %s: NO direct connection, marking as downstream of topology source %s",
                     neighborName, senderNameForTopo);
             float etxForDownstream = NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr);
-            routingGraph->updateDownstream(neighbor.node_id, p->from, etxForDownstream, millis() / 1000);
+            routingGraph->updateDownstream(neighbor.nodeId, p->from, etxForDownstream, millis() / 1000);
         } else {
             LOG_INFO("[SR]   -> %s: HAS direct connection, sender confirms reachability",
                     neighborName);
@@ -633,9 +656,19 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
     char senderName[64];
     getNodeDisplayName(mp.from, senderName, sizeof(senderName));
 
+    // Decode packed neighbors and header
+    PackedHeader hdr = {};
+    PackedNeighborEntry neighbors[MAX_SIGNAL_ROUTING_NEIGHBORS];
+    uint8_t neighborCount = decodePackedNeighbors(p->packed_neighbors.bytes, p->packed_neighbors.size,
+                                                   neighbors, MAX_SIGNAL_ROUTING_NEIGHBORS, &hdr);
+
+    // V2 packets land on field 3 but fail the format_version check — treat as stock node, skip
+    if (hdr.formatVersion != PACKED_NEIGHBOR_FORMAT_VERSION) {
+        return false;
+    }
+
     // Mark sender based on their claimed SR capability
-    // ALL nodes (active and passive) should track capability status of other SR nodes
-    CapabilityStatus newStatus = p->signal_routing_active ? CapabilityStatus::SRactive : CapabilityStatus::Passive;
+    CapabilityStatus newStatus = hdr.signalRoutingActive ? CapabilityStatus::SRactive : CapabilityStatus::Passive;
     CapabilityStatus oldStatus = getCapabilityStatus(mp.from);
     trackNodeCapability(mp.from, newStatus);
 
@@ -645,26 +678,22 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
     }
 
     // Inactive SR roles don't participate in routing decisions - skip topology learning from broadcasts
-    // But they still tracked the sender's capability above
     if (!isActiveRoutingRole()) {
         LOG_INFO("[SR] Passive role: Tracking capability from %s but not processing topology (node count %d)",
-                  senderName, p->neighbors_count);
+                  senderName, neighborCount);
         return false;
     }
 
-    if (p->neighbors_count == 0) {
+    if (neighborCount == 0) {
         LOG_INFO("[SR] %s is online (SR v%d, %s) - no neighbors detected yet",
-                 senderName, p->routing_version,
-                 p->signal_routing_active ? "SR-active" : "passive");
+                 senderName, hdr.routingVersion,
+                 hdr.signalRoutingActive ? "SR-active" : "passive");
 
-        // Clear downstream entries for SR-capable nodes with no neighbors - they can't be relays
-        if (p->signal_routing_active) {
+        if (hdr.signalRoutingActive) {
             routingGraph->clearDownstreamForRelay(mp.from);
         }
 
-        // Bootstrap: if preProcessSignalRoutingPacket didn't run (topology not yet healthy),
-        // mark dirty here so we send our topology at the next opportunity.
-        if (p->signal_routing_active && isDirectPacket(mp)) {
+        if (hdr.signalRoutingActive && isDirectPacket(mp)) {
             LOG_INFO("[SR] Empty broadcast from direct SR neighbor %s — marking topology dirty",
                      senderName);
             markTopologyDirty();
@@ -674,67 +703,57 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
     }
 
     LOG_INFO("[SR] RECEIVED: %s reports %d neighbors (SR v%d, %s)",
-             senderName, p->neighbors_count, p->routing_version,
-             p->signal_routing_active ? "SR-active" : "passive");
+             senderName, neighborCount, hdr.routingVersion,
+             hdr.signalRoutingActive ? "SR-active" : "passive");
 
-    // For passive SR nodes (signal_routing_active = false), we still need to store their edges for direct connection checks
-    // Active nodes use these edges to determine if a passive SR node has direct connections to destinations
-    // However, routing algorithms must not consider paths through passive SR nodes since they don't relay
-    if (!p->signal_routing_active) {
+    if (!hdr.signalRoutingActive) {
         LOG_INFO("[SR] Received topology from passive SR node %08x - storing edges for direct connection detection", mp.from);
     }
 
     // Check if preProcessSignalRoutingPacket already handled edge clearing and rebuilding
-    // for this exact version — skip redundant work if so
     uint8_t preProcessedVer = getTopologyVersion(lastPreProcessedVersion, lastPreProcessedVersionCount, mp.from);
-    bool alreadyPreProcessed = (preProcessedVer != 0 && preProcessedVer == p->routing_version);
+    bool alreadyPreProcessed = (preProcessedVer != 0 && preProcessedVer == hdr.routingVersion);
 
     if (!alreadyPreProcessed) {
         // Clear inferred edges pointing TO this node that were created before we knew it was SR-capable
         routingGraph->clearInferredEdgesToNode(mp.from);
 
-        // Add edges from each neighbor TO the sender
         uint32_t rxTime = millis() / 1000;
-        for (pb_size_t i = 0; i < p->neighbors_count; i++) {
-            const meshtastic_SignalNeighbor& neighbor = p->neighbors[i];
+        for (uint8_t i = 0; i < neighborCount; i++) {
+            const PackedNeighborEntry &neighbor = neighbors[i];
 
-            if (neighbor.node_id == 0 || isPlaceholderNode(neighbor.node_id)) {
+            if (neighbor.nodeId == 0 || isPlaceholderNode(neighbor.nodeId)) {
                 continue;
             }
 
             float etx = NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr);
 
-            uint32_t scaledVariance = static_cast<uint32_t>(neighbor.position_variance) * 12;
-
-            routingGraph->updateEdge(neighbor.node_id, mp.from, etx, rxTime, scaledVariance,
+            routingGraph->updateEdge(neighbor.nodeId, mp.from, etx, rxTime,
                                      Edge::Source::Reported);
-            routingGraph->updateEdge(mp.from, neighbor.node_id, etx, rxTime, scaledVariance,
+            routingGraph->updateEdge(mp.from, neighbor.nodeId, etx, rxTime,
                                      Edge::Source::Mirrored);
 
-            // Propagate the bidirectional link flag from the authoritative sender.
-            // SR nodes report their own edges — always trust their current claim.
-            routingGraph->setEdgeHearsUs(mp.from, neighbor.node_id, neighbor.hears_us);
+            routingGraph->setEdgeHearsUs(mp.from, neighbor.nodeId, neighbor.hearsUs);
         }
     } else {
         LOG_INFO("[SR] Skipping redundant edge rebuild for %s (already pre-processed version %u)",
-                 senderName, p->routing_version);
+                 senderName, hdr.routingVersion);
     }
 
     // Always process gateway relations and logging (even if edges were already built)
-    for (pb_size_t i = 0; i < p->neighbors_count; i++) {
-        const meshtastic_SignalNeighbor& neighbor = p->neighbors[i];
+    for (uint8_t i = 0; i < neighborCount; i++) {
+        const PackedNeighborEntry &neighbor = neighbors[i];
 
-        if (neighbor.node_id == 0 || isPlaceholderNode(neighbor.node_id)) {
+        if (neighbor.nodeId == 0 || isPlaceholderNode(neighbor.nodeId)) {
             continue;
         }
 
         char neighborName[64];
-        getNodeDisplayName(neighbor.node_id, neighborName, sizeof(neighborName));
+        getNodeDisplayName(neighbor.nodeId, neighborName, sizeof(neighborName));
 
         float etx = NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr);
 
-        // Classify signal quality for user-friendly display
-        const char* quality;
+        const char *quality;
         if (etx < 2.0f) quality = "excellent";
         else if (etx < 4.0f) quality = "good";
         else if (etx < 8.0f) quality = "fair";
@@ -742,27 +761,27 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
 
         LOG_INFO("  ├── %s: %s link (%s, ETX=%.1f, var=%u)",
                  neighborName,
-                 neighbor.signal_routing_active ? "SR-active" : "SR-inactive",
+                 neighbor.signalRoutingActive ? "SR-active" : "SR-inactive",
                  quality, etx,
-                 neighbor.position_variance);
+                 neighbor.etxVariance);
 
         // If the sender is SR-capable and reports this neighbor as directly reachable,
-        // clear downstream entries for this neighbor - it's now reachable via the SR network
-        if (p->signal_routing_active) {
-            NodeNum relayForNeighbor = routingGraph->getDownstreamRelay(neighbor.node_id);
+        // clear downstream entries for this neighbor
+        if (hdr.signalRoutingActive) {
+            NodeNum relayForNeighbor = routingGraph->getDownstreamRelay(neighbor.nodeId);
             if (relayForNeighbor != 0 && relayForNeighbor != mp.from) {
                 char gwName[64];
                 getNodeDisplayName(relayForNeighbor, gwName, sizeof(gwName));
                 LOG_INFO("[SR] Clearing downstream for %s (now directly reachable via %s, was via %s)",
                          neighborName, senderName, gwName);
-                routingGraph->clearDownstreamForDestination(neighbor.node_id);
+                routingGraph->clearDownstreamForDestination(neighbor.nodeId);
             }
         }
     }
 
     // Log network topology summary
     LOG_INFO("[SR] Network topology updated - %s now connected to %d neighbors",
-             senderName, p->neighbors_count);
+             senderName, neighborCount);
 
     // Allow others to see this packet too
     return false;
@@ -1493,7 +1512,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                 float defaultSnr = 5.0f;  // default SNR for inferred connectivity
 
                 routingGraph->updateEdge(inferredRelayer, mp.from, NeighborGraph::calculateETX(defaultRssi, defaultSnr),
-                                         monotonicTimestamp, 0, Edge::Source::Mirrored);
+                                         monotonicTimestamp, Edge::Source::Mirrored);
             } else {
                 LOG_INFO("[SR] Skipping direct connectivity inference: relayer %08x is not confirmed Legacy (status=%d)",
                          inferredRelayer, (int)getCapabilityStatus(inferredRelayer));
@@ -2901,7 +2920,7 @@ NodeNum SignalRoutingModule::findBetterPositionedNeighbor(NodeNum destination, N
     return bestNeighbor;
 }
 
-void SignalRoutingModule::updateNeighborInfo(NodeNum nodeId, int32_t rssi, float snr, uint32_t lastRxTime, uint32_t variance)
+void SignalRoutingModule::updateNeighborInfo(NodeNum nodeId, int32_t rssi, float snr, uint32_t lastRxTime)
 {
     if (!routingGraph || !nodeDB) return;
 
@@ -2920,14 +2939,12 @@ void SignalRoutingModule::updateNeighborInfo(NodeNum nodeId, int32_t rssi, float
     // Store edge: nodeId → us (the direction of the transmission we measured)
     // This is used for routing decisions when traffic needs to reach us
     int changeType =
-        routingGraph->updateEdge(nodeId, myNode, etx, monotonicTimestamp, variance, Edge::Source::Reported);
+        routingGraph->updateEdge(nodeId, myNode, etx, monotonicTimestamp, Edge::Source::Reported);
 
     // Also store reverse edge: us → nodeId (assuming approximately symmetric link)
     // Since we directly measured the link quality (even if in the opposite direction),
     // mark this as Reported source, not Mirrored
-    routingGraph->updateEdge(myNode, nodeId, etx, monotonicTimestamp, variance
-                             , Edge::Source::Reported
-                             );
+    routingGraph->updateEdge(myNode, nodeId, etx, monotonicTimestamp, Edge::Source::Reported);
 
     // If significant change, consider sending an update sooner
     if (changeType != EDGE_NO_CHANGE) {
@@ -3053,17 +3070,7 @@ void SignalRoutingModule::handlePositionPacket(const meshtastic_MeshPacket &mp, 
               senderName, isDirectNeighbor ? "true" : "false", latitude, longitude, speed, dop, mp.rx_rssi, mp.rx_snr);
 
     if (isDirectNeighbor && mp.rx_rssi != 0) {
-        uint32_t variance = 0;
-        if (position.gps_accuracy && position.PDOP) {
-            uint32_t dopFactor = std::max<uint32_t>(1, position.PDOP / 100);
-            variance = std::min<uint32_t>(3000, (position.gps_accuracy / 1000) * dopFactor);
-        } else if (position.has_ground_speed && position.ground_speed) {
-            variance = std::min<uint32_t>(3000, position.ground_speed * 5);
-        }
-
-        if (variance > 0) {
-            updateNeighborInfo(mp.from, mp.rx_rssi, mp.rx_snr, mp.rx_time, variance);
-        }
+        updateNeighborInfo(mp.from, mp.rx_rssi, mp.rx_snr, mp.rx_time);
     }
 }
 

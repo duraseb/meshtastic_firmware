@@ -156,7 +156,7 @@ All discovery mechanisms are used to maintain comprehensive network topology:
 
 1. **Direct Neighbor Detection**: When receiving packets directly with signal data (RSSI/SNR), immediate neighbor relationships are established with calculated ETX values
 
-2. **Topology Broadcasts**: Periodically broadcast their complete neighbor list for comprehensive topology learning from other nodes' perspectives. The `hop_limit` of every SR topology packet is capped at `cfgBroadcastMaxHops` (default `SR_BROADCAST_MAX_HOPS`), even if the user has configured a higher limit, to bound topology gossip propagation in large networks.
+2. **Topology Broadcasts**: Periodically broadcast their complete neighbor list using a packed binary format (8 bytes/neighbor) for comprehensive topology learning from other nodes' perspectives. Each entry carries the neighbor's node ID, RSSI, SNR, capability flags, and ETX variance — giving every node the same link stability view. The `hop_limit` of every SR topology packet is capped at `cfgBroadcastMaxHops` (default `SR_BROADCAST_MAX_HOPS`), even if the user has configured a higher limit, to bound topology gossip propagation in large networks.
 
 3. **Relayed Packet Inference**: When receiving a relayed packet, gateway relationships are inferred between the original sender and the relay node. If the relay node is a stock (Legacy) firmware node, a directed edge is also recorded from the relay to the sender — observing a successful relay proves the relay can hear the sender, regardless of the sender's firmware type. The reverse edge is not assumed.
 
@@ -576,7 +576,7 @@ All SR tuning parameters can be set at runtime via the Meshtastic admin interfac
 | `node_ttl_secs` | uint32 | `NODE_TTL_SECS` | Node aging TTL — nodes not heard within this window are removed from the graph |
 | `broadcast_max_hops` | uint32 | `SR_BROADCAST_MAX_HOPS` | `hop_limit` cap applied to SR topology broadcast packets |
 | `poor_link_etx_threshold` | float | `7.0` | ETX above which a link is excluded from pre-coverage marking in relay decisions |
-| `etx_change_threshold` | float | `NeighborGraph::etxChangeThreshold` (default `1.0`) | Minimum ETX delta to register an edge update as significant and trigger a dirty broadcast |
+| `etx_change_threshold` | float | `NeighborGraph::etxChangeThreshold` (default `1.0`) | Base ETX delta threshold; per-edge `etxVariance` is added so noisy links need bigger jumps to trigger dirty |
 
 \* proto3 booleans default to `false` on the wire. When writing any SR config, always set `enabled=true` and `t1_retransmit_enabled=true` unless you explicitly want those features off. If no SR config is stored (`has_signal_routing=false`), firmware defaults apply (both features on).
 
@@ -589,7 +589,7 @@ The default values for the configurable parameters above are defined in `SignalR
 #define SIGNAL_ROUTING_BROADCAST_SECS        360   // periodic topology broadcast interval
 #define SIGNAL_ROUTING_DIRTY_BROADCAST_SECS  300   // minimum gap before early dirty broadcast (5 min)
 #define SR_BROADCAST_MAX_HOPS                  5   // hop_limit cap for topology packets
-#define MAX_SIGNAL_ROUTING_NEIGHBORS          11   // neighbors per broadcast payload (fits 233-byte limit)
+#define MAX_SIGNAL_ROUTING_NEIGHBORS          28   // neighbors per broadcast payload (packed binary, fits 233-byte limit)
 
 // SignalRoutingModule.h (private, class scope)
 static constexpr uint32_t NODE_TTL_SECS = 5400;   // 90 min — graph aging TTL for all nodes
@@ -598,7 +598,8 @@ static constexpr uint32_t ROUTE_CACHE_TIMEOUT_SECS = 300;      // Dijkstra resul
 static constexpr uint32_t CAPABILITY_TTL_SECS = SIGNAL_ROUTING_BROADCAST_SECS * 3 + 10;  // node capability cache
 
 // NeighborGraph.h (private instance variable)
-float etxChangeThreshold = 1.0f;   // minimum ETX delta for a significant edge change
+float etxChangeThreshold = 1.0f;   // minimum ETX delta for a significant edge change (base; per-edge etxVariance added)
+uint8_t etxVariance;               // EWMA of |ETX change| × 20 on each edge — locally computed, broadcast to all
 ```
 
 ### Prompt Dirty-Topology Rebroadcast (`markTopologyDirty()`)

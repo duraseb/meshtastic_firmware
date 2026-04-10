@@ -286,7 +286,10 @@ void RadioLibInterface::onNotify(uint32_t notification)
                 } else {
                     if (isChannelActive()) { // check if there is currently a LoRa packet on the channel
                         startReceive();      // try receiving this packet, afterwards we'll be trying to transmit again
-                        setTransmitDelay();
+                        // Don't redraw the delay — the original backoff has been served.
+                        // Wait one slot and recheck. Drawing a new random delay here causes
+                        // a tight thrash loop (12-108ms cycles) for Router/SR committed relays.
+                        notifyLater(slotTimeMsec, TRANSMIT_DELAY_COMPLETED, false);
                     } else {
                         // Send any outgoing packets we have ready as fast as possible to keep the time between channel scan and
                         // actual transmission as short as possible

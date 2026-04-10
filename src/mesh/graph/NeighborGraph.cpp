@@ -130,7 +130,7 @@ bool NeighborGraph::isOurDirectNeighbor(NodeNum nodeId) const
 
 // --- Core methods ---
 
-int NeighborGraph::updateEdge(NodeNum from, NodeNum to, float etx, uint32_t timestamp, uint32_t variance,
+int NeighborGraph::updateEdge(NodeNum from, NodeNum to, float etx, uint32_t timestamp,
                               Edge::Source source, bool updateTimestamp)
 {
     NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
@@ -186,16 +186,22 @@ int NeighborGraph::updateEdge(NodeNum from, NodeNum to, float etx, uint32_t time
         }
 
         float oldEtx = edge->getEtx();
-        float change = (oldEtx > 0.0f) ? fabs(etx - oldEtx) / oldEtx : 1.0f;
+        float absChange = fabs(etx - oldEtx);
+        float relChange = (oldEtx > 0.0f) ? absChange / oldEtx : 1.0f;
 
         edge->setEtx(etx);
         if (updateTimestamp) {
             edge->lastUpdate = timestamp;
         }
-        edge->variance = ((variance + 6) / 12 > 255) ? 255 : static_cast<uint8_t>((variance + 6) / 12);
+        // Update EWMA variance only on direct observations (Reported edges)
+        if (source == Edge::Source::Reported) {
+            edge->updateEtxVariance(absChange);
+        }
         edge->source = source;
 
-        return (change > etxChangeThreshold) ? EDGE_SIGNIFICANT_CHANGE : EDGE_NO_CHANGE;
+        // Per-edge dirty threshold: noisy links need bigger jumps to trigger dirty
+        float dynamicThreshold = etxChangeThreshold + edge->getEtxVariance();
+        return (relChange > dynamicThreshold) ? EDGE_SIGNIFICANT_CHANGE : EDGE_NO_CHANGE;
     }
 
     // Add new edge
@@ -204,7 +210,7 @@ int NeighborGraph::updateEdge(NodeNum from, NodeNum to, float etx, uint32_t time
         edge->to = to;
         edge->setEtx(etx);
         edge->lastUpdate = timestamp;
-        edge->variance = ((variance + 6) / 12 > 255) ? 255 : static_cast<uint8_t>((variance + 6) / 12);
+        edge->etxVariance = 0;
         edge->source = source;
 
         // Remove redundant downstream entry now that we have a proper edge
@@ -239,7 +245,7 @@ int NeighborGraph::updateEdge(NodeNum from, NodeNum to, float etx, uint32_t time
         edge->to = to;
         edge->setEtx(etx);
         edge->lastUpdate = timestamp;
-        edge->variance = ((variance + 6) / 12 > 255) ? 255 : static_cast<uint8_t>((variance + 6) / 12);
+        edge->etxVariance = 0;
         edge->source = source;
         edge->hearsUs = false; // Reset on edge replacement — must be re-confirmed
         return EDGE_SIGNIFICANT_CHANGE;

@@ -7,10 +7,80 @@
 #include "graph/NeighborGraph.h"
 
 // Routing protocol version for compatibility checking
-#define SIGNAL_ROUTING_VERSION 2
+#define SIGNAL_ROUTING_VERSION 3
 
-// Maximum neighbors per SR broadcast packet (11 fit in 233 byte payload)
-#define MAX_SIGNAL_ROUTING_NEIGHBORS 11
+// Packed neighbor format constants
+static constexpr uint8_t PACKED_NEIGHBOR_FORMAT_VERSION = 1;
+static constexpr uint8_t PACKED_NEIGHBOR_ENTRY_SIZE = 8; // bytes per entry: 4 node_id + 1 rssi + 1 snr + 1 flags + 1 etx_variance
+static constexpr uint8_t PACKED_NEIGHBOR_HEADER_SIZE = 5; // format_version + entry_size + routing_version + topology_version + header_flags
+static constexpr uint8_t PACKED_NEIGHBOR_FLAG_SR_ACTIVE = 0x01;
+static constexpr uint8_t PACKED_NEIGHBOR_FLAG_HEARS_US = 0x02;
+static constexpr uint8_t PACKED_HEADER_FLAG_SR_ACTIVE = 0x01;
+
+// Maximum neighbors per SR broadcast packet (28 fit in 233 byte payload with packed encoding)
+#define MAX_SIGNAL_ROUTING_NEIGHBORS 28
+
+// Decoded packed neighbor entry for iteration
+struct PackedNeighborEntry {
+    NodeNum nodeId;
+    int8_t rssi;
+    int8_t snr;
+    bool signalRoutingActive;
+    bool hearsUs;
+    uint8_t etxVariance;
+};
+
+// Decoded packed header metadata
+struct PackedHeader {
+    uint8_t formatVersion;
+    uint8_t entrySize;
+    uint8_t routingVersion;
+    uint8_t topologyVersion;
+    bool signalRoutingActive;
+};
+
+// Decode packed_neighbors bytes. Returns number of entries decoded into outEntries.
+// outEntries must have room for at least maxEntries elements.
+// header is filled with the packet-level metadata from the 5-byte header.
+static inline uint8_t decodePackedNeighbors(const uint8_t *data, size_t dataLen,
+                                            PackedNeighborEntry *outEntries, uint8_t maxEntries,
+                                            PackedHeader *header = nullptr)
+{
+    if (!data || dataLen < PACKED_NEIGHBOR_HEADER_SIZE) {
+        return 0;
+    }
+    uint8_t entrySize = data[1];
+    if (entrySize < PACKED_NEIGHBOR_ENTRY_SIZE || entrySize == 0) {
+        return 0; // unknown or too-small entry format
+    }
+
+    if (header) {
+        header->formatVersion = data[0];
+        header->entrySize = entrySize;
+        header->routingVersion = data[2];
+        header->topologyVersion = data[3];
+        header->signalRoutingActive = (data[4] & PACKED_HEADER_FLAG_SR_ACTIVE) != 0;
+    }
+
+    size_t payloadLen = dataLen - PACKED_NEIGHBOR_HEADER_SIZE;
+    uint8_t entryCount = payloadLen / entrySize;
+    if (entryCount > maxEntries) {
+        entryCount = maxEntries;
+    }
+
+    for (uint8_t i = 0; i < entryCount; i++) {
+        const uint8_t *e = &data[PACKED_NEIGHBOR_HEADER_SIZE + i * entrySize];
+        PackedNeighborEntry &out = outEntries[i];
+        out.nodeId = (uint32_t)e[0] | ((uint32_t)e[1] << 8) | ((uint32_t)e[2] << 16) | ((uint32_t)e[3] << 24);
+        out.rssi = static_cast<int8_t>(e[4]);
+        out.snr = static_cast<int8_t>(e[5]);
+        out.signalRoutingActive = (e[6] & PACKED_NEIGHBOR_FLAG_SR_ACTIVE) != 0;
+        out.hearsUs = (e[6] & PACKED_NEIGHBOR_FLAG_HEARS_US) != 0;
+        out.etxVariance = e[7];
+    }
+    return entryCount;
+}
+
 
 // Broadcast interval for signal routing info (6 minutes)
 #define SIGNAL_ROUTING_BROADCAST_SECS 360
@@ -42,7 +112,7 @@ public:
     bool shouldRelayUnicastForCoordination(const meshtastic_MeshPacket *p);
     bool hasDirectConnectivity(NodeNum nodeA, NodeNum nodeB);
     bool hasVerifiedConnectivity(NodeNum transmitter, NodeNum receiver, bool* unknownOut = nullptr);
-    void updateNeighborInfo(NodeNum nodeId, int32_t rssi, float snr, uint32_t lastRxTime, uint32_t variance = 0);
+    void updateNeighborInfo(NodeNum nodeId, int32_t rssi, float snr, uint32_t lastRxTime);
     void sendSignalRoutingInfo(NodeNum dest = NODENUM_BROADCAST);
     // Call when this node originates and sends any packet (not a relay).
     // Resets the topology-broadcast keepalive timer so we don't send redundant broadcasts
@@ -56,7 +126,7 @@ public:
 
 protected:
     virtual bool handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshtastic_SignalRoutingInfo *p) override;
-    void updateGraphWithNeighbor(NodeNum sender, const meshtastic_SignalNeighbor &neighbor);
+    void updateGraphWithNeighbor(NodeNum sender, NodeNum neighborId, int8_t rssi, int8_t snr, bool hearsUs);
     virtual ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override;
     virtual bool wantPacket(const meshtastic_MeshPacket *p) override { return true; }
     virtual meshtastic_MeshPacket *allocReply() override;
@@ -90,8 +160,8 @@ private:
     void setTopologyVersion(TopologyVersionEntry *table, uint8_t &count, NodeNum nodeId, uint8_t version);
 
     bool isSignalBasedCapable(NodeNum nodeId) const;
-    void collectNeighborsForBroadcast(meshtastic_SignalNeighbor *outNeighbors, uint8_t &outCount, uint8_t maxCount);
-    void sendTopologyPacket(NodeNum dest, const meshtastic_SignalNeighbor *neighbors, uint8_t count, uint8_t topologyVersion = 0, uint32_t txAfterMs = 0);
+    uint8_t packNeighborsForBroadcast(uint8_t *outBuf, size_t bufSize);
+    void sendTopologyPacket(NodeNum dest, const uint8_t *packedData, size_t packedLen, uint8_t topologyVersion = 0, uint32_t txAfterMs = 0);
 
     enum class CapabilityStatus : uint8_t {
         Unknown = 0,
