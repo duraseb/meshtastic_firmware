@@ -204,6 +204,7 @@ private:
     bool t1RetransmitEnabled = true;
 
     bool hasAnyHearsUsNeighbor() const;
+    bool allHearsUsNeighborsHeardPacket(PacketId packetId) const;
 
 public:
     uint32_t pendingRelayDelayMs = 0; // Set by shouldRelayBroadcast, consumed by commitRelay

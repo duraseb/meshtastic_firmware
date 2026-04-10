@@ -195,6 +195,17 @@ int32_t SignalRoutingModule::runOnce()
             continue;
         }
         if ((int32_t)(nowMs - pr.fireAfterMs) >= 0) {
+            // All hearsUs neighbors already transmitted this packet — they had it before
+            // our relay and will treat our copy as a dupe. T1 is unnecessary.
+            if (allHearsUsNeighborsHeardPacket(pr.packetId)) {
+                LOG_INFO("[SR] T1 canceled for 0x%08x — all hearsUs neighbors already heard packet", pr.packetId);
+                if (pr.packet) {
+                    packetPool.release(pr.packet);
+                    pr.packet = nullptr;
+                }
+                pr.canceled = true;
+                continue;
+            }
             LOG_INFO("[SR] T1 firing for 0x%08x — no relay heard in window; retransmitting now", pr.packetId);
             meshtastic_MeshPacket *toSend = pr.packet;
             pr.packet = nullptr;
@@ -1944,6 +1955,111 @@ bool SignalRoutingModule::hasAnyHearsUsNeighbor() const
         }
     }
     return false;
+}
+
+bool SignalRoutingModule::allHearsUsNeighborsHeardPacket(PacketId packetId) const
+{
+    if (!routingGraph || !nodeDB) {
+        return false;
+    }
+    NodeNum myNode = nodeDB->getNodeNum();
+    const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
+    if (!myEdges || myEdges->edgeCount == 0) {
+        return false;
+    }
+
+    // Find the committed relay entry for this packet
+    const CommittedRelay *relay = nullptr;
+    for (uint8_t i = 0; i < committedRelayCount; i++) {
+        if (committedRelays[i].packetId == packetId) {
+            relay = &committedRelays[i];
+            break;
+        }
+    }
+    if (!relay) {
+        return false; // No committed relay record — can't determine
+    }
+
+    // Build the set of known transmitters: originalHeardFrom + heardTransmitters.
+    // These are nodes we observed transmitting this packet before our relay.
+    NodeNum transmitters[1 + MAX_HEARD_TRANSMITTERS];
+    uint8_t txCount = 0;
+    if (relay->originalHeardFrom != 0 && relay->originalHeardFrom != myNode) {
+        transmitters[txCount++] = relay->originalHeardFrom;
+    }
+    for (uint8_t t = 0; t < relay->heardTransmitterCount; t++) {
+        NodeNum tx = relay->heardTransmitters[t];
+        if (tx != relay->originalHeardFrom) {
+            transmitters[txCount++] = tx;
+        }
+    }
+    if (txCount == 0) {
+        return false; // No known transmitters — can't infer anything
+    }
+
+    // Check every hearsUs neighbor: they must have heard the packet from at least one
+    // known transmitter. A neighbor N heard the packet if:
+    //   (a) N is itself a known transmitter (we directly observed it), OR
+    //   (b) A known transmitter T has a link to N in the graph:
+    //       - T→N edge: T reports hearing N (link exists, likely bidirectional)
+    //       - N→T edge: N reports hearing T (N definitely receives T's broadcasts)
+    // This covers both SR nodes (full topology data) and stock nodes (inferred edges).
+    uint8_t hearsUsCount = 0;
+    for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+        if (!myEdges->edges[i].hearsUs) {
+            continue;
+        }
+        NodeNum neighbor = myEdges->edges[i].to;
+
+        // Placeholder nodes have unknown identity — can't match against transmitters
+        if (isPlaceholderNode(neighbor)) {
+            continue;
+        }
+        hearsUsCount++;
+
+        // (a) Is N itself a known transmitter?
+        bool heard = false;
+        for (uint8_t t = 0; t < txCount; t++) {
+            if (transmitters[t] == neighbor) {
+                heard = true;
+                break;
+            }
+        }
+
+        // (b) Does any known transmitter T have a link to N in the graph?
+        if (!heard) {
+            for (uint8_t t = 0; t < txCount && !heard; t++) {
+                // T→N: transmitter reports neighbor as its neighbor
+                const NodeEdges *txEdges = routingGraph->getEdgesFrom(transmitters[t]);
+                if (txEdges) {
+                    for (uint8_t j = 0; j < txEdges->edgeCount; j++) {
+                        if (txEdges->edges[j].to == neighbor) {
+                            heard = true;
+                            break;
+                        }
+                    }
+                }
+                // N→T: neighbor reports transmitter as its neighbor
+                if (!heard) {
+                    const NodeEdges *nEdges = routingGraph->getEdgesFrom(neighbor);
+                    if (nEdges) {
+                        for (uint8_t j = 0; j < nEdges->edgeCount; j++) {
+                            if (nEdges->edges[j].to == transmitters[t]) {
+                                heard = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!heard) {
+            return false; // This hearsUs neighbor may not have heard the packet
+        }
+    }
+
+    return hearsUsCount > 0; // At least one hearsUs neighbor, and all accounted for
 }
 
 void SignalRoutingModule::maybeScheduleBroadcastRetransmit(const meshtastic_MeshPacket *p)

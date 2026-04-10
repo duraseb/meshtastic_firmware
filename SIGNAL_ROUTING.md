@@ -408,6 +408,8 @@ LoRa is half-duplex: a transmitting node cannot hear its own channel while sendi
 
 **Cancellation:** Any incoming dupe triggers `cancelBroadcastRetransmit()` via `perhapsCancelDupe()`. This covers all paths: committed relay that decides to cancel, already-relayed detection, and non-SR originator dupes.
 
+**Graph-based pre-fire cancellation:** When the T1 timer expires, `allHearsUsNeighborsHeardPacket()` checks whether every `hearsUs` neighbor already received the packet — either because they are a known transmitter themselves, or because a known transmitter has a link to them in the SR graph (edge in either direction). If all `hearsUs` neighbors are accounted for, T1 is canceled without retransmitting. This prevents unnecessary T1 retransmits in the common case where neighbors already had the packet from another path and correctly suppressed our relay as a dupe.
+
 **Guard against T2:** When T1 fires, `isRetransmitting = true` is set before calling `router->send()`. This prevents `maybeScheduleBroadcastRetransmit()` from scheduling a second retransmit when T1 re-enters the send path.
 
 ## Benefits for Mesh Network Reliability
