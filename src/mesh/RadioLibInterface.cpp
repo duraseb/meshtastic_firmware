@@ -271,34 +271,27 @@ void RadioLibInterface::onNotify(uint32_t notification)
         // If we are not currently in receive mode, then restart the random delay (this can happen if the main thread
         // has placed the unit into standby)  FIXME, how will this work if the chipset is in sleep mode?
         if (!txQueue.empty()) {
-            if (!canSendImmediately()) {
-                // Radio is busy (receiving or transmitting) — don't draw a new random backoff,
-                // just re-check after one slot. tx_after is preserved so we resume from the
-                // original deadline once the radio is free.
+            meshtastic_MeshPacket *txp = txQueue.getFront();
+            assert(txp);
+            long delay_remaining = txp->tx_after ? (long)(txp->tx_after - millis()) : 0;
+            if (delay_remaining > 0) {
+                // There's still some delay pending on this packet — wait without checking radio state.
+                // Checking canSendImmediately() here would log busyRx warnings every slot for packets
+                // scheduled seconds in the future (e.g., T1 retransmits).
+                notifyLater(delay_remaining, TRANSMIT_DELAY_COMPLETED, false);
+            } else if (!canSendImmediately()) {
+                // Radio is busy (receiving or transmitting) — re-check after one slot.
+                notifyLater(slotTimeMsec, TRANSMIT_DELAY_COMPLETED, false);
+            } else if (isChannelActive()) {
+                // Channel busy (CAD detected activity) — receive and recheck after one slot.
+                startReceive();
                 notifyLater(slotTimeMsec, TRANSMIT_DELAY_COMPLETED, false);
             } else {
-                meshtastic_MeshPacket *txp = txQueue.getFront();
+                // Channel clear, radio free, delay served — send now.
+                txp = txQueue.dequeue();
                 assert(txp);
-                long delay_remaining = txp->tx_after ? txp->tx_after - millis() : 0;
-                if (delay_remaining > 0) {
-                    // There's still some delay pending on this packet, so resume waiting for it to elapse
-                    notifyLater(delay_remaining, TRANSMIT_DELAY_COMPLETED, false);
-                } else {
-                    if (isChannelActive()) { // check if there is currently a LoRa packet on the channel
-                        startReceive();      // try receiving this packet, afterwards we'll be trying to transmit again
-                        // Don't redraw the delay — the original backoff has been served.
-                        // Wait one slot and recheck. Drawing a new random delay here causes
-                        // a tight thrash loop (12-108ms cycles) for Router/SR committed relays.
-                        notifyLater(slotTimeMsec, TRANSMIT_DELAY_COMPLETED, false);
-                    } else {
-                        // Send any outgoing packets we have ready as fast as possible to keep the time between channel scan and
-                        // actual transmission as short as possible
-                        txp = txQueue.dequeue();
-                        assert(txp);
-                        startSend(txp);
-                        LOG_DEBUG("%d packets remain in the TX queue", txQueue.getMaxLen() - txQueue.getFree());
-                    }
-                }
+                startSend(txp);
+                LOG_DEBUG("%d packets remain in the TX queue", txQueue.getMaxLen() - txQueue.getFree());
             }
         } else {
             // Do nothing, because the queue is empty

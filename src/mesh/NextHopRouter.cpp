@@ -170,12 +170,13 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                     meshtastic_MeshPacket *tosend = packetPool.allocCopy(*p); // keep a copy because we will be sending it
 
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
-                    // Apply slot-based TX delay for SR relays
+                    // Apply slot-based TX delay for SR relays. Always set tx_after slightly
+                    // in the future so setTransmitDelay() takes the "remaining > 0" path and
+                    // respects SR's intended delay, rather than the "expired" path which draws
+                    // a new random Router-class delay on top.
                     if (signalRoutingModule && signalRoutingModule->isCommittedRelay(tosend->id)) {
                         uint32_t delay = signalRoutingModule->getCommittedRelayDelay(tosend->id);
-                        if (delay > 0) {
-                            tosend->tx_after = millis() + delay;
-                        }
+                        tosend->tx_after = millis() + delay + 1;
                     }
 #endif
                     LOG_INFO("Rebroadcast received message coming from %x", p->relay_node);

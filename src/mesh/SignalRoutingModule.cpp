@@ -220,6 +220,11 @@ int32_t SignalRoutingModule::runOnce()
             meshtastic_MeshPacket *toSend = pr.packet;
             pr.packet = nullptr;
             pr.canceled = true; // Mark done before send to block T2 scheduling
+            // Clear stale tx_after from the original packet's scheduling — the copy was made
+            // seconds ago and its tx_after is far in the past. Without this, setTransmitDelay()
+            // sees an expired tx_after and draws an immediate short delay, causing busyRx spam
+            // if the radio happens to be receiving.
+            toSend->tx_after = 0;
             isRetransmitting = true;
             router->send(toSend); // dispatches through FloodingRouter::send()
             isRetransmitting = false;
