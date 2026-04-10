@@ -34,12 +34,12 @@ jobs:
           - { pio_env: rp2040-lora,              platform: rp2040   }
           - { pio_env: heltec-wireless-paper,    platform: esp32s3  }
           - { pio_env: tbeam-s3-core,            platform: esp32s3  }
-          - { pio_env: kapico, platform: rp2040   }
-          - { pio_env: durahydra, platform: esp32s3  }
-          - { pio_env: birbmesh_one, platform: nrf52840 }
-          - { pio_env: birbmesh_one_e22p, platform: nrf52840 }
-          - { pio_env: hydra-e22p, platform: esp32 }
-          - { pio_env: hydra, platform: esp32 }
+          - { pio_env: kapico,                   platform: rp2040   }
+          - { pio_env: durahydra,                platform: esp32s3  }
+          - { pio_env: birbmesh_one,             platform: nrf52840 }
+          - { pio_env: birbmesh_one_e22p,        platform: nrf52840 }
+          - { pio_env: hydra-e22p,               platform: esp32    }
+          - { pio_env: hydra,                    platform: esp32    }
 
     name: build-${{ matrix.pio_env }}
     runs-on: ubuntu-latest
@@ -94,6 +94,54 @@ jobs:
           pio_env: ${{ matrix.pio_env }}
           pio_target: build
 
+      - name: ESP32 - Download Unified OTA firmware
+        if: matrix.platform == 'esp32' || matrix.platform == 'esp32s3'
+        env:
+          PIO_PLATFORM: ${{ matrix.platform }}
+          OTA_URL: https://github.com/meshtastic/esp32-unified-ota/releases/latest/download/mt-${{ matrix.platform }}-ota.bin
+        working-directory: release
+        run: |
+          curl -L -o "mt-$PIO_PLATFORM-ota.bin" $OTA_URL
+
+      - name: Update manifest with OTA file
+        if: matrix.platform == 'esp32' || matrix.platform == 'esp32s3'
+        working-directory: release
+        env:
+          PIO_PLATFORM: ${{ matrix.platform }}
+        run: |
+          OTA_FILE="mt-${PIO_PLATFORM}-ota.bin"
+          if [[ ! -f "$OTA_FILE" ]]; then
+            echo "OTA file $OTA_FILE not found, skipping manifest update"
+            exit 0
+          fi
+          if command -v md5sum &> /dev/null; then
+            OTA_MD5=$(md5sum "$OTA_FILE" | cut -d' ' -f1)
+          else
+            OTA_MD5=$(md5 -q "$OTA_FILE")
+          fi
+          OTA_SIZE=$(stat -f%z "$OTA_FILE" 2>/dev/null || stat -c%s "$OTA_FILE")
+          for manifest in firmware-*.mt.json; do
+            if [[ -f "$manifest" ]]; then
+              echo "Updating $manifest with $OTA_FILE (md5: $OTA_MD5, size: $OTA_SIZE)"
+              jq --arg name "$OTA_FILE" --arg md5 "$OTA_MD5" --argjson bytes "$OTA_SIZE" --arg part "app1" \
+                'if .files | map(select(.name == $name)) | length == 0 then .files += [{"name": $name, "md5": $md5, "bytes": $bytes, "part_name": $part}] else . end' \
+                "$manifest" > "${manifest}.tmp" && mv "${manifest}.tmp" "$manifest"
+            fi
+          done
+
+      - name: Job summary
+        env:
+          PIO_ENV: ${{ matrix.pio_env }}
+        run: |
+          echo "## $PIO_ENV" >> $GITHUB_STEP_SUMMARY
+          echo "<details><summary><strong>Manifest</strong></summary>" >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          cat release/firmware-*.mt.json >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
+
       - name: Store binaries as artifact
         uses: actions/upload-artifact@v7
         with:
@@ -108,4 +156,13 @@ jobs:
             release/*.zip
             release/device-*.sh
             release/device-*.bat
+          retention-days: 30
+
+      - name: Store manifests as artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: manifest-${{ matrix.platform }}-${{ matrix.pio_env }}
+          overwrite: true
+          path: |
+            release/*.mt.json
           retention-days: 30
