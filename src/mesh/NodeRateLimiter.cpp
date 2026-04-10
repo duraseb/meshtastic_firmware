@@ -159,8 +159,8 @@ bool NodeRateLimiter::checkAndUpdateBucket(BucketState &b, uint8_t threshold, No
     getNodeDisplayName(nodeId, nodeName, sizeof(nodeName));
 
     uint32_t windowAge = nowMs - b.windowStart;
-    LOG_DEBUG("[RateLimit] %s %s bucket: count=%u/%u limited=%d windowAge=%ums/%ums",
-              nodeName, bucketName, b.count, threshold, (int)b.limited, windowAge, cfgWindowMs);
+    LOG_INFO("[RateLimit] %s %s bucket: count=%u/%u limited=%d windowAge=%ums/%ums",
+             nodeName, bucketName, b.count, threshold, (int)b.limited, windowAge, cfgWindowMs);
 
     if (b.limited) {
         if (windowAge >= cfgWindowMs) {
@@ -173,7 +173,7 @@ bool NodeRateLimiter::checkAndUpdateBucket(BucketState &b, uint8_t threshold, No
         } else {
             // Still active — reset window so the node must go quiet for WINDOW_MS
             b.windowStart = nowMs;
-            LOG_DEBUG("[RateLimit] %s %s bucket still limited, window reset", nodeName, bucketName);
+            LOG_INFO("[RateLimit] %s %s bucket still limited, window reset", nodeName, bucketName);
             return true;
         }
     }
