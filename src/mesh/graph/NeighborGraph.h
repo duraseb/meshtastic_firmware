@@ -265,7 +265,7 @@ class NeighborGraph {
     float getEtxChangeThreshold() const { return etxChangeThreshold; }
 
   private:
-    float etxChangeThreshold = 0.50f; // Minimum ETX delta to register an edge change as significant
+    float etxChangeThreshold = 1.0f; // Minimum ETX delta to register an edge change as significant
     NodeEdges neighbors[NEIGHBOR_GRAPH_MAX_NEIGHBORS];
     uint8_t neighborCount;
 

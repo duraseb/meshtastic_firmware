@@ -576,7 +576,7 @@ All SR tuning parameters can be set at runtime via the Meshtastic admin interfac
 | `node_ttl_secs` | uint32 | `NODE_TTL_SECS` | Node aging TTL — nodes not heard within this window are removed from the graph |
 | `broadcast_max_hops` | uint32 | `SR_BROADCAST_MAX_HOPS` | `hop_limit` cap applied to SR topology broadcast packets |
 | `poor_link_etx_threshold` | float | `7.0` | ETX above which a link is excluded from pre-coverage marking in relay decisions |
-| `etx_change_threshold` | float | `NeighborGraph::etxChangeThreshold` (default `0.50`) | Minimum ETX delta to register an edge update as significant and trigger a dirty broadcast |
+| `etx_change_threshold` | float | `NeighborGraph::etxChangeThreshold` (default `1.0`) | Minimum ETX delta to register an edge update as significant and trigger a dirty broadcast |
 
 \* proto3 booleans default to `false` on the wire. When writing any SR config, always set `enabled=true` and `t1_retransmit_enabled=true` unless you explicitly want those features off. If no SR config is stored (`has_signal_routing=false`), firmware defaults apply (both features on).
 
@@ -598,7 +598,7 @@ static constexpr uint32_t ROUTE_CACHE_TIMEOUT_SECS = 300;      // Dijkstra resul
 static constexpr uint32_t CAPABILITY_TTL_SECS = SIGNAL_ROUTING_BROADCAST_SECS * 3 + 10;  // node capability cache
 
 // NeighborGraph.h (private instance variable)
-float etxChangeThreshold = 0.50f;  // minimum ETX delta for a significant edge change
+float etxChangeThreshold = 1.0f;   // minimum ETX delta for a significant edge change
 ```
 
 ### Prompt Dirty-Topology Rebroadcast (`markTopologyDirty()`)
