@@ -17,7 +17,7 @@
 
 // Minimum inter-broadcast interval: dirty topology triggers an early broadcast only after this
 // many seconds have elapsed since the last broadcast.
-#define SIGNAL_ROUTING_DIRTY_BROADCAST_SECS 180
+#define SIGNAL_ROUTING_DIRTY_BROADCAST_SECS 300
 
 // Maximum hops for SR topology broadcasts; capped at min(user config, this value)
 #define SR_BROADCAST_MAX_HOPS 5

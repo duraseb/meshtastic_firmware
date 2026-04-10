@@ -587,7 +587,7 @@ The default values for the configurable parameters above are defined in `SignalR
 ```cpp
 // SignalRoutingModule.h
 #define SIGNAL_ROUTING_BROADCAST_SECS        360   // periodic topology broadcast interval
-#define SIGNAL_ROUTING_DIRTY_BROADCAST_SECS  180   // minimum gap before early dirty broadcast
+#define SIGNAL_ROUTING_DIRTY_BROADCAST_SECS  300   // minimum gap before early dirty broadcast (5 min)
 #define SR_BROADCAST_MAX_HOPS                  5   // hop_limit cap for topology packets
 #define MAX_SIGNAL_ROUTING_NEIGHBORS          11   // neighbors per broadcast payload (fits 233-byte limit)
 
