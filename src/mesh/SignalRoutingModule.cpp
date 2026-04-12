@@ -2573,6 +2573,26 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
                 continue;
             }
 
+            // Only reserve a slot if the stock router can hear the transmitter.
+            // We infer this from Mirrored edges added when we observe the stock
+            // router relay packets from that node.  Without evidence it heard
+            // the packet, the slot would be wasted and just delays our own TX.
+            const NodeEdges *stockEdges = routingGraph->getEdgesFrom(neighbor);
+            bool canHearTransmitter = false;
+            if (stockEdges) {
+                for (uint8_t j = 0; j < stockEdges->edgeCount; j++) {
+                    if (stockEdges->edges[j].to == heardFrom) {
+                        canHearTransmitter = true;
+                        break;
+                    }
+                }
+            }
+            if (!canHearTransmitter) {
+                LOG_INFO("[SR] Skipping stock router %08x — no evidence it can hear transmitter %08x", neighbor, heardFrom);
+                candidates.erase(neighbor);
+                continue;
+            }
+
             candidates.erase(neighbor);
 
             if (routingGraph->hasNodeTransmitted(neighbor, p->id, currentTime)) {
