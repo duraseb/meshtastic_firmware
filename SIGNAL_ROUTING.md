@@ -307,7 +307,7 @@ SignalRouting uses a deterministic slot-based algorithm to coordinate broadcast 
 
 1. **Candidate filtering**: Only SR-active neighbors and stock ROUTER/REPEATER/ROUTER_CLIENT nodes are considered relay candidates. Non-SR nodes (CLIENT, CLIENT_MUTE, etc.) are excluded — they either don't relay or relay unpredictably outside SR coordination.
 
-2. **Stock routers first**: Legacy ROUTER/REPEATER/ROUTER_CLIENT neighbors get the earliest slots since they transmit regardless of SR decisions. If they already transmitted, their coverage is absorbed.
+2. **Stock routers first**: Legacy ROUTER/REPEATER/ROUTER_CLIENT neighbors that can hear the transmitter get the earliest slots since they transmit regardless of SR decisions. Stock routers with no evidence of hearing the transmitter (no edge in the topology graph) are skipped — reserving a slot for them would just delay our own TX for nothing. If they already transmitted, their coverage is absorbed.
 
 3. **SR candidate ranking**: Remaining SR-active candidates are iteratively ranked by `findBestRelayCandidate` (most unique coverage, lowest ETX, deterministic node ID tiebreak based on packet ID parity). Each candidate gets the next slot. If it's us, we schedule TX and stop. If a candidate already transmitted, we absorb its coverage without consuming a slot.
 
@@ -346,7 +346,7 @@ Mirrored edges (learned from topology broadcasts) are not cleared when a new top
 
 ### Relay Decision Factors
 
-1. **Stock Router Priority**: Legacy routers/repeaters get earliest slots as they always rebroadcast
+1. **Stock Router Priority**: Legacy routers/repeaters get earliest slots if they can hear the transmitter
 2. **Deterministic Ordering**: All nodes compute the same candidate ranking for consistent slot assignment
 3. **Coverage-Based Selection**: Candidates ranked by unique coverage count, then ETX quality
 4. **Dupe Suppression**: Existing packet deduplication cancels queued relays when earlier slots transmit
@@ -706,7 +706,7 @@ SignalRouting uses a deterministic slot-based algorithm for relay coordination:
 
 1. **Pre-coverage**: heardFrom's neighbors with ETX < 7.0 marked as already covered; ETX ≥ 7.0 (near noise floor) excluded
 2. **Candidate Building**: Only SR-active neighbors and stock ROUTER/REPEATER/ROUTER_CLIENT nodes (excluding heardFrom, source, and non-SR roles like CLIENT/CLIENT_MUTE) plus SR-active co-listeners that can hear the same transmitter
-3. **Stock Router Slots**: Legacy routers/repeaters assigned first slots (they transmit regardless)
+3. **Stock Router Slots**: Legacy routers/repeaters assigned first slots only if they can hear the transmitter (verified via topology graph edges)
 4. **SR Candidate Ranking**: Iteratively pick best candidate (most unique coverage, lowest ETX, packet-ID-parity node ID tiebreak), assign next slot, remove from candidates
 4. **Self-Assignment**: When we're picked as best candidate, schedule TX at that slot's delay
 5. **Already-Transmitted Absorption**: Candidates that already transmitted have their coverage absorbed without consuming a slot

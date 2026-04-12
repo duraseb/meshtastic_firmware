@@ -3051,7 +3051,12 @@ void SignalRoutingModule::handleNodeInfoPacket(const meshtastic_MeshPacket &mp)
     }
 
     if (user.has_is_unmessagable && user.is_unmessagable) {
-        trackNodeCapability(mp.from, CapabilityStatus::Legacy);
+        // Don't downgrade SR-capable nodes — they proved their capability via topology broadcasts.
+        // is_unmessagable just means the node doesn't handle user messages, not that it can't route.
+        CapabilityStatus current = getCapabilityStatus(mp.from);
+        if (current != CapabilityStatus::SRactive && current != CapabilityStatus::Passive) {
+            trackNodeCapability(mp.from, CapabilityStatus::Legacy);
+        }
     }
 }
 
