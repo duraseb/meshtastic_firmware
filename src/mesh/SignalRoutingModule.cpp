@@ -1451,7 +1451,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
         if (!isActiveRoutingRole()) {
             LOG_INFO("[SR] Inactive role: Skipping relayed packet topology inference");
         } else {
-            NodeNum inferredRelayer = resolveRelayIdentity(mp.relay_node);
+            NodeNum inferredRelayer = resolveRelayIdentity(mp.relay_node, mp.rx_rssi, mp.rx_snr);
 
         // If still not resolved, try known nodes (both direct neighbors and topology-known nodes)
         // We need to check ALL edges, not just Reported ones, because the relay might be
@@ -2253,7 +2253,7 @@ bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p)
     // Resolve the dupe's relay node
     NodeNum dupeRelayer = 0;
     if (p->relay_node != 0) {
-        dupeRelayer = resolveRelayIdentity(p->relay_node);
+        dupeRelayer = resolveRelayIdentity(p->relay_node, p->rx_rssi, p->rx_snr);
         if (dupeRelayer == 0) {
             // Try matching from our known neighbors
             NodeNum myNode = nodeDB->getNodeNum();
@@ -3077,7 +3077,7 @@ void SignalRoutingModule::updateNodeActivityForPacketAndRelay(const meshtastic_M
     // Update relay node activity if this is a relayed packet
     // Only update if relay node is not us and not the sender (safety checks)
     if (p->relay_node != 0) {
-        NodeNum relayNodeId = resolveRelayIdentity(p->relay_node);
+        NodeNum relayNodeId = resolveRelayIdentity(p->relay_node, p->rx_rssi, p->rx_snr);
         if (relayNodeId != 0 && relayNodeId != ourNodeId && relayNodeId != p->from) {
             routingGraph->updateNodeActivity(relayNodeId, currentTime);
         }
@@ -3716,24 +3716,34 @@ void SignalRoutingModule::pruneRelayIdentityCache(uint32_t nowMs)
     }
 }
 
-NodeNum SignalRoutingModule::resolveRelayIdentity(uint8_t relayId) const
+NodeNum SignalRoutingModule::resolveRelayIdentity(uint8_t relayId, int16_t rxRssi, float rxSnr) const
 {
     uint32_t nowMs = millis();
     NodeNum bestNode = 0;
     uint32_t newest = 0;
-    NodeNum bestDirectNode = 0;
-    uint32_t newestDirect = 0;
+
+    // Collect direct neighbor candidates (up to 4 per bucket)
+    struct DirectCandidate {
+        NodeNum nodeId;
+        uint16_t edgeEtx; // ETX * 100 from the edge
+    };
+    DirectCandidate directCandidates[4];
+    uint8_t directCount = 0;
 
     // Determine our direct neighbors for tiebreaking
     NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
     const NodeEdges *myEdges = (routingGraph && myNode) ? routingGraph->getEdgesFrom(myNode) : nullptr;
 
-    auto isDirectNeighbor = [&](NodeNum nodeId) -> bool {
-        if (!myEdges) return false;
-        for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
-            if (myEdges->edges[i].to == nodeId) return true;
+    auto getDirectEdgeEtx = [&](NodeNum nodeId) -> int32_t {
+        if (!myEdges) {
+            return -1;
         }
-        return false;
+        for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+            if (myEdges->edges[i].to == nodeId) {
+                return myEdges->edges[i].etxFixed;
+            }
+        }
+        return -1;
     };
 
     for (uint8_t b = 0; b < relayIdentityCacheCount; b++) {
@@ -3745,13 +3755,57 @@ NodeNum SignalRoutingModule::resolveRelayIdentity(uint8_t relayId) const
                 }
                 uint32_t t = bucket->entries[i].lastHeardMs;
                 NodeNum n = bucket->entries[i].nodeId;
-                if (isDirectNeighbor(n)) {
-                    if (t >= newestDirect) { newestDirect = t; bestDirectNode = n; }
-                } else {
+                int32_t edgeEtx = getDirectEdgeEtx(n);
+                if (edgeEtx >= 0 && directCount < 4) {
+                    directCandidates[directCount++] = {n, static_cast<uint16_t>(edgeEtx)};
+                } else if (edgeEtx < 0) {
                     if (t >= newest) { newest = t; bestNode = n; }
                 }
             }
             break;
+        }
+    }
+
+    // Pick best direct neighbor
+    NodeNum bestDirectNode = 0;
+    if (directCount == 1) {
+        bestDirectNode = directCandidates[0].nodeId;
+    } else if (directCount > 1 && rxRssi != 0) {
+        // Multiple direct neighbors share this relay byte — use packet ETX to disambiguate
+        float packetEtx = NeighborGraph::calculateETX(rxRssi, rxSnr);
+        uint16_t packetEtxFixed = static_cast<uint16_t>(packetEtx * 100.0f);
+        uint16_t bestDiff = UINT16_MAX;
+        for (uint8_t i = 0; i < directCount; i++) {
+            uint16_t diff = (packetEtxFixed > directCandidates[i].edgeEtx)
+                                ? (packetEtxFixed - directCandidates[i].edgeEtx)
+                                : (directCandidates[i].edgeEtx - packetEtxFixed);
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                bestDirectNode = directCandidates[i].nodeId;
+            }
+        }
+    } else if (directCount > 1) {
+        // No RSSI hint — fall back to most recently heard
+        uint32_t newestDirect = 0;
+        for (uint8_t b = 0; b < relayIdentityCacheCount; b++) {
+            if (relayIdentityCache[b].relayId == relayId) {
+                const RelayIdentityCacheEntry *bucket = &relayIdentityCache[b];
+                for (uint8_t i = 0; i < bucket->entryCount; i++) {
+                    if ((nowMs - bucket->entries[i].lastHeardMs) > RELAY_ID_CACHE_TTL_MS) {
+                        continue;
+                    }
+                    for (uint8_t d = 0; d < directCount; d++) {
+                        if (directCandidates[d].nodeId == bucket->entries[i].nodeId) {
+                            if (bucket->entries[i].lastHeardMs >= newestDirect) {
+                                newestDirect = bucket->entries[i].lastHeardMs;
+                                bestDirectNode = bucket->entries[i].nodeId;
+                            }
+                            break;
+                        }
+                    }
+                }
+                break;
+            }
         }
     }
 
@@ -3777,7 +3831,7 @@ NodeNum SignalRoutingModule::resolveHeardFrom(const meshtastic_MeshPacket *p, No
         return sourceNode;
     }
 
-    NodeNum resolved = resolveRelayIdentity(p->relay_node);
+    NodeNum resolved = resolveRelayIdentity(p->relay_node, p->rx_rssi, p->rx_snr);
     if (resolved != 0) {
         return resolved;
     }

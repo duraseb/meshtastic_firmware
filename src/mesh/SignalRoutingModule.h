@@ -208,7 +208,7 @@ private:
     bool isLegacyRouter(NodeNum nodeId) const;
     void rememberRelayIdentity(NodeNum nodeId, uint8_t relayId);
     void pruneRelayIdentityCache(uint32_t nowMs);
-    NodeNum resolveRelayIdentity(uint8_t relayId) const;
+    NodeNum resolveRelayIdentity(uint8_t relayId, int16_t rxRssi = 0, float rxSnr = 0) const;
 public:
     NodeNum resolveHeardFrom(const meshtastic_MeshPacket *p, NodeNum sourceNode) const;
 private:
