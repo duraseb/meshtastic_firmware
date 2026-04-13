@@ -48,6 +48,9 @@
 #if !MESHTASTIC_EXCLUDE_NODE_RATE_LIMITER
 #include "mesh/NodeRateLimiter.h"
 #endif
+#if !MESHTASTIC_EXCLUDE_CHANNEL_QOS
+#include "mesh/ChannelQoS.h"
+#endif
 #if !MESHTASTIC_EXCLUDE_TRACEROUTE
 #include "modules/TraceRouteModule.h"
 #endif
@@ -125,9 +128,12 @@ void setupModules()
         buzzerFeedbackThread = new BuzzerFeedbackThread();
     }
 #endif
-    // Rate limiter must be up before any packet can be received
+    // Rate limiter and QoS must be up before any packet can be received
 #if !MESHTASTIC_EXCLUDE_NODE_RATE_LIMITER
     nodeRateLimiter = new NodeRateLimiter();
+#endif
+#if !MESHTASTIC_EXCLUDE_CHANNEL_QOS
+    channelQoS = new ChannelQoS();
 #endif
     statusLEDModule = new StatusLEDModule();
 #if !MESHTASTIC_EXCLUDE_REPLYBOT

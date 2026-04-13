@@ -11,6 +11,9 @@
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
 #include "SignalRoutingModule.h"
 #endif
+#if !MESHTASTIC_EXCLUDE_CHANNEL_QOS
+#include "ChannelQoS.h"
+#endif
 
 NextHopRouter::NextHopRouter() {}
 
@@ -151,6 +154,13 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
         if (p->id != 0) {
             if (isRebroadcaster()) {
                 if (p->next_hop == NO_NEXT_HOP_PREFERENCE || p->next_hop == nodeDB->getLastByteOfNodeNum(getNodeNum())) {
+
+                    // Channel QoS: gradually drop lower priority relays when channel is congested
+#if !MESHTASTIC_EXCLUDE_CHANNEL_QOS
+                    if (channelQoS && !channelQoS->canRelay(p)) {
+                        return false;
+                    }
+#endif
 
                     // Signal-based routing: check if we should relay (broadcasts and unicasts)
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
