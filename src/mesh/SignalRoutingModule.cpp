@@ -1874,13 +1874,13 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     return shouldRelay;
 }
 
-bool SignalRoutingModule::shouldZeroHopLimitForUnicastRelay(const meshtastic_MeshPacket *p)
+int8_t SignalRoutingModule::getUnicastHopLimitForDirectNeighbor(const meshtastic_MeshPacket *p)
 {
     if (!routingGraph || !nodeDB) {
-        return false;
+        return -1;
     }
     if (isBroadcast(p->to)) {
-        return false;
+        return -1;
     }
 
     NodeNum myNode = nodeDB->getNodeNum();
@@ -1888,35 +1888,46 @@ bool SignalRoutingModule::shouldZeroHopLimitForUnicastRelay(const meshtastic_Mes
 
     const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
     if (!myEdges) {
-        return false;
+        return -1;
     }
 
-    // Destination must be a direct neighbor confirmed to hear us
+    // Destination must be a direct neighbor confirmed to hear us.
+    // Track link quality to decide how aggressively to limit hops.
+    static constexpr float RELIABLE_ETX_CEILING = 3.0f;
+
     bool destIsDirectAndHearsUs = false;
+    float destEtx = 0;
     for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
         if (myEdges->edges[i].to == destination && myEdges->edges[i].hearsUs) {
             destIsDirectAndHearsUs = true;
+            destEtx = myEdges->edges[i].getEtx();
             break;
         }
     }
     if (!destIsDirectAndHearsUs) {
-        return false;
+        return -1;
     }
 
-    // If any other direct neighbor is not SR-active (stock firmware), zeroing hop_limit
-    // prevents them from relaying a packet that will be delivered directly.
+    // Only limit hops if at least one other direct neighbor is not SR-active (stock firmware).
+    // SR nodes suppress relays themselves via the slot-based algorithm.
+    bool hasStockNeighbor = false;
     for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
         NodeNum nb = myEdges->edges[i].to;
         if (nb == destination) {
             continue;
         }
         if (getCapabilityStatus(nb) != CapabilityStatus::SRactive) {
-            return true;
+            hasStockNeighbor = true;
+            break;
         }
     }
+    if (!hasStockNeighbor) {
+        return -1;
+    }
 
-    // All other direct neighbors are SR — they will suppress the relay themselves
-    return false;
+    // Good link: zero hops, direct delivery only
+    // Marginal link: 1 hop, allow one retry relay if our TX is lost
+    return (destEtx < RELIABLE_ETX_CEILING) ? 0 : 1;
 }
 
 bool SignalRoutingModule::shouldUseSignalBasedRouting(const meshtastic_MeshPacket *p)

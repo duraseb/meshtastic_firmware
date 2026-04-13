@@ -242,17 +242,25 @@ Destinations that are known through any mechanism are still relayed:
 - Present in the downstream table (reachable via a relay's topology report)
 - Routable via Dijkstra (direct or multi-hop SR path)
 
-### Last-Hop Unicast Hop Limit Zeroing
+### Last-Hop Unicast Hop Limiting
 
-`shouldZeroHopLimitForUnicastRelay()` prevents stock nodes from relaying a unicast that will be delivered in one hop. It fires when **all** of the following are true:
+`getUnicastHopLimitForDirectNeighbor()` limits hops on unicasts destined for a direct `hearsUs` neighbor when stock neighbors are present, preventing unnecessary stock relay. It returns -1 (don't limit) or the hop_limit to set, based on link quality:
 
+| Link quality | ETX | hop_limit | Behavior |
+|-------------|-----|-----------|----------|
+| Good | < 3.0 | 0 | Direct delivery only, no further relay |
+| Marginal | ≥ 3.0 | 1 | Allow one retry relay if our TX is lost |
+
+**Conditions** (all must be true):
 1. The packet is a unicast (not broadcast)
-2. The destination is a **direct neighbor** with `hearsUs = true` (we have a confirmed two-way link)
+2. The destination is a **direct neighbor** with `hearsUs = true`
 3. At least one other direct neighbor is **not SR-active** (stock firmware)
 
-When these conditions hold, `hop_limit` is set to 0 and `hop_start` is adjusted to match before the packet is sent. Stock neighbors that overhear the transmission will see `hop_limit == 0` and will not relay — the destination will receive it directly from us.
+When **all** other direct neighbors are SR-active, hop limiting is skipped — SR nodes suppress relays themselves via the slot-based algorithm.
 
-When **all** other direct neighbors are SR-active, this zeroing is skipped: SR nodes will suppress the relay themselves via the slot-based algorithm, so the extra airtime of a zeroed packet is unnecessary.
+`hop_start` is adjusted to preserve correct `hopsAway` calculation (`hop_start - hop_limit`) for receivers:
+- **Originated packets**: `hop_start = hop_limit` (standard convention)
+- **Relayed packets**: `hop_start = original_hops_taken + limitedHops + 1`
 
 The check is applied in two places:
 - **`NextHopRouter::perhapsRebroadcast()`** — when relaying a unicast we received from another node
@@ -260,8 +268,8 @@ The check is applied in two places:
 
 Log line emitted in both cases:
 ```
-[SR] Zeroing hop_limit for unicast relay 0x<id>: dest is direct hearsUs neighbor, stock neighbors present
-[SR] Zeroing hop_limit for originated unicast 0x<id>: dest is direct hearsUs neighbor, stock neighbors present
+[SR] Limiting hop_limit=<N> for unicast relay 0x<id>: dest is direct hearsUs neighbor, stock neighbors present
+[SR] Limiting hop_limit=<N> for originated unicast 0x<id>: dest is direct hearsUs neighbor, stock neighbors present
 ```
 
 ### Speculative Retransmission

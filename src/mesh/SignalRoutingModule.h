@@ -284,7 +284,11 @@ public:
     uint32_t getCommittedRelayDelay(PacketId packetId) const;
     void clearCommittedRelay(PacketId packetId);
     bool areAllNeighborsCovered(const meshtastic_MeshPacket *p);
-    bool shouldZeroHopLimitForUnicastRelay(const meshtastic_MeshPacket *p);
+    // Returns the hop_limit to set for a unicast to a direct hearsUs neighbor when stock
+    // neighbors are present, or -1 if no limiting should be applied.
+    // Good links (ETX < 3.0): 0 hops (direct delivery, no further relay)
+    // Marginal links: 1 hop (allow one retry relay if our TX is lost)
+    int8_t getUnicastHopLimitForDirectNeighbor(const meshtastic_MeshPacket *p);
     void maybeScheduleBroadcastRetransmit(const meshtastic_MeshPacket *p);
     void cancelBroadcastRetransmit(PacketId packetId);
 };

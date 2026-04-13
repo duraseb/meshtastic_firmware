@@ -377,10 +377,18 @@ ErrorCode Router::send(meshtastic_MeshPacket *p)
     if (isFromUs(p)) {
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
         // If destination is a direct hearsUs neighbor and stock neighbors are present,
-        // zero hop_limit so they don't relay a packet we're delivering in one hop.
-        if (signalRoutingModule && signalRoutingModule->shouldZeroHopLimitForUnicastRelay(p)) {
-            p->hop_limit = 0;
-            LOG_INFO("[SR] Zeroing hop_limit for originated unicast 0x%08x: dest is direct hearsUs neighbor, stock neighbors present", p->id);
+        // limit hop_limit so they don't relay a packet we're delivering directly.
+        // Good links get 0 hops; marginal links get 1 hop for retry resilience.
+        if (signalRoutingModule) {
+            int8_t limitedHops = signalRoutingModule->getUnicastHopLimitForDirectNeighbor(p);
+            if (limitedHops >= 0) {
+                p->hop_limit = limitedHops;
+                // hop_start is set to hop_limit below (line: p->hop_start = p->hop_limit),
+                // so hopsAway = hop_start - hop_limit = 0 for direct reception. If relayed,
+                // hop_limit is decremented and hopsAway increases correctly.
+                LOG_INFO("[SR] Limiting hop_limit=%d for originated unicast 0x%08x: dest is direct hearsUs neighbor, stock neighbors present",
+                         limitedHops, p->id);
+            }
         }
 #endif
         p->hop_start = p->hop_limit;

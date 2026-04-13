@@ -103,12 +103,14 @@ In the topology dump, each direct neighbor has two sub-sections:
 
 `relay for N downstream` reflects `getDownstreamCountForRelay()`. If this shows 0 for a node that is clearly a gateway, the downstream entries were not written — check that the topology broadcast from that node was received and processed (see "Topology propagation" above).
 
-### Last-hop unicast hop_limit zeroing
+### Last-hop unicast hop limiting
 ```
-[SR] Zeroing hop_limit for unicast relay 0x<id>: dest is direct hearsUs neighbor, stock neighbors present
-[SR] Zeroing hop_limit for originated unicast 0x<id>: dest is direct hearsUs neighbor, stock neighbors present
+[SR] Limiting hop_limit=0 for unicast relay 0x<id>: dest is direct hearsUs neighbor, stock neighbors present
+[SR] Limiting hop_limit=1 for unicast relay 0x<id>: dest is direct hearsUs neighbor, stock neighbors present
+[SR] Limiting hop_limit=0 for originated unicast 0x<id>: dest is direct hearsUs neighbor, stock neighbors present
+[SR] Limiting hop_limit=1 for originated unicast 0x<id>: dest is direct hearsUs neighbor, stock neighbors present
 ```
-These fire when the destination is a confirmed direct neighbor (`hearsUs=true`) and at least one other direct neighbor is a stock node. The `hop_limit` is set to 0 so stock nodes do not relay a packet that will be delivered in one hop.
+These fire when the destination is a confirmed direct neighbor (`hearsUs=true`) and at least one other direct neighbor is a stock node. Good links (ETX < 3.0) get `hop_limit=0` (direct delivery, no further relay). Marginal links (ETX ≥ 3.0) get `hop_limit=1`, allowing one retry relay if our transmission is lost. If `hop_limit=1` appears frequently for a link that should be reliable, check the ETX on that edge.
 
 ## Debugging redundant relays
 
@@ -145,7 +147,7 @@ Check that all expected branch nodes are in each other's direct neighbor lists. 
 - **Unicast to unknown destination suppressed**: if the destination is not in the SR graph, not in NodeDB, and not in the downstream table, SR suppresses the relay entirely (`UNICAST SUPPRESS ... unknown destination — not in SR graph or NodeDB`). This is expected — relaying for completely unknown destinations wastes airtime. If the destination should be known, check topology propagation and NodeDB state.
 - **Incorrect slot ordering**: a node picks an early slot when a better-covered node should go first. Compare coverage counts and costs in the slot schedule across both logs.
 - **Topology staleness**: relay decisions based on outdated edges. Compare topology processing timestamps against packet scheduling timestamps.
-- **Stock nodes relaying last-hop unicasts**: if you see a stock node retransmitting a unicast that was already destined for a direct neighbor, check whether `shouldZeroHopLimitForUnicastRelay` fired (look for the `Zeroing hop_limit` log lines). If it did not fire, verify that `hearsUs=true` is set on the destination's edge and that the sender had at least one stock direct neighbor.
+- **Stock nodes relaying last-hop unicasts**: if you see a stock node retransmitting a unicast that was already destined for a direct neighbor, check whether `getUnicastHopLimitForDirectNeighbor` fired (look for the `Limiting hop_limit` log lines). If it did not fire, verify that `hearsUs=true` is set on the destination's edge and that the sender had at least one stock direct neighbor.
 - **T1 firing frequently**: indicates the original T0 transmission is regularly lost to interference or overlapping transmissions. If `T1 firing` appears often without a prior `T1 canceled` (either variant), investigate RF environment. If `T1 canceled — relay confirmed heard` consistently appears, a neighbor retransmitted our relay. If `T1 canceled — all hearsUs neighbors already heard packet` appears, all neighbors already had the packet from another path — graph-based inference prevented a redundant retransmit.
 - **T1 never scheduled**: check that `hearsUs=true` is set on at least one direct neighbor edge (requires that neighbor to have relayed one of our packets), and that `t1_retransmit_enabled=true` in config.
 - **Delayed topology dirty broadcast**: the early broadcast fires after at most `cfgDirtyBroadcastSecs` from the last broadcast. If it never fires, check whether `markTopologyDirty()` was actually called — it only triggers on direct-edge events (new/changed/lost direct neighbor, or SR-zero bootstrap). Remote topology changes do not trigger it by design.

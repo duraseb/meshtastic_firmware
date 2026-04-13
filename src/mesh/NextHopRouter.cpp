@@ -196,13 +196,16 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                         tosend->hop_limit = 0;
                         LOG_INFO("Traffic management: exhausting hops for 0x%08x, setting hop_limit=0", getFrom(p));
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
-                    } else if (signalRoutingModule && signalRoutingModule->shouldZeroHopLimitForUnicastRelay(p)) {
-                        // Destination is a direct neighbor that hears us and at least one other direct
-                        // neighbor runs stock firmware — zero hop_limit so stock nodes don't relay further.
-                        // Adjust hop_start so hopsAway (hop_start - hop_limit) stays correct for receivers.
-                        tosend->hop_start = tosend->hop_start - tosend->hop_limit + 1;
-                        tosend->hop_limit = 0;
-                        LOG_INFO("[SR] Zeroing hop_limit for unicast relay 0x%08x: dest is direct hearsUs neighbor, stock neighbors present", p->id);
+                    } else if (signalRoutingModule &&
+                               signalRoutingModule->getUnicastHopLimitForDirectNeighbor(p) >= 0) {
+                        // Destination is a direct neighbor that hears us and stock neighbors are present.
+                        // Limit hops to prevent unnecessary stock relay. Adjust hop_start so
+                        // hopsAway (hop_start - hop_limit) stays correct for receivers.
+                        int8_t limitedHops = signalRoutingModule->getUnicastHopLimitForDirectNeighbor(p);
+                        tosend->hop_start = tosend->hop_start - tosend->hop_limit + limitedHops + 1;
+                        tosend->hop_limit = limitedHops;
+                        LOG_INFO("[SR] Limiting hop_limit=%d for unicast relay 0x%08x: dest is direct hearsUs neighbor, stock neighbors present",
+                                 limitedHops, p->id);
 #endif
                     } else if (shouldDecrementHopLimit(p)) {
                         // Use shared logic to determine if hop_limit should be decremented
