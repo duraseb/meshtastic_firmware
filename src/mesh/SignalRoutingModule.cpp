@@ -2352,8 +2352,8 @@ bool SignalRoutingModule::shouldRelay(const meshtastic_MeshPacket *p)
             LOG_INFO("[SR-DECISION] UNICAST RELAY pkt=0x%08x: from %s to %s, not routable via SR but known as downstream", p->id, senderName, destName);
             return true;
         }
-        LOG_INFO("[SR-DECISION] UNICAST RELAY pkt=0x%08x: from %s to %s, unknown destination — falling back to broadcast-style relay", p->id, senderName, destName);
-        return true;
+        LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: from %s to %s, unknown destination — not in SR graph or NodeDB", p->id, senderName, destName);
+        return false;
     }
 
     NodeNum sourceNode = p->from;
