@@ -618,11 +618,16 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
         char neighborName[48];
         getNodeDisplayName(neighbor.nodeId, neighborName, sizeof(neighborName));
 
-        if (!hasDirectConnection) {
+        if (!hasDirectConnection && neighbor.hearsUs) {
+            // Only mark as downstream if the link is bidirectional — the neighbor must be able
+            // to hear the topology source, otherwise the source cannot actually deliver to it.
             LOG_INFO("[SR]   -> %s: NO direct connection, marking as downstream of topology source %s",
                     neighborName, senderNameForTopo);
             float etxForDownstream = NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr);
             routingGraph->updateDownstream(neighbor.nodeId, p->from, etxForDownstream, millis() / 1000);
+        } else if (!hasDirectConnection && !neighbor.hearsUs) {
+            LOG_INFO("[SR]   -> %s: NO direct connection, but asymmetric link (hearsUs=false) — skipping downstream of %s",
+                    neighborName, senderNameForTopo);
         } else {
             LOG_INFO("[SR]   -> %s: HAS direct connection, sender confirms reachability",
                     neighborName);
