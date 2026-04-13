@@ -233,6 +233,15 @@ When deciding whether to use SR coordination for unicast packets:
 5. **Designated Gateway Check**: Defer to designated gateways when applicable
 6. **Opportunistic Forwarding**: Use when topology is unhealthy or routes unavailable
 
+### Unknown Destination Suppression
+
+When a unicast packet arrives for a destination that is not in the SR graph (neither as a direct edge, downstream entry, nor Dijkstra-routable) **and** not in NodeDB, SR suppresses the relay entirely rather than falling back to broadcast-style delivery. Blindly relaying packets for completely unknown nodes wastes airtime with no reasonable chance of delivery.
+
+Destinations that are known through any mechanism are still relayed:
+- Present in NodeDB (legacy/stock nodes not in SR graph)
+- Present in the downstream table (reachable via a relay's topology report)
+- Routable via Dijkstra (direct or multi-hop SR path)
+
 ### Last-Hop Unicast Hop Limit Zeroing
 
 `shouldZeroHopLimitForUnicastRelay()` prevents stock nodes from relaying a unicast that will be delivered in one hop. It fires when **all** of the following are true:
@@ -346,12 +355,13 @@ Mirrored edges (learned from topology broadcasts) are not cleared when a new top
 
 ### Relay Decision Factors
 
-1. **Stock Router Priority**: Legacy routers/repeaters get earliest slots if they can hear the transmitter
-2. **Deterministic Ordering**: All nodes compute the same candidate ranking for consistent slot assignment
-3. **Coverage-Based Selection**: Candidates ranked by unique coverage count, then ETX quality
-4. **Dupe Suppression**: Existing packet deduplication cancels queued relays when earlier slots transmit
-5. **Unique Coverage Fallback**: Nodes covering areas no candidate reaches relay with hash-based delay
-6. **Downstream Override**: Nodes recorded as relay for source/destination are forced to relay
+1. **Bidirectional Link Priority**: Candidates with a confirmed round-trip link (`hearsUs=true`) to the packet source get tier 1; others get tier 0. Tier is the highest-priority criterion — a bidi candidate always wins over a non-bidi candidate regardless of coverage. Within the same tier, normal ranking applies. An ETX ceiling (20.0) prevents marginal links (e.g., ETX=40 at RSSI=-110) from qualifying for the bidi boost. See [Asymmetric Link Handling](#asymmetric-link-handling).
+2. **Stock Router Priority**: Legacy routers/repeaters get earliest slots if they can hear the transmitter
+3. **Deterministic Ordering**: All nodes compute the same candidate ranking for consistent slot assignment
+4. **Coverage-Based Selection**: Candidates ranked by unique coverage count, then ETX quality
+5. **Dupe Suppression**: Existing packet deduplication cancels queued relays when earlier slots transmit
+6. **Unique Coverage Fallback**: Nodes covering areas no candidate reaches relay with hash-based delay
+7. **Downstream Override**: Nodes recorded as relay for source/destination are forced to relay
 
 ### Broadcast Coordination Example
 
@@ -411,6 +421,52 @@ LoRa is half-duplex: a transmitting node cannot hear its own channel while sendi
 **Graph-based pre-fire cancellation:** When the T1 timer expires, `allHearsUsNeighborsHeardPacket()` checks whether every `hearsUs` neighbor already received the packet — either because they are a known transmitter themselves, or because a known transmitter has a link to them in the SR graph (edge in either direction). If all `hearsUs` neighbors are accounted for, T1 is canceled without retransmitting. This prevents unnecessary T1 retransmits in the common case where neighbors already had the packet from another path and correctly suppressed our relay as a dupe.
 
 **Guard against T2:** When T1 fires, `isRetransmitting = true` is set before calling `router->send()`. This prevents `maybeScheduleBroadcastRetransmit()` from scheduling a second retransmit when T1 re-enters the send path.
+
+### Asymmetric Link Handling
+
+LoRa links are frequently asymmetric — node A can hear node B but B cannot hear A, or the link quality differs significantly in each direction. SR addresses this at multiple levels:
+
+**Downstream assignment**: When processing a topology broadcast from node X listing neighbor Y, SR only marks Y as downstream of X if X reports `hearsUs=true` for Y — meaning Y can hear X. Without this check, SR might route packets to Y via X even though X cannot deliver to Y.
+
+**Authoritative hearsUs override**: A node is authoritative about who it can hear. When node Y broadcasts its topology and does NOT list node X as a neighbor, SR clears the `hearsUs` flag on the X→Y edge — even if X previously claimed bidirectionality. This corrects stale or incorrect `hearsUs` claims. The override may flip-flop until both nodes converge (X stops claiming bidi after observing Y's topology), but each cycle brings the graph closer to ground truth.
+
+**Bidi slot priority**: In `findBestRelayCandidate()`, candidates with a confirmed bidirectional link (`hearsUs=true`, ETX < 20.0) to the packet source get tier 1 priority. This ensures that on mixed SR/stock branches, the node with round-trip connectivity to the source relays first. Stock nodes on the branch then observe this relay and set their `next_hop` correctly — they never see the asymmetric-link node relay, so they never latch onto an undeliverable gateway.
+
+**Example — mixed branch with asymmetric gateway**:
+```
+       NodeA (remote node)
+      /    ╲
+    NodeB   NodeC    NodeB = bidi link to NodeA, slightly weaker local signal
+      \    /         NodeC = hears NodeA, but NodeA can't hear NodeC; better local signal
+       NodeD
+        |
+      (branch nodes, mix of SR and stock)
+```
+
+Without bidi priority: NodeC relays first (better local ETX), NodeB's relay is canceled as dupe. Branch stock nodes set `next_hop=NodeC`. Unicasts to NodeA via NodeC fail — NodeA can't hear NodeC.
+
+With bidi priority: NodeB gets tier 1 (bidi to NodeA), relays first. Stock nodes set `next_hop=NodeB`. Unicasts to NodeA succeed. NodeC handles other relay duties where its better local signal matters.
+
+## Channel QoS
+
+### Channel-Utilization-Based Relay Gating
+
+`ChannelQoS` gradually drops lower priority relay traffic as channel utilization increases, preserving bandwidth for user messages and critical control traffic. It acts as a prerequisite gate in `perhapsRebroadcast()` — checked before SR's relay decision logic.
+
+**Priority tiers** (lowest dropped first):
+
+| Tier | Packet types | Drop relay above chutil |
+|------|-------------|------------------------|
+| LOW | Telemetry, position, nodeinfo, unknown/undecoded | 25% |
+| MEDIUM | Text on non-primary channel | 30% |
+| HIGH | Routing, SR routing, traceroute, ACKs | 38% |
+| CRITICAL | Text on primary channel, admin | Never dropped |
+
+Thresholds align with stock firmware's existing channel utilization limits (25% polite, 40% impolite). The QoS filter only gates relay decisions — packets addressed to us are always delivered locally.
+
+`ChannelQoS` is orthogonal to `NodeRateLimiter` (per-node abuse detection) and stock `AirTime` TX blocking (blocks our originations). QoS handles aggregate channel load for relay decisions.
+
+Guarded by `MESHTASTIC_EXCLUDE_CHANNEL_QOS` for memory-constrained targets.
 
 ## Benefits for Mesh Network Reliability
 

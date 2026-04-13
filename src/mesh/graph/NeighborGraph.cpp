@@ -1116,10 +1116,15 @@ RelayCandidate NeighborGraph::findBestRelayCandidate(const NodeSet &candidates, 
         // (hearsUs=true on their edge to sourceNode) get a higher tier. This ensures
         // nodes with confirmed round-trip connectivity relay first, so both SR and
         // stock nodes on the branch discover the correct gateway.
+        // ETX above this threshold is too poor to be considered a usable bidirectional link.
+        // ETX=40 is the worst possible calculated value (RSSI=-110, SNR<=0) and is essentially
+        // a placeholder for "heard once, barely" — not a deliverable link.
+        static constexpr float BIDI_ETX_CEILING = 20.0f;
+
         uint8_t candidateTier = 0;
         if (sourceNode != 0 && candidateEdges) {
             const Edge *srcEdge = findEdge(candidateEdges, sourceNode);
-            if (srcEdge && srcEdge->hearsUs) {
+            if (srcEdge && srcEdge->hearsUs && srcEdge->getEtx() < BIDI_ETX_CEILING) {
                 candidateTier = 1;
             }
         }

@@ -18,9 +18,17 @@
 [SR] Slot scheduling for pkt 0x<id>: halfAirtime=<N>ms, <K> candidates
 [SR] Slot 0ms: stock router <nodeId> (already transmitted)
 [SR] Slot 0ms: SR node <nodeId> (coverage=<N>, cost=<F>)
+[SR] Slot 0ms: SR node <nodeId> (coverage=<N>, cost=<F>, bidi)
 [SR] Slot <N>ms: US (<myNode>) — assigned
+[SR] Slot <N>ms: US (<myNode>) — assigned (bidi)
 ```
-Only the node assigned "US" will relay. All slots are computed independently by each node.
+Only the node assigned "US" will relay. All slots are computed independently by each node. The `bidi` tag indicates the candidate has a confirmed bidirectional link (`hearsUs=true`, ETX < 20.0) to the packet source, giving it tier 1 priority over non-bidi candidates regardless of coverage.
+
+### Channel QoS relay gating
+```
+[QoS] Drop relay 0x<id> from 0x<from>: tier <LOW|MEDIUM|HIGH>, chutil <N>% >= <threshold>%
+```
+Fires when channel utilization exceeds the tier threshold. Tiers: LOW (telemetry/position, >25%), MEDIUM (non-primary text, >30%), HIGH (routing/traceroute, >38%). CRITICAL (primary text, admin) is never dropped. If no QoS messages appear, channel utilization is below all thresholds.
 
 ### Committed relay & TX
 ```
@@ -76,9 +84,16 @@ It does **not** fire on remote node count changes during graph aging — those a
 ### Downstream node assignment
 ```
 [SR]   -> <name>: NO direct connection, marking as downstream of topology source <relay>
+[SR]   -> <name>: NO direct connection, but asymmetric link (hearsUs=false) — skipping downstream of <relay>
 [SR]   -> <name>: HAS direct connection, sender confirms reachability
 ```
-When topology arrives from node X, any of X's listed neighbors that *we* cannot hear directly are recorded in the downstream table as `(destination, relay=X)`. A node is considered directly reachable if it has a **Reported** edge pointing to us (i.e., `updateNeighborInfo` was called for it — we received its signal directly).
+When topology arrives from node X, any of X's listed neighbors that *we* cannot hear directly are recorded in the downstream table as `(destination, relay=X)` — but only if X reports `hearsUs=true` for that neighbor (the neighbor can hear X). If `hearsUs=false`, the link is asymmetric and X cannot deliver to that neighbor, so the downstream entry is skipped.
+
+### Authoritative hearsUs override
+```
+[SR] Clearing hearsUs on <name> -> <source>: source topology doesn't list <name> as neighbor
+```
+After processing a topology broadcast from node X, SR checks all graph nodes that claim `hearsUs=true` on their edge to X. If X didn't list that node as a neighbor, the flag is cleared — X is authoritative about who it can hear. This corrects stale bidi claims from nodes that X can no longer receive.
 
 **Stale downstream entries at boot**: a topology from a gateway node may arrive before the gateway's first direct packet. The gateway would be incorrectly marked as downstream of the topology sender. This self-corrects: when the first direct packet from the gateway is received, `clearDownstreamForDestination` removes all downstream entries where that node is the destination.
 
@@ -127,7 +142,7 @@ Check that all expected branch nodes are in each other's direct neighbor lists. 
 
 - **Redundant relays**: multiple nodes transmit the same packet. Check if dupe suppression fired (`Not canceling … unique coverage`) and whether the named uncovered neighbor's topology was available at decision time.
 - **Suppressed relays**: a packet doesn't propagate far enough. Check if slot scheduling assigned no slot (`no unique coverage`) and whether edge data is stale or missing.
-- **Unicast to unknown destination relayed as broadcast**: if the destination is not reachable via the SR topology graph (not in graph, not in NodeDB, not in downstream table), SR falls back to broadcast-style relay. This is expected behavior — verify whether the destination is simply not yet in the topology rather than treating the broadcast relay as an error.
+- **Unicast to unknown destination suppressed**: if the destination is not in the SR graph, not in NodeDB, and not in the downstream table, SR suppresses the relay entirely (`UNICAST SUPPRESS ... unknown destination — not in SR graph or NodeDB`). This is expected — relaying for completely unknown destinations wastes airtime. If the destination should be known, check topology propagation and NodeDB state.
 - **Incorrect slot ordering**: a node picks an early slot when a better-covered node should go first. Compare coverage counts and costs in the slot schedule across both logs.
 - **Topology staleness**: relay decisions based on outdated edges. Compare topology processing timestamps against packet scheduling timestamps.
 - **Stock nodes relaying last-hop unicasts**: if you see a stock node retransmitting a unicast that was already destined for a direct neighbor, check whether `shouldZeroHopLimitForUnicastRelay` fired (look for the `Zeroing hop_limit` log lines). If it did not fire, verify that `hearsUs=true` is set on the destination's edge and that the sender had at least one stock direct neighbor.

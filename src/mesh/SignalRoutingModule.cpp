@@ -634,6 +634,43 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
         }
     }
 
+    // Authoritative hearsUs override: the topology source is authoritative about who it can hear.
+    // If another node claims hearsUs=true on its edge to the source, but the source didn't list
+    // that node as a neighbor, clear the flag — the source can't actually hear that node.
+    if (routingGraph && neighborCount > 0) {
+        NodeNum allNodes[NEIGHBOR_GRAPH_MAX_NEIGHBORS];
+        size_t nodeCount = routingGraph->getAllNodeIds(allNodes, NEIGHBOR_GRAPH_MAX_NEIGHBORS);
+        for (size_t n = 0; n < nodeCount; n++) {
+            NodeNum nodeId = allNodes[n];
+            if (nodeId == p->from) {
+                continue;
+            }
+            const NodeEdges *nodeEdges = routingGraph->getEdgesFrom(nodeId);
+            if (!nodeEdges) {
+                continue;
+            }
+            for (uint8_t e = 0; e < nodeEdges->edgeCount; e++) {
+                if (nodeEdges->edges[e].to == p->from && nodeEdges->edges[e].hearsUs) {
+                    // Check if the source listed this node as a neighbor
+                    bool foundInNeighborList = false;
+                    for (uint8_t i = 0; i < neighborCount; i++) {
+                        if (neighbors[i].nodeId == nodeId) {
+                            foundInNeighborList = true;
+                            break;
+                        }
+                    }
+                    if (!foundInNeighborList) {
+                        char nodeName[48];
+                        getNodeDisplayName(nodeId, nodeName, sizeof(nodeName));
+                        LOG_INFO("[SR] Clearing hearsUs on %s -> %s: source topology doesn't list %s as neighbor",
+                                 nodeName, senderNameForTopo, nodeName);
+                        routingGraph->setEdgeHearsUs(nodeId, p->from, false);
+                    }
+                }
+            }
+        }
+    }
+
     // Update last processed version (minimal state tracking)
     setTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, p->from, receivedVersion);
 
