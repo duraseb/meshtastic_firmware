@@ -2620,7 +2620,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     // Phase 2: Iteratively pick best SR candidate, assign slots
     while (!candidates.empty()) {
         RelayCandidate best = routingGraph->findBestRelayCandidate(candidates, alreadyCovered,
-                                                                    currentTime, p->id, preferHighNodeId);
+                                                                    currentTime, p->id, preferHighNodeId, sourceNode);
         if (best.nodeId == 0) {
             break;
         }
@@ -2643,12 +2643,12 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
             shouldRelay = true;
             myDelay = slotDelay;
             decisionReason = "SR slot assignment";
-            LOG_INFO("[SR] Slot %ums: US (%08x) — assigned", slotDelay, myNode);
+            LOG_INFO("[SR] Slot %ums: US (%08x) — assigned%s", slotDelay, myNode, best.tier > 0 ? " (bidi)" : "");
             break;
         }
 
-        LOG_INFO("[SR] Slot %ums: SR node %08x (coverage=%u, cost=%.2f)", slotDelay, best.nodeId,
-                  best.coverageCount, best.getAvgCost());
+        LOG_INFO("[SR] Slot %ums: SR node %08x (coverage=%u, cost=%.2f%s)", slotDelay, best.nodeId,
+                  best.coverageCount, best.getAvgCost(), best.tier > 0 ? ", bidi" : "");
         slotDelay += halfAirtime;
     }
 

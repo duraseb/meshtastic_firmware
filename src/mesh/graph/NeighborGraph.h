@@ -234,7 +234,7 @@ class NeighborGraph {
 
     RelayCandidate findBestRelayCandidate(const NodeSet &candidates, const NodeSet &alreadyCovered,
                                           uint32_t currentTime, uint32_t packetId,
-                                          bool preferHighNodeId = false) const;
+                                          bool preferHighNodeId = false, NodeNum sourceNode = 0) const;
 
     size_t getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, size_t maxNodes, const NodeNum *alreadyCovered,
                                size_t alreadyCoveredCount) const;

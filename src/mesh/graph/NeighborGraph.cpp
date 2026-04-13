@@ -1068,7 +1068,7 @@ size_t NeighborGraph::getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, 
 
 RelayCandidate NeighborGraph::findBestRelayCandidate(const NodeSet &candidates, const NodeSet &alreadyCovered,
                                                           uint32_t currentTime, uint32_t packetId,
-                                                          bool preferHighNodeId) const
+                                                          bool preferHighNodeId, NodeNum sourceNode) const
 {
     RelayCandidate bestCandidate(0, 0, 0, 0);
 
@@ -1112,16 +1112,31 @@ RelayCandidate NeighborGraph::findBestRelayCandidate(const NodeSet &candidates, 
         float avgCost = totalCost / validCosts;
         uint16_t avgCostFixed = static_cast<uint16_t>(avgCost * 100);
 
-        bool isBetter = uniqueCoverageCount > bestCandidate.coverageCount ||
-                        (uniqueCoverageCount == bestCandidate.coverageCount && avgCostFixed < bestCandidate.avgCostFixed);
-        // Deterministic tiebreak on node ID when coverage and cost are equal
-        if (!isBetter && uniqueCoverageCount == bestCandidate.coverageCount &&
+        // Bidirectional link priority: candidates that can deliver back to the source
+        // (hearsUs=true on their edge to sourceNode) get a higher tier. This ensures
+        // nodes with confirmed round-trip connectivity relay first, so both SR and
+        // stock nodes on the branch discover the correct gateway.
+        uint8_t candidateTier = 0;
+        if (sourceNode != 0 && candidateEdges) {
+            const Edge *srcEdge = findEdge(candidateEdges, sourceNode);
+            if (srcEdge && srcEdge->hearsUs) {
+                candidateTier = 1;
+            }
+        }
+
+        bool isBetter = candidateTier > bestCandidate.tier ||
+                        (candidateTier == bestCandidate.tier && uniqueCoverageCount > bestCandidate.coverageCount) ||
+                        (candidateTier == bestCandidate.tier && uniqueCoverageCount == bestCandidate.coverageCount &&
+                         avgCostFixed < bestCandidate.avgCostFixed);
+        // Deterministic tiebreak on node ID when tier, coverage and cost are equal
+        if (!isBetter && candidateTier == bestCandidate.tier &&
+            uniqueCoverageCount == bestCandidate.coverageCount &&
             avgCostFixed == bestCandidate.avgCostFixed && bestCandidate.nodeId != 0) {
             isBetter = preferHighNodeId ? (candidate > bestCandidate.nodeId)
                                         : (candidate < bestCandidate.nodeId);
         }
         if (isBetter) {
-            bestCandidate = RelayCandidate(candidate, uniqueCoverageCount, avgCostFixed, 0);
+            bestCandidate = RelayCandidate(candidate, uniqueCoverageCount, avgCostFixed, candidateTier);
         }
     }
 
@@ -1251,7 +1266,7 @@ bool NeighborGraph::shouldRelayEnhanced(NodeNum myNode, NodeNum sourceNode, Node
 
     while (!candidates.empty()) {
         RelayCandidate bestCandidate = findBestRelayCandidate(candidates, alreadyCovered, currentTime, packetId,
-                                                               preferHighNodeId);
+                                                               preferHighNodeId, sourceNode);
 
         if (bestCandidate.nodeId == 0) {
             break;
