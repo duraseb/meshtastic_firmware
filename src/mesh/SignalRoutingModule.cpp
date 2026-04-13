@@ -1232,7 +1232,7 @@ void SignalRoutingModule::logNetworkTopology()
 
     NodeNum ourNode = nodeDB->getNodeNum();
     // Single shared name buffer to minimize stack usage in nested loops
-    char nameBuf[48];
+    char nameBuf[80];
     getNodeDisplayName(ourNode, nameBuf, sizeof(nameBuf));
 
     // Get our direct edges
