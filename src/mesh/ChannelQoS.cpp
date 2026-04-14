@@ -3,6 +3,7 @@
 #if !MESHTASTIC_EXCLUDE_CHANNEL_QOS
 
 #include "ChannelQoS.h"
+#include "NodeDB.h"
 #include "airtime.h"
 #include "mesh/generated/meshtastic/portnums.pb.h"
 
@@ -16,6 +17,24 @@ static const char *getTierName(ChannelQoS::Tier t)
         case ChannelQoS::Tier::QOS_HIGH:     return "HIGH";
         case ChannelQoS::Tier::QOS_CRITICAL: return "CRITICAL";
         default:                             return "?";
+    }
+}
+
+static const char *getPortnumShortName(meshtastic_PortNum portnum)
+{
+    switch (portnum) {
+        case meshtastic_PortNum_TEXT_MESSAGE_APP:            return "text";
+        case meshtastic_PortNum_TEXT_MESSAGE_COMPRESSED_APP: return "text_compressed";
+        case meshtastic_PortNum_POSITION_APP:                return "position";
+        case meshtastic_PortNum_NODEINFO_APP:                return "nodeinfo";
+        case meshtastic_PortNum_ROUTING_APP:                 return "routing";
+        case meshtastic_PortNum_ADMIN_APP:                   return "admin";
+        case meshtastic_PortNum_TELEMETRY_APP:               return "telemetry";
+        case meshtastic_PortNum_TRACEROUTE_APP:              return "traceroute";
+        case meshtastic_PortNum_NEIGHBORINFO_APP:            return "neighborinfo";
+        case meshtastic_PortNum_SIGNAL_ROUTING_APP:          return "signal_routing";
+        case meshtastic_PortNum_MAP_REPORT_APP:              return "map_report";
+        default:                                             return nullptr;
     }
 }
 
@@ -39,8 +58,27 @@ bool ChannelQoS::canRelay(const meshtastic_MeshPacket *p)
     }
 
     if (chutil >= threshold) {
-        LOG_INFO("[QoS] Drop relay 0x%08x from 0x%08x: tier %s, chutil %.1f%% >= %d%%",
-                 p->id, p->from, getTierName(tier), chutil, threshold);
+        const char *longName = "";
+        const char *shortName = "?";
+        if (nodeDB) {
+            const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(p->from);
+            if (node && node->has_user) {
+                if (node->user.long_name[0]) {
+                    longName = node->user.long_name;
+                }
+                if (node->user.short_name[0]) {
+                    shortName = node->user.short_name;
+                }
+            }
+        }
+        const char *portnumName = getPortnumShortName(static_cast<meshtastic_PortNum>(p->decoded.portnum));
+        if (portnumName) {
+            LOG_INFO("[QoS] Drop relay 0x%08x from %s (%s, %08x): %s, tier %s, chutil %.1f%% >= %d%%",
+                     p->id, longName, shortName, p->from, portnumName, getTierName(tier), chutil, threshold);
+        } else {
+            LOG_INFO("[QoS] Drop relay 0x%08x from %s (%s, %08x): port %d, tier %s, chutil %.1f%% >= %d%%",
+                     p->id, longName, shortName, p->from, p->decoded.portnum, getTierName(tier), chutil, threshold);
+        }
         return false;
     }
 
