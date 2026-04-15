@@ -7,6 +7,12 @@
 
 static void getNodeDisplayName(NodeNum nodeId, char *buf, size_t bufSize)
 {
+#ifdef DEBUG_MUTE
+    (void)nodeId;
+    if (bufSize > 0) {
+        buf[0] = '\0';
+    }
+#else
     if (!nodeDB) {
         snprintf(buf, bufSize, "(%08x)", nodeId);
         return;
@@ -17,6 +23,7 @@ static void getNodeDisplayName(NodeNum nodeId, char *buf, size_t bufSize)
     } else {
         snprintf(buf, bufSize, "Unknown (%08x)", nodeId);
     }
+#endif
 }
 
 NodeRateLimiter *nodeRateLimiter = nullptr;

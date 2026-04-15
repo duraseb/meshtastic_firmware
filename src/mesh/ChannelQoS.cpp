@@ -58,6 +58,7 @@ bool ChannelQoS::canRelay(const meshtastic_MeshPacket *p)
     }
 
     if (chutil >= threshold) {
+#ifndef DEBUG_MUTE
         const char *longName = "";
         const char *shortName = "?";
         if (nodeDB) {
@@ -79,6 +80,7 @@ bool ChannelQoS::canRelay(const meshtastic_MeshPacket *p)
             LOG_INFO("[QoS] Drop relay 0x%08x from %s (%s, %08x): port %d, tier %s, chutil %.1f%% >= %d%%",
                      p->id, longName, shortName, p->from, p->decoded.portnum, getTierName(tier), chutil, threshold);
         }
+#endif
         return false;
     }
 
