@@ -46,6 +46,12 @@ void SignalRoutingModule::setTopologyVersion(TopologyVersionEntry *table, uint8_
 
 // Helper to get node display name for logging
 static void getNodeDisplayName(NodeNum nodeId, char *buf, size_t bufSize) {
+#ifdef DEBUG_MUTE
+    (void)nodeId;
+    if (bufSize > 0) {
+        buf[0] = '\0';
+    }
+#else
     if (!nodeDB) {
         snprintf(buf, bufSize, "(%08x)", nodeId);
         return;
@@ -56,6 +62,7 @@ static void getNodeDisplayName(NodeNum nodeId, char *buf, size_t bufSize) {
     } else {
         snprintf(buf, bufSize, "Unknown (%08x)", nodeId);
     }
+#endif
 }
 
 // Helper to compute age in seconds; returns -1 if unknown/invalid
@@ -1204,6 +1211,9 @@ bool SignalRoutingModule::shouldRelayForStockNeighbors(NodeNum myNode, NodeNum s
 
 void SignalRoutingModule::logNetworkTopology()
 {
+#ifdef DEBUG_MUTE
+    return;
+#else
     if (!routingGraph) return;
 
     // Use fixed-size arrays only, no heap allocations
@@ -1346,6 +1356,7 @@ void SignalRoutingModule::logNetworkTopology()
     // Add legend explaining ETX to signal quality mapping
     LOG_INFO("[SR] ETX to signal mapping: ETX=1.0~RSSI=-60dB/SNR=10dB, ETX=2.0~RSSI=-90dB/SNR=0dB, ETX=4.0~RSSI=-110dB/SNR=-5dB");
     LOG_INFO("[SR] Topology logging complete");
+#endif // !DEBUG_MUTE
 }
 
 ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &mp)

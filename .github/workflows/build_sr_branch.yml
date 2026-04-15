@@ -37,7 +37,9 @@ jobs:
           - { pio_env: kapico,                   platform: rp2040   }
           - { pio_env: durahydra,                platform: esp32s3  }
           - { pio_env: birbmesh_one,             platform: nrf52840 }
+          - { pio_env: birbmesh_one_nolog,       platform: nrf52840 }
           - { pio_env: birbmesh_one_e22p,        platform: nrf52840 }
+          - { pio_env: birbmesh_one_e22p_nolog,  platform: nrf52840 }
           - { pio_env: hydra-e22p,               platform: esp32    }
           - { pio_env: hydra,                    platform: esp32    }
 

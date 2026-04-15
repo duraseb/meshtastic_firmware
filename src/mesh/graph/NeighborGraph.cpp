@@ -1452,6 +1452,7 @@ bool NeighborGraph::shouldRelaySimpleConservative(NodeNum myNode, NodeNum source
     }
 
     if (totalNeighborsNotCovered > 0) {
+#ifndef DEBUG_MUTE
         char nodeList[128] = "";
         int offset = 0;
         uint8_t logCount = totalNeighborsNotCovered < MAX_LOG_NODES ? totalNeighborsNotCovered : MAX_LOG_NODES;
@@ -1461,6 +1462,7 @@ bool NeighborGraph::shouldRelaySimpleConservative(NodeNum myNode, NodeNum source
                 break;
         }
         LOG_INFO("NeighborGraph: Conservative fallback - have %u uncovered neighbors [%s], relaying", totalNeighborsNotCovered, nodeList);
+#endif
         return true;
     }
 
