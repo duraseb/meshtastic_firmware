@@ -69,7 +69,7 @@ This dual approach provides the reliability of coordinated networking with the e
 | **CLIENT** | Rebroadcasts, can cancel duplicates | Uses SR coordination for broadcasts |
 | **ROUTER/ROUTER_LATE** | Always rebroadcasts, never cancels | **Priority relays** - SR gives them highest priority as they always rebroadcast |
 | **ROUTER_CLIENT** | Rebroadcasts, can cancel duplicates | Uses SR coordination for broadcasts |
-| **REPEATER** | Rebroadcasts, can cancel duplicates | **Priority relays** - SR gives them highest priority as they always rebroadcast |
+| **REPEATER** | Rebroadcasts, can cancel duplicates | **Priority relays** - SR gives them early slots since they typically rebroadcast |
 | **CLIENT_BASE** | Special: acts as ROUTER for favorited nodes | Uses SR coordination for broadcasts |
 | **TRACKER/SENSOR/TAK** | Rebroadcasts, can cancel duplicates | Treated as legacy, no SR participation |
 
@@ -88,7 +88,7 @@ This dual approach provides the reliability of coordinated networking with the e
 
 Passive SR nodes (TRACKER, SENSOR, TAK, or non-active-routing configured nodes) participate minimally in SR:
 
-1. **Topology Maintenance**: Only track directly-heard neighbors (hopStart == hopLimit)
+1. **Topology Maintenance**: Only track directly-heard neighbors (via `isDirectPacket()` — hopStart == hopLimit and relay_node matches sender)
 2. **SR Broadcasts**: Only process topology broadcasts from direct senders
 3. **Node Activity**: Only update activity for direct packets; ignore relayed packets
 4. **Graph Scope**: Limited to Level 1 neighbors - no multi-hop topology
@@ -104,33 +104,36 @@ Passive SR nodes (TRACKER, SENSOR, TAK, or non-active-routing configured nodes) 
 |-------------|-----------------|---------------|
 | **FloodingRouter** | SNR-based delays (poorer SNR = shorter delay) | Immediate send |
 | **NextHopRouter** | SNR-based delays + next hop preference | iface->getRetransmissionMsec() timing |
-| **SignalRouting** | Slot-based: half-airtime per slot + hash-based unique coverage delay | ETX-based route selection + speculative retransmit |
+| **SignalRouting** | Slot-based: half-airtime per slot, deterministic candidate ordering | ETX-based route selection + speculative retransmit |
 
 ## Direct Neighbor Detection
 
-### Reliable Detection Method: hopStart/hopLimit
+### Reliable Detection Method: isDirectPacket()
 
-SignalRouting uses the hop counter to definitively determine if a packet was received directly from the sender:
+SignalRouting determines if a packet was received directly from the sender using a two-part check in `isDirectPacket()`:
 
 ```cpp
-bool isDirectFromSender = (mp.hop_start == mp.hop_limit);
+bool SignalRoutingModule::isDirectPacket(const meshtastic_MeshPacket &mp)
+{
+    if (mp.hop_start != mp.hop_limit)
+        return false;
+    // If relay_node is set and doesn't match the sender's last byte,
+    // a different node relayed this (stock nodes may not decrement hop_limit)
+    if (mp.relay_node != 0 && mp.relay_node != (mp.from & 0xFF))
+        return false;
+    return true;
+}
 ```
 
 **How it works:**
-- When a sender transmits a packet, `hop_start` is set to the initial hop limit
-- Each relay decrements `hop_limit`
-- If `hop_start == hop_limit`, the packet has NOT been decremented, meaning it reached us directly from the sender without any relays
+1. **Hop counter check** (`hop_start == hop_limit`): When a sender transmits a packet, `hop_start` is set to the initial hop limit. Each relay decrements `hop_limit`. If they are equal, the packet has not been decremented by any relay.
+2. **Relay node check** (`relay_node` vs `from & 0xFF`): If `relay_node` is set and does not match the originator's last byte, a different node relayed this packet. This catches cases where stock firmware nodes relay without decrementing `hop_limit`.
 
-**Advantages over relay_node matching:**
-- Immune to node ID collisions (multiple nodes sharing the same last byte)
-- Works correctly even when same packet received via different relay paths
-- More reliable than checking if relay_node matches sender's last byte
-- Handles SR broadcasts correctly since they maintain minimum hopLimit=1
+Both checks must pass for the packet to be considered direct. The hop counter alone is necessary but not sufficient because stock nodes may not always decrement `hop_limit` when relaying.
 
 **Impact on Topology:**
-- Passive nodes only add neighbors from direct packets to their graph
-- Direct packets are identified by `hopStart == hopLimit` condition
-- Passive nodes skip all relayed packets (hopStart > hopLimit)
+- Passive nodes only add neighbors from direct packets (passing both checks) to their graph
+- Passive nodes skip all relayed packets
 - This ensures passive node topology shows only Level 1 neighbors
 
 ETX measures the expected number of transmissions needed to successfully deliver a packet over a wireless link. It's calculated from RSSI (Received Signal Strength Indicator) and SNR (Signal-to-Noise Ratio) measurements:
@@ -167,9 +170,9 @@ All discovery mechanisms are used to maintain comprehensive network topology:
 **Passive Routing Nodes (TRACKER, SENSOR, TAK, and nodes not configured for active routing):**
 Passive nodes maintain a simplified Level 1 topology containing ONLY directly-heard neighbors:
 
-1. **Direct Neighbor Detection**: Only neighbors heard directly (hopStart == hopLimit with signal data) are tracked with measured ETX values
+1. **Direct Neighbor Detection**: Only neighbors heard directly (`isDirectPacket()` — hopStart == hopLimit and relay_node matches sender, with signal data) are tracked with measured ETX values
 
-2. **SR Broadcast Reception**: Only process topology broadcasts from direct senders (hopStart == hopLimit), preventing ingestion of remote network topology
+2. **SR Broadcast Reception**: Only process topology broadcasts from direct senders (`isDirectPacket()`), preventing ingestion of remote network topology
 
 3. **Packet Activity Tracking**: Only update node activity for direct packets; relayed packets are ignored
 
@@ -310,7 +313,7 @@ This ensures last-hop delivery nodes (direct edge to destination) are always sch
 - An SR neighbor that covers `heardFrom` can reach destination → suppress
 
 **Dupe Cancellation:**
-When any dupe arrives for a committed unicast relay, `isDupeRelayRedundant` unconditionally cancels our queued TX. The slot-based ordering guarantees that earlier transmitters are better positioned, so once they relay there is no need for later slots to retransmit.
+When a dupe arrives for a committed unicast relay, `areAllNeighborsCovered()` evaluates whether the dupe relayer can reach the destination. If the dupe relayer has a direct edge or downstream path to the destination, our queued TX is canceled — the slot-based ordering guarantees earlier transmitters are better positioned. However, if the dupe relayer cannot reach the destination but we can (direct edge or downstream relay), our relay is kept to ensure delivery.
 
 ## Broadcast Routing
 
@@ -348,7 +351,6 @@ Slot timing example (150ms half-airtime):
   Slot 2 (300ms):  Best SR candidate (most unique coverage)
   Slot 3 (450ms):  Next SR candidate
   ...
-  Unique (600ms+): Hash-based delay for nodes with uncovered neighbors
 ```
 
 **Deterministic tiebreak**: When two candidates have identical coverage and cost, the winner is determined by node ID direction based on packet ID parity (even → lowest ID, odd → highest ID). This distributes relay duty evenly across nodes.
@@ -368,7 +370,7 @@ Mirrored edges (learned from topology broadcasts) are not cleared when a new top
 3. **Deterministic Ordering**: All nodes compute the same candidate ranking for consistent slot assignment
 4. **Coverage-Based Selection**: Candidates ranked by unique coverage count, then ETX quality
 5. **Dupe Suppression**: Existing packet deduplication cancels queued relays when earlier slots transmit
-6. **Unique Coverage Fallback**: Nodes covering areas no candidate reaches relay with hash-based delay
+6. **Unique Coverage Fallback**: Nodes covering areas no candidate reaches are forced to relay via downstream override or stock coverage checks
 7. **Downstream Override**: Nodes recorded as relay for source/destination are forced to relay
 
 ### Broadcast Coordination Example
@@ -424,7 +426,7 @@ LoRa is half-duplex: a transmitting node cannot hear its own channel while sendi
 3. At least one direct neighbor with `hearsUs=true` exists — confirms we have a known neighbor before spending airtime on the retransmit.
 4. T1 retransmit is not disabled via config (`t1_retransmit_enabled`).
 
-**Cancellation:** Any incoming dupe triggers `cancelBroadcastRetransmit()` via `perhapsCancelDupe()`. This covers all paths: committed relay that decides to cancel, already-relayed detection, and non-SR originator dupes.
+**Cancellation:** Most incoming dupes trigger `cancelBroadcastRetransmit()` via `perhapsCancelDupe()` — including committed relays that decide to cancel, already-relayed detection, and non-SR originator dupes. The one exception is when a committed relay has unique coverage and keeps its queued TX: T1 is also preserved in this case, since the retransmit insurance is still needed if our relay fails.
 
 **Graph-based pre-fire cancellation:** When the T1 timer expires, `allHearsUsNeighborsHeardPacket()` checks whether every `hearsUs` neighbor already received the packet — either because they are a known transmitter themselves, or because a known transmitter has a link to them in the SR graph (edge in either direction). If all `hearsUs` neighbors are accounted for, T1 is canceled without retransmitting. This prevents unnecessary T1 retransmits in the common case where neighbors already had the packet from another path and correctly suppressed our relay as a dupe.
 
@@ -518,7 +520,7 @@ SignalRouting considerations:
 **Congestion Control:**
 - Deterministic slot scheduling minimizes redundant broadcasts
 - Half-airtime spacing between slots ensures physical separation of transmissions
-- Unique coverage relays use hash-based delays (0-2000ms) to spread out remaining transmissions
+- Downstream override and stock coverage checks ensure nodes with unique coverage still relay
 
 ## NeighborGraph Implementation
 
@@ -542,7 +544,7 @@ class NeighborGraph {
 | Struct | Purpose |
 |--------|---------|
 | `Edge` | Link to a neighbor with ETX (fixed-point ×100), variance, source (Reported/Mirrored), timestamp |
-| `NodeEdges` | A neighbor slot: nodeId + up to 16 edges + last full update time |
+| `NodeEdges` | A neighbor slot: nodeId + up to 24 edges + last full update time |
 | `DownstreamEntry` | Remote node routing: (destination, relay, cost, lastUpdate) |
 | `Route` | Cached route result: (destination, nextHop, cost, timestamp) |
 | `RelayCandidate` | Relay selection: (nodeId, coverageCount, avgCost, tier) |
@@ -774,7 +776,7 @@ SignalRouting uses a deterministic slot-based algorithm for relay coordination:
 4. **SR Candidate Ranking**: Iteratively pick best candidate (most unique coverage, lowest ETX, packet-ID-parity node ID tiebreak), assign next slot, remove from candidates
 4. **Self-Assignment**: When we're picked as best candidate, schedule TX at that slot's delay
 5. **Already-Transmitted Absorption**: Candidates that already transmitted have their coverage absorbed without consuming a slot
-6. **Unique Coverage**: If not assigned a slot, check for uncovered neighbors and relay with hash-based delay
+6. **Forced Relay**: If not assigned a slot, downstream override or stock coverage checks may still force a relay
 7. **Dupe Suppression**: If a relay arrives before our slot fires, existing deduplication cancels our queued TX
 
 Slot spacing is half the packet airtime, ensuring the next-slot node detects ongoing reception (`busyRx`) and holds its transmission.
