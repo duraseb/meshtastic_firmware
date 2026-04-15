@@ -29,6 +29,12 @@ public:
     String getChannelName() const override { return "PoznanEvent"; }
     unsigned long getFetchIntervalMs() const override;
 
+    /**
+     * Returns whether the last fetch attempt failed (no forecast produced).
+     * Used to determine if a shorter retry interval should be used.
+     */
+    bool didLastFetchFail() const { return lastFetchFailed; }
+
     String fetchAndFormat(
         std::function<String(const char*, int&)> httpGetCallback) override;
 
@@ -79,10 +85,16 @@ private:
 #endif
 
     // Configuration constants
-    static constexpr unsigned long DEFAULT_FETCH_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+    // 22h interval means the timer elapses around 18:xx the next day; isWithinFetchWindow()
+    // then holds until 20:00, so fetches always land in the 20:00–22:00 window.
+    static constexpr unsigned long DEFAULT_FETCH_INTERVAL_MS = 22 * 60 * 60 * 1000; // 22 hours
+    static constexpr unsigned long RETRY_FETCH_INTERVAL_MS = 30 * 60 * 1000;        // 30 min on failure
+
+    // Set by fetchAndFormat (main loop only, no lock needed)
+    bool lastFetchFailed = false;
     static constexpr int DEFAULT_MIN_HOUR_OF_DAY = 20; // Don't fetch before 20:00
     static constexpr unsigned long WIKIDATA_QUERY_TIMEOUT_MS = 65000; // Wikidata can be slow
-    static constexpr int WIKIDATA_QUERY_MAX_RETRIES = 20;
+    static constexpr int WIKIDATA_QUERY_MAX_RETRIES = 5;
     static constexpr int WIKIDATA_QUERY_LIMIT = 30;
     static constexpr size_t WIKIDATA_MAX_RESPONSE_BYTES = 70000;
     static constexpr size_t WIKIDATA_MAX_PROMPT_CHARS = 3000;

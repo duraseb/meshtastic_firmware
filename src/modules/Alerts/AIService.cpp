@@ -35,8 +35,8 @@ AIService::~AIService()
 
 void AIService::initializeProviders()
 {
-    aiProviders[0].name = "Gemini-1.5";
-    aiProviders[0].endpoint = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent";
+    aiProviders[0].name = "Gemini-2.5-Flash";
+    aiProviders[0].endpoint = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent";
     #ifdef GEMINI_API_KEY
     aiProviders[0].apiKey = GEMINI_API_KEY;
     #else
@@ -44,7 +44,7 @@ void AIService::initializeProviders()
     #endif
     aiProviders[0].requestFormat = "gemini";
 
-    aiProviders[1].name = "Gemini-2.5-Fallback";
+    aiProviders[1].name = "Gemini-2.5-Flash-Lite-Fallback";
     aiProviders[1].endpoint = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash-lite:generateContent";
     #ifdef GEMINI_API_KEY
     aiProviders[1].apiKey = GEMINI_API_KEY;

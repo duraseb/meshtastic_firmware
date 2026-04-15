@@ -69,31 +69,37 @@ String IMGWSynopSource::fetchAndFormat(
         hour = "0" + hour;
     }
 
-    String message = "Pogoda: \xF0\x9F\x93\x8D"; // UTF-8 for 📍 (PIN emoji)
+    String message = "Pogoda \xF0\x9F\x93\x8D"; // UTF-8 for 📍 (PIN emoji)
     message += station;
-    message += " | ";
+    message += " z ";
+    message += date;
+    message += " ";
+    message += hour;
+    message += ":00";
+
+    message += "\n";
 
     // Temperature with thermometer icon
     message += "\xF0\x9F\x8C\xA1 "; // UTF-8 for 🌡️ (thermometer)
     message += temp;
-    message += "\xC2\xB0" "C"; // UTF-8 for ° (degree symbol)
+    message += "\xC2\xB0" "C\n"; // UTF-8 for ° (degree symbol)
 
     // Precipitation
-    message += " | suma opadów: ";
+    message += "suma opadów: ";
     message += precip;
-    message += "mm";
+    message += "mm\n";
 
     // Pressure
-    message += " | ciśnienie: ";
+    message += "ciśnienie: ";
     message += pressure;
-    message += " hPa";
+    message += " hPa\n";
 
     // Wind
-    message += " | wiatr: ";
+    message += "wiatr: ";
     message += windCompass;
     message += " ";
     message += windSpeed;
-    message += "m/s";
+    message += "m/s ";
 
     // Add km/h conversion in parentheses (1 m/s = 3.6 km/h)
     float windSpeedMs = windSpeed.toFloat();
@@ -101,12 +107,6 @@ String IMGWSynopSource::fetchAndFormat(
     message += " (";
     message += String(windSpeedKmh);
     message += "km/h)";
-
-    message += " (";
-    message += date;
-    message += " ";
-    message += hour;
-    message += ":00)";
 
     LOG_INFO("IMGWSynopSource: Formatted weather: %s", message.c_str());
 

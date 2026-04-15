@@ -60,7 +60,7 @@ AiWeatherSource::~AiWeatherSource()
 
 unsigned long AiWeatherSource::getFetchIntervalMs() const
 {
-    return DEFAULT_FETCH_INTERVAL_MS; // 24 hours
+    return lastFetchFailed ? RETRY_FETCH_INTERVAL_MS : DEFAULT_FETCH_INTERVAL_MS;
 }
 
 String AiWeatherSource::fetchAndFormat(
@@ -144,7 +144,9 @@ String AiWeatherSource::fetchAndFormat(
     }
 
     if (asyncFailure.length() > 0) {
-        LOG_WARN("[AiWeatherSource] Last async prefetch failed: %s", asyncFailure.c_str());
+        LOG_WARN("[AiWeatherSource] Last async prefetch failed: %s. Will retry in %lu min",
+                 asyncFailure.c_str(), RETRY_FETCH_INTERVAL_MS / 60000);
+        lastFetchFailed = true;
         return "";
     }
 
@@ -326,6 +328,7 @@ String AiWeatherSource::fetchAndFormat(
 
         LOG_INFO("[AiWeatherSource] Successfully generated weather forecast with [%s]: %s", provider.name.c_str(), message.c_str());
         aiService->setCurrentProviderIndex(providerIdx); // Remember successful provider
+        lastFetchFailed = false;
         return message;
     }
 
@@ -462,7 +465,7 @@ void AiWeatherSource::runAsyncFetch()
     String birthPersonHints;
     LOG_INFO("[AiWeatherSource] Running async fetch for date=%02d-%02d (%s)", month, day, birthDate.c_str());
     if (!fetchBirthPersonHints(month, day, birthDate, birthPersonHints)) {
-        setAsyncResultError("Failed to fetch or parse Wikidata birthday candidates");
+        setAsyncResultError("Wikidata birthday candidates unavailable");
         return;
     }
     LOG_DEBUG("[AiWeatherSource] Async Wikidata stage done: %d hint chars", birthPersonHints.length());
@@ -549,16 +552,17 @@ String AiWeatherSource::buildWeatherPrompt(const String& weatherJson, const Stri
 {
     String prompt = String("Jesteś kreatywnym asystentem AI specjalizującym się w tworzeniu polskich prognoz pogody w stylu historycznych postaci.\n\n") +
                     "Wykonaj dokładnie te kroki:\n\n" +
-                    "1. Wybierz losowo jedną sławną postać historyczną urodzoną " + birthDate + ". Osoba może pochodzić z dowolnego kraju, ale musi być rozpoznawalna i znana Polakom. Wybierz kogoś o charakterystycznym stylu wyrażania się - może to być styl pisania, mówienia, tworzenia muzyki, malowania, czy inne formy artystycznego wyrazu.\n\n";
+                    "1. Wybierz losowo jedną sławną postać historyczną urodzoną " + birthDate + ". Osoba może pochodzić z dowolnego kraju, ale musi być rozpoznawalna i znana Polakom. Wybierz kogoś o charakterystycznym stylu wyrażania się - może to być styl pisania, mówienia, tworzenia muzyki, malowania, czy inne formy artystycznego wyrazu.\n"
+                    "BEZWZGLĘDNIE WAŻNE: chodzi o datę URODZIN (nie śmierci, nie imienin). Postać musi mieć datę urodzenia " + birthDate + ".\n\n";
 
     if (birthPersonHints.length() > 0) {
         prompt += "2. Wybierz jedną osobę z poniższej listy osób urodzonych " + birthDate + ":\n\n";
         prompt += birthPersonHints + "\n\n";
         prompt += "Jeśli żadna z tych osób nie pasuje, możesz wybrać inną znaną postać o podobnym, wyrazistym stylu. "
-                  "MUSISZ jednak wybrać postać urodzoną DOKŁADNIE " + birthDate + ".\n\n";
+                  "MUSISZ jednak wybrać postać urodzoną DOKŁADNIE " + birthDate + " (data urodzenia, nie śmierci).\n\n";
     } else {
         prompt += "2. Wybierz dowolną, rozpoznawalną postać historyczną o charakterystycznym stylu, "
-                  "ale MUSISZ wybrać osobę urodzoną DOKŁADNIE " + birthDate + ".\n\n";
+                  "ale MUSISZ wybrać osobę urodzoną DOKŁADNIE " + birthDate + " (data urodzenia, nie śmierci).\n\n";
     }
 
     prompt += "3. Przeanalizuj poniższe rzeczywiste dane pogodowe dla Poznania na jutro (" + tomorrowDate + ") z Open-Meteo API:\n\n" +
@@ -599,8 +603,7 @@ String AiWeatherSource::buildWikidataBirthdayQuery(int month, int day) const
     query += "  ?person wdt:P31 wd:Q5 .\n";
     query += "  ?person p:P569/psv:P569 [wikibase:timePrecision 11; wikibase:timeValue ?dob] .\n";
     query += "  FILTER(MONTH(?dob) = " + String(month) + " && DAY(?dob) = " + String(day) + ") .\n";
-    query += "  ?person wdt:P19 ?birthplace .\n";
-    query += "  ?birthplace wdt:P131* wd:Q36 .\n";
+    query += "  ?person wdt:P19/wdt:P17 wd:Q36 .\n";
     query += "  VALUES ?culturalOccupation {\n";
     query += "    wd:Q483501 wd:Q36180 wd:Q49757 wd:Q33999 wd:Q639669\n";
     query += "    wd:Q1028181 wd:Q177220 wd:Q214917 wd:Q10737 wd:Q1281618\n";
@@ -986,7 +989,7 @@ bool AiWeatherSource::fetchBirthPersonHints(int month, int day, const String& bi
             }
             http.end();
             if (attempt < WIKIDATA_QUERY_MAX_RETRIES) {
-                yieldMillis(1200 * attempt);
+                yieldMillis(15000);
             }
             continue;
         }
@@ -1029,7 +1032,7 @@ bool AiWeatherSource::fetchBirthPersonHints(int month, int day, const String& bi
                  attempt, WIKIDATA_QUERY_MAX_RETRIES);
 
         if (attempt < WIKIDATA_QUERY_MAX_RETRIES) {
-            yieldMillis(1200 * attempt);
+            yieldMillis(15000);
         }
     }
 
