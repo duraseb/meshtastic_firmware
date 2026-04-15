@@ -1,4 +1,4 @@
-#if defined(HAS_ALERTING) && HAS_ALERTING
+#if defined(HAS_ALERTING) && HAS_ALERTING && !MESHTASTIC_EXCLUDE_ALERT_RCB
 
 #include "RCBAlertSource.h"
 #include "configuration.h"
@@ -313,4 +313,4 @@ uint32_t RCBAlertSource::hashString(const String &str)
     return hash;
 }
 
-#endif // HAS_ALERTING
+#endif // HAS_ALERTING && !MESHTASTIC_EXCLUDE_ALERT_RCB

@@ -1,4 +1,4 @@
-#if defined(HAS_ALERTING) && HAS_ALERTING
+#if defined(HAS_ALERTING) && HAS_ALERTING && !MESHTASTIC_EXCLUDE_ALERT_SYNOP
 
 #include "IMGWSynopSource.h"
 #include "configuration.h"
@@ -156,4 +156,4 @@ String IMGWSynopSource::parseCSVField(const String& line, int fieldIndex)
 }
 
 
-#endif // HAS_ALERTING
+#endif // HAS_ALERTING && !MESHTASTIC_EXCLUDE_ALERT_SYNOP

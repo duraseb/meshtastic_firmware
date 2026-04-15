@@ -1,6 +1,9 @@
+#include "configuration.h"
+
+#if defined(HAS_ALERTING) && HAS_ALERTING && !MESHTASTIC_EXCLUDE_ALERT_IMGW
+
 #include "IMGWAlertSource.h"
 #include "../AlertsModule.h"
-#include "configuration.h"
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -469,3 +472,5 @@ uint32_t IMGWAlertSource::hashString(const String &str)
     }
     return hash;
 }
+
+#endif // HAS_ALERTING && !MESHTASTIC_EXCLUDE_ALERT_IMGW

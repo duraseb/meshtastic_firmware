@@ -2,11 +2,21 @@
 
 #include "AlertsModule.h"
 #include "AIService.h"
+#if !MESHTASTIC_EXCLUDE_ALERT_RCB
 #include "sources/RCBAlertSource.h"
+#endif
+#if !MESHTASTIC_EXCLUDE_ALERT_IMGW
 #include "sources/IMGWAlertSource.h"
+#endif
+#if !MESHTASTIC_EXCLUDE_ALERT_POZ
 #include "sources/POZAlertSource.h"
+#endif
+#if !MESHTASTIC_EXCLUDE_ALERT_SYNOP
 #include "dynamic_sources/IMGWSynopSource.h"
+#endif
+#if !MESHTASTIC_EXCLUDE_ALERT_AIWEATHER
 #include "dynamic_sources/AiWeatherSource.h"
+#endif
 #include "mesh/wifi/WiFiAPClient.h"
 #include "FSCommon.h"
 #include "main.h"
@@ -80,28 +90,34 @@ AlertsModule::AlertsModule() : OSThread("AlertsModule"), sharedJsonDoc(SHARED_JS
     broadcastingEnabled = false;
 
     // Register RCB source
+#if !MESHTASTIC_EXCLUDE_ALERT_RCB
     sources[numSources] = new RCBAlertSource();
     sourceLastFetchTime[numSources] = 0;
     LOG_INFO("[AlertsModule] Registered source: %s (fetch every %lu min)",
              sources[numSources]->getSourceId().c_str(),
              sources[numSources]->getFetchIntervalMs() / 60000);
     numSources++;
+#endif
 
     // Register IMGW source
+#if !MESHTASTIC_EXCLUDE_ALERT_IMGW
     sources[numSources] = new IMGWAlertSource();
     sourceLastFetchTime[numSources] = 0;
     LOG_INFO("[AlertsModule] Registered source: %s (fetch every %lu min)",
              sources[numSources]->getSourceId().c_str(),
              sources[numSources]->getFetchIntervalMs() / 60000);
     numSources++;
+#endif
 
     // Register POZ source
+#if !MESHTASTIC_EXCLUDE_ALERT_POZ
     sources[numSources] = new POZAlertSource();
     sourceLastFetchTime[numSources] = 0;
     LOG_INFO("[AlertsModule] Registered source: %s (fetch every %lu min)",
              sources[numSources]->getSourceId().c_str(),
              sources[numSources]->getFetchIntervalMs() / 60000);
     numSources++;
+#endif
 
     LOG_INFO("[AlertsModule] Total alert sources registered: %d", numSources);
 
@@ -115,14 +131,17 @@ AlertsModule::AlertsModule() : OSThread("AlertsModule"), sharedJsonDoc(SHARED_JS
     currentDynamicSourceIndex = 0;
 
     // Register IMGW SYNOP weather source
+#if !MESHTASTIC_EXCLUDE_ALERT_SYNOP
     dynamicSources[numDynamicSources] = new IMGWSynopSource();
     dynamicSourceLastFetchTime[numDynamicSources] = 0;
     LOG_INFO("[AlertsModule] Registered dynamic source: %s (fetch every %lu min)",
              dynamicSources[numDynamicSources]->getSourceId().c_str(),
              dynamicSources[numDynamicSources]->getFetchIntervalMs() / 60000);
     numDynamicSources++;
+#endif
 
     // Register AI Weather source
+#if !MESHTASTIC_EXCLUDE_ALERT_AIWEATHER
     dynamicSources[numDynamicSources] = new AiWeatherSource();
     dynamicSourceLastFetchTime[numDynamicSources] = 0;
     LOG_INFO("[AlertsModule] Registered dynamic source: %s (fetch every %lu hours, after %02d:00)",
@@ -130,6 +149,7 @@ AlertsModule::AlertsModule() : OSThread("AlertsModule"), sharedJsonDoc(SHARED_JS
              dynamicSources[numDynamicSources]->getFetchIntervalMs() / (60 * 60 * 1000),
              AiWeatherSource::getMinHourOfDay());
     numDynamicSources++;
+#endif
 
     LOG_INFO("[AlertsModule] Total dynamic sources registered: %d", numDynamicSources);
 

@@ -79,6 +79,19 @@ if [ -n "$VARIANT_DIR" ] && [ -f "$VARIANT_DIR/.env" ]; then
     load_env_file "$VARIANT_DIR/.env" "variant environment"
 fi
 
+# Convert EXCLUDE_ALERT_* env vars to build flags
+EXTRA_BUILD_FLAGS=""
+for var in EXCLUDE_ALERT_RCB EXCLUDE_ALERT_IMGW EXCLUDE_ALERT_POZ EXCLUDE_ALERT_SYNOP EXCLUDE_ALERT_AIWEATHER; do
+    val="${!var}"
+    if [ "$val" = "1" ]; then
+        EXTRA_BUILD_FLAGS="$EXTRA_BUILD_FLAGS -DMESHTASTIC_${var}=1"
+        echo "  🚫 Excluding provider: $var"
+    fi
+done
+if [ -n "$EXTRA_BUILD_FLAGS" ]; then
+    export PLATFORMIO_BUILD_FLAGS="${PLATFORMIO_BUILD_FLAGS:-}$EXTRA_BUILD_FLAGS"
+fi
+
 # Find PlatformIO executable
 if command -v pio &> /dev/null; then
     PIO_CMD="pio"

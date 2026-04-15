@@ -1,6 +1,6 @@
 #pragma once
 
-#if defined(HAS_ALERTING) && HAS_ALERTING
+#if defined(HAS_ALERTING) && HAS_ALERTING && !MESHTASTIC_EXCLUDE_ALERT_POZ
 
 #include "configuration.h"
 #include "../AlertSource.h"
@@ -49,4 +49,4 @@ private:
     unsigned long lastInfoBroadcast = 0;
 };
 
-#endif // HAS_ALERTING
+#endif // HAS_ALERTING && !MESHTASTIC_EXCLUDE_ALERT_POZ

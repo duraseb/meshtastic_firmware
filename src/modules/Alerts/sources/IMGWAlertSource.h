@@ -1,6 +1,6 @@
 #pragma once
 
-#if defined(HAS_ALERTING) && HAS_ALERTING
+#if defined(HAS_ALERTING) && HAS_ALERTING && !MESHTASTIC_EXCLUDE_ALERT_IMGW
 
 #include "configuration.h"
 #include "../AlertSource.h"
@@ -52,4 +52,4 @@ private:
     uint32_t hashString(const String &str);
 };
 
-#endif // HAS_ALERTING
+#endif // HAS_ALERTING && !MESHTASTIC_EXCLUDE_ALERT_IMGW

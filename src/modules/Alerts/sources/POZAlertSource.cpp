@@ -1,6 +1,9 @@
+#include "configuration.h"
+
+#if defined(HAS_ALERTING) && HAS_ALERTING && !MESHTASTIC_EXCLUDE_ALERT_POZ
+
 #include "POZAlertSource.h"
 #include "../AlertsModule.h"
-#include "configuration.h"
 #include "RTC.h"
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
@@ -257,3 +260,5 @@ uint32_t POZAlertSource::hashString(const String &str)
     }
     return hash;
 }
+
+#endif // HAS_ALERTING && !MESHTASTIC_EXCLUDE_ALERT_POZ

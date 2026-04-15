@@ -1,4 +1,4 @@
-#if defined(HAS_ALERTING) && HAS_ALERTING
+#if defined(HAS_ALERTING) && HAS_ALERTING && !MESHTASTIC_EXCLUDE_ALERT_AIWEATHER
 
 #include "AiWeatherSource.h"
 #include "concurrency/LockGuard.h"
@@ -1242,4 +1242,4 @@ int AiWeatherSource::getMinHourOfDay()
 }
 
 
-#endif // HAS_ALERTING
+#endif // HAS_ALERTING && !MESHTASTIC_EXCLUDE_ALERT_AIWEATHER

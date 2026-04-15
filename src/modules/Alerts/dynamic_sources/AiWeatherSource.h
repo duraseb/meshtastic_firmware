@@ -1,6 +1,6 @@
 #pragma once
 
-#if defined(HAS_ALERTING) && HAS_ALERTING
+#if defined(HAS_ALERTING) && HAS_ALERTING && !MESHTASTIC_EXCLUDE_ALERT_AIWEATHER
 
 #include "../DynamicSource.h"
 #include "../AIService.h"
@@ -151,4 +151,4 @@ private:
     String extractWeatherForecast(const String& fullResponse) const;
 
 };
-#endif // HAS_ALERTING
+#endif // HAS_ALERTING && !MESHTASTIC_EXCLUDE_ALERT_AIWEATHER
