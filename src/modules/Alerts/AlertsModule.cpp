@@ -562,6 +562,7 @@ Alert AlertsModule::toAlert(const AlertBinary &binAlert)
     a.source = safeString(binAlert.source, sizeof(binAlert.source));
     a.channel = safeString(binAlert.channel, sizeof(binAlert.channel));
     a.severity = binAlert.severity;
+    a.hops = binAlert.hops;
     a.addedAt = binAlert.addedAt;
     a.alert_type = a.title;
     a.lastSent = 0;
@@ -605,6 +606,7 @@ bool AlertsModule::fillAlertBinary(const Alert &alert, AlertBinary &binAlert)
     binAlert.valid_to[sizeof(binAlert.valid_to) - 1] = '\0';
 
     binAlert.severity = alert.severity;
+    binAlert.hops = alert.hops;
     binAlert.addedAt = alert.addedAt;
     binAlert.lastSent = alert.lastSent;
     binAlert.nextSendAt = alert.nextSendAt;
@@ -1195,13 +1197,10 @@ bool AlertsModule::addExternalAlert(const Alert &alert)
     cacheProcessedAlertId(alert.id);
     saveAlertsToSingleFile();
 
-    // Broadcast immediately
-    if (sendAlertToMesh(newAlert)) {
-        alerts.back().lastSent = now;
-        alerts.back().nextSendAt = now + getSendInterval(newAlert.severity) * 1000;
-        saveAlertsToSingleFile();
-        LOG_INFO("[AlertsModule] External alert 0x%x added and broadcast (source: %s)", alert.id, alert.source.c_str());
-    }
+    // Don't broadcast here — sendAlertToMesh triggers Router::sendLocal → handleReceived
+    // → module chain → AlertManager::onNotify recursion, risking stack overflow.
+    // Leave nextSendAt = 0 so runOnce picks it up on the next iteration.
+    LOG_INFO("[AlertsModule] External alert 0x%x added, will broadcast on next cycle (source: %s)", alert.id, alert.source.c_str());
 
     return true;
 }
@@ -1234,6 +1233,7 @@ bool AlertsModule::updateAlertById(uint32_t id, const Alert &updatedAlert)
             existing.valid_from = updatedAlert.valid_from;
             existing.valid_to = updatedAlert.valid_to;
             existing.severity = updatedAlert.severity;
+            existing.hops = updatedAlert.hops;
             existing.channel = updatedAlert.channel;
             existing.addedAt = originalAddedAt;
             // Reset send timing so updated alert gets broadcast soon
@@ -1785,6 +1785,7 @@ int32_t AlertsModule::runOnce()
             processingCtx.alert.id = processingCtx.rawAlert.id; // Store the unique identifier hash
             processingCtx.alert.source = processingCtx.source->getSourceId();
             processingCtx.alert.severity = processingCtx.source->getDefaultSeverity();
+            processingCtx.alert.hops = ALERT_HOP_LIMIT_DEFAULT;
             processingCtx.alert.lastSent = 0;
 
             if (currentTime > 0) {
@@ -2054,11 +2055,13 @@ int32_t AlertsModule::runOnce()
             }
 
             bool sourceAsyncInProgress = false;
+#if !MESHTASTIC_EXCLUDE_ALERT_AIWEATHER
             AiWeatherSource* aiSource = nullptr;
             if (source->getSourceId() == "AI_WEATHER") {
                 aiSource = static_cast<AiWeatherSource *>(source);
                 sourceAsyncInProgress = aiSource != nullptr && aiSource->isAsyncFetchInProgress();
             }
+#endif
 
             // Create HTTP GET callback for the source to use
             auto httpGetCallback = [this](const char* url, int& httpCode) -> String {
@@ -2071,6 +2074,7 @@ int32_t AlertsModule::runOnce()
 
             if (message.length() == 0) {
                 // If async work is still running, wait and retry on next loop tick.
+#if !MESHTASTIC_EXCLUDE_ALERT_AIWEATHER
                 if (sourceAsyncInProgress || (aiSource != nullptr && aiSource->isAsyncFetchInProgress())) {
                     if (isAiWeatherSource) {
                         if (now - lastAiWeatherPreparingLogMs > 30000UL) {
@@ -2090,6 +2094,7 @@ int32_t AlertsModule::runOnce()
                     message = source->fetchAndFormat(httpGetCallback);
                     feedWatchdog();
                 }
+#endif
 
                 if (message.length() == 0) {
                     // Update last fetch time for this source only when no async background work is pending
@@ -2450,13 +2455,17 @@ bool AlertsModule::sendAlertToMesh(const Alert &alert)
     }
 
     if (targetChannel.length() > 0) {
-        int8_t targetChannelIndex = findChannelByName(targetChannel);
-        if (targetChannelIndex >= 0) {
-            alertChannelIndex = targetChannelIndex;
-        } else {
-            LOG_WARN("Alert channel '%s' not found (source: %s), using primary channel",
-                     targetChannel.c_str(), alert.source.c_str());
+        if (strcmp(targetChannel.c_str(), "*") == 0) {
             alertChannelIndex = channels.getPrimaryIndex();
+        } else {
+            int8_t targetChannelIndex = findChannelByName(targetChannel);
+            if (targetChannelIndex >= 0) {
+                alertChannelIndex = targetChannelIndex;
+            } else {
+                LOG_WARN("Alert channel '%s' not found (source: %s), using primary channel",
+                         targetChannel.c_str(), alert.source.c_str());
+                alertChannelIndex = channels.getPrimaryIndex();
+            }
         }
     }
 
@@ -2473,7 +2482,12 @@ bool AlertsModule::sendAlertToMesh(const Alert &alert)
     }
     p->channel = alertChannelIndex;
     p->want_ack = true;
-    
+
+    // Override hop limit if explicitly set (allocForSending sets device default)
+    if (alert.hops != ALERT_HOP_LIMIT_DEFAULT) {
+        p->hop_limit = alert.hops;
+    }
+
     // Set priority based on severity
     if (alert.severity <= 2) {
         p->priority = meshtastic_MeshPacket_Priority_HIGH;

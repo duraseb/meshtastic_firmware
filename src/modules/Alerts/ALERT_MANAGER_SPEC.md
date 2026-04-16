@@ -109,7 +109,7 @@ Send `edit <n>` where `<n>` is the number from `list`. Each field shows its curr
 | `!` | Abort the entire create or edit flow |
 | `..` | Literal `.` character (if your text starts with a period) |
 | `!!` | Literal `!` character (if your text starts with an exclamation) |
-| ` ` (space) | Re-send the current prompt (if previous message was lost) |
+| `?` | Re-send the current prompt (if previous message was lost) |
 
 ## Field Defaults
 
@@ -228,8 +228,8 @@ onNotify(mp):
     1. Filter: only DMs to this node, TEXT_MESSAGE_APP portnum
     2. Extract and trim text payload
     3. Expire stale sessions
-    4. If text is whitespace-only and session exists → re-send prompt, return 1
-    5. If text is whitespace-only and no session → return 0 (pass through)
+    4. If text is `?` and session exists → re-send prompt, return 1
+    5. If text is `?` and no session → send info message, return 1
     6. If active session for mp->from → handleSessionInput(), return 1
     7. Else → handleCommand(), return 1
 ```

@@ -345,7 +345,7 @@ The `create` and `edit` commands start a step-by-step flow prompting for each fi
 | `!` | Abort the entire flow |
 | `..` | Literal `.` character (escaped) |
 | `!!` | Literal `!` character (escaped) |
-| ` ` (space) | Re-send the current step's prompt (useful if previous message was lost) |
+| `?` | Re-send the current step's prompt (or info message if no active session) |
 
 Sessions time out after 5 minutes of inactivity. Up to 3 concurrent sessions are supported.
 

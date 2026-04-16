@@ -16,6 +16,8 @@
 // Forward declaration
 class AlertManager;
 
+static constexpr uint8_t ALERT_HOP_LIMIT_DEFAULT = 0xFF; // Use device default hop limit
+
 // Alert structure - shared between AlertsModule and AlertSource
 struct Alert {
     uint32_t id;       // Unique identifier hash (for file naming and duplicate detection)
@@ -29,6 +31,7 @@ struct Alert {
     String source;     // Source identifier (e.g., "RCB")
     String channel;    // Per-alert channel override (empty = use source default)
     uint8_t severity;  // 0=critical (war, large disaster) to 10=very local/unimportant
+    uint8_t hops;      // Hop limit (0-7 = explicit, HOP_LIMIT_DEFAULT = use device default)
     unsigned long lastSent;
     unsigned long addedAt;
     unsigned long nextSendAt;
@@ -141,11 +144,11 @@ class AlertsModule : public concurrency::OSThread {
         char valid_from[32];
         char valid_to[32];
         uint8_t severity;
+        uint8_t hops;         // 0-7 = explicit, ALERT_HOP_LIMIT_DEFAULT = device default
         uint32_t addedAt;
         uint32_t lastSent;
         uint32_t nextSendAt;
     };
-    // Total: 580 bytes fixed size
 
     struct AlertStorageHeader {
         uint32_t magic;
@@ -155,7 +158,7 @@ class AlertsModule : public concurrency::OSThread {
     };
 
     static constexpr uint32_t ALERTS_STORAGE_MAGIC = 0x41524c54; // "ALRT"
-    static constexpr uint16_t ALERTS_STORAGE_VERSION = 2; // v2: added channel field to AlertBinary
+    static constexpr uint16_t ALERTS_STORAGE_VERSION = 3; // v3: added hops field to AlertBinary
 
     struct ProcessedRefRecord {
         uint32_t id;

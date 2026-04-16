@@ -46,7 +46,8 @@ private:
     // Storage magic numbers
     static constexpr uint32_t PERMISSIONS_MAGIC = 0x55505253; // "UPRS"
     static constexpr uint32_t USER_ALERTS_MAGIC = 0x55414C54; // "UALT"
-    static constexpr uint16_t STORAGE_VERSION = 1;
+    static constexpr uint16_t PERMISSIONS_VERSION = 1;
+    static constexpr uint16_t USER_ALERTS_VERSION = 2; // v2: added hops field to UserAlertEntry
 
     // ===== Session State Machine =====
     enum class SessionState {
@@ -56,6 +57,7 @@ private:
         AWAIT_DATE_FROM,
         AWAIT_DATE_TO,
         AWAIT_CHANNEL,
+        AWAIT_HOPS,
         AWAIT_LOCATION,
         CONFIRM
     };
@@ -73,6 +75,7 @@ private:
         char dateFrom[20];
         char dateTo[20];
         char channel[32];
+        uint8_t hops;
         char location[64];
     };
 
@@ -103,8 +106,9 @@ private:
         char dateFrom[20];
         char dateTo[20];
         uint8_t severity;
+        uint8_t hops;         // 0-7 = explicit, ALERT_HOP_LIMIT_DEFAULT = device default
         uint32_t createdAt;
-        uint8_t padding[2];
+        uint8_t padding[1];
     };
 
     // ===== Permission Levels =====

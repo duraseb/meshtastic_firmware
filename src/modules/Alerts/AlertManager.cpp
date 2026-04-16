@@ -80,15 +80,17 @@ int AlertManager::onNotify(const meshtastic_MeshPacket *mp)
     // Expire stale sessions
     expireStaleSessions();
 
-    // Space-only message: re-send current prompt if session is active
-    if (strlen(start) == 0) {
+    // '?' message: re-send current prompt if session is active, else send info
+    // (space can't be sent through the Meshtastic app, so '?' is used instead)
+    if (strcmp(start, "?") == 0) {
         UserSession *session = findSession(mp->from);
         if (session) {
             session->lastActivityMs = millis();
             promptForField(session, mp->from);
-            return 1;
+        } else {
+            cmdInfo(mp->from);
         }
-        return 0;
+        return 1;
     }
 
     // Check for active session first
@@ -379,6 +381,19 @@ void AlertManager::handleSessionInput(const meshtastic_MeshPacket *mp, const cha
             strncpy(session->channel, input.c_str(), sizeof(session->channel) - 1);
             session->channel[sizeof(session->channel) - 1] = '\0';
         }
+        session->state = SessionState::AWAIT_HOPS;
+        promptForField(session, toNode);
+        break;
+    }
+    case SessionState::AWAIT_HOPS: {
+        if (!accepted) {
+            int h = atoi(input.c_str());
+            if (h < 0 || h > 7) {
+                sendReply(toNode, "Hops must be 0-7. Try again:");
+                return;
+            }
+            session->hops = (uint8_t)h;
+        }
         session->state = SessionState::AWAIT_LOCATION;
         promptForField(session, toNode);
         break;
@@ -442,7 +457,14 @@ void AlertManager::promptForField(UserSession *session, uint32_t toNode)
         if (strlen(session->channel) > 0) {
             snprintf(buf, sizeof(buf), "Channel name\nCurrent: %s\n'.' to keep:", session->channel);
         } else {
-            snprintf(buf, sizeof(buf), "Channel name\n'.' for default alert channel:");
+            snprintf(buf, sizeof(buf), "Channel name\n'*' for primary channel\n'.' for default alert channel:");
+        }
+        break;
+    case SessionState::AWAIT_HOPS:
+        if (session->hops != ALERT_HOP_LIMIT_DEFAULT) {
+            snprintf(buf, sizeof(buf), "Hops (0-7)\nCurrent: %d\n'.' to keep:", session->hops);
+        } else {
+            snprintf(buf, sizeof(buf), "Hops (0-7)\n'.' for default:");
         }
         break;
     case SessionState::AWAIT_LOCATION:
@@ -453,10 +475,17 @@ void AlertManager::promptForField(UserSession *session, uint32_t toNode)
         }
         break;
     case SessionState::CONFIRM: {
-        snprintf(buf, sizeof(buf), "Summary:\nBody: %.80s%s\nSev: %d | Ch: %s\nFrom: %s\nTo: %s\nLoc: %s\n'.' to confirm, '!' to abort",
+        char hopsStr[8];
+        if (session->hops == ALERT_HOP_LIMIT_DEFAULT) {
+            strncpy(hopsStr, "default", sizeof(hopsStr));
+        } else {
+            snprintf(hopsStr, sizeof(hopsStr), "%d", session->hops);
+        }
+        snprintf(buf, sizeof(buf), "Summary:\nBody: %.80s%s\nSev: %d | Ch: %s | Hops: %s\nFrom: %s\nTo: %s\nLoc: %s\n'.' to confirm, '!' to abort",
                  session->body, strlen(session->body) > 80 ? "..." : "",
                  session->severity,
-                 strlen(session->channel) > 0 ? session->channel : "(default)",
+                 strcmp(session->channel, "*") == 0 ? "(primary)" : (strlen(session->channel) > 0 ? session->channel : "(default)"),
+                 hopsStr,
                  session->dateFrom, session->dateTo,
                  strlen(session->location) > 0 ? session->location : "(none)");
         break;
@@ -494,6 +523,7 @@ void AlertManager::finalizeAlert(UserSession *session, uint32_t toNode)
         updated.valid_from = session->dateFrom;
         updated.valid_to = session->dateTo;
         updated.channel = session->channel;
+        updated.hops = session->hops;
         updated.location = session->location;
 
         if (alertsModule->updateAlertById(session->editAlertId, updated)) {
@@ -525,6 +555,7 @@ void AlertManager::finalizeAlert(UserSession *session, uint32_t toNode)
         strncpy(entry.dateTo, session->dateTo, sizeof(entry.dateTo) - 1);
         entry.dateTo[sizeof(entry.dateTo) - 1] = '\0';
         entry.severity = session->severity;
+        entry.hops = session->hops;
         saveUserAlerts();
 
         // Update in main pipeline too
@@ -532,6 +563,7 @@ void AlertManager::finalizeAlert(UserSession *session, uint32_t toNode)
         updated.message = session->body;
         updated.location = session->location;
         updated.channel = session->channel;
+        updated.hops = session->hops;
         updated.valid_from = session->dateFrom;
         updated.valid_to = session->dateTo;
         updated.severity = session->severity;
@@ -564,6 +596,7 @@ void AlertManager::finalizeAlert(UserSession *session, uint32_t toNode)
     entry.ownerNodeNum = toNode;
     entry.createdAt = (uint32_t)now;
     entry.severity = session->severity;
+    entry.hops = session->hops;
     strncpy(entry.body, session->body, sizeof(entry.body) - 1);
     strncpy(entry.location, session->location, sizeof(entry.location) - 1);
     strncpy(entry.channel, session->channel, sizeof(entry.channel) - 1);
@@ -584,6 +617,7 @@ void AlertManager::finalizeAlert(UserSession *session, uint32_t toNode)
     alert.valid_to = entry.dateTo;
     alert.source = "USR";
     alert.severity = entry.severity;
+    alert.hops = entry.hops;
     alert.addedAt = entry.createdAt;
 
     if (alertsModule->addExternalAlert(alert)) {
@@ -684,6 +718,7 @@ void AlertManager::cmdCreate(const meshtastic_MeshPacket *mp, AccessLevel access
     session->isEdit = false;
     session->isSystemEdit = false;
     session->severity = 5;
+    session->hops = ALERT_HOP_LIMIT_DEFAULT;
 
     // Set default channel to empty (will use alert channel)
     session->channel[0] = '\0';
@@ -737,6 +772,7 @@ void AlertManager::cmdEdit(const meshtastic_MeshPacket *mp, int num, AccessLevel
     session->editAlertId = entry.id;
     strncpy(session->body, entry.body, sizeof(session->body) - 1);
     session->severity = entry.severity;
+    session->hops = entry.hops;
     strncpy(session->dateFrom, entry.dateFrom, sizeof(session->dateFrom) - 1);
     strncpy(session->dateTo, entry.dateTo, sizeof(session->dateTo) - 1);
     strncpy(session->channel, entry.channel, sizeof(session->channel) - 1);
@@ -844,25 +880,43 @@ void AlertManager::cmdAllDetail(uint32_t toNode, int num)
         }
     }
 
-    char buf[MAX_REPLY_LEN + 1];
-    if (ownerNode != 0) {
-        snprintf(buf, sizeof(buf), "#%d [%s] sev:%d\nFrom: %s To: %s\nCh: %s Loc: %s\nOwner: 0x%x\n%.100s",
-                 num, a.source.c_str(), a.severity,
-                 a.valid_from.c_str(), a.valid_to.c_str(),
-                 a.channel.length() > 0 ? a.channel.c_str() : "(default)",
-                 a.location.length() > 0 ? a.location.c_str() : "(none)",
-                 ownerNode,
-                 a.message.c_str());
+    const char *chDisplay = a.channel == "*" ? "(primary)" : (a.channel.length() > 0 ? a.channel.c_str() : "(default)");
+    const char *locDisplay = a.location.length() > 0 ? a.location.c_str() : "(none)";
+    char hopsStr[8];
+    if (a.hops == ALERT_HOP_LIMIT_DEFAULT) {
+        strncpy(hopsStr, "default", sizeof(hopsStr));
     } else {
-        snprintf(buf, sizeof(buf), "#%d [%s] sev:%d\nFrom: %s To: %s\nCh: %s Loc: %s\n%.120s",
-                 num, a.source.c_str(), a.severity,
-                 a.valid_from.c_str(), a.valid_to.c_str(),
-                 a.channel.length() > 0 ? a.channel.c_str() : "(default)",
-                 a.location.length() > 0 ? a.location.c_str() : "(none)",
-                 a.message.c_str());
+        snprintf(hopsStr, sizeof(hopsStr), "%d", a.hops);
     }
 
-    sendReply(toNode, buf);
+    char header[MAX_REPLY_LEN + 1];
+    if (ownerNode != 0) {
+        snprintf(header, sizeof(header), "#%d [%s] sev:%d hops:%s\nFrom: %s To: %s\nCh: %s Loc: %s\nOwner: 0x%x",
+                 num, a.source.c_str(), a.severity, hopsStr,
+                 a.valid_from.c_str(), a.valid_to.c_str(),
+                 chDisplay, locDisplay, ownerNode);
+    } else {
+        snprintf(header, sizeof(header), "#%d [%s] sev:%d hops:%s\nFrom: %s To: %s\nCh: %s Loc: %s",
+                 num, a.source.c_str(), a.severity, hopsStr,
+                 a.valid_from.c_str(), a.valid_to.c_str(),
+                 chDisplay, locDisplay);
+    }
+
+    // Send header, then message body across multiple packets if needed
+    sendReply(toNode, header);
+
+    const char *msg = a.message.c_str();
+    size_t msgLen = a.message.length();
+    size_t offset = 0;
+    char chunk[MAX_REPLY_LEN + 1];
+    while (offset < msgLen) {
+        size_t remaining = msgLen - offset;
+        size_t chunkLen = (remaining > MAX_REPLY_LEN) ? MAX_REPLY_LEN : remaining;
+        memcpy(chunk, msg + offset, chunkLen);
+        chunk[chunkLen] = '\0';
+        sendReply(toNode, chunk);
+        offset += chunkLen;
+    }
 }
 
 void AlertManager::cmdAllEdit(const meshtastic_MeshPacket *mp, int num)
@@ -895,6 +949,7 @@ void AlertManager::cmdAllEdit(const meshtastic_MeshPacket *mp, int num)
     session->dateTo[sizeof(session->dateTo) - 1] = '\0';
     strncpy(session->channel, a.channel.c_str(), sizeof(session->channel) - 1);
     session->channel[sizeof(session->channel) - 1] = '\0';
+    session->hops = a.hops;
     strncpy(session->location, a.location.c_str(), sizeof(session->location) - 1);
     session->location[sizeof(session->location) - 1] = '\0';
 
@@ -1055,7 +1110,7 @@ bool AlertManager::loadPermissions()
 
     PermissionsHeader header;
     if (f.read((uint8_t *)&header, sizeof(header)) != sizeof(header) ||
-        header.magic != PERMISSIONS_MAGIC || header.version != STORAGE_VERSION) {
+        header.magic != PERMISSIONS_MAGIC || header.version != PERMISSIONS_VERSION) {
         f.close();
         FSCom.remove(PERMISSIONS_FILE);
         return false;
@@ -1084,7 +1139,7 @@ bool AlertManager::savePermissions()
 
     PermissionsHeader header = {};
     header.magic = PERMISSIONS_MAGIC;
-    header.version = STORAGE_VERSION;
+    header.version = PERMISSIONS_VERSION;
     header.count = numAllowedUsers;
     f.write((const uint8_t *)&header, sizeof(header));
 
@@ -1096,7 +1151,8 @@ bool AlertManager::savePermissions()
     f.close();
 
     FSCom.remove(PERMISSIONS_FILE);
-    return renameFile(PERMISSIONS_FILE_TMP, PERMISSIONS_FILE);
+    // NOTE: call FSCom.rename directly — renameFile() re-acquires spiLock on ESP32.
+    return FSCom.rename(PERMISSIONS_FILE_TMP, PERMISSIONS_FILE);
 }
 
 bool AlertManager::loadUserAlerts()
@@ -1115,7 +1171,7 @@ bool AlertManager::loadUserAlerts()
 
     UserAlertsHeader header;
     if (f.read((uint8_t *)&header, sizeof(header)) != sizeof(header) ||
-        header.magic != USER_ALERTS_MAGIC || header.version != STORAGE_VERSION) {
+        header.magic != USER_ALERTS_MAGIC || header.version != USER_ALERTS_VERSION) {
         f.close();
         FSCom.remove(USER_ALERTS_FILE);
         return false;
@@ -1144,7 +1200,7 @@ bool AlertManager::saveUserAlerts()
 
     UserAlertsHeader header = {};
     header.magic = USER_ALERTS_MAGIC;
-    header.version = STORAGE_VERSION;
+    header.version = USER_ALERTS_VERSION;
     header.count = numUserAlerts;
     f.write((const uint8_t *)&header, sizeof(header));
 
@@ -1156,7 +1212,9 @@ bool AlertManager::saveUserAlerts()
     f.close();
 
     FSCom.remove(USER_ALERTS_FILE);
-    return renameFile(USER_ALERTS_FILE_TMP, USER_ALERTS_FILE);
+    // NOTE: call FSCom.rename directly — renameFile() re-acquires spiLock on ESP32
+    // and would deadlock against the LockGuard above.
+    return FSCom.rename(USER_ALERTS_FILE_TMP, USER_ALERTS_FILE);
 }
 
 uint32_t AlertManager::hashAlertId(uint32_t ownerNode, const char *body, uint32_t createdAt) const
