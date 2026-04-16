@@ -17,6 +17,11 @@
 #if !MESHTASTIC_EXCLUDE_ALERT_AIWEATHER
 #include "dynamic_sources/AiWeatherSource.h"
 #endif
+#if !MESHTASTIC_EXCLUDE_ALERT_INTERACTIVE
+#include "sources/UserAlertSource.h"
+#include "AlertManager.h"
+#include "modules/TextMessageModule.h"
+#endif
 #include "mesh/wifi/WiFiAPClient.h"
 #include "FSCommon.h"
 #include "main.h"
@@ -116,6 +121,15 @@ AlertsModule::AlertsModule() : OSThread("AlertsModule"), sharedJsonDoc(SHARED_JS
     LOG_INFO("[AlertsModule] Registered source: %s (fetch every %lu min)",
              sources[numSources]->getSourceId().c_str(),
              sources[numSources]->getFetchIntervalMs() / 60000);
+    numSources++;
+#endif
+
+    // Register UserAlertSource (alerts from mesh users, managed by AlertManager)
+#if !MESHTASTIC_EXCLUDE_ALERT_INTERACTIVE
+    sources[numSources] = new UserAlertSource();
+    sourceLastFetchTime[numSources] = 0;
+    LOG_INFO("[AlertsModule] Registered source: %s (user-created alerts via mesh DM)",
+             sources[numSources]->getSourceId().c_str());
     numSources++;
 #endif
 
@@ -546,6 +560,7 @@ Alert AlertsModule::toAlert(const AlertBinary &binAlert)
     a.location = safeString(binAlert.location, sizeof(binAlert.location));
     a.message = safeString(binAlert.message, sizeof(binAlert.message));
     a.source = safeString(binAlert.source, sizeof(binAlert.source));
+    a.channel = safeString(binAlert.channel, sizeof(binAlert.channel));
     a.severity = binAlert.severity;
     a.addedAt = binAlert.addedAt;
     a.alert_type = a.title;
@@ -579,6 +594,9 @@ bool AlertsModule::fillAlertBinary(const Alert &alert, AlertBinary &binAlert)
 
     strncpy(binAlert.source, alert.source.c_str(), sizeof(binAlert.source) - 1);
     binAlert.source[sizeof(binAlert.source) - 1] = '\0';
+
+    strncpy(binAlert.channel, alert.channel.c_str(), sizeof(binAlert.channel) - 1);
+    binAlert.channel[sizeof(binAlert.channel) - 1] = '\0';
 
     strncpy(binAlert.valid_from, alert.valid_from.c_str(), sizeof(binAlert.valid_from) - 1);
     binAlert.valid_from[sizeof(binAlert.valid_from) - 1] = '\0';
@@ -1138,6 +1156,97 @@ bool AlertsModule::loadAlertsFromDisk()
 
 
 
+// ========== External Alert Management API ==========
+
+const std::vector<Alert> &AlertsModule::getAlerts() const
+{
+    return alerts;
+}
+
+bool AlertsModule::addExternalAlert(const Alert &alert)
+{
+    if (alert.id == 0) {
+        LOG_ERROR("[AlertsModule] Cannot add external alert with invalid ID");
+        return false;
+    }
+
+    if ((int)alerts.size() >= MAX_ALERTS_IN_MEMORY) {
+        LOG_WARN("[AlertsModule] Cannot add external alert: at capacity (%d)", MAX_ALERTS_IN_MEMORY);
+        return false;
+    }
+
+    // Check for duplicate
+    if (isAlertProcessed(alert.id)) {
+        LOG_WARN("[AlertsModule] External alert 0x%x already exists, skipping", alert.id);
+        return false;
+    }
+
+    // Add to in-memory storage
+    Alert newAlert = alert;
+    unsigned long now = millis();
+    if (newAlert.addedAt == 0) {
+        newAlert.addedAt = getTime();
+    }
+    newAlert.lastSent = 0;
+    newAlert.nextSendAt = 0;
+    alerts.push_back(newAlert);
+
+    // Cache and persist
+    cacheProcessedAlertId(alert.id);
+    saveAlertsToSingleFile();
+
+    // Broadcast immediately
+    if (sendAlertToMesh(newAlert)) {
+        alerts.back().lastSent = now;
+        alerts.back().nextSendAt = now + getSendInterval(newAlert.severity) * 1000;
+        saveAlertsToSingleFile();
+        LOG_INFO("[AlertsModule] External alert 0x%x added and broadcast (source: %s)", alert.id, alert.source.c_str());
+    }
+
+    return true;
+}
+
+bool AlertsModule::removeAlertById(uint32_t id)
+{
+    for (auto it = alerts.begin(); it != alerts.end(); ++it) {
+        if (it->id == id) {
+            LOG_INFO("[AlertsModule] Removing alert 0x%x (source: %s)", id, it->source.c_str());
+            alerts.erase(it);
+            removeProcessedAlertId(id);
+            saveAlertsToSingleFile();
+            return true;
+        }
+    }
+    LOG_WARN("[AlertsModule] Alert 0x%x not found for removal", id);
+    return false;
+}
+
+bool AlertsModule::updateAlertById(uint32_t id, const Alert &updatedAlert)
+{
+    for (auto &existing : alerts) {
+        if (existing.id == id) {
+            LOG_INFO("[AlertsModule] Updating alert 0x%x (source: %s)", id, existing.source.c_str());
+            // Preserve timing metadata
+            unsigned long originalAddedAt = existing.addedAt;
+            existing.title = updatedAlert.title;
+            existing.message = updatedAlert.message;
+            existing.location = updatedAlert.location;
+            existing.valid_from = updatedAlert.valid_from;
+            existing.valid_to = updatedAlert.valid_to;
+            existing.severity = updatedAlert.severity;
+            existing.channel = updatedAlert.channel;
+            existing.addedAt = originalAddedAt;
+            // Reset send timing so updated alert gets broadcast soon
+            existing.lastSent = 0;
+            existing.nextSendAt = 0;
+            saveAlertsToSingleFile();
+            return true;
+        }
+    }
+    LOG_WARN("[AlertsModule] Alert 0x%x not found for update", id);
+    return false;
+}
+
 // ========== Alert Processing Functions ==========
 
 const char* AlertsModule::stateName(ModuleState state)
@@ -1204,6 +1313,19 @@ int32_t AlertsModule::runOnce()
             }
             
             initializationDone = true;
+
+#if !MESHTASTIC_EXCLUDE_ALERT_INTERACTIVE
+            // Initialize AlertManager and subscribe to text messages
+            if (textMessageModule) {
+                alertManager = new AlertManager(this);
+                alertManager->loadFromDisk();
+                alertManager->observe(textMessageModule);
+                LOG_INFO("[AlertsModule] AlertManager initialized and observing text messages");
+            } else {
+                LOG_WARN("[AlertsModule] textMessageModule not ready, AlertManager not started");
+            }
+#endif
+
             transitionToState(ModuleState::IDLE, "initialization complete");
             LOG_INFO("Initialization complete - system responsive");
             return ALERT_PROCESSING_YIELD_MS; // Quick return to continue
@@ -2316,21 +2438,24 @@ bool AlertsModule::sendAlertToMesh(const Alert &alert)
     int8_t alertChannelIndex = findAlertChannel();
     String selectedChannelName = "";
 
-    String sourceChannel = "";
-    for (int i = 0; i < numSources; i++) {
-        if (sources[i] && sources[i]->getSourceId() == alert.source) {
-            sourceChannel = sources[i]->getChannelName();
-            break;
+    // Per-alert channel takes priority, then source default channel
+    String targetChannel = alert.channel;
+    if (targetChannel.length() == 0) {
+        for (int i = 0; i < numSources; i++) {
+            if (sources[i] && sources[i]->getSourceId() == alert.source) {
+                targetChannel = sources[i]->getChannelName();
+                break;
+            }
         }
     }
 
-    if (sourceChannel.length() > 0) {
-        int8_t sourceChannelIndex = findChannelByName(sourceChannel);
-        if (sourceChannelIndex >= 0) {
-            alertChannelIndex = sourceChannelIndex;
+    if (targetChannel.length() > 0) {
+        int8_t targetChannelIndex = findChannelByName(targetChannel);
+        if (targetChannelIndex >= 0) {
+            alertChannelIndex = targetChannelIndex;
         } else {
-            LOG_WARN("Alert source %s requested unknown channel '%s', using primary channel",
-                     alert.source.c_str(), sourceChannel.c_str());
+            LOG_WARN("Alert channel '%s' not found (source: %s), using primary channel",
+                     targetChannel.c_str(), alert.source.c_str());
             alertChannelIndex = channels.getPrimaryIndex();
         }
     }

@@ -75,10 +75,10 @@ PlatformIO automatically loads environment variables from a `.env` file in the p
 3. Build using the helper script (recommended - ensures .env is loaded):
    ```bash
    # Build only
-   ./tmp/build-with-env.sh run -e seeed-xiao-s3
+   ./bin/build-with-env.sh run -e seeed-xiao-s3
    
    # Build and upload
-   ./tmp/build-with-env.sh run -e seeed-xiao-s3 -t upload
+   ./bin/build-with-env.sh run -e seeed-xiao-s3 -t upload
    ```
 
 **Why use the build script?**
@@ -237,12 +237,132 @@ The AlertsModule supports multiple alert sources with a plugin architecture:
    - Fetch interval: 15 minutes
    - Severity: Calculated from CAP alert level
 
+3. **POZ (Poznan Events)**
+   - Poznan city events
+   - Type: JSON API with streaming parser
+   - Fetch interval: 60 minutes
+   - Channel: `PoznanEvent`
+
+4. **USR (User-Created Alerts)** - Interactive
+   - Alerts created by mesh users via private messages
+   - No HTTP fetching, no AI processing
+   - Managed by the AlertManager (see [Interactive Alert Management](#interactive-alert-management))
+
+### Dynamic Sources
+
+1. **SYNOP (IMGW SYNOP Weather)**
+   - Current weather data from IMGW
+   - Type: CSV parsing
+   - Channel: `PoznanEvent`
+
+2. **AiWeather (AI Weather Forecast)**
+   - AI-generated Polish weather forecasts
+   - Type: AI-processed, per-day
+
 ### Source-Specific Features
 
 - **Structured Dates**: IMGW provides dates directly, bypassing AI extraction
 - **Custom AI Prompts**: Each source has optimized prompts for better extraction
 - **Two-Phase Fetching**: RCB fetches article pages only for new alerts (after duplicate check)
+- **Pre-processed Messages**: POZ and USR bypass AI entirely — messages are ready to send
 - **Validation**: Each source validates and cleans up extracted data
+- **Per-Alert Channels**: Alerts can specify a target channel (overrides source default)
+
+### Excluding Individual Providers
+
+Each source can be excluded at compile time via `.env` flags. Uncomment any of these in your `.env` file to disable:
+
+```bash
+# EXCLUDE_ALERT_RCB=1
+# EXCLUDE_ALERT_IMGW=1
+# EXCLUDE_ALERT_POZ=1
+# EXCLUDE_ALERT_SYNOP=1
+# EXCLUDE_ALERT_AIWEATHER=1
+# EXCLUDE_ALERT_INTERACTIVE=1
+```
+
+Build using `bin/build-with-env.sh` for these flags to take effect.
+
+## Interactive Alert Management
+
+The AlertManager allows mesh users to create and manage alerts via private (DM) messages to the node. It is enabled by default when `HAS_ALERTING=1` and can be disabled with `EXCLUDE_ALERT_INTERACTIVE=1`.
+
+### Permission Tiers
+
+| Tier | How Identified | Capabilities |
+|------|---------------|--------------|
+| **Admin** | PKI public key matches one of the node's 3 admin keys | Manage ALL alerts (any source), manage user access |
+| **Allowed User** | Node ID stored in `/alerts/user_permissions.bin` | Create, edit, delete their OWN alerts |
+| **Everyone** | Any other node | `info` command only |
+
+### Commands
+
+Send these as private messages (DMs) to the node:
+
+**Everyone:**
+| Command | Description |
+|---------|-------------|
+| `info` | General info about the alert system and how to request access |
+
+**Allowed Users and Admins:**
+| Command | Description |
+|---------|-------------|
+| `help` | List available commands (filtered by permission level) |
+| `help <cmd>` | Detailed help for a specific command |
+| `stats` | Alert counts and system status |
+| `list` | List your user-created alerts (numbered #1, #2, ...) |
+| `create` | Start interactive alert creation |
+| `edit <n>` | Edit your alert #n |
+| `delete <n>` | Delete your alert #n |
+
+**Admin Only:**
+| Command | Description |
+|---------|-------------|
+| `all` | List ALL alerts from ALL sources |
+| `all <n>` | Show full details for alert #n (includes author for USR alerts) |
+| `all edit <n>` | Edit any alert from any source |
+| `all delete <n>` | Delete any alert from any source |
+| `allow <nodeNum>` | Grant alert access to a node (hex `0x...` or decimal) |
+| `deny <nodeNum>` | Revoke alert access from a node |
+| `users` | List all allowed user nodes |
+
+### Create/Edit Flow
+
+The `create` and `edit` commands start a step-by-step flow prompting for each field:
+
+1. **Body** (required) - The alert message text
+2. **Severity** (0-10) - 0=critical, 10=minor. Default: 5
+3. **Valid from** (YYYY-MM-DD HH:MM:SS) - Default: now
+4. **Valid to** (YYYY-MM-DD HH:MM:SS) - Default: now + 24 hours
+5. **Channel** - Target channel name. Default: global alert channel
+6. **Location** (optional) - Appended as suffix `[location]`. Default: none
+7. **Confirm** - Review summary, then approve
+
+**Special inputs during the flow:**
+| Input | Meaning |
+|-------|---------|
+| `.` | Accept current/default value (in confirm step: approve) |
+| `!` | Abort the entire flow |
+| `..` | Literal `.` character (escaped) |
+| `!!` | Literal `!` character (escaped) |
+| ` ` (space) | Re-send the current step's prompt (useful if previous message was lost) |
+
+Sessions time out after 5 minutes of inactivity. Up to 3 concurrent sessions are supported.
+
+### Storage
+
+AlertManager uses separate storage files from the main alert pipeline:
+
+| File | Content | Limit |
+|------|---------|-------|
+| `/alerts/user_permissions.bin` | Allowed user node IDs | 32 users |
+| `/alerts/user_alerts.bin` | User-created alert metadata (with owner tracking) | 50 alerts |
+
+User-created alerts are also stored in the main `/alerts/alerts.bin` for broadcast scheduling. The `user_alerts.bin` file tracks ownership for access control.
+
+### Author Privacy
+
+The author's node ID is **not** included in broadcast messages. It is only visible to admins via `all <n>` (detail view).
 
 ## Security Notes
 
@@ -251,7 +371,7 @@ The AlertsModule supports multiple alert sources with a plugin architecture:
 - ⚠️ Anyone with access to the binary can extract the keys
 - ✅ The `.env` file is already in `.gitignore`
 - ✅ Use `.env.example` for sharing configuration templates
-- ✅ Use the build script (`tmp/build-with-env.sh`) for reliable builds
+- ✅ Use the build script (`bin/build-with-env.sh`) for reliable builds
 
 ## Troubleshooting
 
@@ -270,7 +390,7 @@ This means you don't have any API keys configured. You need at least one:
    ```
 3. Make sure there are no quotes around the key in `.env`
 4. The file should have Unix line endings (LF, not CRLF)
-5. Use the build script: `./tmp/build-with-env.sh run -e seeed-xiao-s3`
+5. Use the build script: `./bin/build-with-env.sh run -e seeed-xiao-s3`
 
 ### Build succeeds but no AI providers available at runtime
 
@@ -315,7 +435,7 @@ The module loads alerts from disk on startup (unless `PURGE_ALERTS_ON_BOOT` is s
 **Check:**
 1. Look for log: `AlertsModule: Loaded N binary alerts from disk`
 2. Alerts are stored in `/alerts/` directory on the device
-3. Binary format is 548 bytes per alert (v2 format)
+3. Binary format is 580 bytes per alert (v2 format, includes per-alert channel field)
 
 **Note:** If you're upgrading from an older version, set `PURGE_ALERTS_ON_BOOT = true` temporarily to clear old format files.
 
@@ -377,16 +497,23 @@ To add a new alert source:
 2. Inherit from `AlertSource` base class
 3. Implement required virtual methods:
    - `getSourceId()` - e.g., "YOUR_SOURCE"
-   - `getFetchURL()` - Source URL
+   - `getFetchUrl()` - Source URL
    - `getFetchIntervalMs()` - How often to fetch
    - `getDefaultSeverity()` - Default severity for this source
    - `fetchAndParseAlerts()` - Parse source data into RawAlert stubs
    - `buildAIPrompt()` - Create AI prompt for this source type
    - `validateAndCleanup()` - Validate extracted data
-4. Optionally implement `fetchFullAlertContent()` for two-phase fetching
-5. Register in `AlertsModule` constructor
+4. Optionally implement:
+   - `fetchFullAlertContent()` - Two-phase fetching (see `RCBAlertSource`)
+   - `getPreprocessedMessage()` - Bypass AI entirely (see `POZAlertSource`, `UserAlertSource`)
+   - `getChannelName()` - Dedicated channel for this source
+   - `getInfoPrompt()` - Periodic info broadcast
+5. Add a compile-time guard: `MESHTASTIC_EXCLUDE_ALERT_YOURSOURCE`
+6. Register in `AlertsModule` constructor (guarded with `#if !MESHTASTIC_EXCLUDE_...`)
 
-See `RCBAlertSource` and `IMGWAlertSource` for examples.
+**For non-HTTP sources** (like `UserAlertSource`): you can use `AlertsModule::addExternalAlert()` to inject alerts directly into the pipeline, bypassing the HTTP fetch cycle. This is useful for sources that receive data from the mesh, sensors, or other non-HTTP channels.
+
+See `RCBAlertSource` and `IMGWAlertSource` for HTTP-based examples, or `UserAlertSource` for a non-HTTP example.
 
 ## Channel Information Broadcasting
 
@@ -507,5 +634,6 @@ The module enforces these limits to prevent recurrence:
 ---
 
 **For more information, see:**
-- `tmp/ALERT_MODULE_SUMMARY.md` - Complete module documentation
+- `src/modules/Alerts/AlertManager.h` - Interactive alert management
+- `src/modules/Alerts/AlertSource.h` - Alert source interface
 - Source code comments in `src/modules/Alerts/`

@@ -13,6 +13,9 @@
 #include <deque>
 #include <ArduinoJson.h>
 
+// Forward declaration
+class AlertManager;
+
 // Alert structure - shared between AlertsModule and AlertSource
 struct Alert {
     uint32_t id;       // Unique identifier hash (for file naming and duplicate detection)
@@ -24,6 +27,7 @@ struct Alert {
     String alert_type;
     String message;    // Processed message for sending
     String source;     // Source identifier (e.g., "RCB")
+    String channel;    // Per-alert channel override (empty = use source default)
     uint8_t severity;  // 0=critical (war, large disaster) to 10=very local/unimportant
     unsigned long lastSent;
     unsigned long addedAt;
@@ -133,6 +137,7 @@ class AlertsModule : public concurrency::OSThread {
         char message[256];
         char location[64];
         char source[16];
+        char channel[32];
         char valid_from[32];
         char valid_to[32];
         uint8_t severity;
@@ -140,7 +145,7 @@ class AlertsModule : public concurrency::OSThread {
         uint32_t lastSent;
         uint32_t nextSendAt;
     };
-    // Total: 548 bytes fixed size (19% smaller than previous 676 bytes)
+    // Total: 580 bytes fixed size
 
     struct AlertStorageHeader {
         uint32_t magic;
@@ -150,7 +155,7 @@ class AlertsModule : public concurrency::OSThread {
     };
 
     static constexpr uint32_t ALERTS_STORAGE_MAGIC = 0x41524c54; // "ALRT"
-    static constexpr uint16_t ALERTS_STORAGE_VERSION = 1;
+    static constexpr uint16_t ALERTS_STORAGE_VERSION = 2; // v2: added channel field to AlertBinary
 
     struct ProcessedRefRecord {
         uint32_t id;
@@ -226,7 +231,19 @@ class AlertsModule : public concurrency::OSThread {
     unsigned long nextBroadcastTimeMs;
     bool broadcastingEnabled;
 
+    // Interactive alert management (user-created alerts via mesh DM)
+#if !MESHTASTIC_EXCLUDE_ALERT_INTERACTIVE
+    AlertManager *alertManager = nullptr;
+#endif
+
   public:
+    // ===== External Alert Management API =====
+    // (used by AlertManager for user-created alerts and admin operations)
+    const std::vector<Alert> &getAlerts() const;
+    bool addExternalAlert(const Alert &alert);
+    bool removeAlertById(uint32_t id);
+    bool updateAlertById(uint32_t id, const Alert &updatedAlert);
+
     // ===== Core Module Functions =====
     bool loadConfig();
 
