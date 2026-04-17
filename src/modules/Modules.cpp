@@ -38,6 +38,9 @@
 #include "modules/PowerStressModule.h"
 #endif
 #include "modules/RoutingModule.h"
+#if HAS_BROADCAST_BEACON
+#include "modules/BroadcastBeacon/BroadcastBeaconModule.h"
+#endif
 #if HAS_TRAFFIC_MANAGEMENT && !MESHTASTIC_EXCLUDE_TRAFFIC_MANAGEMENT
 #include "modules/TrafficManagementModule.h"
 #endif
@@ -145,6 +148,9 @@ void setupModules()
 #endif
 #if !MESHTASTIC_EXCLUDE_TEXTMESSAGE
     textMessageModule = new TextMessageModule();
+#endif
+#if HAS_BROADCAST_BEACON
+    new BroadcastBeaconModule();
 #endif
 #if !MESHTASTIC_EXCLUDE_TRACEROUTE
     traceRouteModule = new TraceRouteModule();
