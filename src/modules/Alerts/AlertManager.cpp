@@ -236,6 +236,13 @@ void AlertManager::handleCommand(const meshtastic_MeshPacket *mp, const char *te
         cmdList(from, mp->from);
         return;
     }
+    if (strncmp(lower, "list ", 5) == 0) {
+        int num = atoi(lower + 5);
+        if (num > 0) {
+            cmdListDetail(from, num, access);
+            return;
+        }
+    }
     if (strcmp(lower, "create") == 0) {
         cmdCreate(mp, access);
         return;
@@ -378,8 +385,13 @@ void AlertManager::handleSessionInput(const meshtastic_MeshPacket *mp, const cha
     }
     case SessionState::AWAIT_CHANNEL: {
         if (!accepted) {
-            strncpy(session->channel, input.c_str(), sizeof(session->channel) - 1);
-            session->channel[sizeof(session->channel) - 1] = '\0';
+            // '-' resets to the default alert channel (empty string)
+            if (input == "-") {
+                session->channel[0] = '\0';
+            } else {
+                strncpy(session->channel, input.c_str(), sizeof(session->channel) - 1);
+                session->channel[sizeof(session->channel) - 1] = '\0';
+            }
         }
         session->state = SessionState::AWAIT_HOPS;
         promptForField(session, toNode);
@@ -430,48 +442,78 @@ void AlertManager::promptForField(UserSession *session, uint32_t toNode)
     switch (session->state) {
     case SessionState::AWAIT_BODY:
         if (session->isEdit && strlen(session->body) > 0) {
-            snprintf(buf, sizeof(buf), "Body (current: %.100s%s)\n'.' to keep, '!' to abort:",
-                     session->body, strlen(session->body) > 100 ? "..." : "");
+            // Always send the body as its own packet so long (near-240-byte) bodies
+            // don't blow the PKI-encrypted DM on-air limit when combined with the
+            // instructions line. The follow-up instructions go out as the usual
+            // sendReply(buf) below.
+            sendReply(toNode, session->body);
+            snprintf(buf, sizeof(buf), "'.' to keep, '!' to abort, or send new body:");
         } else {
             snprintf(buf, sizeof(buf), "Enter alert body text ('!' to abort):");
         }
         break;
-    case SessionState::AWAIT_SEVERITY:
-        snprintf(buf, sizeof(buf), "Severity 0-10 (0=critical, 10=minor)\nCurrent: %d\n'.' to keep:", session->severity);
+    case SessionState::AWAIT_SEVERITY: {
+        // Build interval hints from the live firmware mapping
+        char hints[96];
+        int hintsOffset = 0;
+        const uint8_t sampleSevs[] = {0, 1, 5, 8, 10};
+        for (size_t i = 0; i < sizeof(sampleSevs) && hintsOffset < (int)sizeof(hints); i++) {
+            unsigned long sec = alertsModule->getSendInterval(sampleSevs[i]);
+            unsigned long h = sec / 3600;
+            unsigned long m = (sec % 3600) / 60;
+            char slot[16];
+            if (h == 0) {
+                snprintf(slot, sizeof(slot), "%u=%lum", sampleSevs[i], m);
+            } else if (m == 0) {
+                snprintf(slot, sizeof(slot), "%u=%luh", sampleSevs[i], h);
+            } else {
+                snprintf(slot, sizeof(slot), "%u=%luh%lum", sampleSevs[i], h, m);
+            }
+            hintsOffset += snprintf(hints + hintsOffset, sizeof(hints) - hintsOffset,
+                                    "%s%s", i == 0 ? "" : " ", slot);
+        }
+        snprintf(buf, sizeof(buf),
+                 "Severity 0-10 (0=critical, 10=minor)\nIntervals: %s\nCurrent: %d\n'.' to keep, '!' to abort:",
+                 hints, session->severity);
         break;
+    }
     case SessionState::AWAIT_DATE_FROM:
         if (strlen(session->dateFrom) > 0) {
-            snprintf(buf, sizeof(buf), "Valid from (YYYY-MM-DD HH:MM:SS)\nCurrent: %s\n'.' to keep:", session->dateFrom);
+            snprintf(buf, sizeof(buf), "Valid from (YYYY-MM-DD HH:MM:SS)\nCurrent: %s\n'.' to keep, '!' to abort:", session->dateFrom);
         } else {
-            snprintf(buf, sizeof(buf), "Valid from (YYYY-MM-DD HH:MM:SS)\n'.' for now:");
+            snprintf(buf, sizeof(buf), "Valid from (YYYY-MM-DD HH:MM:SS)\n'.' for now, '!' to abort:");
         }
         break;
     case SessionState::AWAIT_DATE_TO:
         if (strlen(session->dateTo) > 0) {
-            snprintf(buf, sizeof(buf), "Valid to (YYYY-MM-DD HH:MM:SS)\nCurrent: %s\n'.' to keep:", session->dateTo);
+            snprintf(buf, sizeof(buf), "Valid to (YYYY-MM-DD HH:MM:SS)\nCurrent: %s\n'.' to keep, '!' to abort:", session->dateTo);
         } else {
-            snprintf(buf, sizeof(buf), "Valid to (YYYY-MM-DD HH:MM:SS)\n'.' for +24h:");
+            snprintf(buf, sizeof(buf), "Valid to (YYYY-MM-DD HH:MM:SS)\n'.' for +24h, '!' to abort:");
         }
         break;
     case SessionState::AWAIT_CHANNEL:
         if (strlen(session->channel) > 0) {
-            snprintf(buf, sizeof(buf), "Channel name\nCurrent: %s\n'.' to keep:", session->channel);
+            const char *annotation = strcmp(session->channel, "*") == 0 ? " (PRIMARY)" : "";
+            snprintf(buf, sizeof(buf),
+                     "Channel name\nCurrent: %s%s\n'*'=primary, '-'=default alert ch, '.' keep, '!' abort:",
+                     session->channel, annotation);
         } else {
-            snprintf(buf, sizeof(buf), "Channel name\n'*' for primary channel\n'.' for default alert channel:");
+            snprintf(buf, sizeof(buf),
+                     "Channel name\n'*'=primary, '-' or '.' for default alert ch, '!' to abort:");
         }
         break;
     case SessionState::AWAIT_HOPS:
         if (session->hops != ALERT_HOP_LIMIT_DEFAULT) {
-            snprintf(buf, sizeof(buf), "Hops (0-7)\nCurrent: %d\n'.' to keep:", session->hops);
+            snprintf(buf, sizeof(buf), "Hops (0-7)\nCurrent: %d\n'.' to keep, '!' to abort:", session->hops);
         } else {
-            snprintf(buf, sizeof(buf), "Hops (0-7)\n'.' for default:");
+            snprintf(buf, sizeof(buf), "Hops (0-7)\n'.' for default, '!' to abort:");
         }
         break;
     case SessionState::AWAIT_LOCATION:
         if (strlen(session->location) > 0) {
-            snprintf(buf, sizeof(buf), "Location\nCurrent: %s\n'.' to keep:", session->location);
+            snprintf(buf, sizeof(buf), "Location\nCurrent: %s\n'.' to keep, '!' to abort:", session->location);
         } else {
-            snprintf(buf, sizeof(buf), "Location (optional)\n'.' to skip:");
+            snprintf(buf, sizeof(buf), "Location (optional)\n'.' to skip, '!' to abort:");
         }
         break;
     case SessionState::CONFIRM: {
@@ -481,8 +523,9 @@ void AlertManager::promptForField(UserSession *session, uint32_t toNode)
         } else {
             snprintf(hopsStr, sizeof(hopsStr), "%d", session->hops);
         }
-        snprintf(buf, sizeof(buf), "Summary:\nBody: %.80s%s\nSev: %d | Ch: %s | Hops: %s\nFrom: %s\nTo: %s\nLoc: %s\n'.' to confirm, '!' to abort",
-                 session->body, strlen(session->body) > 80 ? "..." : "",
+        // Body is confirmed at the AWAIT_BODY step, so omit it here — keeps the
+        // packet under the PKI-encrypted DM size limit (~227 bytes on air).
+        snprintf(buf, sizeof(buf), "Summary:\nSev: %d | Ch: %s | Hops: %s\nFrom: %s\nTo: %s\nLoc: %s\n'.' to confirm, '!' to abort",
                  session->severity,
                  strcmp(session->channel, "*") == 0 ? "(primary)" : (strlen(session->channel) > 0 ? session->channel : "(default)"),
                  hopsStr,
@@ -638,9 +681,9 @@ void AlertManager::cmdInfo(uint32_t toNode)
 void AlertManager::cmdHelp(uint32_t toNode, AccessLevel access)
 {
     if (access == AccessLevel::ADMIN) {
-        sendReply(toNode, "Commands:\nstats, list, create\nedit <n>, delete <n>\nall, all <n>, all edit <n>\nall delete <n>\nallow <node>, deny <node>\nusers\nhelp <cmd>");
+        sendReply(toNode, "Commands:\nstats, list, list <n>, create\nedit <n>, delete <n>\nall, all <n>, all edit <n>\nall delete <n>\nallow <node>, deny <node>\nusers\nhelp <cmd>");
     } else {
-        sendReply(toNode, "Commands:\nstats, list, create\nedit <n>, delete <n>\nhelp <cmd>");
+        sendReply(toNode, "Commands:\nstats, list, list <n>, create\nedit <n>, delete <n>\nhelp <cmd>");
     }
 }
 
@@ -653,7 +696,7 @@ void AlertManager::cmdHelpCommand(uint32_t toNode, const char *cmd, AccessLevel 
     } else if (strcmp(cmd, "delete") == 0) {
         sendReply(toNode, "delete <n> - Delete your alert #n from 'list'.");
     } else if (strcmp(cmd, "list") == 0) {
-        sendReply(toNode, "list - Show your user-created alerts.\nNumbers can be used with edit/delete.");
+        sendReply(toNode, "list - Show your user-created alerts.\nlist <n> - Show full details for alert #n.\nNumbers can be used with edit/delete.");
     } else if (strcmp(cmd, "stats") == 0) {
         sendReply(toNode, "stats - Show alert statistics:\nuser alerts, total system alerts, next broadcast.");
     } else if (strcmp(cmd, "all") == 0 && access == AccessLevel::ADMIN) {
@@ -704,6 +747,52 @@ void AlertManager::cmdList(uint32_t toNode, uint32_t callerNode)
     } else {
         buf[offset] = '\0';
         sendReply(toNode, buf);
+    }
+}
+
+void AlertManager::cmdListDetail(uint32_t toNode, int num, AccessLevel access)
+{
+    int count = 0;
+    int targetIdx = -1;
+    for (int i = 0; i < numUserAlerts; i++) {
+        if (userAlerts[i].ownerNodeNum == toNode || access == AccessLevel::ADMIN) {
+            count++;
+            if (count == num) {
+                targetIdx = i;
+                break;
+            }
+        }
+    }
+    if (targetIdx < 0) {
+        sendReplyFmt(toNode, "Alert #%d not found.", num);
+        return;
+    }
+
+    const UserAlertEntry &e = userAlerts[targetIdx];
+    const char *chDisplay =
+        strcmp(e.channel, "*") == 0 ? "(primary)" : (strlen(e.channel) > 0 ? e.channel : "(default)");
+    const char *locDisplay = strlen(e.location) > 0 ? e.location : "(none)";
+    char hopsStr[8];
+    if (e.hops == ALERT_HOP_LIMIT_DEFAULT) {
+        strncpy(hopsStr, "default", sizeof(hopsStr));
+    } else {
+        snprintf(hopsStr, sizeof(hopsStr), "%d", e.hops);
+    }
+
+    char header[MAX_REPLY_LEN + 1];
+    snprintf(header, sizeof(header),
+             "#%d sev:%d hops:%s\nFrom: %s To: %s\nCh: %s Loc: %s",
+             num, e.severity, hopsStr, e.dateFrom, e.dateTo, chDisplay, locDisplay);
+
+    // Prefer a single packet when the combined text fits; otherwise put the
+    // body first so the user sees the full message before the metadata.
+    char combined[MAX_REPLY_LEN + 1];
+    int combinedLen = snprintf(combined, sizeof(combined), "%s\n%s", e.body, header);
+    if (combinedLen > 0 && combinedLen < (int)sizeof(combined)) {
+        sendReply(toNode, combined);
+    } else {
+        sendReply(toNode, e.body);
+        sendReply(toNode, header);
     }
 }
 
@@ -1058,28 +1147,36 @@ void AlertManager::sendReply(uint32_t toNodeNum, const char *text)
         return;
     }
 
-    meshtastic_MeshPacket *p = router->allocForSending();
-    if (!p) {
-        LOG_ERROR("[AlertManager] Failed to allocate packet");
-        return;
-    }
+    // The radio rejects PKI-encrypted DMs whose encoded Data exceeds
+    // MAX_LORA_PAYLOAD_LEN (255) − header (16) − PKC overhead (12) = 227 bytes.
+    // Data encoding adds ~7 bytes (portnum + payload tag+length varint + bitfield),
+    // leaving ~220 bytes for the text itself. Chunk to stay under the limit
+    // regardless of what the caller passes in.
+    size_t totalLen = strlen(text);
+    size_t offset = 0;
+    do {
+        size_t remaining = totalLen - offset;
+        size_t chunkLen = remaining > MAX_PACKET_TEXT_LEN ? MAX_PACKET_TEXT_LEN : remaining;
 
-    p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
-    p->to = toNodeNum;
-    p->from = nodeDB->getNodeNum();
-    p->channel = 0; // Primary channel for DMs
-    p->want_ack = false;
-    p->decoded.want_response = false;
+        meshtastic_MeshPacket *p = router->allocForSending();
+        if (!p) {
+            LOG_ERROR("[AlertManager] Failed to allocate packet");
+            return;
+        }
 
-    size_t len = strlen(text);
-    size_t maxLen = sizeof(p->decoded.payload.bytes);
-    if (len > maxLen) {
-        len = maxLen;
-    }
-    p->decoded.payload.size = len;
-    memcpy(p->decoded.payload.bytes, text, len);
+        p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+        p->to = toNodeNum;
+        p->from = nodeDB->getNodeNum();
+        p->channel = 0; // Primary channel for DMs
+        p->want_ack = false;
+        p->decoded.want_response = false;
 
-    service->sendToMesh(p);
+        p->decoded.payload.size = chunkLen;
+        memcpy(p->decoded.payload.bytes, text + offset, chunkLen);
+
+        service->sendToMesh(p);
+        offset += chunkLen;
+    } while (offset < totalLen);
 }
 
 void AlertManager::sendReplyFmt(uint32_t toNodeNum, const char *fmt, ...)

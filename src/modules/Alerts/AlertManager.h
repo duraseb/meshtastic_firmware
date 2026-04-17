@@ -35,7 +35,13 @@ private:
     static constexpr unsigned long SESSION_TIMEOUT_MS = 5UL * 60 * 1000;
     static constexpr int MAX_ALLOWED_USERS = 32;
     static constexpr int MAX_USER_ALERTS = 50;
-    static constexpr int MAX_REPLY_LEN = 230; // Safe mesh text payload
+    // Max text bytes that fit in a single PKI-encrypted DM on the wire
+    // (MAX_LORA_PAYLOAD_LEN 255 − header 16 − PKC overhead 12 − ~7 bytes of
+    // Data encoding = ~220). sendReply chunks anything longer into multiple packets.
+    static constexpr int MAX_PACKET_TEXT_LEN = 220;
+    // Buffer size used by promptForField() and sendReplyFmt(); matches the
+    // single-packet limit so a prompt formatted into it can't trip TOO_LARGE.
+    static constexpr int MAX_REPLY_LEN = MAX_PACKET_TEXT_LEN;
 
     // Storage paths
     static constexpr const char *PERMISSIONS_FILE = "/alerts/user_permissions.bin";
@@ -148,6 +154,7 @@ private:
     void cmdHelpCommand(uint32_t toNode, const char *cmd, AccessLevel access);
     void cmdStats(uint32_t toNode, AccessLevel access);
     void cmdList(uint32_t toNode, uint32_t callerNode);
+    void cmdListDetail(uint32_t toNode, int num, AccessLevel access);
     void cmdCreate(const meshtastic_MeshPacket *mp, AccessLevel access);
     void cmdEdit(const meshtastic_MeshPacket *mp, int num, AccessLevel access);
     void cmdDelete(const meshtastic_MeshPacket *mp, int num, AccessLevel access);

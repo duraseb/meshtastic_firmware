@@ -839,6 +839,9 @@ bool AlertsModule::saveProcessedIdsToSingleFile()
 
 bool AlertsModule::loadAlertsFromSingleFile()
 {
+    bool droppedExcluded = false;
+    bool result;
+    {
     concurrency::LockGuard g(spiLock);
 
     File f = FSCom.open(ALERTS_DATA_FILE, FILE_O_READ);
@@ -889,6 +892,31 @@ bool AlertsModule::loadAlertsFromSingleFile()
             }
 
             Alert a = toAlert(*binAlert);
+            // Drop alerts whose source was excluded at build time — otherwise
+            // previously-persisted alerts (RCB/IMGW/POZ/SYNOP/AIWEATHER) keep
+            // rebroadcasting on their schedule even after the provider is off.
+            bool sourceExcluded = false;
+#if MESHTASTIC_EXCLUDE_ALERT_RCB
+            if (a.source == "RCB") sourceExcluded = true;
+#endif
+#if MESHTASTIC_EXCLUDE_ALERT_IMGW
+            if (a.source == "IMGW") sourceExcluded = true;
+#endif
+#if MESHTASTIC_EXCLUDE_ALERT_POZ
+            if (a.source == "POZ") sourceExcluded = true;
+#endif
+#if MESHTASTIC_EXCLUDE_ALERT_SYNOP
+            if (a.source == "SYNOP") sourceExcluded = true;
+#endif
+#if MESHTASTIC_EXCLUDE_ALERT_AIWEATHER
+            if (a.source == "AI_WEATHER") sourceExcluded = true;
+#endif
+            if (sourceExcluded) {
+                LOG_INFO("[AlertsModule] Dropping persisted alert 0x%x from excluded source %s",
+                         binAlert->id, a.source.c_str());
+                droppedExcluded = true;
+                continue;
+            }
             if (isAlertValid(a)) {
                 upsertAlertInMemory(a);
             }
@@ -904,13 +932,21 @@ bool AlertsModule::loadAlertsFromSingleFile()
             processedAlertIdOrder.pop_front();
             processedAlertIds.erase(oldestId);
         }
+        f.close();
+        result = true;
     } else {
         f.close();
-        return false;
+        result = false;
     }
+    } // LockGuard scope ends here
 
-    f.close();
-    return true;
+    // Rewrite the file without the excluded-source entries so we don't pay
+    // the filter cost on every boot. Done after releasing spiLock because
+    // saveAlertsToSingleFile acquires it too.
+    if (result && droppedExcluded) {
+        saveAlertsToSingleFile();
+    }
+    return result;
 }
 
 bool AlertsModule::loadProcessedIdsFromSingleFile()
