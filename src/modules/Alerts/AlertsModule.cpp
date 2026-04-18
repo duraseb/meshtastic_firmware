@@ -1244,7 +1244,8 @@ bool AlertsModule::addExternalAlert(const Alert &alert)
     // Don't broadcast here — sendAlertToMesh triggers Router::sendLocal → handleReceived
     // → module chain → AlertManager::onNotify recursion, risking stack overflow.
     // Leave nextSendAt = 0 so runOnce picks it up on the next iteration.
-    LOG_INFO("[AlertsModule] External alert 0x%x added, will broadcast on next cycle (source: %s)", alert.id, alert.source.c_str());
+    LOG_INFO("[AlertsModule] External alert 0x%x added, will broadcast on next cycle (source: %s)",
+             alert.id, alert.source.c_str());
 
     return true;
 }
@@ -1381,24 +1382,23 @@ int32_t AlertsModule::runOnce()
             // Priority 1: Check for alerts that need re-sending (works without WiFi)
             // Only send if time is synced (to check dates) and radio is available
             if (currentTime > 0 && currentTime >= MIN_VALID_EPOCH) {
-                // Time is synced, we can check and resend existing alerts
-                // Limit processing to avoid blocking - only check a few alerts per cycle
+                // Scan every valid alert to find one that is due. Checking is cheap
+                // (a timestamp compare); the expensive part is sendAlertToMesh, which
+                // we gate via ALERT_BROADCAST_MIN_SPACING_MS. We only transmit at most
+                // one alert per cycle (returning after the send), but we never hide a
+                // due alert behind a long sleep interval.
                 static size_t lastCheckedIndex = 0;
-                size_t alertsCheckedThisCycle = 0;
-                const size_t MAX_CHECKS_PER_CYCLE = 1;
 
                 // Check if it's time to log pending alerts (every 3 minutes)
                 bool shouldLogPending = (currentMillis - lastPendingAlertLogTime >= PENDING_ALERT_LOG_INTERVAL_MS);
 
-                for (size_t i = 0; i < alerts.size() && alertsCheckedThisCycle < MAX_CHECKS_PER_CYCLE; i++) {
+                for (size_t i = 0; i < alerts.size(); i++) {
                     size_t checkIndex = (lastCheckedIndex + i) % alerts.size();
                     const Alert alert = alerts[checkIndex];
 
                     if (!isAlertValid(alert)) {
                         continue;
                     }
-
-                    alertsCheckedThisCycle++;
 
                     // Check if it's time to send based on pre-calculated nextSendAt
                     // nextSendAt is stored as absolute Unix timestamp
@@ -1413,15 +1413,8 @@ int32_t AlertsModule::runOnce()
                         // Time to re-send this alert (mesh only, no WiFi needed)
                         if (sendAlertToMesh(alert)) {
                             alerts[checkIndex].lastSent = currentMillis;
-                            // Calculate next send time based on severity
                             unsigned long interval = getSendInterval(alert.severity);
-                            // Store absolute time instead of relative time from boot
-                            if (currentTime > 0) {
-                                alerts[checkIndex].nextSendAt = currentTime + interval;
-                            } else {
-                                // Fallback if time not synced (shouldn't happen in resend logic)
-                                alerts[checkIndex].nextSendAt = currentTime + interval;
-                            }
+                            alerts[checkIndex].nextSendAt = currentTime + interval;
                             saveAlertToDisk(alerts[checkIndex]);
                             LOG_INFO("Re-sent alert [%s, sev:%d]: %s (next in %lu min)",
                                      alert.source.c_str(), alert.severity, alert.title.c_str(), interval / 60);
@@ -1432,19 +1425,15 @@ int32_t AlertsModule::runOnce()
                         // Only resend one alert per cycle to avoid blocking
                         lastCheckedIndex = (checkIndex + 1) % alerts.size(); // Resume after this alert
                         return RESEND_CHECK_YIELD_MS;
-                    } else {
-                        // Alert is pending but not yet due
-                        // Log all pending alerts if it's time to log (every 3 minutes)
-                        if (shouldLogPending) {
-                            unsigned long remainingSec = alert.nextSendAt - currentTime;
-                            if (remainingSec > 120) {
-                                unsigned long remainingMin = remainingSec / 60;
-                                LOG_DEBUG("Alert pending (will send in %lu min, source: %s, severity: %d): %s",
-                                          remainingMin, alert.source.c_str(), alert.severity, alert.title.c_str());
-                            } else {
-                                LOG_DEBUG("Alert pending (will send in %lu sec, source: %s, severity: %d): %s",
-                                          remainingSec, alert.source.c_str(), alert.severity, alert.title.c_str());
-                            }
+                    } else if (shouldLogPending) {
+                        // Alert is pending but not yet due — log periodically
+                        unsigned long remainingSec = alert.nextSendAt - currentTime;
+                        if (remainingSec > 120) {
+                            LOG_DEBUG("Alert pending (will send in %lu min, source: %s, severity: %d): %s",
+                                      remainingSec / 60, alert.source.c_str(), alert.severity, alert.title.c_str());
+                        } else {
+                            LOG_DEBUG("Alert pending (will send in %lu sec, source: %s, severity: %d): %s",
+                                      remainingSec, alert.source.c_str(), alert.severity, alert.title.c_str());
                         }
                     }
                 }
@@ -1452,11 +1441,6 @@ int32_t AlertsModule::runOnce()
                 // Update the logging timestamp after processing all alerts in this cycle
                 if (shouldLogPending) {
                     lastPendingAlertLogTime = currentMillis;
-                }
-
-                // Update starting index for next cycle (guard against division by zero)
-                if (!alerts.empty()) {
-                    lastCheckedIndex = (lastCheckedIndex + alertsCheckedThisCycle) % alerts.size();
                 }
             }
             
