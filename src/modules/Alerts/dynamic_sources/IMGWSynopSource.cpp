@@ -2,6 +2,7 @@
 
 #include "IMGWSynopSource.h"
 #include "configuration.h"
+#include "../DateUtils.h"
 
 IMGWSynopSource::IMGWSynopSource()
 {
@@ -69,12 +70,22 @@ String IMGWSynopSource::fetchAndFormat(
         hour = "0" + hour;
     }
 
+    // IMGW publishes SYNOP observations in UTC; convert to local so the header
+    // matches the user's wall clock.
+    String localStamp = AlertsDateUtils::utcStringToLocal(date + " " + hour + ":00");
+    String localDate = date;
+    String localHour = hour;
+    if (localStamp.length() >= 16) {
+        localDate = localStamp.substring(0, 10);
+        localHour = localStamp.substring(11, 13);
+    }
+
     String message = "Pogoda \xF0\x9F\x93\x8D"; // UTF-8 for 📍 (PIN emoji)
     message += station;
     message += " z ";
-    message += date;
+    message += localDate;
     message += " ";
-    message += hour;
+    message += localHour;
     message += ":00";
 
     message += "\n";

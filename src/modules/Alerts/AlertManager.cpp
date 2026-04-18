@@ -8,6 +8,7 @@
 #include "FSCommon.h"
 #include "SPILock.h"
 #include "RTC.h"
+extern int32_t getTZOffset(); // not declared in RTC.h public surface
 #include <cstring>
 #include <cstdarg>
 #include <cstdio>
@@ -542,8 +543,12 @@ void AlertManager::promptForField(UserSession *session, uint32_t toNode)
 
 static void formatTimestamp(char *buf, size_t bufLen, time_t t)
 {
+    // Treat t as a UTC epoch and render it as local wall-clock time. We shift
+    // by getTZOffset() and then gmtime the result so the fields reflect the
+    // configured local timezone (config.device.tzdef).
+    time_t localEpoch = t + getTZOffset();
     struct tm timeinfo;
-    gmtime_r(&t, &timeinfo);
+    gmtime_r(&localEpoch, &timeinfo);
     snprintf(buf, bufLen, "%04d-%02d-%02d %02d:%02d:%02d",
              timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
              timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);

@@ -4,6 +4,7 @@
 
 #include "IMGWAlertSource.h"
 #include "../AlertsModule.h"
+#include "../DateUtils.h"
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -202,11 +203,16 @@ bool IMGWAlertSource::parseIMGWStream(WiFiClient* stream, DynamicJsonDocument& d
                             String(info["expires"].as<const char*>()) : "";
             
             if (onset.length() >= 19) {
-                rawAlert.structuredStartDate = onset.substring(0, 10) + " " + onset.substring(11, 19);
+                // meteoalarm.org publishes timestamps in UTC (trailing 'Z'); convert
+                // to the device's local time so the displayed/scheduled times match
+                // the user's wall clock.
+                String utcOnset = onset.substring(0, 10) + " " + onset.substring(11, 19);
+                rawAlert.structuredStartDate = AlertsDateUtils::utcStringToLocal(utcOnset);
                 rawAlert.dateStr = onset;
             }
             if (expires.length() >= 19) {
-                rawAlert.structuredEndDate = expires.substring(0, 10) + " " + expires.substring(11, 19);
+                String utcExpires = expires.substring(0, 10) + " " + expires.substring(11, 19);
+                rawAlert.structuredEndDate = AlertsDateUtils::utcStringToLocal(utcExpires);
             }
             
             // Build context from area descriptions
