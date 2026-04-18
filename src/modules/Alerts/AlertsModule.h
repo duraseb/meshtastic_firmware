@@ -120,6 +120,9 @@ class AlertsModule : public concurrency::OSThread {
     static constexpr unsigned long RESEND_CHECK_YIELD_MS = 500;
     static constexpr unsigned long MAX_RUNONCE_INTERVAL_MS = 15000;
     static constexpr unsigned long ALERT_PROCESSING_THROTTLE_MS = 2000; // Minimum 2 seconds between alert processing starts
+    // Minimum spacing between successive radio broadcasts of alerts. Prevents flooding
+    // the mesh when several alerts become due at once (new-from-fetch + scheduled resends).
+    static constexpr unsigned long ALERT_BROADCAST_MIN_SPACING_MS = 5000;
     static constexpr int MAX_ALERTS_PER_CYCLE = 1;
 
     // Memory management settings
@@ -226,6 +229,9 @@ class AlertsModule : public concurrency::OSThread {
 
     // Logging throttling
     unsigned long lastPendingAlertLogTime;
+
+    // millis() of the last successful alert broadcast; enforces ALERT_BROADCAST_MIN_SPACING_MS.
+    unsigned long lastAlertBroadcastMs;
 
     // Dynamic source processing state
     int currentDynamicSourceIndex;

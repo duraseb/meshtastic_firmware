@@ -82,6 +82,7 @@ AlertsModule::AlertsModule() : OSThread("AlertsModule"), sharedJsonDoc(SHARED_JS
     lastMemoryCheckTime = 0;
     lastPendingAlertLogTime = 0;
     lastReportedMemoryUsage = 0;
+    lastAlertBroadcastMs = 0;
 
     processingCtx.active = false;
     processingCtx.source = nullptr;
@@ -1395,6 +1396,13 @@ int32_t AlertsModule::runOnce()
                     // Check if it's time to send based on pre-calculated nextSendAt
                     // nextSendAt is stored as absolute Unix timestamp
                     if (currentTime >= alert.nextSendAt) {
+                        // Enforce minimum spacing between radio broadcasts so multiple
+                        // due alerts don't flood the mesh. Yield without touching state
+                        // so we retry once the cooldown elapses.
+                        unsigned long sinceLast = currentMillis - lastAlertBroadcastMs;
+                        if (lastAlertBroadcastMs != 0 && sinceLast < ALERT_BROADCAST_MIN_SPACING_MS) {
+                            return ALERT_BROADCAST_MIN_SPACING_MS - sinceLast;
+                        }
                         // Time to re-send this alert (mesh only, no WiFi needed)
                         if (sendAlertToMesh(alert)) {
                             alerts[checkIndex].lastSent = currentMillis;
@@ -1823,6 +1831,7 @@ int32_t AlertsModule::runOnce()
             processingCtx.alert.severity = processingCtx.source->getDefaultSeverity();
             processingCtx.alert.hops = ALERT_HOP_LIMIT_DEFAULT;
             processingCtx.alert.lastSent = 0;
+            processingCtx.alert.nextSendAt = 0;
 
             if (currentTime > 0) {
                 processingCtx.alert.addedAt = currentTime;
@@ -2041,32 +2050,36 @@ int32_t AlertsModule::runOnce()
                 return ALERT_PROCESSING_YIELD_MS;
             }
             
-            // Add to alerts vector if not duplicate
-            if (!alertExists(processingCtx.alert.id)) {
-                // Send to mesh
-                if (sendAlertToMesh(processingCtx.alert)) {
-                    processingCtx.alert.lastSent = currentMillis;
-                    // Calculate next send time based on severity
-                    unsigned long interval = getSendInterval(processingCtx.alert.severity);
-                    processingCtx.alert.nextSendAt = currentTime + interval;
-                    saveAlertToFile(processingCtx.alert, id, processingCtx.alert.valid_from);
-                    LOG_INFO("Sent NEW alert [%s, sev:%d]: %s (next in %lu min)",
-                             processingCtx.alert.source.c_str(), processingCtx.alert.severity,
-                             processingCtx.alert.title.c_str(), interval / 60);
-                } else {
-                    // Failed to send - set retry delay to avoid tight loop
-                    processingCtx.alert.nextSendAt = currentTime + 60; // Retry in 1 minute
-                    saveAlertToFile(processingCtx.alert, id, processingCtx.alert.valid_from);
-                    LOG_WARN("Failed to send new alert, will retry in 1 min [%s, sev:%d]: %s",
-                             processingCtx.alert.source.c_str(), processingCtx.alert.severity,
-                             processingCtx.alert.title.c_str());
-                }
+            // NOTE: SAVING_ALERT already called saveAlertToFile -> upsertAlertInMemory,
+            // so the alert is already in the vector. Send it, then rewrite the stored
+            // copy with updated lastSent/nextSendAt.
 
-                alerts.push_back(processingCtx.alert);
-                LOG_INFO("Alert processed successfully (total in memory: %d)", alerts.size());
-            } else {
-                LOG_DEBUG("Alert already exists in memory");
+            // Enforce minimum spacing between radio broadcasts so multiple newly-queued
+            // alerts don't flood the mesh. Stay in SENDING_ALERT and retry after cooldown.
+            {
+                unsigned long sinceLast = currentMillis - lastAlertBroadcastMs;
+                if (lastAlertBroadcastMs != 0 && sinceLast < ALERT_BROADCAST_MIN_SPACING_MS) {
+                    return ALERT_BROADCAST_MIN_SPACING_MS - sinceLast;
+                }
             }
+
+            if (sendAlertToMesh(processingCtx.alert)) {
+                processingCtx.alert.lastSent = currentMillis;
+                unsigned long interval = getSendInterval(processingCtx.alert.severity);
+                processingCtx.alert.nextSendAt = currentTime + interval;
+                saveAlertToFile(processingCtx.alert, id, processingCtx.alert.valid_from);
+                LOG_INFO("Sent NEW alert [%s, sev:%d]: %s (next in %lu min)",
+                         processingCtx.alert.source.c_str(), processingCtx.alert.severity,
+                         processingCtx.alert.title.c_str(), interval / 60);
+            } else {
+                // Failed to send - retry soon instead of the full severity interval.
+                processingCtx.alert.nextSendAt = currentTime + 60;
+                saveAlertToFile(processingCtx.alert, id, processingCtx.alert.valid_from);
+                LOG_WARN("Failed to send new alert, will retry in 1 min [%s, sev:%d]: %s",
+                         processingCtx.alert.source.c_str(), processingCtx.alert.severity,
+                         processingCtx.alert.title.c_str());
+            }
+            LOG_INFO("Alert processed successfully (total in memory: %d)", alerts.size());
             
             // Done processing this alert
             processingCtx.active = false;
@@ -2554,6 +2567,7 @@ bool AlertsModule::sendAlertToMesh(const Alert &alert)
     if (service) {
         p->from = nodeDB->getNodeNum();
         service->sendToMesh(p, RX_SRC_USER, true);
+        lastAlertBroadcastMs = millis();
         LOG_DEBUG("Alert sent to mesh network");
     } else {
         LOG_ERROR("MeshService not available");
