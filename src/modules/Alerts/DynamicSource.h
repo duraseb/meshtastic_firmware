@@ -67,6 +67,14 @@ public:
      * Default is true. Override to false for local data sources.
      */
     virtual bool requiresWiFi() const { return true; }
+
+    /**
+     * Whether the source is currently eligible to fetch. Sources can use this
+     * to implement time-of-day windows or other gating rules. When this returns
+     * false, the module will retry again shortly instead of treating the fetch
+     * attempt as consumed (which would defer by the full getFetchIntervalMs()).
+     */
+    virtual bool isReadyToFetch() { return true; }
 };
 
 #endif // HAS_ALERTING

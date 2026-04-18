@@ -41,6 +41,9 @@ public:
     bool isAsyncFetchInProgress() const;
     bool isAsyncFetchReady() const;
 
+    // Only eligible to fetch once the time-of-day window has opened.
+    bool isReadyToFetch() override;
+
     /**
      * Get the minimum hour of day for fetches
      * @return configured minimum hour or default (20)

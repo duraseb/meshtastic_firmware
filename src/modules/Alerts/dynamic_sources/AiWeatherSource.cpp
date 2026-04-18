@@ -548,6 +548,11 @@ bool AiWeatherSource::isWithinFetchWindow() const
     return currentHour >= getMinHourOfDay();
 }
 
+bool AiWeatherSource::isReadyToFetch()
+{
+    return isWithinFetchWindow();
+}
+
 String AiWeatherSource::buildWeatherPrompt(const String& weatherJson, const String& tomorrowDate, const String& birthDate, const String& birthPersonHints) const
 {
     String prompt = String("Jesteś kreatywnym asystentem AI specjalizującym się w tworzeniu polskich prognoz pogody w stylu historycznych postaci.\n\n") +

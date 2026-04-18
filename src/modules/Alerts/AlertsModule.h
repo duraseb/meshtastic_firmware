@@ -123,6 +123,9 @@ class AlertsModule : public concurrency::OSThread {
     // Minimum spacing between successive radio broadcasts of alerts. Prevents flooding
     // the mesh when several alerts become due at once (new-from-fetch + scheduled resends).
     static constexpr unsigned long ALERT_BROADCAST_MIN_SPACING_MS = 5000;
+    // Retry cadence for dynamic sources that report isReadyToFetch()==false. Short so
+    // a time-of-day gate doesn't park the source for the whole fetch interval.
+    static constexpr unsigned long DYNAMIC_SOURCE_GATE_RETRY_MS = 10UL * 60 * 1000;
     static constexpr int MAX_ALERTS_PER_CYCLE = 1;
 
     // Memory management settings

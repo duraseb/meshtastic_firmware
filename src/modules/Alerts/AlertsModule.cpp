@@ -568,7 +568,14 @@ Alert AlertsModule::toAlert(const AlertBinary &binAlert)
     a.alert_type = a.title;
     a.lastSent = 0;
 
-    if (binAlert.nextSendAt >= MIN_VALID_EPOCH) {
+    // Validate persisted nextSendAt on both ends of the range. The lower bound
+    // rejects never-sent / uninitialized values; the upper bound rejects
+    // implausible-future timestamps (legitimate schedules are at most one
+    // severity interval ahead — anything beyond that is corrupted data).
+    // Out-of-range values collapse to 0 so the resend loop picks them up.
+    uint32_t nowSec = getTime(false);
+    uint32_t maxFutureSec = (nowSec >= MIN_VALID_EPOCH) ? nowSec + SEVERITY_MAX_INTERVAL_SEC : UINT32_MAX;
+    if (binAlert.nextSendAt >= MIN_VALID_EPOCH && binAlert.nextSendAt <= maxFutureSec) {
         a.nextSendAt = binAlert.nextSendAt;
     } else {
         a.nextSendAt = 0;
@@ -1571,6 +1578,17 @@ int32_t AlertsModule::runOnce()
 
                 // On first run (lastFetch == 0), fetch immediately when WiFi is ready
                 if (lastFetch == 0 || (currentMillis - lastFetch) >= fetchInterval) {
+                    // If the source is gated (e.g. time-of-day window not yet open),
+                    // defer by DYNAMIC_SOURCE_GATE_RETRY_MS instead of the full interval
+                    // so we re-evaluate once the gate might have opened.
+                    if (!dynamicSources[i]->isReadyToFetch()) {
+                        dynamicSourceLastFetchTime[i] =
+                            currentMillis - fetchInterval + DYNAMIC_SOURCE_GATE_RETRY_MS;
+                        LOG_DEBUG("Dynamic source %s not ready yet, retry in %lu min",
+                                  dynamicSources[i]->getSourceId().c_str(),
+                                  DYNAMIC_SOURCE_GATE_RETRY_MS / 60000);
+                        continue;
+                    }
                     currentDynamicSourceIndex = i;
                     if (lastFetch == 0) {
                         LOG_INFO("Initial fetch for dynamic source %s",
