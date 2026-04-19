@@ -24,8 +24,6 @@ class SerialConsole : public StreamAPI, public RedirectablePrint, private concur
 
     virtual size_t write(uint8_t c) override
     {
-        if (c == '\n') // prefix any newlines with carriage return
-            RedirectablePrint::write('\r');
         return RedirectablePrint::write(c);
     }
 
@@ -49,3 +47,4 @@ void consolePrintf(const char *format, ...);
 void consoleInit();
 
 extern SerialConsole *console;
+
