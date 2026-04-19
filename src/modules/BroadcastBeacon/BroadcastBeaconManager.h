@@ -52,6 +52,7 @@ public:
         uint8_t numPresets;
         uint32_t intervalMinutes;
         bool enabled;
+        bool sendPosition; // also broadcast our position on each preset switch
     };
 
     // ===== Broadcast State (survives reboots) =====
@@ -121,6 +122,7 @@ private:
         // Config editing
         CFG_AWAIT_PRESETS,
         CFG_AWAIT_INTERVAL,
+        CFG_AWAIT_SEND_POSITION,
         CFG_CONFIRM
     };
 
@@ -140,6 +142,7 @@ private:
         meshtastic_Config_LoRaConfig_ModemPreset pendingPresets[MAX_BROADCAST_PRESETS];
         uint8_t pendingNumPresets;
         uint32_t pendingIntervalMinutes;
+        bool pendingSendPosition;
     };
 
     // ===== Storage Structures =====

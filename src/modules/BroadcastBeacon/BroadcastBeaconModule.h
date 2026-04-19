@@ -68,9 +68,17 @@
  * A broadcast message has: body text, a channel (selected from the node's
  * configured channel list -- PSKs are whatever that channel already defines),
  * optional ISO-8601 start/end dates, and a hop limit. When no end date is set
- * the message broadcasts indefinitely. Once every configured message has
- * expired, or the operator runs `/bb off`, the module restores the home preset
- * and reboots back into normal operation.
+ * the message broadcasts indefinitely.
+ *
+ * The config also has a "send position" toggle. When enabled, the node also
+ * broadcasts its current position (via `PositionModule::sendOurPosition()`,
+ * which uses the node's default hop limit and bypasses PositionModule's normal
+ * interval throttling) on each preset switch. With this on, having no text
+ * messages is fine -- position alone keeps the cycle running.
+ *
+ * Once every configured message has expired (and position is off), or the
+ * operator runs `/bb off`, the module restores the home preset and reboots
+ * back into normal operation.
  *
  * ## Compile guard
  *

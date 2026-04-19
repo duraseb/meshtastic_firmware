@@ -279,8 +279,8 @@ void BroadcastBeaconManager::cmdOn(const meshtastic_MeshPacket *mp)
         sendReply(from, "No presets configured. Use '/bb config' first.");
         return;
     }
-    if (numMessages == 0) {
-        sendReply(from, "No messages configured. Use '/bb create' first.");
+    if (numMessages == 0 && !broadcastConfig.sendPosition) {
+        sendReply(from, "No messages and position broadcast is off. Add messages or enable position via '/bb config'.");
         return;
     }
 
@@ -498,6 +498,7 @@ void BroadcastBeaconManager::cmdConfig(const meshtastic_MeshPacket *mp)
     session->pendingNumPresets = broadcastConfig.numPresets;
     memcpy(session->pendingPresets, broadcastConfig.presets, sizeof(session->pendingPresets));
     session->pendingIntervalMinutes = broadcastConfig.intervalMinutes;
+    session->pendingSendPosition = broadcastConfig.sendPosition;
 
     promptForField(session, mp->from);
 }
@@ -662,6 +663,23 @@ void BroadcastBeaconManager::handleSessionInput(const meshtastic_MeshPacket *mp,
             }
             session->pendingIntervalMinutes = (uint32_t)minutes;
         }
+        session->state = SessionState::CFG_AWAIT_SEND_POSITION;
+        promptForField(session, toNode);
+        break;
+    }
+
+    case SessionState::CFG_AWAIT_SEND_POSITION: {
+        if (!accepted) {
+            char c = input.length() > 0 ? tolower(input[0]) : 0;
+            if (c == 'y') {
+                session->pendingSendPosition = true;
+            } else if (c == 'n') {
+                session->pendingSendPosition = false;
+            } else {
+                sendReply(toNode, "Reply 'y' or 'n' (or '.' to keep, '!' to abort):");
+                return;
+            }
+        }
         session->state = SessionState::CFG_CONFIRM;
         promptForField(session, toNode);
         break;
@@ -793,6 +811,12 @@ void BroadcastBeaconManager::promptForField(UserSession *session, uint32_t toNod
         }
         break;
 
+    case SessionState::CFG_AWAIT_SEND_POSITION:
+        snprintf(buf, sizeof(buf),
+                 "Also broadcast our position on each preset switch?\nCurrent: %s\n'y' yes, 'n' no, '.' to keep, '!' to abort:",
+                 broadcastConfig.sendPosition ? "yes" : "no");
+        break;
+
     case SessionState::CFG_CONFIRM: {
         int pos = snprintf(buf, sizeof(buf), "Config summary:\nPresets:");
         for (int i = 0; i < session->pendingNumPresets && pos < (int)sizeof(buf) - 20; i++) {
@@ -803,6 +827,8 @@ void BroadcastBeaconManager::promptForField(UserSession *session, uint32_t toNod
                         session->pendingNumPresets > 0
                             ? session->pendingIntervalMinutes / session->pendingNumPresets
                             : 0);
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "\nPosition: %s",
+                        session->pendingSendPosition ? "yes" : "no");
         pos += snprintf(buf + pos, sizeof(buf) - pos, "\nHome preset auto-included.\n'.' to confirm, '!' to abort");
         break;
     }
@@ -912,6 +938,7 @@ void BroadcastBeaconManager::finalizeConfig(UserSession *session, uint32_t toNod
     broadcastConfig.numPresets = session->pendingNumPresets;
     memcpy(broadcastConfig.presets, session->pendingPresets, sizeof(broadcastConfig.presets));
     broadcastConfig.intervalMinutes = session->pendingIntervalMinutes;
+    broadcastConfig.sendPosition = session->pendingSendPosition;
     saveConfig();
 
     sendReplyFmt(toNode, "Config saved. %d presets, %d min interval (%d min per preset).",

@@ -5,6 +5,7 @@
 #include "mesh/MeshService.h"
 #include "mesh/NodeDB.h"
 #include "mesh/Router.h"
+#include "modules/PositionModule.h"
 #include "modules/TextMessageModule.h"
 #include "main.h"
 #include "RTC.h"
@@ -59,14 +60,17 @@ int32_t BroadcastBeaconModule::runOnce()
         return 10000; // Check every 10s in case it gets enabled
     }
 
-    // ===== Phase 3: No presets or messages configured =====
-    if (cfg.numPresets == 0 || manager->getNumMessages() == 0) {
+    // ===== Phase 3: Nothing to broadcast =====
+    // Need presets, plus either at least one message or position broadcasting on.
+    bool nothingToBroadcast = cfg.numPresets == 0 ||
+                              (manager->getNumMessages() == 0 && !cfg.sendPosition);
+    if (nothingToBroadcast) {
         if (state.broadcasting) {
-            LOG_INFO("[BroadcastBeacon] No presets or messages, restoring home preset");
+            LOG_INFO("[BroadcastBeacon] Nothing to broadcast, restoring home preset");
             restoreHomePresetAndReboot();
             return -1;
         }
-        return 30000; // Check every 30s
+        return 30000;
     }
 
     // ===== Phase 4: Check for active messages =====
@@ -98,6 +102,13 @@ int32_t BroadcastBeaconModule::runOnce()
         }
 
         sendPendingMessages();
+
+        // Position broadcast (bypasses PositionModule's runOnce interval throttling)
+        if (cfg.sendPosition && positionModule) {
+            positionModule->sendOurPosition();
+            LOG_INFO("[BroadcastBeacon] Position broadcast on preset %d", state.currentPresetIndex);
+        }
+
         messagesSent = true;
         LOG_INFO("[BroadcastBeacon] Messages sent on preset %d (%s)",
                  state.currentPresetIndex,
@@ -225,6 +236,11 @@ bool BroadcastBeaconModule::hasAnyActiveMessages() const
 {
     if (!manager) {
         return false;
+    }
+
+    // Position broadcast alone is reason enough to keep cycling
+    if (manager->getConfig().sendPosition) {
+        return true;
     }
 
     int numMessages = manager->getNumMessages();
