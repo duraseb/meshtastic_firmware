@@ -210,7 +210,6 @@ AlertsModule::~AlertsModule() {
     pendingAlerts.clear();
     alerts.clear();
     processedAlertIds.clear();
-    processedAlertIdOrder.clear();
 
     // Note: aiService is a global managed elsewhere, not cleaned up here
 }
@@ -419,8 +418,7 @@ bool AlertsModule::alertExists(uint32_t id)
 
 bool AlertsModule::isAlertProcessed(uint32_t id)
 {
-    // Use the in-memory cache only - it's populated at startup from loadAlertsFromDisk()
-    bool found = processedAlertIds.find(id) != processedAlertIds.end();
+    bool found = std::find(processedAlertIds.begin(), processedAlertIds.end(), id) != processedAlertIds.end();
     if (found) {
         LOG_DEBUG("Alert ID 0x%x found in processed cache", id);
     } else {
@@ -436,49 +434,35 @@ void AlertsModule::cacheProcessedAlertId(uint32_t id)
         return;
     }
 
-    if (processedAlertIds.find(id) != processedAlertIds.end()) {
-        // Keep most-recent usage order and persist current order
-        for (auto it = processedAlertIdOrder.begin(); it != processedAlertIdOrder.end(); ++it) {
-            if (*it == id) {
-                processedAlertIdOrder.erase(it);
-                break;
-            }
-        }
-        processedAlertIdOrder.push_back(id);
+    // Move existing entry to the tail so it counts as most-recently-used.
+    auto existing = std::find(processedAlertIds.begin(), processedAlertIds.end(), id);
+    if (existing != processedAlertIds.end()) {
+        processedAlertIds.erase(existing);
+        processedAlertIds.push_back(id);
         saveProcessedIdsToSingleFile();
-        LOG_DEBUG("ID 0x%x already in cache, skipping", id);
+        LOG_DEBUG("ID 0x%x already in cache, refreshed position", id);
         return;
     }
 
+    // Evict oldest (front) if full.
     if (processedAlertIds.size() >= MAX_PROCESSED_IDS_CACHE) {
-        if (!processedAlertIdOrder.empty()) {
-            uint32_t oldest = processedAlertIdOrder.front();
-            processedAlertIdOrder.pop_front();
-            processedAlertIds.erase(oldest);
-            LOG_DEBUG("Cache full (%d), removed oldest ID: 0x%x", MAX_PROCESSED_IDS_CACHE, oldest);
-        }
+        uint32_t oldest = processedAlertIds.front();
+        processedAlertIds.erase(processedAlertIds.begin());
+        LOG_DEBUG("Cache full (%d), removed oldest ID: 0x%x", MAX_PROCESSED_IDS_CACHE, oldest);
     }
 
-    processedAlertIds.insert(id);
-    processedAlertIdOrder.push_back(id);
+    processedAlertIds.push_back(id);
     saveProcessedIdsToSingleFile();
     LOG_DEBUG("Added ID 0x%x to processed cache (cache now has %d items)", id, processedAlertIds.size());
 }
 
 void AlertsModule::removeProcessedAlertId(uint32_t id)
 {
-    processedAlertIds.erase(id);
-    if (processedAlertIdOrder.empty()) {
+    auto it = std::find(processedAlertIds.begin(), processedAlertIds.end(), id);
+    if (it == processedAlertIds.end()) {
         return;
     }
-
-    for (auto it = processedAlertIdOrder.begin(); it != processedAlertIdOrder.end(); ++it) {
-        if (*it == id) {
-            processedAlertIdOrder.erase(it);
-            break;
-        }
-    }
-
+    processedAlertIds.erase(it);
     saveProcessedIdsToSingleFile();
 }
 
@@ -799,7 +783,7 @@ bool AlertsModule::saveProcessedIdsToSingleFile()
     header.magic = PROCESSED_IDS_MAGIC;
     header.version = PROCESSED_IDS_VERSION;
     header.reserved = 0;
-    header.refCount = processedAlertIdOrder.size();
+    header.refCount = processedAlertIds.size();
 
     size_t writtenHeader = f.write((const uint8_t*)&header, sizeof(header));
     if (writtenHeader != sizeof(header)) {
@@ -810,7 +794,7 @@ bool AlertsModule::saveProcessedIdsToSingleFile()
     }
 
     size_t index = 0;
-    for (const auto id : processedAlertIdOrder) {
+    for (const auto id : processedAlertIds) {
         ProcessedRefRecord rec;
         rec.id = id;
         rec.seenAt = getTime(false);
@@ -838,10 +822,10 @@ bool AlertsModule::saveProcessedIdsToSingleFile()
 
     uint32_t elapsedMs = millis() - startMs;
     if (elapsedMs > 100) {
-        LOG_WARN("saveProcessedIdsToSingleFile took %lu ms for %d ids", elapsedMs, processedAlertIdOrder.size());
+        LOG_WARN("saveProcessedIdsToSingleFile took %lu ms for %d ids", elapsedMs, processedAlertIds.size());
     }
 
-    LOG_DEBUG("Saved %d processed IDs to %s", processedAlertIdOrder.size(), PROCESSED_IDS_FILE);
+    LOG_DEBUG("Saved %d processed IDs to %s", processedAlertIds.size(), PROCESSED_IDS_FILE);
     return true;
 }
 
@@ -929,16 +913,13 @@ bool AlertsModule::loadAlertsFromSingleFile()
                 upsertAlertInMemory(a);
             }
             // Even if alert is expired, keep ID for duplicate suppression
-            if (processedAlertIds.find(binAlert->id) == processedAlertIds.end()) {
-                processedAlertIds.insert(binAlert->id);
-                processedAlertIdOrder.push_back(binAlert->id);
+            if (std::find(processedAlertIds.begin(), processedAlertIds.end(), binAlert->id) == processedAlertIds.end()) {
+                processedAlertIds.push_back(binAlert->id);
             }
         }
         delete binAlert;
-        while (processedAlertIdOrder.size() > MAX_PROCESSED_IDS_CACHE) {
-            uint32_t oldestId = processedAlertIdOrder.front();
-            processedAlertIdOrder.pop_front();
-            processedAlertIds.erase(oldestId);
+        while (processedAlertIds.size() > MAX_PROCESSED_IDS_CACHE) {
+            processedAlertIds.erase(processedAlertIds.begin());
         }
         f.close();
         result = true;
@@ -1001,23 +982,16 @@ bool AlertsModule::loadProcessedIdsFromSingleFile()
             return false;
         }
 
-        if (processedAlertIds.find(rec.id) == processedAlertIds.end()) {
-            processedAlertIds.insert(rec.id);
-            processedAlertIdOrder.push_back(rec.id);
+        if (std::find(processedAlertIds.begin(), processedAlertIds.end(), rec.id) == processedAlertIds.end()) {
+            processedAlertIds.push_back(rec.id);
         }
     }
 
     f.close();
 
-    while (processedAlertIdOrder.size() > MAX_PROCESSED_IDS_CACHE) {
-        processedAlertIdOrder.pop_front();
+    while (processedAlertIds.size() > MAX_PROCESSED_IDS_CACHE) {
+        processedAlertIds.erase(processedAlertIds.begin());
     }
-    // Rebuild set to match order after trimming
-    std::unordered_set<uint32_t> trimmedSet;
-    for (const auto id : processedAlertIdOrder) {
-        trimmedSet.insert(id);
-    }
-    processedAlertIds.swap(trimmedSet);
 
     return true;
 }
@@ -1060,9 +1034,8 @@ bool AlertsModule::loadLegacyAlertFiles()
                     Alert a = toAlert(*binAlert);
                     upsertAlertInMemory(a);
 
-                    if (processedAlertIds.find(a.id) == processedAlertIds.end()) {
-                        processedAlertIds.insert(a.id);
-                        processedAlertIdOrder.push_back(a.id);
+                    if (std::find(processedAlertIds.begin(), processedAlertIds.end(), a.id) == processedAlertIds.end()) {
+                        processedAlertIds.push_back(a.id);
                     }
                     legacyFiles.push_back(filename);
                     migrated = true;
@@ -1095,10 +1068,8 @@ bool AlertsModule::loadLegacyAlertFiles()
         }
     }
 
-    while (processedAlertIdOrder.size() > MAX_PROCESSED_IDS_CACHE) {
-        uint32_t oldestId = processedAlertIdOrder.front();
-        processedAlertIdOrder.pop_front();
-        processedAlertIds.erase(oldestId);
+    while (processedAlertIds.size() > MAX_PROCESSED_IDS_CACHE) {
+        processedAlertIds.erase(processedAlertIds.begin());
     }
 
     return migrated;
@@ -1160,7 +1131,7 @@ bool AlertsModule::loadAlertsFromDisk()
     LOG_DEBUG("Loading alerts from disk (memory-optimized)");
     alerts.clear();
     processedAlertIds.clear();
-    processedAlertIdOrder.clear();
+    processedAlertIds.clear();
     bool tmpCleaned = cleanupTempFilesFromAlertsDir();
     if (tmpCleaned) {
         LOG_INFO("Cleaned up stale temporary alert files during boot");
@@ -1174,7 +1145,7 @@ bool AlertsModule::loadAlertsFromDisk()
         alerts.clear();
         if (!loadedProcessedIds) {
             processedAlertIds.clear();
-            processedAlertIdOrder.clear();
+            processedAlertIds.clear();
         }
         if (loadLegacyAlertFiles()) {
             if (!saveAlertsToSingleFile()) {
@@ -2862,7 +2833,7 @@ void AlertsModule::purgeAllAlerts()
 
     alerts.clear();
     processedAlertIds.clear();
-    processedAlertIdOrder.clear();
+    processedAlertIds.clear();
     LOG_INFO("Purged %d files and cleared in-memory cache", deletedCount);
 }
 

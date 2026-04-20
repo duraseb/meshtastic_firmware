@@ -9,8 +9,7 @@
 #include "DynamicSource.h"
 #include <Arduino.h>
 #include <vector>
-#include <unordered_set>
-#include <deque>
+#include <algorithm>
 #include <ArduinoJson.h>
 
 // Forward declaration
@@ -130,7 +129,7 @@ class AlertsModule : public concurrency::OSThread {
 
     // Memory management settings
     // We only keep valid (non-expired) alerts in memory
-    static constexpr int MAX_ALERTS_IN_MEMORY = 400; // Reasonable upper limit for edge cases
+    static constexpr int MAX_ALERTS_IN_MEMORY = 300; // Upper bound on concurrent active alerts
     static constexpr int MAX_PENDING_ALERTS = 30; // Limit pending alerts queue
     static constexpr unsigned long MEMORY_CHECK_INTERVAL_MS = 60000;
     static constexpr size_t MAX_PROCESSED_IDS_CACHE = 800; // Limit processed IDs cache size
@@ -222,9 +221,11 @@ class AlertsModule : public concurrency::OSThread {
     // Stored alerts
     std::vector<Alert> alerts;
 
-    // Cache of processed alert IDs for fast duplicate checking (prevents slow filesystem scans)
-    std::unordered_set<uint32_t> processedAlertIds;
-    std::deque<uint32_t> processedAlertIdOrder;
+    // Cache of processed alert IDs for duplicate suppression. Single FIFO vector
+    // (insertion order maintained by position) instead of an unordered_set +
+    // deque pair. Saves ~20–30 KB of heap vs std::unordered_set for typical cache
+    // sizes; linear lookup is cheap at this scale.
+    std::vector<uint32_t> processedAlertIds;
 
     // Memory management
     unsigned long lastMemoryCheckTime;

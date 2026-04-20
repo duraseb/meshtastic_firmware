@@ -4,7 +4,6 @@
 
 #include "IMGWAlertSource.h"
 #include "../AlertsModule.h"
-#include "../DateUtils.h"
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -202,17 +201,16 @@ bool IMGWAlertSource::parseIMGWStream(WiFiClient* stream, DynamicJsonDocument& d
             String expires = info.containsKey("expires") ? 
                             String(info["expires"].as<const char*>()) : "";
             
+            // meteoalarm.org returns Polish alert timestamps already in local
+            // Polish time (CET/CEST), not UTC — despite an ISO 8601 `Z` suffix
+            // in some responses. Keep them as-is so the displayed/scheduled
+            // times match the user's wall clock.
             if (onset.length() >= 19) {
-                // meteoalarm.org publishes timestamps in UTC (trailing 'Z'); convert
-                // to the device's local time so the displayed/scheduled times match
-                // the user's wall clock.
-                String utcOnset = onset.substring(0, 10) + " " + onset.substring(11, 19);
-                rawAlert.structuredStartDate = AlertsDateUtils::utcStringToLocal(utcOnset);
+                rawAlert.structuredStartDate = onset.substring(0, 10) + " " + onset.substring(11, 19);
                 rawAlert.dateStr = onset;
             }
             if (expires.length() >= 19) {
-                String utcExpires = expires.substring(0, 10) + " " + expires.substring(11, 19);
-                rawAlert.structuredEndDate = AlertsDateUtils::utcStringToLocal(utcExpires);
+                rawAlert.structuredEndDate = expires.substring(0, 10) + " " + expires.substring(11, 19);
             }
             
             // Build context from area descriptions
