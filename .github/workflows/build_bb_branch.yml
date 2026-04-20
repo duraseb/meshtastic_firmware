@@ -1,0 +1,159 @@
+name: Build BroadcastBeacon Branch
+
+on:
+  push:
+    branches:
+      - broadcast_beacon
+    paths-ignore:
+      - "**.md"
+
+permissions: read-all
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { pio_env: heltec-v3,               platform: esp32s3  }
+          - { pio_env: heltec-v4,               platform: esp32s3  }
+          - { pio_env: nrf52_promicro_diy_tcxo, platform: nrf52840 }
+          - { pio_env: seeed_xiao_nrf52840_kit, platform: nrf52840 }
+          - { pio_env: seeed-xiao-s3,           platform: esp32s3  }
+          - { pio_env: rak4631,                  platform: nrf52840 }
+          - { pio_env: meshtastic-diy-v1,        platform: esp32    }
+          - { pio_env: heltec-wsl-v3,            platform: esp32s3  }
+          - { pio_env: tlora-v2-1-1_6,           platform: esp32    }
+          - { pio_env: t-echo,                   platform: nrf52840 }
+          - { pio_env: tlora-t3s3-v1,            platform: esp32s3  }
+          - { pio_env: tracker-t1000-e,          platform: nrf52840 }
+          - { pio_env: heltec-mesh-node-t114,    platform: nrf52840 }
+          - { pio_env: heltec-v2_0,              platform: esp32    }
+          - { pio_env: heltec-mesh-pocket-5000,  platform: nrf52840 }
+          - { pio_env: seeed_wio_tracker_L1,     platform: nrf52840 }
+          - { pio_env: rp2040-lora,              platform: rp2040   }
+          - { pio_env: heltec-wireless-paper,    platform: esp32s3  }
+          - { pio_env: tbeam-s3-core,            platform: esp32s3  }
+
+    name: build-${{ matrix.pio_env }}
+    runs-on: ubuntu-latest
+
+    # Compile the BroadcastBeacon module into every target. The module is
+    # off by default (guarded by HAS_BROADCAST_BEACON); we force it on for
+    # this branch's artifacts.
+    env:
+      PLATFORMIO_BUILD_FLAGS: -DHAS_BROADCAST_BEACON=1
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get -y update --fix-missing
+          sudo apt-get install -y cppcheck libbluetooth-dev libgpiod-dev libyaml-cpp-dev lsb-release
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: 3.x
+          cache: pip
+          cache-dependency-path: |
+            .github/actions/**
+            **.ini
+
+      - name: Upgrade python tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -U --no-build-isolation --no-cache-dir "setuptools<72"
+          pip install -U platformio adafruit-nrfutil --no-build-isolation
+          pip install -U poetry --no-build-isolation
+          pip install -U meshtastic --pre --no-build-isolation
+          pio upgrade
+
+      - name: PlatformIO cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.platformio/.cache
+          key: pio-cache-${{ matrix.platform }}-${{ hashFiles('.github/actions/**', '**.ini') }}
+
+      - name: Build ${{ matrix.pio_env }}
+        uses: meshtastic/gh-action-firmware@main
+        with:
+          pio_platform: ${{ matrix.platform }}
+          pio_env: ${{ matrix.pio_env }}
+          pio_target: build
+
+      - name: ESP32 - Download Unified OTA firmware
+        if: matrix.platform == 'esp32' || matrix.platform == 'esp32s3'
+        env:
+          PIO_PLATFORM: ${{ matrix.platform }}
+          OTA_URL: https://github.com/meshtastic/esp32-unified-ota/releases/latest/download/mt-${{ matrix.platform }}-ota.bin
+        working-directory: release
+        run: |
+          curl -L -o "mt-$PIO_PLATFORM-ota.bin" $OTA_URL
+
+      - name: Update manifest with OTA file
+        if: matrix.platform == 'esp32' || matrix.platform == 'esp32s3'
+        working-directory: release
+        env:
+          PIO_PLATFORM: ${{ matrix.platform }}
+        run: |
+          OTA_FILE="mt-${PIO_PLATFORM}-ota.bin"
+          if [[ ! -f "$OTA_FILE" ]]; then
+            echo "OTA file $OTA_FILE not found, skipping manifest update"
+            exit 0
+          fi
+          if command -v md5sum &> /dev/null; then
+            OTA_MD5=$(md5sum "$OTA_FILE" | cut -d' ' -f1)
+          else
+            OTA_MD5=$(md5 -q "$OTA_FILE")
+          fi
+          OTA_SIZE=$(stat -f%z "$OTA_FILE" 2>/dev/null || stat -c%s "$OTA_FILE")
+          for manifest in firmware-*.mt.json; do
+            if [[ -f "$manifest" ]]; then
+              echo "Updating $manifest with $OTA_FILE (md5: $OTA_MD5, size: $OTA_SIZE)"
+              jq --arg name "$OTA_FILE" --arg md5 "$OTA_MD5" --argjson bytes "$OTA_SIZE" --arg part "app1" \
+                'if .files | map(select(.name == $name)) | length == 0 then .files += [{"name": $name, "md5": $md5, "bytes": $bytes, "part_name": $part}] else . end' \
+                "$manifest" > "${manifest}.tmp" && mv "${manifest}.tmp" "$manifest"
+            fi
+          done
+
+      - name: Job summary
+        env:
+          PIO_ENV: ${{ matrix.pio_env }}
+        run: |
+          echo "## $PIO_ENV" >> $GITHUB_STEP_SUMMARY
+          echo "<details><summary><strong>Manifest</strong></summary>" >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          cat release/firmware-*.mt.json >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
+
+      - name: Store binaries as artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: firmware-${{ matrix.platform }}-${{ matrix.pio_env }}
+          overwrite: true
+          path: |
+            release/*.mt.json
+            release/*.bin
+            release/*.elf
+            release/*.uf2
+            release/*.hex
+            release/*.zip
+            release/device-*.sh
+            release/device-*.bat
+          retention-days: 30
+
+      - name: Store manifests as artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: manifest-${{ matrix.platform }}-${{ matrix.pio_env }}
+          overwrite: true
+          path: |
+            release/*.mt.json
+          retention-days: 30
