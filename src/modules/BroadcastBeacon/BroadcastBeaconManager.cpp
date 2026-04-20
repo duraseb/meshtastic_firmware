@@ -499,6 +499,7 @@ void BroadcastBeaconManager::cmdConfig(const meshtastic_MeshPacket *mp)
     memcpy(session->pendingPresets, broadcastConfig.presets, sizeof(session->pendingPresets));
     session->pendingIntervalMinutes = broadcastConfig.intervalMinutes;
     session->pendingSendPosition = broadcastConfig.sendPosition;
+    session->pendingSkipHomeMessages = broadcastConfig.skipHomeMessages;
 
     promptForField(session, mp->from);
 }
@@ -680,6 +681,23 @@ void BroadcastBeaconManager::handleSessionInput(const meshtastic_MeshPacket *mp,
                 return;
             }
         }
+        session->state = SessionState::CFG_AWAIT_SKIP_HOME_MESSAGES;
+        promptForField(session, toNode);
+        break;
+    }
+
+    case SessionState::CFG_AWAIT_SKIP_HOME_MESSAGES: {
+        if (!accepted) {
+            char c = input.length() > 0 ? tolower(input[0]) : 0;
+            if (c == 'y') {
+                session->pendingSkipHomeMessages = true;
+            } else if (c == 'n') {
+                session->pendingSkipHomeMessages = false;
+            } else {
+                sendReply(toNode, "Reply 'y' or 'n' (or '.' to keep, '!' to abort):");
+                return;
+            }
+        }
         session->state = SessionState::CFG_CONFIRM;
         promptForField(session, toNode);
         break;
@@ -817,6 +835,12 @@ void BroadcastBeaconManager::promptForField(UserSession *session, uint32_t toNod
                  broadcastConfig.sendPosition ? "yes" : "no");
         break;
 
+    case SessionState::CFG_AWAIT_SKIP_HOME_MESSAGES:
+        snprintf(buf, sizeof(buf),
+                 "Skip text messages on the home preset? (home still sends NodeInfo/position)\nCurrent: %s\n'y' yes, 'n' no, '.' to keep, '!' to abort:",
+                 broadcastConfig.skipHomeMessages ? "yes" : "no");
+        break;
+
     case SessionState::CFG_CONFIRM: {
         int pos = snprintf(buf, sizeof(buf), "Config summary:\nPresets:");
         for (int i = 0; i < session->pendingNumPresets && pos < (int)sizeof(buf) - 20; i++) {
@@ -829,6 +853,8 @@ void BroadcastBeaconManager::promptForField(UserSession *session, uint32_t toNod
                             : 0);
         pos += snprintf(buf + pos, sizeof(buf) - pos, "\nPosition: %s",
                         session->pendingSendPosition ? "yes" : "no");
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "\nSkip msgs on home: %s",
+                        session->pendingSkipHomeMessages ? "yes" : "no");
         pos += snprintf(buf + pos, sizeof(buf) - pos, "\nHome preset auto-included.\n'.' to confirm, '!' to abort");
         break;
     }
@@ -939,6 +965,7 @@ void BroadcastBeaconManager::finalizeConfig(UserSession *session, uint32_t toNod
     memcpy(broadcastConfig.presets, session->pendingPresets, sizeof(broadcastConfig.presets));
     broadcastConfig.intervalMinutes = session->pendingIntervalMinutes;
     broadcastConfig.sendPosition = session->pendingSendPosition;
+    broadcastConfig.skipHomeMessages = session->pendingSkipHomeMessages;
     saveConfig();
 
     sendReplyFmt(toNode, "Config saved. %d presets, %d min interval (%d min per preset).",

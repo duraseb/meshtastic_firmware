@@ -70,11 +70,21 @@
  * optional ISO-8601 start/end dates, and a hop limit. When no end date is set
  * the message broadcasts indefinitely.
  *
- * The config also has a "send position" toggle. When enabled, the node also
- * broadcasts its current position (via `PositionModule::sendOurPosition()`,
- * which uses the node's default hop limit and bypasses PositionModule's normal
- * interval throttling) on each preset switch. With this on, having no text
- * messages is fine -- position alone keeps the cycle running.
+ * Every preset window starts with a NodeInfo broadcast (throttle bypassed) so
+ * neighbours on that preset immediately learn who we are, followed by the
+ * active broadcast messages, and then -- if configured -- a position packet.
+ * The position packet uses the node's default hop limit and is only sent when
+ * a GPS device is connected and has acquired a fix
+ * (`nodeDB->hasLocalPositionSinceBoot()`).
+ *
+ * Two config toggles refine the behaviour:
+ *  - "send position" -- broadcast our position on each preset switch. With
+ *    this on, having no text messages is fine -- position alone keeps the
+ *    cycle running.
+ *  - "skip home messages" -- during the home preset window, send only
+ *    NodeInfo (and position, if enabled) and omit the configured text
+ *    messages. This keeps the home network quiet while still letting the
+ *    node receive admin commands there.
  *
  * Once every configured message has expired (and position is off), or the
  * operator runs `/bb off`, the module restores the home preset and reboots
@@ -102,7 +112,11 @@ private:
 
     // Post-boot message sending
     bool messagesSent;
+    bool positionSent;    // true once the position packet has gone out this window
     unsigned long bootMs; // millis() when broadcasting window started
+
+    // How often to re-check for GPS lock while position is still pending
+    static constexpr int32_t POSITION_POLL_MS = 5000;
 
     // Broadcast sending
     void sendPendingMessages();

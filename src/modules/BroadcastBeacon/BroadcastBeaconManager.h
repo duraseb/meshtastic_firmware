@@ -52,7 +52,9 @@ public:
         uint8_t numPresets;
         uint32_t intervalMinutes;
         bool enabled;
-        bool sendPosition; // also broadcast our position on each preset switch
+        bool sendPosition;       // also broadcast our position on each preset switch
+        bool skipHomeMessages;   // skip text messages on the home preset window
+                                 // (home preset still gets NodeInfo / position)
     };
 
     // ===== Broadcast State (survives reboots) =====
@@ -123,6 +125,7 @@ private:
         CFG_AWAIT_PRESETS,
         CFG_AWAIT_INTERVAL,
         CFG_AWAIT_SEND_POSITION,
+        CFG_AWAIT_SKIP_HOME_MESSAGES,
         CFG_CONFIRM
     };
 
@@ -143,6 +146,7 @@ private:
         uint8_t pendingNumPresets;
         uint32_t pendingIntervalMinutes;
         bool pendingSendPosition;
+        bool pendingSkipHomeMessages;
     };
 
     // ===== Storage Structures =====

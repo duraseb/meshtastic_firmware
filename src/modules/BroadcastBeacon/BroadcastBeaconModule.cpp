@@ -5,6 +5,7 @@
 #include "mesh/MeshService.h"
 #include "mesh/NodeDB.h"
 #include "mesh/Router.h"
+#include "modules/NodeInfoModule.h"
 #include "modules/PositionModule.h"
 #include "modules/TextMessageModule.h"
 #include "main.h"
@@ -17,7 +18,7 @@
 
 BroadcastBeaconModule::BroadcastBeaconModule()
     : concurrency::OSThread("BroadcastBeacon"),
-      manager(nullptr), initialized(false), messagesSent(false), bootMs(0)
+      manager(nullptr), initialized(false), messagesSent(false), positionSent(false), bootMs(0)
 {
 }
 
@@ -101,18 +102,35 @@ int32_t BroadcastBeaconModule::runOnce()
             return BroadcastBeaconManager::POST_BOOT_DELAY_MS - elapsed;
         }
 
-        sendPendingMessages();
+        bool onHomePreset = cfg.numPresets > 0 && cfg.presets[state.currentPresetIndex] == state.homePreset;
 
-        // Position broadcast (bypasses PositionModule's runOnce interval throttling)
-        if (cfg.sendPosition && positionModule) {
-            positionModule->sendOurPosition();
-            LOG_INFO("[BroadcastBeacon] Position broadcast on preset %d", state.currentPresetIndex);
+        // NodeInfo first so neighbours on this preset know who we are before we
+        // start broadcasting. Bypass the regular throttle -- we want one per
+        // preset window regardless of how recently we last announced.
+        if (nodeInfoModule) {
+            nodeInfoModule->sendOurNodeInfo(NODENUM_BROADCAST, false, 0, false, /*bypassThrottle=*/true);
+            LOG_INFO("[BroadcastBeacon] NodeInfo broadcast on preset %d", state.currentPresetIndex);
+        }
+
+        // Skip text messages on the home preset if configured -- home preset
+        // still gets NodeInfo/position and can receive admin commands normally.
+        if (!(onHomePreset && cfg.skipHomeMessages)) {
+            sendPendingMessages();
+        } else {
+            LOG_INFO("[BroadcastBeacon] Skipping text messages on home preset");
         }
 
         messagesSent = true;
         LOG_INFO("[BroadcastBeacon] Messages sent on preset %d (%s)",
                  state.currentPresetIndex,
                  cfg.numPresets > 0 ? manager->presetDisplayName(cfg.presets[state.currentPresetIndex]) : "?");
+    }
+
+    // ===== Phase 6b: Position -- send as soon as GPS lock is available =====
+    if (cfg.sendPosition && !positionSent && positionModule && nodeDB->hasLocalPositionSinceBoot()) {
+        positionModule->sendOurPosition();
+        positionSent = true;
+        LOG_INFO("[BroadcastBeacon] Position broadcast on preset %d", state.currentPresetIndex);
     }
 
     // ===== Phase 7: Wait for window to elapse, then switch =====
@@ -124,8 +142,15 @@ int32_t BroadcastBeaconModule::runOnce()
         return -1; // Disable thread, reboot is pending
     }
 
-    // Sleep until window end
-    return (int32_t)(windowDurationMs - elapsed);
+    int32_t windowRemainingMs = (int32_t)(windowDurationMs - elapsed);
+
+    // If position is still pending, poll for the GPS lock instead of sleeping
+    // all the way to the window end.
+    if (cfg.sendPosition && !positionSent) {
+        return windowRemainingMs < POSITION_POLL_MS ? windowRemainingMs : POSITION_POLL_MS;
+    }
+
+    return windowRemainingMs;
 }
 
 // ========== Message Sending ==========
