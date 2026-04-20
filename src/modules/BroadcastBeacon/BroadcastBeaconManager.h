@@ -32,14 +32,19 @@ public:
     // ===== Constants =====
     static constexpr int MAX_BROADCAST_MESSAGES = 20;
     static constexpr int MAX_BROADCAST_PRESETS = 10;
+    static constexpr int MAX_CHANNELS_PER_MESSAGE = 8; // matches Meshtastic's MAX_NUM_CHANNELS
+    static constexpr int CHANNEL_NAME_LEN = 32;
     static constexpr uint8_t BB_HOP_LIMIT_DEFAULT = 0xFF;
     static constexpr unsigned long POST_BOOT_DELAY_MS = 10000;
 
     // ===== Broadcast Message =====
+    //
+    // APPEND-ONLY: new fields go at the end. Never reorder/rename/insert.
     struct BroadcastMessage {
         uint32_t id;
         char body[237];
-        char channel[32];
+        char channels[MAX_CHANNELS_PER_MESSAGE][CHANNEL_NAME_LEN]; // empty entry [0] == primary
+        uint8_t numChannels;
         char dateFrom[20];   // ISO 8601 or empty = immediate
         char dateTo[20];     // ISO 8601 or empty = indefinite
         uint8_t hops;        // 0-7 explicit, BB_HOP_LIMIT_DEFAULT = device default
@@ -47,6 +52,11 @@ public:
     };
 
     // ===== Broadcast Config =====
+    //
+    // APPEND-ONLY: new fields go at the end of this struct. Never reorder,
+    // rename, or insert in the middle -- loadConfig() tolerates short reads
+    // by zero-initing missing tail bytes, so pure appends are safe across
+    // firmware upgrades. Breaking changes require a STORAGE_VERSION bump.
     struct BroadcastConfig {
         meshtastic_Config_LoRaConfig_ModemPreset presets[MAX_BROADCAST_PRESETS];
         uint8_t numPresets;
@@ -55,11 +65,14 @@ public:
         bool sendPosition;       // also broadcast our position on each preset switch
         bool skipHomeMessages;   // skip text messages on the home preset window
                                  // (home preset still gets NodeInfo / position)
+        meshtastic_Config_LoRaConfig_ModemPreset homePreset; // user-chosen, persisted
+        bool homePresetValid;    // true once the user has set it via /bb config
     };
 
     // ===== Broadcast State (survives reboots) =====
+    //
+    // APPEND-ONLY: new fields go at the end. Never reorder/rename/insert.
     struct BroadcastState {
-        meshtastic_Config_LoRaConfig_ModemPreset homePreset;
         uint8_t currentPresetIndex;
         bool broadcasting;
     };
@@ -76,7 +89,6 @@ public:
     // ===== State mutators (called by module) =====
     void setCurrentPresetIndex(uint8_t idx);
     void setBroadcasting(bool active);
-    void setHomePreset(meshtastic_Config_LoRaConfig_ModemPreset preset);
     void clearBroadcastingState();
 
     // ===== Helpers (used by module too) =====
@@ -97,6 +109,7 @@ private:
     static constexpr int MAX_REPLY_LEN = MAX_PACKET_TEXT_LEN;
 
     // Storage paths
+    static constexpr const char *STORAGE_DIR = "/broadcast_beacon";
     static constexpr const char *CONFIG_FILE = "/broadcast_beacon/config.bin";
     static constexpr const char *CONFIG_FILE_TMP = "/broadcast_beacon/config.bin.tmp";
     static constexpr const char *MESSAGES_FILE = "/broadcast_beacon/messages.bin";
@@ -104,11 +117,14 @@ private:
     static constexpr const char *STATE_FILE = "/broadcast_beacon/state.bin";
     static constexpr const char *STATE_FILE_TMP = "/broadcast_beacon/state.bin.tmp";
 
-    // Storage magic numbers
+    // Storage magic numbers. Append-only discipline + tolerant reads in
+    // load*() make an explicit version field unnecessary: pure field
+    // appends don't need any bump. If a genuinely incompatible change is
+    // ever needed (reorder, remove, change type), bump the magic below to
+    // force old files to be treated as foreign and wiped.
     static constexpr uint32_t CONFIG_MAGIC = 0x42424347;   // "BBCG"
-    static constexpr uint32_t MESSAGES_MAGIC = 0x42424D53;  // "BBMS"
+    static constexpr uint32_t MESSAGES_MAGIC = 0x42424D32;  // "BBM2" (bumped: old layout had 1096B records)
     static constexpr uint32_t STATE_MAGIC = 0x42425354;     // "BBST"
-    static constexpr uint16_t STORAGE_VERSION = 1;
 
     // ===== Session State Machine =====
     enum class SessionState {
@@ -122,6 +138,7 @@ private:
         MSG_CONFIRM,
         MSG_AWAIT_ANOTHER,
         // Config editing
+        CFG_AWAIT_HOME_PRESET,
         CFG_AWAIT_PRESETS,
         CFG_AWAIT_INTERVAL,
         CFG_AWAIT_SEND_POSITION,
@@ -137,11 +154,13 @@ private:
         uint16_t editIndex;
         // Message fields
         char body[237];
-        char channel[32];
+        char channels[MAX_CHANNELS_PER_MESSAGE][CHANNEL_NAME_LEN];
+        uint8_t numChannels;
         char dateFrom[20];
         char dateTo[20];
         uint8_t hops;
         // Config fields (used during CFG_ states)
+        meshtastic_Config_LoRaConfig_ModemPreset pendingHomePreset;
         meshtastic_Config_LoRaConfig_ModemPreset pendingPresets[MAX_BROADCAST_PRESETS];
         uint8_t pendingNumPresets;
         uint32_t pendingIntervalMinutes;
@@ -152,7 +171,6 @@ private:
     // ===== Storage Structures =====
     struct StorageHeader {
         uint32_t magic;
-        uint16_t version;
         uint16_t count;
     };
 
@@ -197,6 +215,9 @@ private:
     // ===== Messaging =====
     void sendReply(uint32_t toNodeNum, const char *text);
     void sendReplyFmt(uint32_t toNodeNum, const char *fmt, ...);
+    // "Done." for a completed create/edit series, with a contextual hint about
+    // the next setup step if config or /bb on is still missing.
+    void sendDoneWithHint(uint32_t toNodeNum);
 
     // ===== Storage =====
     bool loadConfig();
@@ -207,6 +228,11 @@ private:
 
     // ===== Helpers =====
     uint32_t hashMessageId(const char *body, uint32_t createdAt) const;
+
+    // Format a list of channel names (raw form where "" means primary) into a
+    // human-readable string like "PRIMARY, Alert". Returns number of chars written.
+    int formatChannelList(char *out, size_t outLen,
+                          const char channels[][CHANNEL_NAME_LEN], uint8_t count) const;
 
     static String unescapeInput(const char *text);
     static bool isAccept(const char *text);

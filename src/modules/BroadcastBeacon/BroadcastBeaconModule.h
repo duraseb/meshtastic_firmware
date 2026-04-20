@@ -100,6 +100,9 @@ class BroadcastBeaconModule : private concurrency::OSThread {
 public:
     BroadcastBeaconModule();
 
+    /// Seconds remaining in the current preset window, or 0 if not cycling yet.
+    uint32_t getWindowRemainingSec() const;
+
 protected:
     int32_t runOnce() override;
 
@@ -108,12 +111,13 @@ private:
 
     // Initialization state
     bool initialized;
-    static constexpr unsigned long INIT_DELAY_MS = 30000; // Wait for textMessageModule
 
     // Post-boot message sending
     bool messagesSent;
-    bool positionSent;    // true once the position packet has gone out this window
-    unsigned long bootMs; // millis() when broadcasting window started
+    bool positionSent;     // true once the position packet has gone out this window
+    bool wasBroadcasting;  // previous observed state.broadcasting -- used to detect
+                           // the false->true transition that starts a new window
+    unsigned long bootMs;  // millis() anchor for the current window
 
     // How often to re-check for GPS lock while position is still pending
     static constexpr int32_t POSITION_POLL_MS = 5000;

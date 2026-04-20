@@ -18,8 +18,28 @@
 
 BroadcastBeaconModule::BroadcastBeaconModule()
     : concurrency::OSThread("BroadcastBeacon"),
-      manager(nullptr), initialized(false), messagesSent(false), positionSent(false), bootMs(0)
+      manager(nullptr), initialized(false), messagesSent(false), positionSent(false),
+      wasBroadcasting(false), bootMs(0)
 {
+}
+
+// ========== Accessors ==========
+
+uint32_t BroadcastBeaconModule::getWindowRemainingSec() const
+{
+    if (!manager || !initialized) {
+        return 0;
+    }
+    const auto &cfg = manager->getConfig();
+    if (cfg.numPresets == 0 || cfg.intervalMinutes == 0) {
+        return 0;
+    }
+    unsigned long windowDurationMs = ((unsigned long)cfg.intervalMinutes * 60UL * 1000UL) / cfg.numPresets;
+    unsigned long elapsed = millis() - bootMs;
+    if (elapsed >= windowDurationMs) {
+        return 0;
+    }
+    return (uint32_t)((windowDurationMs - elapsed) / 1000UL);
 }
 
 // ========== Main Loop ==========
@@ -28,14 +48,11 @@ int32_t BroadcastBeaconModule::runOnce()
 {
     // ===== Phase 1: Initialization =====
     if (!initialized) {
-        if (millis() < INIT_DELAY_MS) {
-            return 5000; // Check again in 5s
-        }
-
-        // textMessageModule should be available by now
+        // textMessageModule is created earlier in setupModules(), so it's
+        // normally available on the very first runOnce call. Retry briefly
+        // just in case module ordering ever changes.
         if (!textMessageModule) {
-            LOG_WARN("[BroadcastBeacon] textMessageModule not available yet");
-            return 5000;
+            return 1000;
         }
 
         manager = new BroadcastBeaconManager(this);
@@ -56,7 +73,7 @@ int32_t BroadcastBeaconModule::runOnce()
             // Was broadcasting but got disabled (e.g., by /bb off in another context)
             // The /bb off command handles the reboot itself, but in case state is stale:
             restoreHomePresetAndReboot();
-            return -1;
+            return disable();
         }
         return 10000; // Check every 10s in case it gets enabled
     }
@@ -69,7 +86,7 @@ int32_t BroadcastBeaconModule::runOnce()
         if (state.broadcasting) {
             LOG_INFO("[BroadcastBeacon] Nothing to broadcast, restoring home preset");
             restoreHomePresetAndReboot();
-            return -1;
+            return disable();
         }
         return 30000;
     }
@@ -79,21 +96,35 @@ int32_t BroadcastBeaconModule::runOnce()
         if (state.broadcasting) {
             LOG_INFO("[BroadcastBeacon] All messages expired, restoring home preset");
             restoreHomePresetAndReboot();
-            return -1;
+            return disable();
         }
         return 30000;
     }
 
     // ===== Phase 5: Start broadcasting if not already =====
     if (!state.broadcasting) {
-        // Begin broadcast cycle
-        manager->setHomePreset(config.lora.modem_preset);
+        // Home preset is set explicitly via /bb config; don't auto-capture it
+        // here (cycling would otherwise bake the current preset as home on any
+        // fresh state.bin).
         manager->setCurrentPresetIndex(0);
         manager->setBroadcasting(true);
         manager->saveState();
-        bootMs = millis();
-        LOG_INFO("[BroadcastBeacon] Starting broadcast cycle, home preset saved");
+        LOG_INFO("[BroadcastBeacon] Starting broadcast cycle (home=%s)",
+                 manager->presetDisplayName(cfg.homePreset));
     }
+
+    // Detect false->true transition (which may have happened in cmdOn rather
+    // than above) and anchor the window start to *now*, otherwise we'd inherit
+    // bootMs from module-init time and immediately conclude the window expired.
+    if (!wasBroadcasting && state.broadcasting) {
+        bootMs = millis();
+        messagesSent = false;
+        positionSent = false;
+        LOG_INFO("[BroadcastBeacon] Window started on preset %d (%s)",
+                 state.currentPresetIndex,
+                 cfg.numPresets > 0 ? manager->presetDisplayName(cfg.presets[state.currentPresetIndex]) : "?");
+    }
+    wasBroadcasting = state.broadcasting;
 
     // ===== Phase 6: Send messages after post-boot delay =====
     if (!messagesSent) {
@@ -102,7 +133,7 @@ int32_t BroadcastBeaconModule::runOnce()
             return BroadcastBeaconManager::POST_BOOT_DELAY_MS - elapsed;
         }
 
-        bool onHomePreset = cfg.numPresets > 0 && cfg.presets[state.currentPresetIndex] == state.homePreset;
+        bool onHomePreset = cfg.numPresets > 0 && cfg.presets[state.currentPresetIndex] == cfg.homePreset;
 
         // NodeInfo first so neighbours on this preset know who we are before we
         // start broadcasting. Bypass the regular throttle -- we want one per
@@ -139,7 +170,7 @@ int32_t BroadcastBeaconModule::runOnce()
 
     if (elapsed >= windowDurationMs) {
         switchToNextPresetAndReboot();
-        return -1; // Disable thread, reboot is pending
+        return disable(); // thread off; reboot is pending
     }
 
     int32_t windowRemainingMs = (int32_t)(windowDurationMs - elapsed);
@@ -169,39 +200,46 @@ void BroadcastBeaconModule::sendPendingMessages()
             continue;
         }
 
-        // Resolve channel
-        int8_t chIdx = manager->resolveChannelIndex(msgs[i].channel);
-        if (chIdx < 0) {
-            LOG_WARN("[BroadcastBeacon] Cannot resolve channel '%s', using primary", msgs[i].channel);
-            chIdx = 0;
+        uint8_t channelCount = msgs[i].numChannels > 0 ? msgs[i].numChannels : 1; // fallback = primary
+        for (uint8_t c = 0; c < channelCount; c++) {
+            const char *chName = msgs[i].numChannels > 0 ? msgs[i].channels[c] : "";
+            int8_t chIdx = manager->resolveChannelIndex(chName);
+            if (chIdx < 0) {
+                LOG_WARN("[BroadcastBeacon] Cannot resolve channel '%s', skipping for msg %d",
+                         chName, i);
+                continue;
+            }
+
+            meshtastic_MeshPacket *p = router->allocForSending();
+            if (!p) {
+                LOG_ERROR("[BroadcastBeacon] Failed to allocate packet for message %d", i);
+                break;
+            }
+
+            p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+            p->to = NODENUM_BROADCAST;
+            p->channel = chIdx;
+            p->want_ack = false;
+            p->decoded.want_response = false;
+
+            if (msgs[i].hops != BroadcastBeaconManager::BB_HOP_LIMIT_DEFAULT) {
+                p->hop_limit = msgs[i].hops;
+            }
+
+            size_t bodyLen = strlen(msgs[i].body);
+            size_t maxLen = sizeof(p->decoded.payload.bytes);
+            if (bodyLen > maxLen) {
+                bodyLen = maxLen;
+            }
+            p->decoded.payload.size = bodyLen;
+            memcpy(p->decoded.payload.bytes, msgs[i].body, bodyLen);
+
+            service->sendToMesh(p);
+            LOG_INFO("[BroadcastBeacon] TX broadcast msg #%d ch=%d hop=%u: %.60s%s",
+                     i, chIdx,
+                     msgs[i].hops == BroadcastBeaconManager::BB_HOP_LIMIT_DEFAULT ? 0xFFu : msgs[i].hops,
+                     msgs[i].body, strlen(msgs[i].body) > 60 ? "..." : "");
         }
-
-        meshtastic_MeshPacket *p = router->allocForSending();
-        if (!p) {
-            LOG_ERROR("[BroadcastBeacon] Failed to allocate packet for message %d", i);
-            continue;
-        }
-
-        p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
-        p->to = NODENUM_BROADCAST;
-        p->channel = chIdx;
-        p->want_ack = false;
-        p->decoded.want_response = false;
-
-        if (msgs[i].hops != BroadcastBeaconManager::BB_HOP_LIMIT_DEFAULT) {
-            p->hop_limit = msgs[i].hops;
-        }
-
-        size_t bodyLen = strlen(msgs[i].body);
-        size_t maxLen = sizeof(p->decoded.payload.bytes);
-        if (bodyLen > maxLen) {
-            bodyLen = maxLen;
-        }
-        p->decoded.payload.size = bodyLen;
-        memcpy(p->decoded.payload.bytes, msgs[i].body, bodyLen);
-
-        service->sendToMesh(p);
-        LOG_INFO("[BroadcastBeacon] Sent message %d on channel %d: %.40s", i, chIdx, msgs[i].body);
     }
 }
 
@@ -312,9 +350,15 @@ void BroadcastBeaconModule::restoreHomePresetAndReboot()
         return;
     }
 
-    const auto &state = manager->getState();
-    meshtastic_Config_LoRaConfig_ModemPreset homePreset = state.homePreset;
+    if (!manager->getConfig().homePresetValid) {
+        // Nothing to restore to -- clear state and bail; the node will stay on
+        // whatever preset it's currently on.
+        manager->clearBroadcastingState();
+        LOG_WARN("[BroadcastBeacon] No home preset configured; cannot restore");
+        return;
+    }
 
+    meshtastic_Config_LoRaConfig_ModemPreset homePreset = manager->getConfig().homePreset;
     manager->clearBroadcastingState();
 
     // Restore home preset via proper config API
