@@ -30,22 +30,29 @@ std::vector<AlertSource::RawAlert> RCBAlertSource::fetchAndParseAlerts(
         return alerts;
     }
     
-    // Parse HTML page for alert cards
-    // Look for <a href="/web/rcb/..." tags that contain alert cards
+    // Page layout (gov.pl, as of 2026-04):
+    //   <span class="date"> DD.MM.YYYY </span>
+    //   ...
+    //   <div class="title">
+    //     <a href="/web/rcb/alert-rcb-..."> Alert RCB - ... </a>
+    //   </div>
+    // The date span is a sibling that precedes the title div, not a child of <a>.
+    // Anchor on the alert link (path prefix excludes the navigation "alertrcb" link),
+    // take the title from the link's visible text, and look backward for the nearest
+    // preceding date span.
     int pos = 0;
     int foundCount = 0;
+    const char *kAlertHrefPrefix = "<a href=\"/web/rcb/alert-rcb";
 
     while (true) {
-        // Find next <a href="/web/rcb/..." tag
-        int aPos = payload.indexOf("<a href=\"/web/rcb/", pos);
+        int aPos = payload.indexOf(kAlertHrefPrefix, pos);
         if (aPos < 0) break;
 
-        // Extract href value
         int hrefStart = payload.indexOf('"', aPos) + 1;
         int hrefEnd = payload.indexOf('"', hrefStart);
-        if (hrefEnd <= hrefStart) { 
-            pos = aPos + 1; 
-            continue; 
+        if (hrefEnd <= hrefStart) {
+            pos = aPos + 1;
+            continue;
         }
 
         String link = payload.substring(hrefStart, hrefEnd);
@@ -54,62 +61,41 @@ std::vector<AlertSource::RawAlert> RCBAlertSource::fetchAndParseAlerts(
         }
         link = String("https://www.gov.pl") + link;
 
-        // Find the closing </a> tag
         int aEnd = payload.indexOf("</a>", aPos);
-        if (aEnd < 0) { 
-            pos = aPos + 1; 
-            continue; 
+        if (aEnd < 0) {
+            pos = aPos + 1;
+            continue;
         }
 
-        // Extract content between <a> and </a>
-        String cardContent = payload.substring(aPos, aEnd);
+        int titleStart = payload.indexOf('>', aPos) + 1;
+        String title = payload.substring(titleStart, aEnd);
+        title.trim();
 
-        // Extract date from <span class="date">
         String dateStr = "";
-        int dateSpanPos = cardContent.indexOf("<span class=\"date\">");
+        int dateSpanPos = payload.lastIndexOf("<span class=\"date\">", aPos);
         if (dateSpanPos >= 0) {
-            int dateStart = cardContent.indexOf('>', dateSpanPos) + 1;
-            int dateEnd = cardContent.indexOf("</span>", dateStart);
+            int dateStart = payload.indexOf('>', dateSpanPos) + 1;
+            int dateEnd = payload.indexOf("</span>", dateStart);
             if (dateEnd > dateStart) {
-                dateStr = cardContent.substring(dateStart, dateEnd);
+                dateStr = payload.substring(dateStart, dateEnd);
                 dateStr.trim();
             }
         }
 
-        // Extract title from <div class="title">
-        String title = "";
-        int titleDivPos = cardContent.indexOf("<div class=\"title\">");
-        if (titleDivPos >= 0) {
-            int titleStart = cardContent.indexOf('>', titleDivPos) + 1;
-            int titleEnd = cardContent.indexOf("</div>", titleStart);
-            if (titleEnd > titleStart) {
-                title = cardContent.substring(titleStart, titleEnd);
-                title.trim();
-            }
-        }
-
-        // Only process if we have link, title, and title contains "Alert RCB"
-        if (link.length() > 0 && title.length() > 0 && title.indexOf("Alert RCB") >= 0) {
-            // Calculate unique alert ID from the URL (used for duplicate checking)
-            uint32_t id = hashString(link);
-            
-            // For first pass, just create a stub with minimal info
-            // Full content will be fetched later only for new alerts
+        if (title.length() > 0 && title.indexOf("Alert RCB") >= 0) {
             RawAlert alert;
             alert.link = link;
-            alert.id = id;
+            alert.id = hashString(link);
             alert.title = title;
             alert.dateStr = dateStr;
-            alert.intro = "";  // Will be populated by fetchFullAlertContent if needed
+            alert.intro = "";  // Filled in later by fetchFullAlertContent
             alert.context = "";
-            
+
             alerts.push_back(alert);
             foundCount++;
-            
-            pos = aEnd + 1;
-        } else {
-            pos = aPos + 1;
         }
+
+        pos = aEnd + 1;
     }
     
     LOG_INFO("RCBAlertSource: Found %d alerts in page", foundCount);
