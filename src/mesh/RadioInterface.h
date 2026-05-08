@@ -293,8 +293,8 @@ class RadioInterface
   protected:
     int8_t power = 17; // Set by applyModemConfig()
 
-    float savedFreq;
-    uint32_t savedChannelNum;
+    float savedFreq = 0.0f;
+    uint32_t savedChannelNum = 0;
 
     /***
      * given a packet set sendingPacket and decode the protobufs into radiobuf.  Returns # of bytes to send (including the
@@ -319,6 +319,12 @@ class RadioInterface
      * Save the channel we selected for later reuse.
      */
     virtual void saveChannelNum(uint32_t savedChannelNum);
+
+    /**
+     * Get current RSSI reading from the radio.
+     * Returns 0 if not available.
+     */
+    virtual int16_t getCurrentRSSI() { return 0; }
 
   private:
     /**

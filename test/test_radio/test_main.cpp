@@ -1,7 +1,10 @@
 #include "MeshRadio.h"
 #include "MeshService.h"
+#include "NodeDB.h"
 #include "RadioInterface.h"
+#include "RadioLibInterface.h"
 #include "TestUtil.h"
+#include <SPI.h>
 #include <unity.h>
 
 #include "meshtastic/config.pb.h"
@@ -29,6 +32,38 @@ class TestableRadioInterface : public RadioInterface
     // Stubs for pure virtual methods required by RadioInterface
     uint32_t getPacketTime(uint32_t, bool) override { return 0; }
     ErrorCode send(meshtastic_MeshPacket *p) override { return ERRNO_OK; }
+};
+
+static LockingArduinoHal *getTestHal()
+{
+    static LockingArduinoHal hal(SPI, SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    return &hal;
+}
+
+class TestableRadioLibInterface : public RadioLibInterface
+{
+  public:
+    TestableRadioLibInterface() : RadioLibInterface(getTestHal(), RADIOLIB_NC, RADIOLIB_NC, RADIOLIB_NC, RADIOLIB_NC, nullptr) {}
+
+    void seedNoiseFloorForTest()
+    {
+        noiseFloorSamples[0] = -110;
+        currentSampleIndex = 1;
+        isNoiseFloorBufferFull = false;
+        lastNoiseFloorUpdate = 1234;
+        currentNoiseFloor = -110;
+    }
+
+    uint32_t getLastNoiseFloorUpdateForTest() const { return lastNoiseFloorUpdate; }
+
+  protected:
+    void disableInterrupt() override {}
+    void enableInterrupt(void (*)()) override {}
+    bool isChannelActive() override { return false; }
+    bool isActivelyReceiving() override { return false; }
+    void addReceiveMetadata(meshtastic_MeshPacket *) override {}
+    uint32_t getPacketTime(uint32_t, bool) override { return 0; }
+    int16_t getCurrentRSSI() override { return NOISE_FLOOR_DEFAULT; }
 };
 
 static void test_bwCodeToKHz_specialMappings()
@@ -197,6 +232,44 @@ static void test_reloadConfig_applies_modem_after_the_radio_is_live()
     TEST_ASSERT_FLOAT_WITHIN(0.01f, 250.0f, testRadio->getBw());
 }
 
+static void configureLongFastUs(float frequencyOffset = 0.0f)
+{
+    config.lora = meshtastic_Config_LoRaConfig_init_zero;
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+    config.lora.use_preset = true;
+    config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST;
+    config.lora.frequency_offset = frequencyOffset;
+}
+
+static void test_radioLibReconfigureResetsNoiseFloorWhenFrequencyChanges()
+{
+    TestableRadioLibInterface testRadioLib;
+    configureLongFastUs();
+    testRadioLib.reconfigure();
+    testRadioLib.seedNoiseFloorForTest();
+
+    config.lora.frequency_offset = 0.125f;
+    testRadioLib.reconfigure();
+
+    TEST_ASSERT_FALSE(testRadioLib.hasNoiseFloorSamples());
+    TEST_ASSERT_EQUAL_INT32(-120, testRadioLib.getNoiseFloor());
+    TEST_ASSERT_EQUAL_UINT32(0, testRadioLib.getLastNoiseFloorUpdateForTest());
+}
+
+static void test_radioLibReconfigureKeepsNoiseFloorWhenFrequencyUnchanged()
+{
+    TestableRadioLibInterface testRadioLib;
+    configureLongFastUs();
+    testRadioLib.reconfigure();
+    testRadioLib.seedNoiseFloorForTest();
+
+    testRadioLib.reconfigure();
+
+    TEST_ASSERT_TRUE(testRadioLib.hasNoiseFloorSamples());
+    TEST_ASSERT_EQUAL_INT32(-110, testRadioLib.getNoiseFloor());
+    TEST_ASSERT_EQUAL_UINT32(1234, testRadioLib.getLastNoiseFloorUpdateForTest());
+}
+
 void setUp(void)
 {
     mockMeshService = new MockMeshService();
@@ -238,6 +311,8 @@ void setup()
     RUN_TEST(test_applyModemConfig_customCodingRateHigherThanPreset);
     RUN_TEST(test_applyModemConfig_customCodingRateLowerThanPreset);
     RUN_TEST(test_reloadConfig_applies_modem_after_the_radio_is_live);
+    RUN_TEST(test_radioLibReconfigureResetsNoiseFloorWhenFrequencyChanges);
+    RUN_TEST(test_radioLibReconfigureKeepsNoiseFloorWhenFrequencyUnchanged);
     exit(UNITY_END());
 }
 

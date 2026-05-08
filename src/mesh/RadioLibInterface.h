@@ -99,10 +99,41 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     /// are _trying_ to receive a packet currently (note - we might just be waiting for one)
     bool isReceiving = false;
 
+  protected:
+    // Noise floor tracking - rolling window of samples.
+    static const uint8_t NOISE_FLOOR_SAMPLES = 20;
+    static const int32_t NOISE_FLOOR_DEFAULT = -120;
+    static const int32_t NOISE_FLOOR_VALID_MIN = -127;
+    static const int32_t NOISE_FLOOR_INVALID = -128;
+    int32_t noiseFloorSamples[NOISE_FLOOR_SAMPLES];
+    uint8_t currentSampleIndex = 0;
+    bool isNoiseFloorBufferFull = false;
+    uint32_t lastNoiseFloorUpdate = 0;
+    static const uint32_t NOISE_FLOOR_UPDATE_INTERVAL_MS = 5000;
+    int32_t currentNoiseFloor = NOISE_FLOOR_DEFAULT;
+
+    /**
+     * Pure virtual hook for derived radio interfaces to provide instantaneous RSSI.
+     * Implementations should return dBm, or an invalid value that updateNoiseFloor()
+     * can reject.
+     */
+    virtual int16_t getCurrentRSSI() = 0;
+
   public:
     /** Our ISR code currently needs this to find our active instance
      */
     static RadioLibInterface *instance;
+
+    /**
+     * Get the current calculated noise floor in dBm
+     * Returns -120 dBm if not yet calibrated
+     */
+    int32_t getNoiseFloor();
+
+    /**
+     * Calculate the average noise floor from collected samples
+     */
+    int32_t getAverageNoiseFloor();
 
     /**
      * Glue functions called from ISR land
@@ -135,6 +166,8 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
   public:
     RadioLibInterface(LockingArduinoHal *hal, RADIOLIB_PIN_TYPE cs, RADIOLIB_PIN_TYPE irq, RADIOLIB_PIN_TYPE rst,
                       RADIOLIB_PIN_TYPE busy, PhysicalLayer *iface = NULL);
+
+    virtual bool reconfigure() override;
 
     virtual ErrorCode send(meshtastic_MeshPacket *p) override;
 
@@ -172,7 +205,38 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     /** Attempt to find a packet in the TxQueue. Returns true if the packet was found. */
     virtual bool findInTxQueue(NodeNum from, PacketId id) override;
 
+    /**
+     * Update the noise floor measurement by sampling RSSI from a slow path.
+     * This should not be called from radio interrupt or TX/RX critical paths.
+     */
+    void updateNoiseFloor();
+
+    /**
+     * Check if we have collected any noise floor samples
+     */
+    bool hasNoiseFloorSamples();
+
+    /**
+     * Get the number of samples in the rolling window
+     */
+    uint8_t getNoiseFloorSampleCount();
+
+    /**
+     * Reset the noise floor calibration
+     * Will automatically restart collection
+     */
+    void resetNoiseFloor();
+
+    /**
+     * Request randomness sourced from the LoRa modem, if supported by the active RadioLib interface.
+     * @return true if len bytes were produced, false otherwise.
+     */
+    bool randomBytes(uint8_t *buffer, size_t length);
+
   private:
+    uint8_t getNoiseFloorSampleCountInternal() const;
+    int32_t getAverageNoiseFloorInternal() const;
+
     /** if we have something waiting to send, start a short (random) timer so we can come check for collision before actually
      * doing the transmit */
     void setTransmitDelay();
@@ -238,29 +302,41 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     /**
      * Derive packet time either for a received (using header info) or a transmitted packet
      */
+    template <typename T>
+    auto computeReceivedPacketTime(T &lora, uint32_t pl, int)
+        -> decltype(lora.getLoRaRxHeaderInfo(static_cast<uint8_t *>(nullptr), static_cast<bool *>(nullptr)), uint32_t())
+    {
+        // First get the actual coding rate and CRC status from the received packet
+        uint8_t rxCR;
+        bool hasCRC;
+        lora.getLoRaRxHeaderInfo(&rxCR, &hasCRC);
+        // Go from raw header value to denominator
+        if (rxCR < 5) {
+            rxCR += 4;
+        } else if (rxCR == 7) {
+            rxCR = 8;
+        }
+
+        // Received packet configuration must be the same as configured, except for coding rate and CRC
+        DataRate_t dr = getDataRate();
+        dr.lora.codingRate = rxCR;
+
+        PacketConfig_t pc = getPacketConfig();
+        pc.lora.crcEnabled = hasCRC;
+
+        return lora.calculateTimeOnAir(modemType, dr, pc, pl) / 1000;
+    }
+
+    template <typename T> uint32_t computeReceivedPacketTime(T &lora, uint32_t pl, ...)
+    {
+        // Some RadioLib drivers do not expose received coding-rate/CRC metadata.
+        return lora.getTimeOnAir(pl) / 1000;
+    }
+
     template <typename T> uint32_t computePacketTime(T &lora, uint32_t pl, bool received)
     {
-        if (received) {
-            // First get the actual coding rate and CRC status from the received packet
-            uint8_t rxCR;
-            bool hasCRC;
-            lora.getLoRaRxHeaderInfo(&rxCR, &hasCRC);
-            // Go from raw header value to denominator
-            if (rxCR < 5) {
-                rxCR += 4;
-            } else if (rxCR == 7) {
-                rxCR = 8;
-            }
-
-            // Received packet configuration must be the same as configured, except for coding rate and CRC
-            DataRate_t dr = getDataRate();
-            dr.lora.codingRate = rxCR;
-
-            PacketConfig_t pc = getPacketConfig();
-            pc.lora.crcEnabled = hasCRC;
-
-            return lora.calculateTimeOnAir(modemType, dr, pc, pl) / 1000;
-        }
+        if (received)
+            return computeReceivedPacketTime(lora, pl, 0);
 
         return lora.getTimeOnAir(pl) / 1000;
     }
