@@ -1854,8 +1854,24 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         srCandidates[j + 1] = key;
     }
 
-    LOG_INFO("[SR] Unicast slot scheduling for pkt 0x%08x to %s: halfAirtime=%ums, %u SR candidates",
-              p->id, destName, halfAirtime, srCount);
+    // ETX-weighted slot delay.
+    //
+    // Each candidate's delay = slotDelay (Phase 1 reservation) + scaledGap + jitter, where
+    // scaledGap stretches with the candidate's cost gap vs. the best candidate. Lower-cost
+    // relays fire sooner; higher-cost relays defer long enough that a better candidate's
+    // transmission would dupe-cancel them via perhapsCancelDupe(). This degrades gracefully
+    // when local SR graphs disagree about ordering — each node picks delay from its own
+    // edge cost without needing a global view.
+    //
+    // etxFixed is ETX*100 (so 100 units == 1 ETX). 1 ETX of gap == 1 halfAirtime of extra delay.
+    const uint16_t bestCost = (srCount > 0) ? (srCandidates[0].cost & 0x7FFFu) : 0;
+    // Deterministic per-packet jitter, ±halfAirtime/4, breaks ties without global coordination.
+    const uint32_t jitterRange = std::max(halfAirtime / 2, (uint32_t)20);
+    const int32_t jitter = (int32_t)(((uint32_t)(myNode ^ p->id)) % jitterRange) - (int32_t)(jitterRange / 2);
+    const uint32_t MAX_UNICAST_RELAY_HOLD_MS = 2000;
+
+    LOG_INFO("[SR] Unicast slot scheduling for pkt 0x%08x to %s: halfAirtime=%ums, %u SR candidates, bestCost=%.2f, jitter=%dms",
+              p->id, destName, halfAirtime, srCount, bestCost / 100.0f, jitter);
 
     for (uint8_t i = 0; i < srCount; i++) {
         NodeNum candidate = srCandidates[i].nodeId;
@@ -1864,14 +1880,28 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
             continue;
         }
         if (candidate == myNode) {
+            // Hop-budget gate: if hop_limit==1 and we have no direct edge to dest, we can't
+            // actually deliver — let some other candidate win the slot if possible.
+            bool canReachDestDirectly = hasDirectConnectivity(myNode, destination);
+            if (p->hop_limit <= 1 && !canReachDestDirectly) {
+                LOG_INFO("[SR] Unicast slot --: US (%08x) skipped — hop_limit=%u with no direct edge to dest",
+                         myNode, p->hop_limit);
+                continue;
+            }
+            uint16_t myCostEtx = srCandidates[i].cost & 0x7FFFu;
+            uint16_t costGap = (myCostEtx > bestCost) ? (myCostEtx - bestCost) : 0;
+            uint32_t scaledGap = ((uint32_t)costGap * halfAirtime) / 100u;
+            int64_t totalDelay = (int64_t)slotDelay + (int64_t)scaledGap + (int64_t)jitter;
+            if (totalDelay < 0) totalDelay = 0;
+            if ((uint64_t)totalDelay > MAX_UNICAST_RELAY_HOLD_MS) totalDelay = MAX_UNICAST_RELAY_HOLD_MS;
             shouldRelay = true;
-            myDelay = slotDelay;
-            LOG_INFO("[SR] Unicast slot %ums: US (%08x) — assigned", slotDelay, myNode);
+            myDelay = (uint32_t)totalDelay;
+            LOG_INFO("[SR] Unicast slot %ums: US (%08x) — cost=%.2f, gap=%.2f, scaledGap=%ums",
+                     myDelay, myNode, myCostEtx / 100.0f, costGap / 100.0f, scaledGap);
             break;
         }
-        LOG_INFO("[SR] Unicast slot %ums: SR node %08x (cost=%.2f)", slotDelay, candidate,
-                  srCandidates[i].cost / 100.0f);
-        slotDelay += halfAirtime;
+        LOG_INFO("[SR] Unicast slot --: SR node %08x ahead of us (cost=%.2f)",
+                  candidate, srCandidates[i].cost / 100.0f);
     }
 
     LOG_INFO("[SR-DECISION] UNICAST %s pkt=0x%08x: from %s to %s via %s (delay=%ums)",
@@ -2461,9 +2491,26 @@ bool SignalRoutingModule::shouldRelay(const meshtastic_MeshPacket *p)
             if (nextHopHeardFromSource) {
                 char nextHopName[64];
                 getNodeDisplayName(nextHop, nextHopName, sizeof(nextHopName));
-                LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: from %s to %s, next hop %s already heard source",
+                // The designated next-hop is a graph-neighbor of the source, so it probably
+                // heard the same transmission we did. But topology inference is not the same
+                // as confirmed RF reception: if the next-hop misses this particular frame
+                // (asymmetric/marginal link, collision, busy RX), the packet is lost unless
+                // someone defers a backup relay. Hand off to coordination with a hint to
+                // wait long enough for the next-hop's slot 0 to fire first; if we overhear
+                // its retransmission, perhapsCancelDupe() will cancel our queued relay.
+                //
+                // Suppress outright only when we cannot add value: hop_limit==0 means we
+                // can't relay at all, and hop_limit==1 with no direct edge to destination
+                // means our one-hop relay can't reach the destination either.
+                bool canReachDestDirectly = hasDirectConnectivity(nodeDB->getNodeNum(), p->to);
+                if (p->hop_limit == 0 || (p->hop_limit <= 1 && !canReachDestDirectly)) {
+                    LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: from %s to %s, next hop %s heard source and we have no headroom (hop_limit=%u, directEdgeToDest=%d)",
+                             p->id, senderName, destName, nextHopName, p->hop_limit, canReachDestDirectly);
+                    return false;
+                }
+                LOG_INFO("[SR-DECISION] UNICAST DEFER pkt=0x%08x: from %s to %s, next hop %s likely has it — scheduling backup relay",
                          p->id, senderName, destName, nextHopName);
-                return false;
+                // Fall through to coordination — it will assign us a non-zero slot.
             }
         }
     }
