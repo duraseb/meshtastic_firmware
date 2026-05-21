@@ -503,7 +503,7 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     uint32_t currentTime = millis() / 1000;
     if (routingGraph->hasNodeTransmitted(ourNode, p->id, currentTime)) {
         // orig: "[SR] Skipping topology processing for rebroadcast of our packet %08x"
-        LOG_INFO("[SR] Skip topo proc (own rebcast %08x)", p->id);
+        LOG_INFO("[SR] Skip topo (own rebcast %08x)", p->id);
         return;
     }
 
@@ -595,7 +595,7 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     char senderNameForTopo[48];
     getNodeDisplayName(p->from, senderNameForTopo, sizeof(senderNameForTopo));
     // orig: "[SR] Processing topology from %s: %d neighbors (version %u, %s, relay=0x%02x)"
-    LOG_INFO("[SR] Topo from %s: %dn v%u %s r=0x%02x",
+    LOG_INFO("[SR] Topo %s %dn v%u %s r=%02x",
               senderNameForTopo, neighborCount, receivedVersion,
               isNewVersion ? "new version" : "continuation", p->relay_node);
 
@@ -1424,7 +1424,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                 }
             } else if (hasDirectConnectionToRelay && !singleHopRelay) {
                 // orig: "[SR] Skipping downstream inference for %08x via %08x: %d hops taken (SR-aware source, topology self-reported)"
-                LOG_INFO("[SR] Skip ds-inf %08x via %08x (%dh SR)",
+                LOG_INFO("[SR] Skip ds-inf %08x v %08x %dh",
                          mp.from, inferredRelayer, mp.hop_start - mp.hop_limit);
             }
 
@@ -1447,7 +1447,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                                          monotonicTimestamp, Edge::Source::Mirrored);
             } else {
                 // orig: "[SR] Skipping direct connectivity inference: relayer %08x is not confirmed Legacy (status=%d)"
-                LOG_INFO("[SR] Skip conn-inf r=%08x !Legacy st=%d",
+                LOG_INFO("[SR] Skip conn-inf r=%08x !L st=%d",
                          inferredRelayer, (int)getCapabilityStatus(inferredRelayer));
             }
 
@@ -2398,7 +2398,7 @@ bool SignalRoutingModule::shouldRelay(const meshtastic_MeshPacket *p)
                     return false;
                 }
                 // orig: "[SR-DECISION] UNICAST DEFER pkt=0x%08x: from %s to %s, next hop %s likely has it — scheduling backup relay"
-                LOG_INFO("[SR-DECISION] U-DEFER 0x%08x via 0x%08x", p->id, nextHop);
+                LOG_INFO("[SR-DEC] U-DEFER 0x%08x v %08x", p->id, nextHop);
                 // Fall through to coordination — it will assign us a non-zero slot.
             }
         }
@@ -3153,11 +3153,11 @@ void SignalRoutingModule::handleRoutingControlPacket(const meshtastic_MeshPacket
             }
         } else {
             // orig: "[SR] Skipping placeholder resolution for route_request: packet is relayed (not from direct sender)"
-            LOG_INFO("[SR] Skip placeholder res (relayed pkt)");
+            LOG_INFO("[SR] Skip ph res (relayed)");
         }
         break;
     case meshtastic_Routing_route_reply_tag:
-        LOG_INFO("[SR] Routing reply from %s for %u hops", senderName, routing.route_reply.route_back_count);
+        LOG_INFO("[SR] Routing reply %s h=%u", senderName, routing.route_reply.route_back_count);
 
         // Check for placeholder resolution in route_reply hops
         // Only resolve if: 1) routing packet is from direct sender, and 2) hop node is direct neighbor of ours
@@ -3191,18 +3191,18 @@ void SignalRoutingModule::handleRoutingControlPacket(const meshtastic_MeshPacket
             }
         } else {
             // orig: "[SR] Skipping placeholder resolution for route_reply: packet is relayed (not from direct sender)"
-            LOG_INFO("[SR] Skip placeholder res (relayed pkt)");
+            LOG_INFO("[SR] Skip ph res (relayed)");
         }
         break;
     case meshtastic_Routing_error_reason_tag:
         if (routing.error_reason == meshtastic_Routing_Error_NONE) {
-            LOG_INFO("[SR] Routing status from %s (no error)", senderName);
+            LOG_INFO("[SR] Routing OK from %s", senderName);
         } else {
             LOG_WARN("[SR] Routing error from %s reason=%u", senderName, routing.error_reason);
         }
         break;
     default:
-        LOG_INFO("[SR] Routing control variant %u from %s", routing.which_variant, senderName);
+        LOG_INFO("[SR] Routing ctrl v=%u %s", routing.which_variant, senderName);
         break;
     }
 }
