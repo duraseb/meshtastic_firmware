@@ -27,5 +27,8 @@
 // ratio of voltage divider = 3.20 (R12=100k, R10=220k)
 #define ADC_MULTIPLIER 3.2
 #define BATTERY_PIN 13 // A battery voltage measurement pin, voltage divider connected here to measure battery voltage
-#define ADC_CHANNEL ADC2_GPIO13_CHANNEL
+// ESP-IDF's ADCn_GPIOxx_CHANNEL macros expand to raw ints, and Arduino-3.x's
+// stricter -fpermissive promotion rejects int -> adc_channel_t in Power.cpp.
+// Cast at the macro site so the variant is self-contained (no stock-code edit).
+#define ADC_CHANNEL ((adc_channel_t)ADC2_GPIO13_CHANNEL)
 #define BAT_MEASURE_ADC_UNIT 2
