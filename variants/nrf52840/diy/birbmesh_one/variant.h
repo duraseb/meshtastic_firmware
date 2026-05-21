@@ -37,10 +37,10 @@
 #define PIN_CHARGER _PINNUM(1, 6)
 #define CHARGER_STATE_ENABLED LOW
 
-// BirbMesh board have TXEN connected to DIO2
-#define SX126X_DIO2_AS_RF_SWITCH
-#define SX126X_TXEN RADIOLIB_NC
-#define SX126X_RXEN _PINNUM(0, 17)
+// BirbMesh board has TXEN connected to DIO2.
+// SX126X_DIO2_AS_RF_SWITCH / SX126X_TXEN / SX126X_RXEN are inherited unchanged
+// from the included nrf52_promicro_diy_tcxo/variant.h above — no redefinition
+// needed (was triggering -Wmacro-redefined as an error in CI).
 
 #ifdef USE_EBYTE_E22P
 
@@ -48,6 +48,12 @@
 #undef USE_RF95
 #undef USE_LR1121
 #undef LR11X0_DIO_AS_RF_SWITCH
+// LR2021 is also unused on E22P (this is an SX1262 board). Leaving these defined
+// pulls LR11x0-style rfswitch.h into LR20x0Interface.cpp via the unified-compile
+// in InterfacesTemplates.cpp, which collides with LR11x0Interface.cpp's own copy
+// of the static rfswitch_dio_pins / rfswitch_table arrays.
+#undef USE_LR2021
+#undef LR2021_DIO_AS_RF_SWITCH
 /* Internally, a DIO3 is used to power a 32MHz TCXO crystal oscillator(the DIO3 is configured to output 1.8V) . */
 #undef TCXO_OPTIONAL
 
