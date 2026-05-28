@@ -178,7 +178,7 @@ SignalRoutingModule::SignalRoutingModule()
     needsBootBroadcast = true;
     setIntervalFromNow(5 * 1000);
 
-    LOG_INFO("[SR] Module initialized (version %d)", SIGNAL_ROUTING_VERSION);
+    LOG_INFO("[SR] Initialized (v. %d)", SIGNAL_ROUTING_VERSION);
 }
 
 void SignalRoutingModule::markTopologyDirty()
@@ -616,7 +616,7 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
         // Reject neighbors with invalid node IDs (0 or placeholders)
         if (neighbor.nodeId == 0 || isPlaceholderNode(neighbor.nodeId)) {
             // orig: "[SR] Skipping invalid neighbor node ID: %08x"
-            LOG_WARN("[SR] Invalid neighbor id: %08x", neighbor.nodeId);
+            LOG_WARN("[SR] Inv. neighb id: %08x", neighbor.nodeId);
             continue;
         }
 
@@ -2694,7 +2694,8 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
 NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode, NodeNum heardFrom, bool allowOpportunistic)
 {
     if (!routingGraph) {
-        LOG_WARN("[SR] No graph available for routing");
+        // orig: "[SR] No graph available for routing"
+        LOG_WARN("[SR] No graph for routing");
         return 0;
     }
 

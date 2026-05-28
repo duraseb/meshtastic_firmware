@@ -1189,7 +1189,7 @@ bool NeighborGraph::hasUniqueCoverage(NodeNum myNode, const NodeNum *coveredBy, 
         }
 
         if (!covered) {
-            LOG_INFO("[SR] Unique coverage: neighbor %08x not covered by any coveredBy node", neighbor);
+            LOG_INFO("[SR] Uniq cov: neighbor %08x not covered by any coveredBy node", neighbor);
             return true; // Found a neighbor not covered by anyone
         }
     }
@@ -1319,7 +1319,7 @@ bool NeighborGraph::shouldRelayEnhanced(NodeNum myNode, NodeNum sourceNode, Node
                 NodeNum neighbor = myEdges->edges[i].to;
                 if (!alreadyCovered.contains(neighbor) &&
                     !relayCoverage.contains(neighbor)) {
-                    LOG_INFO("[SR] Unique coverage in relay decision: neighbor %08x uncovered", neighbor);
+                    LOG_INFO("[SR] Uniq cov in relay decision: neighbor %08x uncovered", neighbor);
                     haveUniqueCoverage = true;
                     break;
                 }
@@ -1338,7 +1338,7 @@ bool NeighborGraph::shouldRelayEnhanced(NodeNum myNode, NodeNum sourceNode, Node
     if (myEdges) {
         for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
             if (!alreadyCovered.contains(myEdges->edges[i].to)) {
-                LOG_INFO("[SR] Unique coverage fallthrough: neighbor %08x uncovered", myEdges->edges[i].to);
+                LOG_INFO("[SR] Uniq cov fallthrough: neighbor %08x uncovered", myEdges->edges[i].to);
                 return true;
             }
         }
