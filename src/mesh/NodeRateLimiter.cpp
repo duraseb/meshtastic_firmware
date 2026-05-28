@@ -51,7 +51,7 @@ NodeRateLimiter::NodeRateLimiter() : entryCount(0)
         }
     }
 
-    LOG_INFO("[RateLimit] Init: enabled=%d slots=%u window=%us thresholds=text:%u routing:%u other:%u",
+    LOG_INFO("[RateLimit] Initialized: enabled=%d slots=%u window=%us thresholds=text:%u routing:%u other:%u",
              cfgEnabled, MAX_ENTRIES, cfgWindowMs / 1000u,
              cfgTextThreshold, cfgRoutingThreshold, cfgOtherThreshold);
 }
