@@ -30,5 +30,5 @@
 // ESP-IDF's ADCn_GPIOxx_CHANNEL macros expand to raw ints, and Arduino-3.x's
 // stricter -fpermissive promotion rejects int -> adc_channel_t in Power.cpp.
 // Cast at the macro site so the variant is self-contained (no stock-code edit).
-#define ADC_CHANNEL ((adc_channel_t)ADC2_GPIO13_CHANNEL)
+#define ADC_CHANNEL ((adc2_channel_t)ADC2_GPIO13_CHANNEL)
 #define BAT_MEASURE_ADC_UNIT 2
