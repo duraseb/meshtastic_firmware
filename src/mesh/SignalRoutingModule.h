@@ -49,17 +49,22 @@ static inline uint8_t decodePackedNeighbors(const uint8_t *data, size_t dataLen,
     if (!data || dataLen < PACKED_NEIGHBOR_HEADER_SIZE) {
         return 0;
     }
-    uint8_t entrySize = data[1];
-    if (entrySize < PACKED_NEIGHBOR_ENTRY_SIZE || entrySize == 0) {
-        return 0; // unknown or too-small entry format
-    }
 
     if (header) {
         header->formatVersion = data[0];
-        header->entrySize = entrySize;
+        header->entrySize = data[1];
         header->routingVersion = data[2];
         header->topologyVersion = data[3];
         header->signalRoutingActive = (data[4] & PACKED_HEADER_FLAG_SR_ACTIVE) != 0;
+    }
+
+    if (data[0] != PACKED_NEIGHBOR_FORMAT_VERSION) {
+        return 0;
+    }
+
+    uint8_t entrySize = data[1];
+    if (entrySize < PACKED_NEIGHBOR_ENTRY_SIZE || entrySize == 0) {
+        return 0; // unknown or too-small entry format
     }
 
     size_t payloadLen = dataLen - PACKED_NEIGHBOR_HEADER_SIZE;

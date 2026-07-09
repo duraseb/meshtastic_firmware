@@ -39,6 +39,9 @@ def readProps(prefsLoc):
         verObj["long"] = verObj["short"]
         verObj["deb"] = "{}.{}~{}".format(verObj["short"], run_number, build_location)
 
+    # Signal Routing branch: suffix reported firmware version for app/device metadata (fits firmware_version[18])
+    verObj["long"] = verObj["long"] + "-sr"
+
     # print("firmware version " + verStr)
     return verObj
 

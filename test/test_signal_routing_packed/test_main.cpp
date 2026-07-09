@@ -90,6 +90,25 @@ static void test_merge_cost_from_decoded_signal()
     TEST_ASSERT_FLOAT_WITHIN(0.001f, expected, etx);
 }
 
+static void test_reject_v2_format_returns_zero()
+{
+    uint8_t buf[32] = {};
+    buf[0] = 2; // v2 etx_fixed wire format — not supported on this branch
+    buf[1] = PACKED_NEIGHBOR_ENTRY_SIZE;
+    buf[2] = SIGNAL_ROUTING_VERSION;
+    buf[3] = 1;
+    buf[4] = 0;
+
+    encodePackedNeighborEntry(&buf[PACKED_NEIGHBOR_HEADER_SIZE], 0x01020304, -80, 10, false, false, 0);
+
+    PackedHeader header = {};
+    PackedNeighborEntry out[1] = {};
+    uint8_t count = decodePackedNeighbors(buf, PACKED_NEIGHBOR_HEADER_SIZE + PACKED_NEIGHBOR_ENTRY_SIZE, out, 1, &header);
+
+    TEST_ASSERT_EQUAL_UINT8(0, count);
+    TEST_ASSERT_EQUAL_UINT8(2, header.formatVersion);
+}
+
 static void test_direct_signal_upsert_lookup_and_prune()
 {
     DirectNeighborSignal table[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE] = {};
@@ -129,6 +148,7 @@ void setup()
     RUN_TEST(test_encode_decode_round_trip);
     RUN_TEST(test_packed_layout_offsets);
     RUN_TEST(test_merge_cost_from_decoded_signal);
+    RUN_TEST(test_reject_v2_format_returns_zero);
     RUN_TEST(test_direct_signal_upsert_lookup_and_prune);
 
     UNITY_END();

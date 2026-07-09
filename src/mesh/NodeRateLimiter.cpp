@@ -3,7 +3,6 @@
 #include "NodeDB.h"
 #include "configuration.h"
 #include <Arduino.h>
-#include <cstring>
 
 static void getNodeDisplayName(NodeNum nodeId, char *buf, size_t bufSize)
 {
@@ -30,8 +29,6 @@ NodeRateLimiter *nodeRateLimiter = nullptr;
 
 NodeRateLimiter::NodeRateLimiter() : entryCount(0)
 {
-    memset(entries, 0, sizeof(entries));
-
     // Load config overrides. Numeric fields: 0 means "use firmware default". Bool fields: if the
     // message exists, the value is used as-is (proto3 default false = disabled).
     if (moduleConfig.has_node_rate_limiter) {
@@ -150,7 +147,7 @@ NodeRateLimiter::RateLimitEntry *NodeRateLimiter::getOrCreateEntry(NodeNum nodeI
         slot = &entries[findEvictionCandidate()];
     }
 
-    memset(slot, 0, sizeof(RateLimitEntry));
+    *slot = RateLimitEntry{};
     slot->nodeId = nodeId;
     slot->maxHopSeen = hops;
     slot->text.windowStart = nowMs;
