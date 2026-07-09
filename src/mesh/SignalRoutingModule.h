@@ -81,6 +81,107 @@ static inline uint8_t decodePackedNeighbors(const uint8_t *data, size_t dataLen,
     return entryCount;
 }
 
+static inline void encodePackedNeighborEntry(uint8_t *entry, NodeNum nodeId, int8_t rssi, int8_t snr,
+                                             bool signalRoutingActive, bool hearsUs, uint8_t etxVariance)
+{
+    entry[0] = static_cast<uint8_t>((nodeId >> 0) & 0xFF);
+    entry[1] = static_cast<uint8_t>((nodeId >> 8) & 0xFF);
+    entry[2] = static_cast<uint8_t>((nodeId >> 16) & 0xFF);
+    entry[3] = static_cast<uint8_t>((nodeId >> 24) & 0xFF);
+    entry[4] = static_cast<uint8_t>(rssi);
+    entry[5] = static_cast<uint8_t>(snr);
+    uint8_t flags = 0;
+    if (signalRoutingActive) {
+        flags |= PACKED_NEIGHBOR_FLAG_SR_ACTIVE;
+    }
+    if (hearsUs) {
+        flags |= PACKED_NEIGHBOR_FLAG_HEARS_US;
+    }
+    entry[6] = flags;
+    entry[7] = etxVariance;
+}
+
+struct DirectNeighborSignal {
+    NodeNum nodeId = 0;
+    int8_t rssi = 0;
+    int8_t snr = 0;
+    uint32_t lastRx = 0; // monotonic seconds (millis()/1000)
+};
+
+static inline const DirectNeighborSignal *lookupDirectNeighborSignal(const DirectNeighborSignal *table, uint8_t count,
+                                                                     NodeNum nodeId)
+{
+    for (uint8_t i = 0; i < count; i++) {
+        if (table[i].nodeId == nodeId) {
+            return &table[i];
+        }
+    }
+    return nullptr;
+}
+
+static inline void upsertDirectNeighborSignal(DirectNeighborSignal *table, uint8_t &count, size_t maxEntries,
+                                              NodeNum nodeId, int8_t rssi, int8_t snr, uint32_t nowSecs)
+{
+    for (uint8_t i = 0; i < count; i++) {
+        if (table[i].nodeId == nodeId) {
+            table[i].rssi = rssi;
+            table[i].snr = snr;
+            table[i].lastRx = nowSecs;
+            return;
+        }
+    }
+
+    if (count < maxEntries) {
+        table[count].nodeId = nodeId;
+        table[count].rssi = rssi;
+        table[count].snr = snr;
+        table[count].lastRx = nowSecs;
+        count++;
+        return;
+    }
+
+    uint8_t oldestIdx = 0;
+    uint32_t oldestRx = table[0].lastRx;
+    for (uint8_t i = 1; i < count; i++) {
+        if (table[i].lastRx < oldestRx) {
+            oldestRx = table[i].lastRx;
+            oldestIdx = i;
+        }
+    }
+    table[oldestIdx].nodeId = nodeId;
+    table[oldestIdx].rssi = rssi;
+    table[oldestIdx].snr = snr;
+    table[oldestIdx].lastRx = nowSecs;
+}
+
+static inline void removeDirectNeighborSignal(DirectNeighborSignal *table, uint8_t &count, NodeNum nodeId)
+{
+    for (uint8_t i = 0; i < count;) {
+        if (table[i].nodeId == nodeId) {
+            if (i < count - 1) {
+                table[i] = table[count - 1];
+            }
+            count--;
+        } else {
+            i++;
+        }
+    }
+}
+
+static inline void pruneDirectNeighborSignals(DirectNeighborSignal *table, uint8_t &count, uint32_t nowSecs,
+                                              uint32_t ttlSecs)
+{
+    for (uint8_t i = 0; i < count;) {
+        if ((nowSecs - table[i].lastRx) > ttlSecs) {
+            if (i < count - 1) {
+                table[i] = table[count - 1];
+            }
+            count--;
+        } else {
+            i++;
+        }
+    }
+}
 
 // Broadcast interval for signal routing info (10 minutes)
 #define SIGNAL_ROUTING_BROADCAST_SECS 600
@@ -162,6 +263,15 @@ private:
     bool isSignalBasedCapable(NodeNum nodeId) const;
     uint8_t packNeighborsForBroadcast(uint8_t *outBuf, size_t bufSize);
     void sendTopologyPacket(NodeNum dest, const uint8_t *packedData, size_t packedLen, uint8_t topologyVersion = 0, uint32_t txAfterMs = 0);
+
+    DirectNeighborSignal directSignals[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
+    uint8_t directSignalCount = 0;
+
+    void upsertDirectSignal(NodeNum nodeId, int8_t rssi, int8_t snr, uint32_t nowSecs);
+    const DirectNeighborSignal *lookupDirectSignal(NodeNum nodeId) const;
+    void removeDirectSignal(NodeNum nodeId);
+    void pruneDirectSignals(uint32_t nowSecs);
+    void syncDirectSignalsWithGraph();
 
     enum class CapabilityStatus : uint8_t {
         Unknown = 0,

@@ -204,6 +204,7 @@ int32_t SignalRoutingModule::runOnce()
 
     pruneCapabilityCache(nowSecs);
     pruneRelayIdentityCache(nowMs);
+    pruneDirectSignals(nowSecs);
 
     // --- Fire pending T1 broadcast retransmits ---
     for (uint8_t i = 0; i < MAX_PENDING_RETRANSMITS; i++) {
@@ -400,30 +401,20 @@ uint8_t SignalRoutingModule::packNeighborsForBroadcast(uint8_t *outBuf, size_t b
     size_t maxEntries = (bufSize - PACKED_NEIGHBOR_HEADER_SIZE) / PACKED_NEIGHBOR_ENTRY_SIZE;
     for (uint8_t i = 0; i < edgeCount && count < maxEntries; i++) {
         const Edge *edge = edgePtrs[i];
+        if (edge->source != Edge::Source::Reported) {
+            continue;
+        }
+
+        const DirectNeighborSignal *sig = lookupDirectSignal(edge->to);
+        if (!sig) {
+            continue;
+        }
+
         uint8_t *entry = &outBuf[PACKED_NEIGHBOR_HEADER_SIZE + count * PACKED_NEIGHBOR_ENTRY_SIZE];
 
-        // node_id in little-endian
-        uint32_t nodeId = edge->to;
-        entry[0] = (nodeId >> 0) & 0xFF;
-        entry[1] = (nodeId >> 8) & 0xFF;
-        entry[2] = (nodeId >> 16) & 0xFF;
-        entry[3] = (nodeId >> 24) & 0xFF;
-
-        int32_t rssi32, snr32;
-        NeighborGraph::etxToSignal(edge->getEtx(), rssi32, snr32);
-        entry[4] = static_cast<uint8_t>(static_cast<int8_t>(std::max((int32_t)-128, std::min((int32_t)127, rssi32))));
-        entry[5] = static_cast<uint8_t>(static_cast<int8_t>(std::max((int32_t)-128, std::min((int32_t)127, snr32))));
-
-        uint8_t flags = 0;
         CapabilityStatus neighborStatus = getCapabilityStatus(edge->to);
-        if (neighborStatus == CapabilityStatus::SRactive) {
-            flags |= PACKED_NEIGHBOR_FLAG_SR_ACTIVE;
-        }
-        if (edge->hearsUs) {
-            flags |= PACKED_NEIGHBOR_FLAG_HEARS_US;
-        }
-        entry[6] = flags;
-        entry[7] = edge->etxVariance;
+        encodePackedNeighborEntry(entry, edge->to, sig->rssi, sig->snr,
+                                  neighborStatus == CapabilityStatus::SRactive, edge->hearsUs, edge->etxVariance);
 
         count++;
     }
@@ -1655,6 +1646,8 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
             } else {
                 LOG_INFO("[SR] Graph aged (no node count change)");
             }
+
+            syncDirectSignalsWithGraph();
 
             // Safety check: ensure we still have our own node
             if (!routingGraph->getEdgesFrom(nodeDB->getNodeNum())) {
@@ -3056,6 +3049,57 @@ NodeNum SignalRoutingModule::findBetterPositionedNeighbor(NodeNum destination, N
     return bestNeighbor;
 }
 
+void SignalRoutingModule::upsertDirectSignal(NodeNum nodeId, int8_t rssi, int8_t snr, uint32_t nowSecs)
+{
+    upsertDirectNeighborSignal(directSignals, directSignalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, nodeId, rssi, snr,
+                               nowSecs);
+}
+
+const DirectNeighborSignal *SignalRoutingModule::lookupDirectSignal(NodeNum nodeId) const
+{
+    return lookupDirectNeighborSignal(directSignals, directSignalCount, nodeId);
+}
+
+void SignalRoutingModule::removeDirectSignal(NodeNum nodeId)
+{
+    removeDirectNeighborSignal(directSignals, directSignalCount, nodeId);
+}
+
+void SignalRoutingModule::pruneDirectSignals(uint32_t nowSecs)
+{
+    pruneDirectNeighborSignals(directSignals, directSignalCount, nowSecs, cfgNodeTtlSecs);
+}
+
+void SignalRoutingModule::syncDirectSignalsWithGraph()
+{
+    if (!routingGraph || !nodeDB) {
+        return;
+    }
+
+    NodeNum myNode = nodeDB->getNodeNum();
+    const NodeEdges *nodeEdges = routingGraph->getEdgesFrom(myNode);
+
+    for (uint8_t i = 0; i < directSignalCount;) {
+        NodeNum nodeId = directSignals[i].nodeId;
+        bool hasReportedEdge = false;
+        if (nodeEdges) {
+            for (uint8_t e = 0; e < nodeEdges->edgeCount; e++) {
+                const Edge &edge = nodeEdges->edges[e];
+                if (edge.to == nodeId && edge.source == Edge::Source::Reported) {
+                    hasReportedEdge = true;
+                    break;
+                }
+            }
+        }
+
+        if (!hasReportedEdge) {
+            removeDirectSignal(nodeId);
+        } else {
+            i++;
+        }
+    }
+}
+
 void SignalRoutingModule::updateNeighborInfo(NodeNum nodeId, int32_t rssi, float snr, uint32_t lastRxTime)
 {
     if (!routingGraph || !nodeDB) return;
@@ -3081,6 +3125,9 @@ void SignalRoutingModule::updateNeighborInfo(NodeNum nodeId, int32_t rssi, float
     // Since we directly measured the link quality (even if in the opposite direction),
     // mark this as Reported source, not Mirrored
     routingGraph->updateEdge(myNode, nodeId, etx, monotonicTimestamp, Edge::Source::Reported);
+
+    int8_t clampedSnr = static_cast<int8_t>(std::max(-128.f, std::min(127.f, snr)));
+    upsertDirectSignal(nodeId, static_cast<int8_t>(rssi), clampedSnr, monotonicTimestamp);
 
     // If significant change, consider sending an update sooner
     if (changeType != EDGE_NO_CHANGE) {
