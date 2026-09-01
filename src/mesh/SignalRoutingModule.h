@@ -188,6 +188,55 @@ static inline void pruneDirectNeighborSignals(DirectNeighborSignal *table, uint8
     }
 }
 
+// Jittered delay before replying to an empty SR-active bootstrap topology (direct neighbor).
+static constexpr uint32_t EMPTY_TOPOLOGY_REPLY_DELAY_BASE_MS = 5000;
+static constexpr uint32_t EMPTY_TOPOLOGY_REPLY_DELAY_JITTER_MS = 11001;
+
+static inline uint32_t computeEmptyTopologyReplyDelayMs(NodeNum senderNodeId, PacketId packetId, NodeNum ourNodeId)
+{
+    return EMPTY_TOPOLOGY_REPLY_DELAY_BASE_MS +
+           ((senderNodeId ^ packetId ^ ourNodeId) % EMPTY_TOPOLOGY_REPLY_DELAY_JITTER_MS);
+}
+
+static inline bool hasReportedDirectEdgeTo(const NeighborGraph *graph, NodeNum myNode, NodeNum neighborId)
+{
+    if (!graph) {
+        return false;
+    }
+    const NodeEdges *nodeEdges = graph->getEdgesFrom(myNode);
+    if (!nodeEdges) {
+        return false;
+    }
+    for (uint8_t i = 0; i < nodeEdges->edgeCount; i++) {
+        if (nodeEdges->edges[i].to == neighborId && nodeEdges->edges[i].source == Edge::Source::Reported) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Update Reported direct-neighbor edges and the outbound topology signal cache from a local RF observation.
+static inline int refreshReportedDirectNeighborObservation(NeighborGraph *graph, DirectNeighborSignal *signals,
+                                                           uint8_t &signalCount, size_t maxSignals, NodeNum myNode,
+                                                           NodeNum nodeId, int32_t rssi, float snr, uint32_t nowSecs)
+{
+    if (!graph) {
+        return EDGE_NO_CHANGE;
+    }
+
+    float etx = NeighborGraph::calculateETX(rssi, snr);
+    int changeToUs = graph->updateEdge(nodeId, myNode, etx, nowSecs, Edge::Source::Reported);
+    int changeFromUs = graph->updateEdge(myNode, nodeId, etx, nowSecs, Edge::Source::Reported);
+    int changeType = changeToUs;
+    if (changeFromUs == EDGE_NEW || (changeFromUs == EDGE_SIGNIFICANT_CHANGE && changeType != EDGE_NEW)) {
+        changeType = changeFromUs;
+    }
+
+    int8_t clampedSnr = static_cast<int8_t>(std::max(-128.f, std::min(127.f, snr)));
+    upsertDirectNeighborSignal(signals, signalCount, maxSignals, nodeId, static_cast<int8_t>(rssi), clampedSnr, nowSecs);
+    return changeType;
+}
+
 // Broadcast interval for signal routing info (10 minutes)
 #define SIGNAL_ROUTING_BROADCAST_SECS 600
 
@@ -249,7 +298,14 @@ private:
     bool signalBasedRoutingEnabled = true;
     bool needsBootBroadcast = false;
     bool topologyDirty = false; // Set when topology changes; triggers early broadcast via runOnce
+    bool topologyBroadcastActive = false; // True while sendSignalRoutingInfo() is sending
     uint32_t lastBroadcast = 0;
+
+    struct PendingTopologyReply {
+        bool active = false;
+        uint32_t fireAfterMs = 0;
+    };
+    PendingTopologyReply pendingTopologyReply;
     uint8_t currentTopologyVersion = 0;
 
     static constexpr size_t MAX_TOPOLOGY_VERSION_ENTRIES = 24;
@@ -348,6 +404,10 @@ private:
     void logNetworkTopology();
 
     void markTopologyDirty();
+    void commitTopologyTxTimestamp();
+    void scheduleEmptyTopologyReply(NodeNum senderNodeId, PacketId packetId);
+    int refreshReportedDirectNeighbor(NodeNum nodeId, int32_t rssi, float snr, uint32_t nowSecs);
+    bool hasReportedDirectEdge(NodeNum neighborId) const;
     bool isNonRelayingLegacyRole(NodeNum nodeId) const;
     void markStockNodeRelayedOurPacket(NodeNum stockNode);
 

@@ -187,6 +187,47 @@ void SignalRoutingModule::markTopologyDirty()
     }
 }
 
+void SignalRoutingModule::commitTopologyTxTimestamp()
+{
+    lastBroadcast = millis();
+}
+
+void SignalRoutingModule::scheduleEmptyTopologyReply(NodeNum senderNodeId, PacketId packetId)
+{
+    if (!nodeDB || !canSendTopology()) {
+        return;
+    }
+
+    NodeNum ourNode = nodeDB->getNodeNum();
+    uint32_t delayMs = computeEmptyTopologyReplyDelayMs(senderNodeId, packetId, ourNode);
+    uint32_t fireAfter = millis() + delayMs;
+
+    if (!pendingTopologyReply.active || (int32_t)(fireAfter - pendingTopologyReply.fireAfterMs) < 0) {
+        pendingTopologyReply.active = true;
+        pendingTopologyReply.fireAfterMs = fireAfter;
+        LOG_INFO("[SR] Scheduling non-dirty topology reply in %u ms (empty bootstrap from %08x)", delayMs, senderNodeId);
+        setIntervalFromNow(delayMs < 20 ? 20 : delayMs);
+    }
+}
+
+bool SignalRoutingModule::hasReportedDirectEdge(NodeNum neighborId) const
+{
+    if (!routingGraph || !nodeDB) {
+        return false;
+    }
+    return hasReportedDirectEdgeTo(routingGraph, nodeDB->getNodeNum(), neighborId);
+}
+
+int SignalRoutingModule::refreshReportedDirectNeighbor(NodeNum nodeId, int32_t rssi, float snr, uint32_t nowSecs)
+{
+    if (!routingGraph || !nodeDB) {
+        return EDGE_NO_CHANGE;
+    }
+    return refreshReportedDirectNeighborObservation(routingGraph, directSignals, directSignalCount,
+                                                    NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, nodeDB->getNodeNum(), nodeId,
+                                                    rssi, snr, nowSecs);
+}
+
 // Write the 5-byte packed header into buf.
 static inline void writePackedHeader(uint8_t *buf, uint8_t topologyVersion, bool signalRoutingActive)
 {
@@ -240,6 +281,15 @@ int32_t SignalRoutingModule::runOnce()
     }
 
     if (routingGraph && signalBasedRoutingEnabled) {
+        if (pendingTopologyReply.active && (int32_t)(nowMs - pendingTopologyReply.fireAfterMs) >= 0) {
+            pendingTopologyReply.active = false;
+            if (!topologyBroadcastActive && canSendTopology()) {
+                LOG_INFO("[SR] Firing jittered reply to empty SR bootstrap topology");
+                sendSignalRoutingInfo();
+                commitTopologyTxTimestamp();
+            }
+        }
+
         // Send empty SR broadcast at boot to announce presence and trigger
         // neighbor topology responses, regardless of whether we have neighbors yet
         if (needsBootBroadcast) {
@@ -248,15 +298,18 @@ int32_t SignalRoutingModule::runOnce()
             uint8_t bootBuf[PACKED_NEIGHBOR_HEADER_SIZE];
             writePackedHeader(bootBuf, 0, isActiveRoutingRole());
             sendTopologyPacket(NODENUM_BROADCAST, bootBuf, PACKED_NEIGHBOR_HEADER_SIZE);
+            commitTopologyTxTimestamp();
         } else if (nowMs - lastBroadcast >= cfgBroadcastSecs * 1000) {
             sendSignalRoutingInfo();
             topologyDirty = false;
+            commitTopologyTxTimestamp();
         } else if (topologyDirty && nowMs - lastBroadcast >= cfgDirtyBroadcastSecs * 1000) {
             // Topology changed and the minimum inter-broadcast interval has elapsed
             // since the last broadcast — send the early broadcast now.
             LOG_INFO("[SR] Topology dirty — sending early broadcast");
             sendSignalRoutingInfo();
             topologyDirty = false;
+            commitTopologyTxTimestamp();
         }
 
         // Topology logging: log on every dirty wakeup and at least every GRAPH_MAINTENANCE_INTERVAL_SECS seconds.
@@ -287,6 +340,13 @@ int32_t SignalRoutingModule::runOnce()
         }
     }
 
+    if (pendingTopologyReply.active) {
+        int32_t remaining = (int32_t)(pendingTopologyReply.fireAfterMs - nowMs);
+        if (remaining > 0 && (uint32_t)remaining < nextDelay) {
+            nextDelay = (uint32_t)remaining;
+        }
+    }
+
     if (nextDelay < 20) {
         nextDelay = 20;
     }
@@ -301,6 +361,8 @@ void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
         return;
     }
 
+    topologyBroadcastActive = true;
+
     // Pack all neighbors into a large buffer (header placeholder + entries)
     static constexpr size_t MAX_TOTAL_PACKED = MAX_SIGNAL_ROUTING_NEIGHBORS * 6 * PACKED_NEIGHBOR_ENTRY_SIZE + PACKED_NEIGHBOR_HEADER_SIZE;
     uint8_t allPacked[MAX_TOTAL_PACKED];
@@ -314,6 +376,7 @@ void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
         uint8_t emptyBuf[PACKED_NEIGHBOR_HEADER_SIZE];
         writePackedHeader(emptyBuf, topologyVersion, srActive);
         sendTopologyPacket(dest, emptyBuf, PACKED_NEIGHBOR_HEADER_SIZE);
+        topologyBroadcastActive = false;
         return;
     }
 
@@ -352,11 +415,12 @@ void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
         size_t chunkLen = PACKED_NEIGHBOR_HEADER_SIZE + count * PACKED_NEIGHBOR_ENTRY_SIZE;
 
         uint32_t txAfter = packetIndex > 0 ? millis() + packetIndex * packetSpacingMs : 0;
-        sendTopologyPacket(dest, chunkBuf, chunkLen);
+        sendTopologyPacket(dest, chunkBuf, chunkLen, 0, txAfter);
     }
 
     // Update our own capability after sending
     trackNodeCapability(nodeDB->getNodeNum(), isActiveRoutingRole() ? CapabilityStatus::SRactive : CapabilityStatus::Passive);
+    topologyBroadcastActive = false;
 }
 
 void SignalRoutingModule::notifyOriginatedPacketSent()
@@ -570,11 +634,11 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
               senderNameForTopo, neighborCount, receivedVersion,
               isNewVersion ? "new version" : "continuation", p->relay_node);
 
-    // Empty SR broadcast from a direct SR neighbor = bootstrap request.
+    // Empty SR broadcast from a direct SR neighbor = bootstrap request — reply after jitter, not immediately.
     if (neighborCount == 0 && isDirectPacket(*p) && hdr.signalRoutingActive) {
-        LOG_INFO("[SR] Empty broadcast from direct SR neighbor %s — marking topology dirty",
+        LOG_INFO("[SR] Empty broadcast from direct SR neighbor %s — scheduling jittered topology reply",
                  senderNameForTopo);
-        markTopologyDirty();
+        scheduleEmptyTopologyReply(p->from, p->id);
     }
 
     // Mirrored edges are not cleared on new topology versions — they age out naturally.
@@ -736,12 +800,6 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
 
         if (hdr.signalRoutingActive) {
             routingGraph->clearDownstreamForRelay(mp.from);
-        }
-
-        if (hdr.signalRoutingActive && isDirectPacket(mp)) {
-            LOG_INFO("[SR] Empty broadcast from direct SR neighbor %s — marking topology dirty",
-                     senderName);
-            markTopologyDirty();
         }
 
         return false;
@@ -1509,17 +1567,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
             // 2. We don't have a direct connection to mp.from ourselves
             // 3. We haven't already seen this source recently via a different relay
             //    (prevents inflated downstream counts when SR cluster nodes re-relay the same traffic)
-            bool hasDirectConnectionToRelay = false;
-            const NodeEdges* edges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
-            if (edges) {
-                for (uint8_t i = 0; i < edges->edgeCount; i++) {
-                    if (edges->edges[i].to == inferredRelayer &&
-                        edges->edges[i].source == Edge::Source::Reported) {
-                        hasDirectConnectionToRelay = true;
-                        break;
-                    }
-                }
-            }
+            bool hasDirectConnectionToRelay = hasReportedDirectEdge(inferredRelayer);
 
             // Infer downstream relationship based on hop count and source capability:
             // - Single-hop (hop_start - hop_limit == 1): always infer — sender went directly through
@@ -1567,37 +1615,13 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                          inferredRelayer, (int)getCapabilityStatus(inferredRelayer));
             }
 
-            // Update relay node's edge in the graph since it's actively relaying
-            if (hasSignalData) {
-                updateNeighborInfo(inferredRelayer, mp.rx_rssi, mp.rx_snr, mp.rx_time);
-            } else {
-                // No direct signal data available - preserve existing edge or create with defaults
-                const NodeEdges *relayEdges = routingGraph->getEdgesFrom(inferredRelayer);
-                bool hasExistingEdge = false;
-                int32_t existingRssi = -70; // default
-                int32_t existingSnr = 5;   // default
-
-                if (relayEdges) {
-                    for (uint8_t i = 0; i < relayEdges->edgeCount; i++) {
-                        if (relayEdges->edges[i].to == nodeDB->getNodeNum()) {
-                            // Found existing edge - preserve its signal data by recalculating backwards
-                            float existingEtx = relayEdges->edges[i].getEtx();
-                            int32_t approxRssi;
-                            NeighborGraph::etxToSignal(existingEtx, approxRssi, existingSnr);
-                            existingRssi = approxRssi;
-                            hasExistingEdge = true;
-                            break;
-                        }
-                    }
+            // Refresh Reported direct-neighbor link quality from relay-heard RF measurements.
+            if (hasSignalData && hasDirectConnectionToRelay && !isPlaceholderNode(inferredRelayer)) {
+                uint32_t monotonicTimestamp = millis() / 1000;
+                int changeType = refreshReportedDirectNeighbor(inferredRelayer, mp.rx_rssi, mp.rx_snr, monotonicTimestamp);
+                if (changeType == EDGE_SIGNIFICANT_CHANGE) {
+                    markTopologyDirty();
                 }
-
-                if (hasExistingEdge) {
-                    LOG_INFO("[SR] Preserving existing signal data for relay node 0x%08x", inferredRelayer);
-                } else {
-                    LOG_INFO("[SR] Using default signal data for new relay node 0x%08x", inferredRelayer);
-                }
-
-                updateNeighborInfo(inferredRelayer, existingRssi, existingSnr, mp.rx_time);
             }
 
             // Record transmission for contention window tracking
@@ -3104,30 +3128,11 @@ void SignalRoutingModule::updateNeighborInfo(NodeNum nodeId, int32_t rssi, float
 {
     if (!routingGraph || !nodeDB) return;
 
-    NodeNum myNode = nodeDB->getNodeNum();
-
     // IMPORTANT: Use monotonic time (seconds since boot) for edge timestamps, not RTC time
     uint32_t monotonicTimestamp = millis() / 1000;
     (void)lastRxTime;  // Unused - we use monotonic time instead
 
-    // Calculate ETX from the received signal quality
-    // The RSSI/SNR describes how well we received from nodeId,
-    // which characterizes the nodeId→us transmission quality
-    float etx =
-        NeighborGraph::calculateETX(rssi, snr);
-
-    // Store edge: nodeId → us (the direction of the transmission we measured)
-    // This is used for routing decisions when traffic needs to reach us
-    int changeType =
-        routingGraph->updateEdge(nodeId, myNode, etx, monotonicTimestamp, Edge::Source::Reported);
-
-    // Also store reverse edge: us → nodeId (assuming approximately symmetric link)
-    // Since we directly measured the link quality (even if in the opposite direction),
-    // mark this as Reported source, not Mirrored
-    routingGraph->updateEdge(myNode, nodeId, etx, monotonicTimestamp, Edge::Source::Reported);
-
-    int8_t clampedSnr = static_cast<int8_t>(std::max(-128.f, std::min(127.f, snr)));
-    upsertDirectSignal(nodeId, static_cast<int8_t>(rssi), clampedSnr, monotonicTimestamp);
+    int changeType = refreshReportedDirectNeighbor(nodeId, rssi, snr, monotonicTimestamp);
 
     // If significant change, consider sending an update sooner
     if (changeType != EDGE_NO_CHANGE) {
