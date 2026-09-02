@@ -440,6 +440,12 @@ LoRa links are frequently asymmetric — node A can hear node B but B cannot hea
 
 **Authoritative hearsUs override**: A node is authoritative about who it can hear. When node Y broadcasts its topology and does NOT list node X as a neighbor, SR clears the `hearsUs` flag on the X→Y edge — even if X previously claimed bidirectionality. This corrects stale or incorrect `hearsUs` claims. The override may flip-flop until both nodes converge (X stops claiming bidi after observing Y's topology), but each cycle brings the graph closer to ground truth.
 
+**hearsUs from topology listing**: The same authority works in the positive direction. When node Y's topology broadcast lists *us* as a directly heard neighbor, SR sets `hearsUs=true` on our edge to Y. A node only packs neighbors it has a measured direct RSSI/SNR for, so being listed is proof Y heard us on RF. This is the only way an SR-passive neighbor can earn the flag — it broadcasts topology but never relays, so it can never prove bidirectionality by relaying one of our packets. SR-active neighbors gain the flag on their first topology report instead of waiting for that relay to happen.
+
+The flag matters in four places: T1 retransmit insurance (`hasAnyHearsUsNeighbor()` gates it, `allHearsUsNeighborsHeardPacket()` cancels it), last-hop unicast hop limiting, route approval when sender connectivity is otherwise unverified, and our own outbound topology — which is what gives us bidi tier-1 priority in *other* nodes' relay-slot selection when that neighbor is the packet source. It does not affect stock-neighbor coverage, which only counts `Legacy` nodes.
+
+Implemented by `confirmTopologySenderHearsUs()` in `SignalRoutingModule.h`, called from both topology-processing paths. Stale claims are bounded from both sides: the authoritative override clears the flag when Y's next topology omits us, and `pruneCapabilityCache()` clears it when Y stops broadcasting altogether (capability TTL).
+
 **Bidi slot priority**: In `findBestRelayCandidate()`, candidates with a confirmed bidirectional link (`hearsUs=true`, ETX < 20.0) to the packet source get tier 1 priority. This ensures that on mixed SR/stock branches, the node with round-trip connectivity to the source relays first. Stock nodes on the branch then observe this relay and set their `next_hop` correctly — they never see the asymmetric-link node relay, so they never latch onto an undeliverable gateway.
 
 **Example — mixed branch with asymmetric gateway**:
@@ -477,6 +483,30 @@ Thresholds align with stock firmware's existing channel utilization limits (25% 
 `ChannelQoS` is orthogonal to `NodeRateLimiter` (per-node abuse detection) and stock `AirTime` TX blocking (blocks our originations). QoS handles aggregate channel load for relay decisions.
 
 Guarded by `MESHTASTIC_EXCLUDE_CHANNEL_QOS` for memory-constrained targets.
+
+## Inbound Rate Limiting
+
+### Per-Node Packet Buckets
+
+`NodeRateLimiter` protects the node from a single misbehaving or malfunctioning neighbor that floods the mesh. It is checked in `Router::handleReceived()` after decode but before `MeshModule::callModules()`, so a limited packet reaches no module: it is not relayed, not ACKed, and not delivered to the phone.
+
+Each tracked source node gets three independent buckets:
+
+| Bucket | Portnums | Packets per 90 s window |
+|--------|----------|------------------------|
+| TEXT | `TEXT_MESSAGE_APP`, `TEXT_MESSAGE_COMPRESSED_APP` | 30 |
+| ROUTING | `ROUTING_APP`, `SIGNAL_ROUTING_APP`, `TRACEROUTE_APP` | 10 |
+| OTHER | everything else, including undecodable packets | 4 |
+
+Once a bucket trips, every further packet in that bucket resets the window, so the source stays limited until it goes quiet for a full window. Up to 16 sources are tracked; when full, the entry with the greatest hop distance is evicted (ties broken by oldest window).
+
+**Exemptions** — the limiter never acts on:
+
+- Packets we originated (`isFromUs`).
+- **Packets addressed to us (`isToUs`).** These are never relayed, so they cost no relay airtime, and they are the replies and requests we asked for: admin responses, DMs, ACKs. Dropping one silently kills the ACK and implicit-ACK path and the delivery to the phone. Because `ADMIN_APP` falls in the OTHER bucket, a remote node answering a burst of admin GETs tripped the limit on its 4th reply in 90 s, after which every further reply kept the window reset and remote admin never recovered.
+- Nodes marked `is_favorite` in NodeDB.
+
+Thresholds and the window are overridable via `moduleConfig.node_rate_limiter`; guarded by `MESHTASTIC_EXCLUDE_NODE_RATE_LIMITER` for memory-constrained targets.
 
 ## Benefits for Mesh Network Reliability
 

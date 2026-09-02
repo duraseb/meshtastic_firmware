@@ -215,6 +215,33 @@ static inline bool hasReportedDirectEdgeTo(const NeighborGraph *graph, NodeNum m
     return false;
 }
 
+// A topology sender that lists us among its directly heard neighbors has proven it hears us.
+// SR-passive senders broadcast topology but never relay, so this is the only way they can earn
+// `hearsUs` on our edge to them (SR-active senders also earn it by relaying our packets).
+// Returns true only when the flag transitions false -> true, so callers can log the event once.
+static inline bool confirmTopologySenderHearsUs(NeighborGraph *graph, NodeNum myNode, NodeNum sender,
+                                                NodeNum listedNeighbor)
+{
+    if (!graph || listedNeighbor != myNode || sender == myNode) {
+        return false;
+    }
+    const NodeEdges *myEdges = graph->getEdgesFrom(myNode);
+    if (!myEdges) {
+        return false;
+    }
+    for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+        if (myEdges->edges[i].to != sender) {
+            continue;
+        }
+        if (myEdges->edges[i].hearsUs) {
+            return false;
+        }
+        graph->setEdgeHearsUs(myNode, sender, true);
+        return true;
+    }
+    return false;
+}
+
 // Update Reported direct-neighbor edges and the outbound topology signal cache from a local RF observation.
 static inline int refreshReportedDirectNeighborObservation(NeighborGraph *graph, DirectNeighborSignal *signals,
                                                            uint8_t &signalCount, size_t maxSignals, NodeNum myNode,
@@ -282,6 +309,8 @@ public:
 protected:
     virtual bool handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshtastic_SignalRoutingInfo *p) override;
     void updateGraphWithNeighbor(NodeNum sender, NodeNum neighborId, int8_t rssi, int8_t snr, bool hearsUs);
+    // Set hearsUs on our edge to `sender` when its topology lists us as a direct neighbor (logs on transition).
+    void noteTopologySenderHearsUs(NodeNum sender, NodeNum listedNeighbor);
     virtual ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override;
     virtual bool wantPacket(const meshtastic_MeshPacket *p) override { return true; }
     virtual meshtastic_MeshPacket *allocReply() override;

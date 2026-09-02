@@ -533,6 +533,20 @@ void SignalRoutingModule::updateGraphWithNeighbor(NodeNum sender, NodeNum neighb
 
         // Propagate the bidirectional link flag from the authoritative sender
         routingGraph->setEdgeHearsUs(sender, neighborId, hearsUs);
+
+        noteTopologySenderHearsUs(sender, neighborId);
+    }
+}
+
+void SignalRoutingModule::noteTopologySenderHearsUs(NodeNum sender, NodeNum listedNeighbor)
+{
+    if (!nodeDB) {
+        return;
+    }
+    if (confirmTopologySenderHearsUs(routingGraph, nodeDB->getNodeNum(), sender, listedNeighbor)) {
+        char senderName[64];
+        getNodeDisplayName(sender, senderName, sizeof(senderName));
+        LOG_INFO("[SR] %s lists us in its topology — confirmed bidirectional link (hearsUs)", senderName);
     }
 }
 
@@ -837,6 +851,7 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
                                      Edge::Source::Mirrored);
 
             routingGraph->setEdgeHearsUs(mp.from, neighbor.nodeId, neighbor.hearsUs);
+            noteTopologySenderHearsUs(mp.from, neighbor.nodeId);
         }
     } else {
         LOG_INFO("[SR] Skipping redundant edge rebuild for %s (already pre-processed version %u)",

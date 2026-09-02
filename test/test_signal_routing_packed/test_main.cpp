@@ -261,6 +261,48 @@ static void test_mirrored_edge_update_does_not_upgrade_reported_edge()
     }
 }
 
+static void test_topology_listing_us_confirms_sender_hears_us()
+{
+    constexpr NodeNum localNode = 0x0A0B0C0D;
+    constexpr NodeNum passiveSender = 0x22334455;
+    constexpr NodeNum otherNode = 0x66778899;
+    initGraphTestNodeDb(localNode);
+
+    NeighborGraph graph;
+    DirectNeighborSignal signals[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE] = {};
+    uint8_t signalCount = 0;
+
+    // No edge to the sender yet: nothing to confirm.
+    TEST_ASSERT_FALSE(confirmTopologySenderHearsUs(&graph, localNode, passiveSender, localNode));
+
+    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, localNode,
+                                             passiveSender, -78, 9.0f, 3000);
+
+    auto hearsUsOnEdgeToSender = [&]() {
+        const NodeEdges *myEdges = graph.getEdgesFrom(localNode);
+        TEST_ASSERT_NOT_NULL(myEdges);
+        for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+            if (myEdges->edges[i].to == passiveSender) {
+                return myEdges->edges[i].hearsUs;
+            }
+        }
+        TEST_FAIL_MESSAGE("edge to sender missing");
+        return false;
+    };
+
+    TEST_ASSERT_FALSE(hearsUsOnEdgeToSender());
+
+    // Sender listing some other node says nothing about us.
+    TEST_ASSERT_FALSE(confirmTopologySenderHearsUs(&graph, localNode, passiveSender, otherNode));
+    TEST_ASSERT_FALSE(hearsUsOnEdgeToSender());
+
+    // Sender listing us proves it hears us: flag transitions once, then stays set.
+    TEST_ASSERT_TRUE(confirmTopologySenderHearsUs(&graph, localNode, passiveSender, localNode));
+    TEST_ASSERT_TRUE(hearsUsOnEdgeToSender());
+    TEST_ASSERT_FALSE(confirmTopologySenderHearsUs(&graph, localNode, passiveSender, localNode));
+    TEST_ASSERT_TRUE(hearsUsOnEdgeToSender());
+}
+
 } // namespace
 
 void setUp(void) {}
@@ -282,6 +324,7 @@ void setup()
     RUN_TEST(test_refresh_reported_direct_neighbor_updates_cache_and_variance);
     RUN_TEST(test_relay_refresh_skips_without_reported_edge);
     RUN_TEST(test_mirrored_edge_update_does_not_upgrade_reported_edge);
+    RUN_TEST(test_topology_listing_us_confirms_sender_hears_us);
 
     UNITY_END();
 }

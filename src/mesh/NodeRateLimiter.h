@@ -27,7 +27,9 @@ class NodeRateLimiter
 
     /**
      * Returns true if the packet should be dropped (rate limited).
-     * Acts on packets from any other node regardless of hop distance.
+     * Acts on packets from any other node regardless of hop distance, except packets
+     * addressed to us: those are never relayed and must always reach the ACK path and
+     * the phone (admin replies, DMs).
      * Decoded packets are bucketed by portnum; undecoded (wrong key / decode
      * failure) packets fall into the OTHER bucket — they still consume airtime.
      * DECODE_FATAL packets (already cancelled by the caller) should not be passed.

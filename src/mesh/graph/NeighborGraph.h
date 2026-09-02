@@ -84,7 +84,7 @@ struct Edge {
     uint32_t lastUpdate; // Full timestamp (seconds since boot)
     uint8_t etxVariance; // EWMA of |ETX change| × 20 (range 0.00–12.75 ETX units)
     Source source;
-    bool hearsUs;        // True if this node has relayed our packets (confirmed bidirectional link)
+    bool hearsUs;        // True if this node proved it hears us: relayed our packets or listed us in its topology
 
     Edge() : to(0), etxFixed(100), lastUpdate(0), etxVariance(0), source(Source::Mirrored), hearsUs(false) {}
 

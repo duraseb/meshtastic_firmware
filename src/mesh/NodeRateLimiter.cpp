@@ -208,6 +208,14 @@ bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
     if (p->from == 0 || isFromUs(p)) {
         return false;
     }
+    // Packets addressed to us are never relayed, so they cost no relay airtime or CPU; they are
+    // replies and requests we asked for (admin responses, DMs, ACKs). Dropping one here silently
+    // kills the ACK/implicit-ACK path and the delivery to the phone: a remote node answering a
+    // burst of admin GETs trips the 4/90s OTHER bucket on its 4th reply, after which every further
+    // reply keeps the window reset and remote admin never recovers.
+    if (isToUs(p)) {
+        return false;
+    }
 
     if (nodeDB) {
         const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(p->from);
