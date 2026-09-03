@@ -74,6 +74,13 @@ class NextHopRouter : public FloodingRouter
      */
     virtual ErrorCode send(meshtastic_MeshPacket *p) override;
 
+    /**
+     * Send a relayed copy whose next hop was decided by SignalRouting: `nextHop` (a relay byte, or
+     * NO_NEXT_HOP_PREFERENCE) replaces the NodeDB-learned value send() would stamp. Relayer-side
+     * retransmissions are armed exactly as for a NodeDB next hop.
+     */
+    ErrorCode sendRelay(meshtastic_MeshPacket *p, uint8_t nextHop);
+
     /** Do our retransmission handling */
     virtual int32_t runOnce() override
     {

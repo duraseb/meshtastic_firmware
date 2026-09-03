@@ -188,6 +188,10 @@ class RadioInterface
     /** The delay to use when we want to send something */
     [[nodiscard]] uint32_t getTxDelayMsec();
 
+    /** Upper bound of getTxDelayMsec() at the current channel utilization: the longest a node
+     * drawing from the same contention window can wait before keying up. */
+    [[nodiscard]] uint32_t getTxDelayMsecMaxAtUtil();
+
     /** The CW to use when calculating SNR_based delays */
     [[nodiscard]] uint8_t getCWsize(float snr);
 

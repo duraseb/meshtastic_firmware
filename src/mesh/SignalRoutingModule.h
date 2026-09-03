@@ -311,6 +311,14 @@ public:
     SignalRoutingModule& operator=(const SignalRoutingModule&) = delete;
 
     bool shouldUseSignalBasedRouting(const meshtastic_MeshPacket *p);
+
+    /** The next hop SR chose for the unicast it just approved in shouldRelay() (0 = none); cleared on read. */
+    NodeNum takePendingUnicastNextHop()
+    {
+        NodeNum n = pendingUnicastNextHop;
+        pendingUnicastNextHop = 0;
+        return n;
+    }
     void updateNodeActivityForPacket(NodeNum nodeId);
     void updateNodeActivityForPacketAndRelay(const meshtastic_MeshPacket *p);
     bool shouldRelay(const meshtastic_MeshPacket *p);
@@ -510,6 +518,8 @@ private:
 
 public:
     uint32_t pendingRelayDelayMs = 0; // Set by shouldRelayBroadcast, consumed by commitRelay
+    // Set by shouldRelayUnicastForCoordination: the next hop to stamp on our relayed copy (0 = none).
+    NodeNum pendingUnicastNextHop = 0;
 
     void commitRelay(PacketId packetId, NodeNum originalHeardFrom, uint32_t txDelayMs = 0);
     bool isCommittedRelay(PacketId packetId) const;

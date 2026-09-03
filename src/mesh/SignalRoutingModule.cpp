@@ -1808,27 +1808,40 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     // pendingRelayDelayMs and returns true.  Any dupe cancels our queued relay.
 
     uint32_t halfAirtime = 150;
+    uint32_t airtimeMs = 300;
     if (router && router->getRadioInterface()) {
-        uint32_t airtime = router->getRadioInterface()->getPacketTime(p);
-        halfAirtime = std::max(airtime / 2, (uint32_t)50);
+        airtimeMs = router->getRadioInterface()->getPacketTime(p);
+        halfAirtime = std::max(airtimeMs / 2, (uint32_t)50);
     }
 
-    // Returns the candidate's cost to reach destination.
-    // Direct edge: raw etxFixed. Indirect via shared next hop: etxFixed | 0x8000.
+    // The next hop we will stamp on our relayed copy: SR's route pick, or none when the route
+    // picker fell back to "relay it ourselves" (our own byte must never go on the wire: legacy nodes
+    // would refuse the packet and SR peers would wait for a second copy from us).
+    pendingUnicastNextHop = (myNextHop == myNode) ? 0 : myNextHop;
+
+    // Returns the candidate's cost to reach destination, in three tiers that never overlap:
+    //   direct edge to destination      -> etxFixed (clamped below 0x7FFF)
+    //   known downstream relay of dest  -> 0x7FFF (the downstream table is often the only knowledge
+    //                                      we have of a gateway's branch before its topology arrives)
+    //   edge to the shared next hop     -> etxFixed | 0x8000
     auto getCandidateCost = [&](NodeNum node) -> uint16_t {
         const NodeEdges *edges = routingGraph->getEdgesFrom(node);
-        if (!edges) {
-            return UINT16_MAX;
-        }
-        for (uint8_t i = 0; i < edges->edgeCount; i++) {
-            if (edges->edges[i].to == destination) {
-                return edges->edges[i].etxFixed;
+        if (edges) {
+            for (uint8_t i = 0; i < edges->edgeCount; i++) {
+                if (edges->edges[i].to == destination) {
+                    return std::min<uint16_t>(edges->edges[i].etxFixed, 0x7FFEu);
+                }
             }
         }
-        if (myNextHop != destination) {
+        NodeNum dsRelay = routingGraph->getDownstreamRelay(destination);
+        if (dsRelay != 0 && dsRelay == node) {
+            return 0x7FFFu;
+        }
+        // A neighbour reaching "us" is not a path when the route picker fell back to us.
+        if (edges && myNextHop != destination && myNextHop != myNode && myNextHop != node) {
             for (uint8_t i = 0; i < edges->edgeCount; i++) {
                 if (edges->edges[i].to == myNextHop) {
-                    return edges->edges[i].etxFixed | 0x8000u;
+                    return std::min<uint16_t>(edges->edges[i].etxFixed, 0x7FFFu) | 0x8000u;
                 }
             }
         }
@@ -1855,23 +1868,22 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
             return true;
         }
 
-        // Determine slot 0 width:
-        //   - SR next_hop: halfAirtime — they fire at 0ms, dupe suppression handles the rest
-        //   - Stock/unknown next_hop: worst-case stock CLIENT delay so we don't fire before them
-        //     Stock CLIENT uses (2*CWmax + 2^CWsize) * slotTimeMsec — call getTxDelayMsecWeightedWorst
+        // Determine slot 0 width: long enough for the designated node's relay to have left the air.
+        //   - SR next_hop: it queues its relay behind its own contention delay (up to 2^CW slots at the
+        //     current utilization) and then needs one airtime. A half-airtime reservation let a peer
+        //     pre-empt a healthy designated node by 200 ms in the field.
+        //   - Stock/unknown next_hop: worst-case stock CLIENT delay plus one airtime.
         NodeNum nextHopNode = resolveRelayIdentity(p->next_hop);
         bool nextHopIsSR = (nextHopNode != 0 && getCapabilityStatus(nextHopNode) == CapabilityStatus::SRactive);
-        if (nextHopIsSR) {
-            slotDelay += halfAirtime;
-            LOG_INFO("[SR] Unicast slot 0ms: SR next_hop %08x (halfAirtime=%ums reserved)", nextHopNode, halfAirtime);
-        } else {
-            uint32_t stockWorstCase = halfAirtime; // fallback if no radio interface
-            if (router && router->getRadioInterface()) {
-                stockWorstCase = router->getRadioInterface()->getTxDelayMsecWeightedWorst(p->rx_snr);
-            }
-            slotDelay += stockWorstCase;
-            LOG_INFO("[SR] Unicast slot 0ms: stock/unknown next_hop 0x%02x (stockWorstCase=%ums reserved)", p->next_hop, stockWorstCase);
+        uint32_t reserve = halfAirtime; // fallback if no radio interface
+        if (router && router->getRadioInterface()) {
+            RadioInterface *radio = router->getRadioInterface();
+            reserve = airtimeMs + (nextHopIsSR ? radio->getTxDelayMsecMaxAtUtil()
+                                               : radio->getTxDelayMsecWeightedWorst(p->rx_snr));
         }
+        slotDelay += reserve;
+        LOG_INFO("[SR] Unicast slot 0ms: %s next_hop 0x%02x (%ums reserved)", nextHopIsSR ? "SR" : "stock/unknown",
+                 p->next_hop, reserve);
     }
 
     // Phase 2: SR candidates (including self) sorted by cost to destination.

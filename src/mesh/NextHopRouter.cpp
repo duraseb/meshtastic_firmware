@@ -153,7 +153,18 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
     if (!isToUs(p) && !isFromUs(p) && (p->hop_limit > 0 || exhaustHops)) {
         if (p->id != 0) {
             if (isRebroadcaster()) {
-                if (p->next_hop == NO_NEXT_HOP_PREFERENCE || p->next_hop == nodeDB->getLastByteOfNodeNum(getNodeNum())) {
+                // Stock rule: relay a unicast only when it names nobody or names us. SignalRouting
+                // coordinates unicasts by slot instead: a unicast naming another node still reaches
+                // shouldRelay(), which reserves slot 0 for the designated node and ranks the rest.
+                bool srCoordinatedUnicast = false;
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+                srCoordinatedUnicast = !isBroadcast(p->to) && signalRoutingModule &&
+                                       signalRoutingModule->shouldUseSignalBasedRouting(p);
+#endif
+                bool srDecidedUnicast = false;
+                NodeNum srNextHop = 0;
+                if (p->next_hop == NO_NEXT_HOP_PREFERENCE || p->next_hop == nodeDB->getLastByteOfNodeNum(getNodeNum()) ||
+                    srCoordinatedUnicast) {
 
                     // Channel QoS: gradually drop lower priority relays when channel is congested
 #if !MESHTASTIC_EXCLUDE_CHANNEL_QOS
@@ -174,6 +185,10 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                         uint32_t relayDelay = signalRoutingModule->pendingRelayDelayMs;
                         signalRoutingModule->pendingRelayDelayMs = 0;
                         signalRoutingModule->commitRelay(p->id, heardFrom, relayDelay);
+                        if (!isBroadcast(p->to)) {
+                            srDecidedUnicast = true;
+                            srNextHop = signalRoutingModule->takePendingUnicastNextHop();
+                        }
                     }
 #endif
 
@@ -221,6 +236,16 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                     }
 #endif
 
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+                    if (srDecidedUnicast) {
+                        // SR chose this leg's next hop (or none). Stamp it instead of the NodeDB-learned
+                        // value, and never forward the incoming byte: it named us or a node that stayed
+                        // silent, and legacy nodes relay a unicast only when the byte is clear or theirs.
+                        uint8_t nextHopByte = srNextHop ? nodeDB->getLastByteOfNodeNum(srNextHop) : NO_NEXT_HOP_PREFERENCE;
+                        NextHopRouter::sendRelay(tosend, nextHopByte);
+                        return true;
+                    }
+#endif
                     if (p->next_hop == NO_NEXT_HOP_PREFERENCE) {
                         FloodingRouter::send(tosend);
                     } else {
@@ -238,6 +263,17 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
     }
 
     return false;
+}
+
+ErrorCode NextHopRouter::sendRelay(meshtastic_MeshPacket *p, uint8_t nextHop)
+{
+    p->relay_node = nodeDB->getLastByteOfNodeNum(getNodeNum());
+    wasSeenRecently(p);
+    p->next_hop = nextHop;
+    LOG_DEBUG("Setting SR next hop for relayed packet with dest %x to %x", p->to, p->next_hop);
+    if (p->next_hop != NO_NEXT_HOP_PREFERENCE && (p->hop_limit > 0 || p->want_ack))
+        startRetransmission(packetPool.allocCopy(*p));
+    return Router::send(p);
 }
 
 /**

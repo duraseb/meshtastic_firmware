@@ -586,6 +586,13 @@ uint32_t RadioInterface::getTxDelayMsec()
     return random(0, pow_of_2(CWsize)) * slotTimeMsec;
 }
 
+uint32_t RadioInterface::getTxDelayMsecMaxAtUtil()
+{
+    float channelUtil = airTime->channelUtilizationPercent();
+    uint8_t CWsize = map(channelUtil, 0, 100, CWmin, CWmax);
+    return pow_of_2(CWsize) * slotTimeMsec;
+}
+
 /** The CW size to use when calculating SNR_based delays */
 uint8_t RadioInterface::getCWsize(float snr)
 {

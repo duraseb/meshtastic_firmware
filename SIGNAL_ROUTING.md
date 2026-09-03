@@ -299,15 +299,21 @@ When a unicast packet is transmitted, nodes that overhear it can participate in 
 4. **Optimal Selection**: Best-positioned relay (lowest ETX to destination) gets the earliest slot
 
 **Slot 0 — Designated Next Hop:**
-If the packet carries a `next_hop` field (set by stock NextHopRouter), slot 0 is reserved for that designated node. Any SR node whose last-byte matches `p->next_hop` relays immediately at slot 0. All other SR nodes start their candidate ranking from slot 1. If `next_hop` is not set (`NO_NEXT_HOP_PREFERENCE`), SR candidates start from slot 0.
+If the packet carries a `next_hop` field, slot 0 is reserved for that designated node. Any SR node whose last-byte matches `p->next_hop` relays immediately at slot 0. All other SR nodes start their candidate ranking from slot 1, after a reservation long enough for the designated node's relay to have left the air: one airtime plus the maximum contention delay at the current channel utilization for an SR next hop, or plus the worst-case stock CLIENT delay for a stock or unknown one. If `next_hop` is not set (`NO_NEXT_HOP_PREFERENCE`), SR candidates start from slot 0.
+
+`NextHopRouter::perhapsRebroadcast` lets SR-coordinated unicasts past the stock gate (which otherwise admits a unicast only when it names nobody or names us), so this path is reachable; nodes without SR keep the stock rule.
 
 **Candidate Cost Metric (SR candidates, slot 1+):**
-For each candidate (self + SR-active direct neighbors):
-- Direct edge to destination → raw `etxFixed` (range ~100–32767)
-- Edge to the shared next hop (indirect) → `etxFixed | 0x8000` — always sorts after direct-edge candidates
+For each candidate (self + SR-active direct neighbors), three tiers that never overlap:
+- Direct edge to destination → `etxFixed` (clamped below 0x7FFF)
+- Known downstream relay of the destination → `0x7FFF` — the downstream table is often the only knowledge we have of a gateway's branch before its topology report arrives
+- Edge to the shared next hop (indirect) → `etxFixed | 0x8000` — always sorts after the two tiers above
 - No usable path → excluded
 
-This ensures last-hop delivery nodes (direct edge to destination) are always scheduled before intermediate relays, and within each group the lower ETX wins.
+This ensures last-hop delivery nodes are always scheduled before intermediate relays, and within each tier the lower ETX wins.
+
+**Next hop on the relayed copy:**
+When SR approves a unicast relay, `NextHopRouter::sendRelay()` stamps SR's route pick as `next_hop` instead of the NodeDB-learned value, or clears the field when the route picker fell back to "relay it ourselves" (our own byte never goes on the wire). The incoming byte is never forwarded: it named us or a node that stayed silent, and legacy nodes relay a unicast only when the byte is clear or their own. A stamped next hop arms the usual relayer-side retransmissions, whose last retry clears the field and falls back to flooding.
 
 **Quick Suppression Checks (before slot scheduling):**
 - Source and destination both downstream of the same relay → suppress
