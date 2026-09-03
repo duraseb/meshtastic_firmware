@@ -19,6 +19,10 @@
 // Capacity: enough for one node's edges + some margin. Keeps stack usage predictable.
 static constexpr size_t NODE_SET_MAX = 48;
 
+/// ETX costs are compared in buckets this wide (ETX × 100): half an ETX. Own links and peer-reported
+/// links price a few hundredths apart, and exact comparison made colocated nodes disagree on order.
+static constexpr uint16_t SR_COST_BUCKET_FIXED = 50;
+
 struct NodeSet {
     NodeNum nodes[NODE_SET_MAX];
     uint16_t count = 0;

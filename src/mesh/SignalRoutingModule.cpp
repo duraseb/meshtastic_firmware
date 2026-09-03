@@ -1824,12 +1824,18 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     //   known downstream relay of dest  -> 0x7FFF (the downstream table is often the only knowledge
     //                                      we have of a gateway's branch before its topology arrives)
     //   edge to the shared next hop     -> etxFixed | 0x8000
+    // Costs are compared in half-ETX buckets. Each node prices its own link from its own
+    // measurements and a peer's link from the peer's packed report, so near-equal costs differ by a
+    // few hundredths in a direction that varies per node; exact comparison ranked two colocated
+    // nodes in opposite orders and both took the same slot. Within a bucket the node-id tie-break
+    // below decides identically everywhere.
+    auto bucket = [](uint16_t etxFixed) -> uint16_t { return (uint16_t)(etxFixed / SR_COST_BUCKET_FIXED * SR_COST_BUCKET_FIXED); };
     auto getCandidateCost = [&](NodeNum node) -> uint16_t {
         const NodeEdges *edges = routingGraph->getEdgesFrom(node);
         if (edges) {
             for (uint8_t i = 0; i < edges->edgeCount; i++) {
                 if (edges->edges[i].to == destination) {
-                    return std::min<uint16_t>(edges->edges[i].etxFixed, 0x7FFEu);
+                    return bucket(std::min<uint16_t>(edges->edges[i].etxFixed, 0x7FFEu));
                 }
             }
         }
@@ -1841,7 +1847,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         if (edges && myNextHop != destination && myNextHop != myNode && myNextHop != node) {
             for (uint8_t i = 0; i < edges->edgeCount; i++) {
                 if (edges->edges[i].to == myNextHop) {
-                    return std::min<uint16_t>(edges->edges[i].etxFixed, 0x7FFFu) | 0x8000u;
+                    return bucket(std::min<uint16_t>(edges->edges[i].etxFixed, 0x7FFFu)) | 0x8000u;
                 }
             }
         }

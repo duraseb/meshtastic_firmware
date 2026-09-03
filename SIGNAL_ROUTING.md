@@ -310,7 +310,7 @@ For each candidate (self + SR-active direct neighbors), three tiers that never o
 - Edge to the shared next hop (indirect) → `etxFixed | 0x8000` — always sorts after the two tiers above
 - No usable path → excluded
 
-This ensures last-hop delivery nodes are always scheduled before intermediate relays, and within each tier the lower ETX wins.
+This ensures last-hop delivery nodes are always scheduled before intermediate relays, and within each tier the lower ETX wins. Costs are compared in half-ETX buckets (`SR_COST_BUCKET_FIXED`), for unicast candidates and for the broadcast ranking's average cost alike: a node prices its own link from its own measurements and a peer's link from the peer's packed report, so near-equal costs differ by a few hundredths in a direction that varies per node, and exact comparison let two colocated nodes rank each other in opposite orders and take the same slot. Within a bucket the packet-id-parity node-id tie-break decides identically everywhere.
 
 **Slot timing:** slots are ordinal. Slot 0 keys up at once; every later slot first waits for the leader's relay to have left the air (one airtime plus the maximum contention delay at the current channel utilization), then slots space out by half an airtime. Behind a designated next hop the ranked candidates follow its slot-0 reservation. A deterministic ±quarter-airtime jitter keeps equal slots apart. (The earlier ETX-gap formula masked the tier bit off the costs, so a downstream-tier leader made every gap zero and a node ranked last fired at 0 ms.)
 

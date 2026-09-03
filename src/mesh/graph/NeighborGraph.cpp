@@ -1118,6 +1118,7 @@ RelayCandidate NeighborGraph::findBestRelayCandidate(const NodeSet &candidates, 
 
         float avgCost = totalCost / validCosts;
         uint16_t avgCostFixed = static_cast<uint16_t>(avgCost * 100);
+        avgCostFixed = (uint16_t)(avgCostFixed / SR_COST_BUCKET_FIXED * SR_COST_BUCKET_FIXED); // half-ETX buckets
 
         // Bidirectional link priority: candidates that can deliver back to the source
         // (hearsUs=true on their edge to sourceNode) get a higher tier. This ensures

@@ -415,6 +415,36 @@ static void test_unique_coverage_ignores_poor_links_and_peer_owned_stock_nodes()
     TEST_ASSERT_FALSE(graph.hasUniqueCoverage(me, nobody, 1, 7.0f, notOurs, 2));
 }
 
+static void test_ranking_costs_within_a_bucket_tie_on_node_id()
+{
+    constexpr NodeNum me = 0x0A0B0C0D; // lower id
+    constexpr NodeNum peer = 0x11111111;
+    constexpr NodeNum a = 0x22222222;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, peer, 1.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(me, a, 1.31f, 1000, Edge::Source::Reported);
+    graph.updateEdge(peer, a, 1.18f, 1000, Edge::Source::Mirrored);
+
+    NodeSet candidates;
+    candidates.insert(me);
+    candidates.insert(peer);
+    NodeSet covered;
+    covered.insert(peer); // the peer heard the packet; only `a` is left to cover
+    // Equal unique coverage {a}; costs 1.31 vs 1.18 sit in the same half-ETX bucket, so the
+    // packet-id parity decides: even id -> lower node id (me), odd id -> higher (peer).
+    RelayCandidate even = graph.findBestRelayCandidate(candidates, covered, 1, 0x10, false, 0, me);
+    TEST_ASSERT_EQUAL_UINT32(me, even.nodeId);
+    RelayCandidate odd = graph.findBestRelayCandidate(candidates, covered, 1, 0x11, true, 0, me);
+    TEST_ASSERT_EQUAL_UINT32(peer, odd.nodeId);
+    // A full bucket apart (ETX cannot go below 1.0, so make ours worse), the cheaper link wins
+    // regardless of parity.
+    graph.updateEdge(me, a, 1.6f, 1000, Edge::Source::Reported);
+    RelayCandidate cheaper = graph.findBestRelayCandidate(candidates, covered, 1, 0x10, false, 0, me);
+    TEST_ASSERT_EQUAL_UINT32(peer, cheaper.nodeId);
+}
+
 } // namespace
 
 void setUp(void) {}
@@ -440,6 +470,7 @@ void setup()
     RUN_TEST(test_self_coverage_counts_only_reported_edges);
     RUN_TEST(test_topology_listing_peer_confirms_peer_hears_sender);
     RUN_TEST(test_unique_coverage_ignores_poor_links_and_peer_owned_stock_nodes);
+    RUN_TEST(test_ranking_costs_within_a_bucket_tie_on_node_id);
 
     UNITY_END();
 }
