@@ -48,9 +48,9 @@ NodeRateLimiter::NodeRateLimiter() : entryCount(0)
         }
     }
 
-    LOG_INFO("[RateLimit] Initialized: enabled=%d slots=%u window=%us thresholds=text:%u routing:%u other:%u",
+    LOG_INFO("[RateLimit] Initialized: enabled=%d slots=%u window=%us thresholds=text:%u routing:%u other:%u unknown:%u",
              cfgEnabled, MAX_ENTRIES, cfgWindowMs / 1000u,
-             cfgTextThreshold, cfgRoutingThreshold, cfgOtherThreshold);
+             cfgTextThreshold, cfgRoutingThreshold, cfgOtherThreshold, cfgUnknownThreshold);
 }
 
 NodeRateLimiter::Bucket NodeRateLimiter::classifyBucket(meshtastic_PortNum portnum)
@@ -93,10 +93,11 @@ int NodeRateLimiter::findEvictionCandidate() const
     // breaking ties by oldest window start.  If every entry is limited, fall back to oldest window
     // start across all entries so we at least evict the stalest one.
     auto isLimited = [](const RateLimitEntry &e) {
-        return e.text.limited || e.routing.limited || e.other.limited;
+        return e.text.limited || e.routing.limited || e.other.limited || e.unknown.limited;
     };
     auto oldestWindowStart = [](const RateLimitEntry &e) {
-        return std::min(e.text.windowStart, std::min(e.routing.windowStart, e.other.windowStart));
+        return std::min(std::min(e.text.windowStart, e.routing.windowStart),
+                        std::min(e.other.windowStart, e.unknown.windowStart));
     };
 
     // Check if any non-limited entry exists.
@@ -153,12 +154,16 @@ NodeRateLimiter::RateLimitEntry *NodeRateLimiter::getOrCreateEntry(NodeNum nodeI
     slot->text.windowStart = nowMs;
     slot->routing.windowStart = nowMs;
     slot->other.windowStart = nowMs;
+    slot->unknown.windowStart = nowMs;
     return slot;
 }
 
 bool NodeRateLimiter::checkAndUpdateBucket(BucketState &b, uint8_t threshold, NodeNum nodeId, Bucket bucket, uint32_t nowMs)
 {
-    const char *bucketName = (bucket == Bucket::TEXT) ? "text" : (bucket == Bucket::ROUTING) ? "routing" : "other";
+    const char *bucketName = (bucket == Bucket::TEXT)      ? "text"
+                             : (bucket == Bucket::ROUTING) ? "routing"
+                             : (bucket == Bucket::UNKNOWN) ? "unknown"
+                                                           : "other";
     char nodeName[48];
     getNodeDisplayName(nodeId, nodeName, sizeof(nodeName));
 
@@ -226,11 +231,16 @@ bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
 
     uint8_t hops = hopsAway(p);
 
+    // Undecodable packets (a channel we hold no key for, or PKI traffic for another node) get
+    // their own UNKNOWN bucket. A relay without the key cannot tell chat from telemetry, while a
+    // key-holding relay judges the same packets by their real port: with OTHER (4/90 s) a private
+    // group chatting normally flowed through key holders and died at the first relay without the
+    // key, and TEXT (30/90 s) would let encrypted admin/DM traffic for others run at chat rates.
     Bucket bucket;
     if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag) {
         bucket = classifyBucket(p->decoded.portnum);
     } else {
-        bucket = Bucket::OTHER;
+        bucket = Bucket::UNKNOWN;
     }
 
     uint32_t nowMs = millis();
@@ -241,6 +251,7 @@ bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
     switch (bucket) {
         case Bucket::TEXT:    b = &entry->text;    threshold = cfgTextThreshold;    break;
         case Bucket::ROUTING: b = &entry->routing; threshold = cfgRoutingThreshold; break;
+        case Bucket::UNKNOWN: b = &entry->unknown; threshold = cfgUnknownThreshold; break;
         default:              b = &entry->other;   threshold = cfgOtherThreshold;   break;
     }
 

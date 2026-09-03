@@ -496,7 +496,10 @@ Each tracked source node gets three independent buckets:
 |--------|----------|------------------------|
 | TEXT | `TEXT_MESSAGE_APP`, `TEXT_MESSAGE_COMPRESSED_APP` | 30 |
 | ROUTING | `ROUTING_APP`, `SIGNAL_ROUTING_APP`, `TRACEROUTE_APP` | 10 |
-| OTHER | everything else, including undecodable packets | 4 |
+| OTHER | every other decoded portnum | 4 |
+| UNKNOWN | undecodable packets: no key for the channel, PKI traffic for other nodes | 12 |
+
+A relay without the key cannot tell chat from telemetry, while a key-holding relay judges the same packets by their real port; with the OTHER threshold a private group chatting normally flowed through key holders and died at the first relay without the key, and the TEXT threshold would let encrypted admin and DM traffic for others run at chat rates. UNKNOWN sits between the two and has no `moduleConfig` override; 12 lets a relayed remote-admin Channels screen (nine sequential requests) load within one window.
 
 Once a bucket trips, every further packet in that bucket resets the window, so the source stays limited until it goes quiet for a full window. Up to 16 sources are tracked; when full, the entry with the greatest hop distance is evicted (ties broken by oldest window).
 

@@ -7,10 +7,11 @@
  * Per-node rate limiter for inbound packets.
  *
  * Tracks up to MAX_ENTRIES nodes using a fixed-size array (no heap allocation).
- * Each node has three independent buckets:
+ * Each node has four independent buckets:
  *   - TEXT    : TEXT_MESSAGE_APP and TEXT_MESSAGE_COMPRESSED_APP
  *   - ROUTING : ROUTING_APP, SIGNAL_ROUTING_APP and TRACEROUTE_APP
- *   - OTHER   : everything else
+ *   - OTHER   : every other decoded portnum
+ *   - UNKNOWN : undecodable packets (no key for the channel, PKI traffic for other nodes)
  *
  * When a bucket receives >= threshold packets within WINDOW_MS, the node is
  * rate-limited on that bucket. Every subsequent packet resets the window timer,
@@ -31,7 +32,9 @@ class NodeRateLimiter
      * addressed to us: those are never relayed and must always reach the ACK path and
      * the phone (admin replies, DMs).
      * Decoded packets are bucketed by portnum; undecoded (wrong key / decode
-     * failure) packets fall into the OTHER bucket — they still consume airtime.
+     * failure) packets count against the UNKNOWN bucket, whose threshold sits
+     * between OTHER and TEXT: a relay without the key cannot tell chat from
+     * telemetry, but must not let encrypted traffic for others run at chat rates.
      * DECODE_FATAL packets (already cancelled by the caller) should not be passed.
      * Calling this method also updates the internal counters.
      */
@@ -47,8 +50,11 @@ class NodeRateLimiter
     uint8_t  cfgTextThreshold    = 30; // packets per window before limiting
     uint8_t  cfgRoutingThreshold = 10;
     uint8_t  cfgOtherThreshold   = 4;
+    // Undecodable packets; no proto override. Sized so a relayed remote-admin Channels screen
+    // (channel 0, LoRa config, then channels 1..7 one at a time: nine requests) loads in one window.
+    uint8_t  cfgUnknownThreshold = 12;
 
-    enum class Bucket : uint8_t { TEXT, ROUTING, OTHER };
+    enum class Bucket : uint8_t { TEXT, ROUTING, OTHER, UNKNOWN };
 
     struct BucketState {
         uint32_t windowStart = 0; // ms timestamp when current window started
@@ -61,10 +67,11 @@ class NodeRateLimiter
         BucketState text;
         BucketState routing;
         BucketState other;
+        BucketState unknown;
         uint8_t     maxHopSeen  = 0; // for eviction: prefer evicting distant nodes
     };
-    // sizeof(RateLimitEntry) = 4 + 3*(4+1+1) + 1 = 23 bytes
-    // 23 * 16 = 368 bytes total
+    // sizeof(RateLimitEntry) = 4 + 4*(4+1+1+2 pad) + 1 (+3 pad) = 40 bytes
+    // 40 * 16 = 640 bytes total
 
     RateLimitEntry entries[MAX_ENTRIES];
     uint8_t        entryCount = 0;
