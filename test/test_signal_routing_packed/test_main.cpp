@@ -303,6 +303,50 @@ static void test_topology_listing_us_confirms_sender_hears_us()
     TEST_ASSERT_TRUE(hearsUsOnEdgeToSender());
 }
 
+static void test_self_coverage_counts_only_reported_edges()
+{
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum peer = 0x11111111;
+    constexpr NodeNum a = 0x22222222;
+    constexpr NodeNum b = 0x33333333;
+    constexpr NodeNum c = 0x44444444;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    // Our reported neighbours: the peer and a. b is only mirrored (it relayed us once).
+    graph.updateEdge(me, peer, 1.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(me, a, 1.5f, 1000, Edge::Source::Reported);
+    graph.updateEdge(me, b, 1.5f, 1000, Edge::Source::Mirrored);
+    // The peer's topology as we mirrored it: a, b and c.
+    graph.updateEdge(peer, a, 1.5f, 1000, Edge::Source::Reported);
+    graph.updateEdge(peer, b, 1.5f, 1000, Edge::Source::Mirrored);
+    graph.updateEdge(peer, c, 1.5f, 1000, Edge::Source::Mirrored);
+
+    NodeNum out[NODE_SET_MAX];
+    // Ranking ourselves: only what we report (and peers can see) counts.
+    size_t n = graph.getCoverageIfRelays(me, out, NODE_SET_MAX, nullptr, 0, me);
+    TEST_ASSERT_EQUAL_UINT32(2, n);
+    for (size_t i = 0; i < n; i++) {
+        TEST_ASSERT_NOT_EQUAL(b, out[i]);
+    }
+    // Ranking a peer from our mirrored view: every edge we hold for it counts.
+    TEST_ASSERT_EQUAL_UINT32(3, graph.getCoverageIfRelays(peer, out, NODE_SET_MAX, nullptr, 0, me));
+    // Without a self node the legacy behaviour is unchanged.
+    TEST_ASSERT_EQUAL_UINT32(3, graph.getCoverageIfRelays(me, out, NODE_SET_MAX, nullptr, 0));
+
+    // Through the ranking: the peer covers three nodes, we report two. The legacy count gave us a
+    // phantom third (b) and let our cheaper edges win slot 0; the peer sees it the other way round.
+    NodeSet candidates;
+    candidates.insert(me);
+    candidates.insert(peer);
+    NodeSet covered;
+    RelayCandidate best = graph.findBestRelayCandidate(candidates, covered, 1, 0x10, false, 0, me);
+    TEST_ASSERT_EQUAL_UINT32(peer, best.nodeId);
+    TEST_ASSERT_EQUAL_UINT32(3, best.coverageCount);
+    RelayCandidate legacy = graph.findBestRelayCandidate(candidates, covered, 1, 0x10, false, 0);
+    TEST_ASSERT_EQUAL_UINT32(me, legacy.nodeId);
+}
+
 } // namespace
 
 void setUp(void) {}
@@ -325,6 +369,7 @@ void setup()
     RUN_TEST(test_relay_refresh_skips_without_reported_edge);
     RUN_TEST(test_mirrored_edge_update_does_not_upgrade_reported_edge);
     RUN_TEST(test_topology_listing_us_confirms_sender_hears_us);
+    RUN_TEST(test_self_coverage_counts_only_reported_edges);
 
     UNITY_END();
 }

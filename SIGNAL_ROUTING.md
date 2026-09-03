@@ -245,6 +245,8 @@ Destinations that are known through any mechanism are still relayed:
 - Present in the downstream table (reachable via a relay's topology report)
 - Routable via Dijkstra (direct or multi-hop SR path)
 
+`isNodeRoutable()` filters the intermediate hops Dijkstra may use: SR-passive nodes (CLIENT_MUTE, TRACKER, SENSOR, TAK, CLIENT_HIDDEN) broadcast topology but never relay, so they are never hops, and legacy nodes qualify only as ROUTER/REPEATER/ROUTER_CLIENT. The filter is not applied to the destination, so a passive node stays reachable.
+
 ### Last-Hop Unicast Hop Limiting
 
 `getUnicastHopLimitForDirectNeighbor()` limits hops on unicasts destined for a direct `hearsUs` neighbor when stock neighbors are present, preventing unnecessary stock relay. It returns -1 (don't limit) or the hop_limit to set, based on link quality:
@@ -329,9 +331,9 @@ SignalRouting uses a deterministic slot-based algorithm to coordinate broadcast 
 
 2. **Stock routers first**: Legacy ROUTER/REPEATER/ROUTER_CLIENT neighbors that can hear the transmitter get the earliest slots since they transmit regardless of SR decisions. Stock routers with no evidence of hearing the transmitter (no edge in the topology graph) are skipped — reserving a slot for them would just delay our own TX for nothing. If they already transmitted, their coverage is absorbed.
 
-3. **SR candidate ranking**: Remaining SR-active candidates are iteratively ranked by `findBestRelayCandidate` (most unique coverage, lowest ETX, deterministic node ID tiebreak based on packet ID parity). Each candidate gets the next slot. If it's us, we schedule TX and stop. If a candidate already transmitted, we absorb its coverage without consuming a slot.
+3. **SR candidate ranking**: Remaining SR-active candidates are iteratively ranked by `findBestRelayCandidate` (most unique coverage, lowest ETX, deterministic node ID tiebreak based on packet ID parity). Each candidate gets the next slot. If it's us, we schedule TX and stop. If a candidate already transmitted, we absorb its coverage without consuming a slot. An earlier slot holder that has not transmitted yet is assumed to relay, so its coverage is absorbed too before the next pick. Our own coverage counts only our **Reported** edges (what we broadcast in topology): peers rank us on what they mirrored from us, and counting our Mirrored edges made every node see more coverage for itself than its neighbours saw for it, so colocated nodes both took slot 0.
 
-4. **Overrides**: Downstream relay obligations and stock coverage needs can force a relay.
+4. **Overrides**: Downstream relay obligations and stock coverage needs can force a relay. The stock-coverage fallback is coordinated across the SR peers that took part in the ranking: a mute or legacy neighbour already covered by an earlier slot holder needs nobody else, and each remaining uncovered stock neighbour is owned by exactly one SR node, the lowest node id among us and the peers with an edge to it. Without that rule every SR node beside the same mute neighbour relayed in the same slot.
 
 **Post-cancellation — unique coverage re-evaluation:**
 When a dupe arrives, `FloodingRouter::perhapsCancelDupe` is called. For SR committed relays, it first checks whether the packet is still in the TX queue (`findInTxQueue`):

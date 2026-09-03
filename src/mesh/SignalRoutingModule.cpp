@@ -1152,7 +1152,36 @@ bool SignalRoutingModule::hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum 
     return false;
 }
 
-bool SignalRoutingModule::shouldRelayForStockNeighbors(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom, uint32_t currentTime)
+/// Which SR node relays for an uncovered stock neighbour: the lowest node id among `myNode` and the SR
+/// peers that have an edge to it. Every peer evaluates the same rule on the shared topology, so exactly
+/// one of them keys up instead of all of them in the same slot.
+static NodeNum stockCoverageOwner(const NeighborGraph *graph, NodeNum myNode, const NodeSet &srPeers,
+                                  NodeNum stockNeighbor)
+{
+    auto hasEdgeTo = [&](NodeNum from) {
+        const NodeEdges *edges = graph->getEdgesFrom(from);
+        if (!edges)
+            return false;
+        for (uint8_t i = 0; i < edges->edgeCount; i++) {
+            if (edges->edges[i].to == stockNeighbor)
+                return true;
+        }
+        return false;
+    };
+    NodeNum owner = hasEdgeTo(myNode) ? myNode : 0;
+    for (uint16_t i = 0; i < srPeers.count; i++) {
+        NodeNum peer = srPeers.nodes[i];
+        if (peer == myNode || !hasEdgeTo(peer))
+            continue;
+        if (owner == 0 || peer < owner)
+            owner = peer;
+    }
+    return owner;
+}
+
+bool SignalRoutingModule::shouldRelayForStockNeighbors(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom,
+                                                       uint32_t currentTime, const NodeSet &alreadyCovered,
+                                                       const NodeSet &srPeers)
 {
     if (!routingGraph) {
         return false;
@@ -1209,6 +1238,12 @@ bool SignalRoutingModule::shouldRelayForStockNeighbors(NodeNum myNode, NodeNum s
             heardDirectly = true;
         }
 
+        // Covered by a node that already transmitted or holds an earlier slot: it relays, not us.
+        if (!heardDirectly && alreadyCovered.contains(stockNeighbor)) {
+            heardDirectly = true;
+            LOG_INFO("[SR] Stock neighbor %08x already covered by an earlier slot holder", stockNeighbor);
+        }
+
         // Check if original source can reach stock neighbor
         if (!heardDirectly) {
             const NodeEdges* sourceEdges = routingGraph->getEdgesFrom(sourceNode);
@@ -1240,6 +1275,14 @@ bool SignalRoutingModule::shouldRelayForStockNeighbors(NodeNum myNode, NodeNum s
         if (!heardDirectly) {
             hasUncoveredStockNeighbor = true;
             LOG_INFO("[SR] Stock neighbor %08x did not hear transmission directly", stockNeighbor);
+
+            // One SR node owns each uncovered stock neighbour; the others stay silent.
+            NodeNum owner = stockCoverageOwner(routingGraph, myNode, srPeers, stockNeighbor);
+            if (owner != myNode) {
+                LOG_INFO("[SR] Stock neighbor %08x is covered by SR peer %08x (lowest id with an edge), not us",
+                         stockNeighbor, owner);
+                continue;
+            }
 
             // Check if we're the best positioned to reach this stock neighbor
             const NodeEdges* myEdges = routingGraph->getEdgesFrom(myNode);
@@ -2755,10 +2798,25 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         }
     }
 
+    // The SR peers that took part in the ranking: the stock-coverage fallback coordinates
+    // ownership of uncovered mute neighbours across exactly this set.
+    NodeSet srPeers = candidates;
+
+    auto absorbRelayCoverage = [&](NodeNum relay) {
+        const NodeEdges *ne = routingGraph->getEdgesFrom(relay);
+        if (ne) {
+            for (uint8_t j = 0; j < ne->edgeCount; j++) {
+                alreadyCovered.insert(ne->edges[j].to);
+            }
+        }
+        alreadyCovered.insert(relay);
+    };
+
     // Phase 2: Iteratively pick best SR candidate, assign slots
     while (!candidates.empty()) {
         RelayCandidate best = routingGraph->findBestRelayCandidate(candidates, alreadyCovered,
-                                                                    currentTime, p->id, preferHighNodeId, sourceNode);
+                                                                    currentTime, p->id, preferHighNodeId, sourceNode,
+                                                                    myNode);
         if (best.nodeId == 0) {
             break;
         }
@@ -2766,13 +2824,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         candidates.erase(best.nodeId);
 
         if (routingGraph->hasNodeTransmitted(best.nodeId, p->id, currentTime)) {
-            const NodeEdges *ne = routingGraph->getEdgesFrom(best.nodeId);
-            if (ne) {
-                for (uint8_t j = 0; j < ne->edgeCount; j++) {
-                    alreadyCovered.insert(ne->edges[j].to);
-                }
-            }
-            alreadyCovered.insert(best.nodeId);
+            absorbRelayCoverage(best.nodeId);
             LOG_INFO("[SR] Slot --: SR node %08x (already transmitted, coverage absorbed)", best.nodeId);
             continue;
         }
@@ -2787,6 +2839,9 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
 
         LOG_INFO("[SR] Slot %ums: SR node %08x (coverage=%u, cost=%.2f%s)", slotDelay, best.nodeId,
                   best.coverageCount, best.getAvgCost(), best.tier > 0 ? ", bidi" : "");
+        // An earlier slot holder is assumed to relay: subtract its coverage so later candidates
+        // (and the stock-coverage fallback) only relay for nodes nobody ahead of them reaches.
+        absorbRelayCoverage(best.nodeId);
         slotDelay += halfAirtime;
     }
 
@@ -2802,7 +2857,8 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
 
     // Phase 5: Check stock coverage needs
     if (!shouldRelay) {
-        bool stockCoverageNeeded = shouldRelayForStockNeighbors(myNode, sourceNode, heardFrom, relayDecisionTime);
+        bool stockCoverageNeeded =
+            shouldRelayForStockNeighbors(myNode, sourceNode, heardFrom, relayDecisionTime, alreadyCovered, srPeers);
         if (stockCoverageNeeded) {
             shouldRelay = true;
             myDelay = slotDelay;
@@ -3684,6 +3740,12 @@ bool SignalRoutingModule::isNodeRoutable(NodeNum nodeId) const {
     // Check if this is a known mute node (signal_routing_active = false)
     // For remote nodes, we use the capability tracking
     CapabilityStatus status = getCapabilityStatus(nodeId);
+    // SR-passive nodes (CLIENT_MUTE, TRACKER, SENSOR, ...) broadcast topology but never relay, so a
+    // route through one is dead. They remain reachable as destinations: calculateRoute() only applies
+    // this filter to intermediate hops.
+    if (status == CapabilityStatus::Passive) {
+        return false;
+    }
     if (status == CapabilityStatus::Legacy) {
         // Legacy nodes participate in SR routing only if they are routers/repeaters
         // that will actually relay packets

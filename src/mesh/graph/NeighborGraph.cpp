@@ -1037,7 +1037,8 @@ void NeighborGraph::clearInferredEdgesToNode(NodeNum nodeId)
 // --- Relay decisions (ported from GraphLite) ---
 
 size_t NeighborGraph::getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, size_t maxNodes,
-                                           const NodeNum *alreadyCovered, size_t alreadyCoveredCount) const
+                                           const NodeNum *alreadyCovered, size_t alreadyCoveredCount,
+                                           NodeNum selfNode) const
 {
     if (!coveredNodes || maxNodes == 0)
         return 0;
@@ -1048,6 +1049,11 @@ size_t NeighborGraph::getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, 
         return 0;
 
     for (uint8_t i = 0; i < relayEdges->edgeCount && coveredCount < maxNodes; i++) {
+        // Our own Mirrored edges (nodes we only know relayed us, or that listed us) are invisible to
+        // our peers: they rank us on what we report. Counting them here made every node see more
+        // coverage for itself than its neighbours saw for it, and colocated nodes both took slot 0.
+        if (relay == selfNode && selfNode != 0 && relayEdges->edges[i].source != Edge::Source::Reported)
+            continue;
         NodeNum target = relayEdges->edges[i].to;
 
         bool isAlreadyCovered = false;
@@ -1068,7 +1074,8 @@ size_t NeighborGraph::getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, 
 
 RelayCandidate NeighborGraph::findBestRelayCandidate(const NodeSet &candidates, const NodeSet &alreadyCovered,
                                                           uint32_t currentTime, uint32_t packetId,
-                                                          bool preferHighNodeId, NodeNum sourceNode) const
+                                                          bool preferHighNodeId, NodeNum sourceNode,
+                                                          NodeNum selfNode) const
 {
     RelayCandidate bestCandidate(0, 0, 0, 0);
 
@@ -1079,7 +1086,7 @@ RelayCandidate NeighborGraph::findBestRelayCandidate(const NodeSet &candidates, 
         }
 
         NodeNum newCoverage[NODE_SET_MAX];
-        size_t coverageCount = getCoverageIfRelays(candidate, newCoverage, NODE_SET_MAX, nullptr, 0);
+        size_t coverageCount = getCoverageIfRelays(candidate, newCoverage, NODE_SET_MAX, nullptr, 0, selfNode);
 
         size_t uniqueCoverageCount = 0;
         for (size_t i = 0; i < coverageCount; i++) {

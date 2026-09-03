@@ -427,7 +427,8 @@ private:
     NodeNum getPlaceholderForRelay(uint8_t relayId) const;
     void replaceGatewayNode(NodeNum oldNode, NodeNum newNode);
     bool isPlaceholderConnectedToUs(NodeNum placeholderId) const;
-    bool shouldRelayForStockNeighbors(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom, uint32_t currentTime);
+    bool shouldRelayForStockNeighbors(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom, uint32_t currentTime,
+                                      const NodeSet &alreadyCovered, const NodeSet &srPeers);
     bool hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum heardFrom, NodeNum destination = 0);
     bool isNodeRoutable(NodeNum nodeId) const;
     void logNetworkTopology();

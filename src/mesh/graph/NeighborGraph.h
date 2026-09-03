@@ -232,12 +232,15 @@ class NeighborGraph {
 
     bool shouldRelaySimpleConservative(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom, uint32_t currentTime) const;
 
+    /// `selfNode` is the node running the ranking: its own coverage counts only Reported edges (what it
+    /// broadcasts in its topology), so peers ranking it from their mirrored view reach the same order.
     RelayCandidate findBestRelayCandidate(const NodeSet &candidates, const NodeSet &alreadyCovered,
                                           uint32_t currentTime, uint32_t packetId,
-                                          bool preferHighNodeId = false, NodeNum sourceNode = 0) const;
+                                          bool preferHighNodeId = false, NodeNum sourceNode = 0,
+                                          NodeNum selfNode = 0) const;
 
     size_t getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, size_t maxNodes, const NodeNum *alreadyCovered,
-                               size_t alreadyCoveredCount) const;
+                               size_t alreadyCoveredCount, NodeNum selfNode = 0) const;
 
     bool hasUniqueCoverage(NodeNum myNode, const NodeNum *coveredBy, size_t coveredByCount) const;
 
