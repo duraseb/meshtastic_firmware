@@ -699,8 +699,9 @@ void printPacket(const char *prefix, const meshtastic_MeshPacket *p)
         out += DEBUG_PORT.mt_sprintf(" via MQTT");
     if (p->hop_start != 0)
         out += DEBUG_PORT.mt_sprintf(" hopStart=%d", p->hop_start);
-    if (p->next_hop != 0)
-        out += DEBUG_PORT.mt_sprintf(" nextHop=0x%x", p->next_hop);
+    // Unicasts always show the field: a cleared next hop is a routing decision, not an omission.
+    if (p->next_hop != 0 || !isBroadcast(p->to))
+        out += DEBUG_PORT.mt_sprintf(" nextHop=0x%02x", p->next_hop);
     if (p->relay_node != 0)
         out += DEBUG_PORT.mt_sprintf(" relay=0x%x", p->relay_node);
     if (p->priority != 0)
