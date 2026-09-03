@@ -312,6 +312,8 @@ For each candidate (self + SR-active direct neighbors), three tiers that never o
 
 This ensures last-hop delivery nodes are always scheduled before intermediate relays, and within each tier the lower ETX wins.
 
+**Slot timing:** slots are ordinal. Slot 0 keys up at once; every later slot first waits for the leader's relay to have left the air (one airtime plus the maximum contention delay at the current channel utilization), then slots space out by half an airtime. Behind a designated next hop the ranked candidates follow its slot-0 reservation. A deterministic ±quarter-airtime jitter keeps equal slots apart. (The earlier ETX-gap formula masked the tier bit off the costs, so a downstream-tier leader made every gap zero and a node ranked last fired at 0 ms.)
+
 **Next hop on the relayed copy:**
 When SR approves a unicast relay, `NextHopRouter::sendRelay()` stamps SR's route pick as `next_hop` instead of the NodeDB-learned value, or clears the field when the route picker fell back to "relay it ourselves" (our own byte never goes on the wire). The incoming byte is never forwarded: it named us or a node that stayed silent, and legacy nodes relay a unicast only when the byte is clear or their own. A stamped next hop arms the usual relayer-side retransmissions, whose last retry clears the field and falls back to flooding.
 
@@ -345,7 +347,7 @@ SignalRouting uses a deterministic slot-based algorithm to coordinate broadcast 
 When a dupe arrives, `FloodingRouter::perhapsCancelDupe` is called. For SR committed relays, it first checks whether the packet is still in the TX queue (`findInTxQueue`):
 
 - **Already transmitted** (not in TX queue): the packet has already been sent; nothing to cancel. Log "Already relayed — ignoring dupe" and return immediately. Coverage computation is skipped entirely since it would be wasted work.
-- **Still pending** (in TX queue): call `areAllNeighborsCovered(p)` to evaluate whether the dupe relayer now covers all our neighbors. Transmitters are accumulated across all dupes for the same packet (original `heardFrom` + all subsequent dupe relayers). If all neighbors are covered → cancel and clear the committed relay. If we still have unique coverage → keep our scheduled relay.
+- **Still pending** (in TX queue): call `areAllNeighborsCovered(p)` to evaluate whether the dupe relayer now covers all our neighbors. Transmitters are accumulated across all dupes for the same packet (original `heardFrom` + all subsequent dupe relayers). If all neighbors are covered → cancel and clear the committed relay. If we still have unique coverage → keep our scheduled relay. A transmitter's edge counts as coverage only below the poor-link ETX threshold (7.0), the same rule pre-coverage applies at ranking time; and a stock neighbour that a lower-id SR peer owns under the stock-coverage rule is that peer's to cover, so it is not our unique coverage.
 
 Note: a packet is removed from the TX queue at `dequeue()`, which happens immediately before `startSend()` — not after transmission completes. So `findInTxQueue` returns false as soon as the packet starts transmitting.
 

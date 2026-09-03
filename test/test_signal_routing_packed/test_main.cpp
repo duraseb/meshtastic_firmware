@@ -384,6 +384,37 @@ static void test_self_coverage_counts_only_reported_edges()
     TEST_ASSERT_EQUAL_UINT32(me, legacy.nodeId);
 }
 
+static void test_unique_coverage_ignores_poor_links_and_peer_owned_stock_nodes()
+{
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum peer = 0x11111111;
+    constexpr NodeNum u = 0x22222222;
+    constexpr NodeNum mute = 0x33333333;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, peer, 1.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(me, u, 1.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(me, mute, 1.0f, 1000, Edge::Source::Reported);
+    // The peer reaches u only at ETX 40 (heard once, barely) and the mute node well.
+    graph.updateEdge(peer, u, 40.0f, 1000, Edge::Source::Mirrored);
+    graph.updateEdge(peer, mute, 1.5f, 1000, Edge::Source::Mirrored);
+    const NodeNum coveredBy[] = {peer};
+
+    // Legacy rule: any edge is coverage, so nothing is unique.
+    TEST_ASSERT_FALSE(graph.hasUniqueCoverage(me, coveredBy, 1));
+    // With the poor-link threshold the ETX-40 edge does not cover u.
+    TEST_ASSERT_TRUE(graph.hasUniqueCoverage(me, coveredBy, 1, 7.0f));
+    // Fix the peer's link to u: covered again.
+    graph.updateEdge(peer, u, 1.5f, 1000, Edge::Source::Mirrored);
+    TEST_ASSERT_FALSE(graph.hasUniqueCoverage(me, coveredBy, 1, 7.0f));
+    // A neighbour nobody covers is unique, unless another SR peer owns it.
+    const NodeNum nobody[] = {u};
+    TEST_ASSERT_TRUE(graph.hasUniqueCoverage(me, nobody, 1, 7.0f));
+    const NodeNum notOurs[] = {mute, peer};
+    TEST_ASSERT_FALSE(graph.hasUniqueCoverage(me, nobody, 1, 7.0f, notOurs, 2));
+}
+
 } // namespace
 
 void setUp(void) {}
@@ -408,6 +439,7 @@ void setup()
     RUN_TEST(test_topology_listing_us_confirms_sender_hears_us);
     RUN_TEST(test_self_coverage_counts_only_reported_edges);
     RUN_TEST(test_topology_listing_peer_confirms_peer_hears_sender);
+    RUN_TEST(test_unique_coverage_ignores_poor_links_and_peer_owned_stock_nodes);
 
     UNITY_END();
 }

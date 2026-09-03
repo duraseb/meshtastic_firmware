@@ -242,7 +242,11 @@ class NeighborGraph {
     size_t getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, size_t maxNodes, const NodeNum *alreadyCovered,
                                size_t alreadyCoveredCount, NodeNum selfNode = 0) const;
 
-    bool hasUniqueCoverage(NodeNum myNode, const NodeNum *coveredBy, size_t coveredByCount) const;
+    /// Do we still reach a direct neighbour none of `coveredBy` reaches? A coverer's edge counts only
+    /// below `poorLinkEtx` (0 = no threshold), the same rule pre-coverage applies at ranking time.
+    /// `notOurs` lists neighbours another SR peer owns under the stock-coverage rule; they are skipped.
+    bool hasUniqueCoverage(NodeNum myNode, const NodeNum *coveredBy, size_t coveredByCount, float poorLinkEtx = 0.0f,
+                           const NodeNum *notOurs = nullptr, size_t notOursCount = 0) const;
 
     bool isGatewayNode(NodeNum nodeId, NodeNum sourceNode) const;
 

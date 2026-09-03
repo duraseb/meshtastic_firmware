@@ -1946,25 +1946,27 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         srCandidates[j + 1] = key;
     }
 
-    // ETX-weighted slot delay.
+    // Ordinal slot delay, as in MeshRustic.
     //
-    // Each candidate's delay = slotDelay (Phase 1 reservation) + scaledGap + jitter, where
-    // scaledGap stretches with the candidate's cost gap vs. the best candidate. Lower-cost
-    // relays fire sooner; higher-cost relays defer long enough that a better candidate's
-    // transmission would dupe-cancel them via perhapsCancelDupe(). This degrades gracefully
-    // when local SR graphs disagree about ordering — each node picks delay from its own
-    // edge cost without needing a global view.
-    //
-    // etxFixed is ETX*100 (so 100 units == 1 ETX). 1 ETX of gap == 1 halfAirtime of extra delay.
-    const uint16_t bestCost = (srCount > 0) ? (srCandidates[0].cost & 0x7FFFu) : 0;
-    // Deterministic per-packet jitter, ±halfAirtime/4, breaks ties without global coordination.
+    // Candidates hold slots in ranked order. Slot 0 keys up at once. Every later slot first waits
+    // for the leader's relay to have left the air (its contention delay at the current channel
+    // utilization plus one airtime), then slots space out by half an airtime. When Phase 1
+    // reserved slot 0 for a designated next hop, the ranked candidates follow that reservation.
+    // The earlier ETX-gap formula masked the tier bit off the costs, so with a downstream-tier
+    // leader every gap clamped to zero and a node ranked last fired at 0 ms.
+    uint32_t leaderWait = 2 * halfAirtime;
+    if (router && router->getRadioInterface()) {
+        leaderWait = airtimeMs + router->getRadioInterface()->getTxDelayMsecMaxAtUtil();
+    }
+    // Deterministic per-packet jitter, ±halfAirtime/4, keeps two nodes with the same slot apart.
     const uint32_t jitterRange = std::max(halfAirtime / 2, (uint32_t)20);
     const int32_t jitter = (int32_t)(((uint32_t)(myNode ^ p->id)) % jitterRange) - (int32_t)(jitterRange / 2);
     const uint32_t MAX_UNICAST_RELAY_HOLD_MS = 2000;
 
-    LOG_INFO("[SR] Unicast slot scheduling for pkt 0x%08x to %s: halfAirtime=%ums, %u SR candidates, bestCost=%.2f, jitter=%dms",
-              p->id, destName, halfAirtime, srCount, bestCost / 100.0f, jitter);
+    LOG_INFO("[SR] Unicast slot scheduling for pkt 0x%08x to %s: halfAirtime=%ums, %u SR candidates, leaderWait=%ums, jitter=%dms",
+             p->id, destName, halfAirtime, srCount, leaderWait, jitter);
 
+    uint8_t slotIndex = 0; // among candidates that have not transmitted yet
     for (uint8_t i = 0; i < srCount; i++) {
         NodeNum candidate = srCandidates[i].nodeId;
         if (routingGraph->hasNodeTransmitted(candidate, p->id, currentTime)) {
@@ -1980,20 +1982,27 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
                          myNode, p->hop_limit);
                 continue;
             }
-            uint16_t myCostEtx = srCandidates[i].cost & 0x7FFFu;
-            uint16_t costGap = (myCostEtx > bestCost) ? (myCostEtx - bestCost) : 0;
-            uint32_t scaledGap = ((uint32_t)costGap * halfAirtime) / 100u;
-            int64_t totalDelay = (int64_t)slotDelay + (int64_t)scaledGap + (int64_t)jitter;
+            int64_t totalDelay;
+            if (slotDelay > 0) {
+                // Designated next hop owns slot 0; we hold slot slotIndex+1 behind its reservation.
+                totalDelay = (int64_t)slotDelay + (int64_t)slotIndex * halfAirtime;
+            } else if (slotIndex == 0) {
+                totalDelay = 0;
+            } else {
+                totalDelay = (int64_t)leaderWait + (int64_t)(slotIndex - 1) * halfAirtime;
+            }
+            totalDelay += jitter;
             if (totalDelay < 0) totalDelay = 0;
             if ((uint64_t)totalDelay > MAX_UNICAST_RELAY_HOLD_MS) totalDelay = MAX_UNICAST_RELAY_HOLD_MS;
             shouldRelay = true;
             myDelay = (uint32_t)totalDelay;
-            LOG_INFO("[SR] Unicast slot %ums: US (%08x) — cost=%.2f, gap=%.2f, scaledGap=%ums",
-                     myDelay, myNode, myCostEtx / 100.0f, costGap / 100.0f, scaledGap);
+            LOG_INFO("[SR] Unicast slot %ums: US (%08x) — rank %u, cost=%.2f", myDelay, myNode, slotIndex,
+                     (srCandidates[i].cost & 0x7FFFu) / 100.0f);
             break;
         }
-        LOG_INFO("[SR] Unicast slot --: SR node %08x ahead of us (cost=%.2f)",
-                  candidate, srCandidates[i].cost / 100.0f);
+        LOG_INFO("[SR] Unicast slot %u: SR node %08x ahead of us (cost=%.2f%s)", slotIndex, candidate,
+                 (srCandidates[i].cost & 0x7FFFu) / 100.0f, (srCandidates[i].cost & 0x8000u) ? ", indirect" : "");
+        slotIndex++;
     }
 
     LOG_INFO("[SR-DECISION] UNICAST %s pkt=0x%08x: from %s to %s via %s (delay=%ums)",
@@ -2484,7 +2493,33 @@ bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p)
         }
     }
 
-    bool unique = routingGraph->hasUniqueCoverage(myNode, coveredBy, coveredByCount);
+    // Stock neighbours (mute, or legacy nodes that hear us) are covered by exactly one SR node under
+    // the stock-coverage rule: the lowest node id among us and the SR-active peers with an edge to
+    // them. Those a lower-id peer owns are not our unique coverage.
+    NodeNum notOurs[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
+    uint8_t notOursCount = 0;
+    if (const NodeEdges *mine = routingGraph->getEdgesFrom(myNode)) {
+        for (uint8_t i = 0; i < mine->edgeCount && notOursCount < NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE; i++) {
+            NodeNum n = mine->edges[i].to;
+            if (isPlaceholderNode(n) || getCapabilityStatus(n) != CapabilityStatus::Legacy || isImmediateRelayRouter(n)) {
+                continue;
+            }
+            bool peerOwns = false;
+            for (uint8_t j = 0; j < mine->edgeCount && !peerOwns; j++) {
+                NodeNum peer = mine->edges[j].to;
+                if (peer >= myNode || !mine->edges[j].hearsUs || getCapabilityStatus(peer) != CapabilityStatus::SRactive) {
+                    continue;
+                }
+                peerOwns = hasDirectConnectivity(peer, n);
+            }
+            if (peerOwns) {
+                notOurs[notOursCount++] = n;
+            }
+        }
+    }
+
+    bool unique = routingGraph->hasUniqueCoverage(myNode, coveredBy, coveredByCount, cfgPoorLinkEtxThreshold, notOurs,
+                                                  notOursCount);
 
     if (unique) {
         LOG_INFO("[SR] Broadcast dupe pkt=0x%08x from %s — %u transmitters, coverage incomplete — keeping relay",

@@ -1155,7 +1155,8 @@ RelayCandidate NeighborGraph::findBestRelayCandidate(const NodeSet &candidates, 
     return bestCandidate;
 }
 
-bool NeighborGraph::hasUniqueCoverage(NodeNum myNode, const NodeNum *coveredBy, size_t coveredByCount) const
+bool NeighborGraph::hasUniqueCoverage(NodeNum myNode, const NodeNum *coveredBy, size_t coveredByCount, float poorLinkEtx,
+                                      const NodeNum *notOurs, size_t notOursCount) const
 {
     const NodeEdges *myEdges = findNeighbor(myNode);
     if (!myEdges || myEdges->edgeCount == 0) {
@@ -1181,13 +1182,25 @@ bool NeighborGraph::hasUniqueCoverage(NodeNum myNode, const NodeNum *coveredBy, 
         }
         if (isCoverer) continue;
 
-        // Check if any coveredBy node covers this neighbor
+        // A stock neighbour a lower-id SR peer owns is that peer's to cover, not ours.
+        bool ownedElsewhere = false;
+        for (size_t k = 0; k < notOursCount; k++) {
+            if (notOurs[k] == neighbor) {
+                ownedElsewhere = true;
+                break;
+            }
+        }
+        if (ownedElsewhere) continue;
+
+        // Check if any coveredBy node covers this neighbor. A marginal edge (ETX at or above the
+        // poor-link threshold, including the 40.0 "heard once" sentinel) is not coverage.
         bool covered = false;
         for (size_t c = 0; c < coveredByCount && !covered; c++) {
             const NodeEdges *covererEdges = findNeighbor(coveredBy[c]);
             if (covererEdges) {
                 for (uint8_t j = 0; j < covererEdges->edgeCount; j++) {
-                    if (covererEdges->edges[j].to == neighbor) {
+                    const Edge &e = covererEdges->edges[j];
+                    if (e.to == neighbor && (poorLinkEtx <= 0.0f || e.getEtx() < poorLinkEtx)) {
                         covered = true;
                         break;
                     }
