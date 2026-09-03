@@ -448,6 +448,8 @@ The flag matters in four places: T1 retransmit insurance (`hasAnyHearsUsNeighbor
 
 Implemented by `confirmTopologySenderHearsUs()` in `SignalRoutingModule.h`, called from both topology-processing paths. Stale claims are bounded from both sides: the authoritative override clears the flag when Y's next topology omits us, and `pruneCapabilityCache()` clears it when Y stops broadcasting altogether (capability TTL).
 
+The listing is applied to peers as well (`confirmTopologySenderHearsNeighbor()`): every node the sender names that has already reported an edge to the sender gets `hearsUs` on that edge. Two colocated nodes that both just learned a passive neighbour otherwise each modelled the other as not covering it and both took slot 0 for its packets; with the peer's edge flagged from the same report their costs tie and the packet-parity tie-break picks one relayer on both nodes. No edge is invented.
+
 **Bidi slot priority**: In `findBestRelayCandidate()`, candidates with a confirmed bidirectional link (`hearsUs=true`, ETX < 20.0) to the packet source get tier 1 priority. This ensures that on mixed SR/stock branches, the node with round-trip connectivity to the source relays first. Stock nodes on the branch then observe this relay and set their `next_hop` correctly — they never see the asymmetric-link node relay, so they never latch onto an undeliverable gateway.
 
 **Example — mixed branch with asymmetric gateway**:

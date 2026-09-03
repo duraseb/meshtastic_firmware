@@ -303,6 +303,43 @@ static void test_topology_listing_us_confirms_sender_hears_us()
     TEST_ASSERT_TRUE(hearsUsOnEdgeToSender());
 }
 
+static void test_topology_listing_peer_confirms_peer_hears_sender()
+{
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum peer = 0x11111111;
+    constexpr NodeNum passive = 0x22222222;
+    constexpr NodeNum stranger = 0x33333333;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, peer, 1.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(me, passive, 1.0f, 1000, Edge::Source::Reported);
+    // The peer reported the passive node before the passive node listed it.
+    graph.updateEdge(peer, passive, 1.2f, 1000, Edge::Source::Mirrored);
+
+    auto peerEdgeHearsUs = [&]() {
+        const NodeEdges *edges = graph.getEdgesFrom(peer);
+        TEST_ASSERT_NOT_NULL(edges);
+        for (uint8_t i = 0; i < edges->edgeCount; i++) {
+            if (edges->edges[i].to == passive) {
+                return edges->edges[i].hearsUs;
+            }
+        }
+        TEST_FAIL_MESSAGE("peer edge to passive missing");
+        return false;
+    };
+    TEST_ASSERT_FALSE(peerEdgeHearsUs());
+
+    // The passive node lists the peer: the peer's edge to it is now known heard.
+    TEST_ASSERT_TRUE(confirmTopologySenderHearsNeighbor(&graph, passive, peer));
+    TEST_ASSERT_TRUE(peerEdgeHearsUs());
+    TEST_ASSERT_FALSE(confirmTopologySenderHearsNeighbor(&graph, passive, peer));
+
+    // A listed node without an edge to the sender gets nothing invented.
+    TEST_ASSERT_FALSE(confirmTopologySenderHearsNeighbor(&graph, passive, stranger));
+    TEST_ASSERT_NULL(graph.getEdgesFrom(stranger));
+}
+
 static void test_self_coverage_counts_only_reported_edges()
 {
     constexpr NodeNum me = 0x0A0B0C0D;
@@ -370,6 +407,7 @@ void setup()
     RUN_TEST(test_mirrored_edge_update_does_not_upgrade_reported_edge);
     RUN_TEST(test_topology_listing_us_confirms_sender_hears_us);
     RUN_TEST(test_self_coverage_counts_only_reported_edges);
+    RUN_TEST(test_topology_listing_peer_confirms_peer_hears_sender);
 
     UNITY_END();
 }

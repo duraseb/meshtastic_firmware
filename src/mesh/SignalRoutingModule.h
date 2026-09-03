@@ -242,6 +242,33 @@ static inline bool confirmTopologySenderHearsUs(NeighborGraph *graph, NodeNum my
     return false;
 }
 
+// The same listing proves the sender hears every other node it names. If that node has reported an
+// edge to the sender, mark it heard, so we model our peers' coverage of the sender the way they model
+// it themselves. Without this, two nodes that both just learned a passive neighbour each saw the other
+// as not covering it and both took slot 0 for its packets. No edge is invented: only an existing edge
+// listed -> sender is flagged. Returns true only on a false -> true transition.
+static inline bool confirmTopologySenderHearsNeighbor(NeighborGraph *graph, NodeNum sender, NodeNum listedNeighbor)
+{
+    if (!graph || listedNeighbor == sender || listedNeighbor == 0) {
+        return false;
+    }
+    const NodeEdges *edges = graph->getEdgesFrom(listedNeighbor);
+    if (!edges) {
+        return false;
+    }
+    for (uint8_t i = 0; i < edges->edgeCount; i++) {
+        if (edges->edges[i].to != sender) {
+            continue;
+        }
+        if (edges->edges[i].hearsUs) {
+            return false;
+        }
+        graph->setEdgeHearsUs(listedNeighbor, sender, true);
+        return true;
+    }
+    return false;
+}
+
 // Update Reported direct-neighbor edges and the outbound topology signal cache from a local RF observation.
 static inline int refreshReportedDirectNeighborObservation(NeighborGraph *graph, DirectNeighborSignal *signals,
                                                            uint8_t &signalCount, size_t maxSignals, NodeNum myNode,
