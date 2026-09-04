@@ -198,6 +198,11 @@ void SignalRoutingModule::scheduleEmptyTopologyReply(NodeNum senderNodeId, Packe
         return;
     }
 
+    if (lastBootstrapReplyMs != 0 && millis() - lastBootstrapReplyMs < BOOTSTRAP_REPLY_MIN_INTERVAL_MS) {
+        LOG_INFO("[SR] Bootstrap reply rate-limited (last list %u ms ago), %08x gets the periodic broadcast",
+                 millis() - lastBootstrapReplyMs, senderNodeId);
+        return;
+    }
     NodeNum ourNode = nodeDB->getNodeNum();
     uint32_t delayMs = computeEmptyTopologyReplyDelayMs(senderNodeId, packetId, ourNode);
     uint32_t fireAfter = millis() + delayMs;
@@ -287,6 +292,7 @@ int32_t SignalRoutingModule::runOnce()
                 LOG_INFO("[SR] Firing jittered reply to empty SR bootstrap topology");
                 sendSignalRoutingInfo();
                 commitTopologyTxTimestamp();
+                lastBootstrapReplyMs = nowMs;
             }
         }
 
@@ -1568,6 +1574,27 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
         if (routingGraph) {
             uint32_t currentTime = millis() / 1000;  // Use monotonic time
             routingGraph->recordNodeTransmission(mp.from, mp.id, currentTime);
+        }
+        // A passive role never reaches preProcessSignalRoutingPacket (shouldRelay() returns before
+        // calling it), so it never saw a neighbour's empty boot broadcast and never answered it. It
+        // still broadcasts topology, and a rebooted neighbour depends on that listing to learn that
+        // we hear it: two nodes spent 24 minutes without hearsUs on their edge to a phone node this
+        // way. Detect the bootstrap request here and schedule the same jittered reply active nodes send.
+        if (!isActiveRoutingRole() && mp.which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
+            mp.decoded.portnum == meshtastic_PortNum_SIGNAL_ROUTING_APP) {
+            meshtastic_SignalRoutingInfo info = meshtastic_SignalRoutingInfo_init_zero;
+            if (pb_decode_from_bytes(mp.decoded.payload.bytes, mp.decoded.payload.size, &meshtastic_SignalRoutingInfo_msg,
+                                     &info)) {
+                PackedHeader hdr = {};
+                PackedNeighborEntry bootNeighbors[MAX_SIGNAL_ROUTING_NEIGHBORS];
+                uint8_t bootCount = decodePackedNeighbors(info.packed_neighbors.bytes, info.packed_neighbors.size,
+                                                          bootNeighbors, MAX_SIGNAL_ROUTING_NEIGHBORS, &hdr);
+                if (hdr.formatVersion == PACKED_NEIGHBOR_FORMAT_VERSION && bootCount == 0 && hdr.signalRoutingActive) {
+                    LOG_INFO("[SR] Passive role: empty bootstrap from direct SR neighbor %s — scheduling jittered topology reply",
+                             senderName);
+                    scheduleEmptyTopologyReply(mp.from, mp.id);
+                }
+            }
         }
     } else if (notViaMqtt && !isDirectFromSender && mp.relay_node != 0) {
         // Process relayed packets to infer network topology (skip for inactive roles - they only track direct neighbors)

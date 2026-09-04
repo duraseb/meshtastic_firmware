@@ -370,6 +370,11 @@ private:
         uint32_t fireAfterMs = 0;
     };
     PendingTopologyReply pendingTopologyReply;
+    // Bootstrap replies are rate-limited: a burst of empty broadcasts (many reboots, or a rogue) must not
+    // make every node answer each one with its list. The requester is in our graph regardless and gets
+    // the next periodic broadcast.
+    static constexpr uint32_t BOOTSTRAP_REPLY_MIN_INTERVAL_MS = 60000;
+    uint32_t lastBootstrapReplyMs = 0; // 0 = never
     uint8_t currentTopologyVersion = 0;
 
     static constexpr size_t MAX_TOPOLOGY_VERSION_ENTRIES = 24;
