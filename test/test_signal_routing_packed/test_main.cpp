@@ -463,6 +463,30 @@ static void test_topology_version_window_is_forward_only_and_wraps()
     TEST_ASSERT_FALSE(srTopologyVersionInWindow(1, 98));   // rebooted peer: needs boot reset or silence rule
 }
 
+static void test_topology_header_chunk_flags_round_trip()
+{
+    uint8_t buf[PACKED_NEIGHBOR_HEADER_SIZE];
+    PackedHeader h = {};
+    writePackedTopologyHeader(buf, 9, true);
+    TEST_ASSERT_EQUAL_UINT8(0, decodePackedNeighbors(buf, sizeof(buf), nullptr, 0, &h));
+    TEST_ASSERT_EQUAL_UINT8(9, h.topologyVersion);
+    TEST_ASSERT_TRUE(h.signalRoutingActive);
+    TEST_ASSERT_TRUE(h.isCompleteList());
+
+    writePackedTopologyHeader(buf, 9, false, true, false); // first of several chunks
+    decodePackedNeighbors(buf, sizeof(buf), nullptr, 0, &h);
+    TEST_ASSERT_FALSE(h.signalRoutingActive);
+    TEST_ASSERT_TRUE(h.moreChunks);
+    TEST_ASSERT_FALSE(h.continuation);
+    TEST_ASSERT_FALSE(h.isCompleteList());
+
+    writePackedTopologyHeader(buf, 9, true, false, true); // last chunk
+    decodePackedNeighbors(buf, sizeof(buf), nullptr, 0, &h);
+    TEST_ASSERT_FALSE(h.moreChunks);
+    TEST_ASSERT_TRUE(h.continuation);
+    TEST_ASSERT_FALSE(h.isCompleteList());
+}
+
 void setup()
 {
     initializeTestEnvironment();
@@ -484,6 +508,7 @@ void setup()
     RUN_TEST(test_unique_coverage_ignores_poor_links_and_peer_owned_stock_nodes);
     RUN_TEST(test_ranking_costs_within_a_bucket_tie_on_node_id);
     RUN_TEST(test_topology_version_window_is_forward_only_and_wraps);
+    RUN_TEST(test_topology_header_chunk_flags_round_trip);
 
     UNITY_END();
 }

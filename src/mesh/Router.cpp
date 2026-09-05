@@ -392,13 +392,9 @@ ErrorCode Router::send(meshtastic_MeshPacket *p)
         }
 #endif
         p->hop_start = p->hop_limit;
-        // Reset SR broadcast keepalive: any originated packet makes us visible to neighbors,
-        // so there is no need to send a topology broadcast just to prove we are alive.
-#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
-        if (signalRoutingModule) {
-            signalRoutingModule->notifyOriginatedPacketSent();
-        }
-#endif
+        // Originated packets no longer reset the SR topology timer: they prove we are alive but
+        // carry no neighbour list, and a phone-connected node sending positions and telemetry
+        // pushed its topology broadcast back for 10-40 minutes at a time.
     }
 
     // If the packet hasn't yet been encrypted, do so now (it might already be encrypted if we are just forwarding it)

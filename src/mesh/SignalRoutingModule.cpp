@@ -243,14 +243,11 @@ int SignalRoutingModule::refreshReportedDirectNeighbor(NodeNum nodeId, int32_t r
                                                     rssi, snr, nowSecs);
 }
 
-// Write the 5-byte packed header into buf.
-static inline void writePackedHeader(uint8_t *buf, uint8_t topologyVersion, bool signalRoutingActive)
+// Write the 5-byte packed header into buf (see writePackedTopologyHeader for the chunk flags).
+static inline void writePackedHeader(uint8_t *buf, uint8_t topologyVersion, bool signalRoutingActive,
+                                     bool moreChunks = false, bool continuation = false)
 {
-    buf[0] = PACKED_NEIGHBOR_FORMAT_VERSION;
-    buf[1] = PACKED_NEIGHBOR_ENTRY_SIZE;
-    buf[2] = SIGNAL_ROUTING_VERSION;
-    buf[3] = topologyVersion;
-    buf[4] = signalRoutingActive ? PACKED_HEADER_FLAG_SR_ACTIVE : 0;
+    writePackedTopologyHeader(buf, topologyVersion, signalRoutingActive, moreChunks, continuation);
 }
 
 int32_t SignalRoutingModule::runOnce()
@@ -425,7 +422,7 @@ void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
 
         // Build per-packet packed buffer: 5-byte header + this chunk's entries
         uint8_t chunkBuf[PACKED_NEIGHBOR_HEADER_SIZE + MAX_SIGNAL_ROUTING_NEIGHBORS * PACKED_NEIGHBOR_ENTRY_SIZE];
-        writePackedHeader(chunkBuf, topologyVersion, srActive);
+        writePackedHeader(chunkBuf, topologyVersion, srActive, packetIndex + 1 < packetsNeeded, packetIndex > 0);
         size_t dataOffset = PACKED_NEIGHBOR_HEADER_SIZE + startNeighbor * PACKED_NEIGHBOR_ENTRY_SIZE;
         memcpy(&chunkBuf[PACKED_NEIGHBOR_HEADER_SIZE], &allPacked[dataOffset], count * PACKED_NEIGHBOR_ENTRY_SIZE);
         size_t chunkLen = PACKED_NEIGHBOR_HEADER_SIZE + count * PACKED_NEIGHBOR_ENTRY_SIZE;
@@ -437,12 +434,6 @@ void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
     // Update our own capability after sending
     trackNodeCapability(nodeDB->getNodeNum(), isActiveRoutingRole() ? CapabilityStatus::SRactive : CapabilityStatus::Passive);
     topologyBroadcastActive = false;
-}
-
-void SignalRoutingModule::notifyOriginatedPacketSent()
-{
-    LOG_INFO("[SR] Originated packet sent — resetting topology broadcast timer");
-    lastBroadcast = millis();
 }
 
 uint8_t SignalRoutingModule::packNeighborsForBroadcast(uint8_t *outBuf, size_t bufSize)
@@ -636,7 +627,8 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     if (nowMs == 0) nowMs = 1;
 
     bool inWindow = topologyVersionInWindow(receivedVersion, lastProcessedVersion);
-    bool bootReset = neighborCount == 0 && receivedVersion == 0 && isDirectPacket(*p) && hdr.signalRoutingActive;
+    // Passive peers reboot too: their header-only version-0 broadcast resets the tracked version as well.
+    bool bootReset = neighborCount == 0 && receivedVersion == 0 && isDirectPacket(*p);
     bool silence = lastAcceptMs != 0 && (nowMs - lastAcceptMs) >= topologyResyncMs() &&
                    (nowMs - lastAcceptMs) < 0x80000000u;
 
@@ -737,7 +729,38 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     // Authoritative hearsUs override: the topology source is authoritative about who it can hear.
     // If another node claims hearsUs=true on its edge to the source, but the source didn't list
     // that node as a neighbor, clear the flag — the source can't actually hear that node.
-    if (routingGraph && neighborCount > 0) {
+    // The rule needs the source's complete list: chunks of a multi-packet report are gathered in
+    // pendingListed and the rule runs on the last chunk. A chunk whose first packet was missed leaves
+    // the flags untouched.
+    if (!hdr.continuation) {
+        pendingListedValid = true;
+        pendingListedSender = p->from;
+        pendingListedVersion = receivedVersion;
+        pendingListedCount = 0;
+    }
+    const NodeNum *listedIds = nullptr;
+    uint8_t listedCount = 0;
+    if (pendingListedValid && pendingListedSender == p->from && pendingListedVersion == receivedVersion) {
+        for (uint8_t i = 0; i < neighborCount; i++) {
+            if (pendingListedCount < NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE) {
+                pendingListed[pendingListedCount++] = neighbors[i].nodeId;
+            } else {
+                pendingListedValid = false;
+            }
+        }
+        if (!hdr.moreChunks) {
+            if (pendingListedValid) {
+                listedIds = pendingListed;
+                listedCount = pendingListedCount;
+            }
+            pendingListedValid = false;
+        }
+    } else if (hdr.continuation) {
+        LOG_INFO("[SR] Topology chunk from %08x (version %u) without its first packet — hearsUs override skipped",
+                 p->from, receivedVersion);
+        pendingListedValid = false;
+    }
+    if (routingGraph && listedIds && listedCount > 0) {
         NodeNum allNodes[NEIGHBOR_GRAPH_MAX_NEIGHBORS];
         size_t nodeCount = routingGraph->getAllNodeIds(allNodes, NEIGHBOR_GRAPH_MAX_NEIGHBORS);
         for (size_t n = 0; n < nodeCount; n++) {
@@ -751,10 +774,10 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
             }
             for (uint8_t e = 0; e < nodeEdges->edgeCount; e++) {
                 if (nodeEdges->edges[e].to == p->from && nodeEdges->edges[e].hearsUs) {
-                    // Check if the source listed this node as a neighbor
+                    // Check if the source listed this node as a neighbor (whole list, all chunks)
                     bool foundInNeighborList = false;
-                    for (uint8_t i = 0; i < neighborCount; i++) {
-                        if (neighbors[i].nodeId == nodeId) {
+                    for (uint8_t i = 0; i < listedCount; i++) {
+                        if (listedIds[i] == nodeId) {
                             foundInNeighborList = true;
                             break;
                         }

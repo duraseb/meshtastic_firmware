@@ -159,7 +159,7 @@ All discovery mechanisms are used to maintain comprehensive network topology:
 
 1. **Direct Neighbor Detection**: When receiving packets directly with signal data (RSSI/SNR), immediate neighbor relationships are established with calculated ETX values
 
-2. **Topology Broadcasts**: Periodically broadcast their complete neighbor list using a packed binary format (8 bytes/neighbor) for comprehensive topology learning from other nodes' perspectives. Each entry carries the neighbor's node ID, RSSI, SNR, capability flags, and ETX variance — giving every node the same link stability view. **Transmit path:** a local `directSignals[]` side table (sized to `NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE`, same as direct edge slots) caches the real measured RSSI/SNR from direct RX (`updateNeighborInfo()` only); topology packing reads from that table rather than approximating signal from stored ETX. **Receive path:** mirrored/downstream links remain ETX-only in RAM; merge still uses `calculateETX(reported_rssi, reported_snr)`. The `hop_limit` of every SR topology packet is capped at `cfgBroadcastMaxHops` (default `SR_BROADCAST_MAX_HOPS`), even if the user has configured a higher limit, to bound topology gossip propagation in large networks. **Version acceptance:** each broadcast carries the sender's u8 topology version. A report is processed when its version repeats or moves forward from the last accepted one by less than 128 (wraparound-safe), when it is the sender's header-only boot broadcast with version 0 (the sender's counter restarted, so the tracked version is reset to 0), or when nothing has been accepted from that sender for two broadcast intervals (`2 × topology_broadcast_secs`, any version is taken as the new base). The last two rules keep a rebooted neighbour from being ignored for hours while its counter catches up; each such re-base is logged as `Topology version resync`. Anything else is logged as `Ignoring stale topology broadcast` and does not touch the graph.
+2. **Topology Broadcasts**: Periodically broadcast their complete neighbor list using a packed binary format (8 bytes/neighbor) for comprehensive topology learning from other nodes' perspectives. Each entry carries the neighbor's node ID, RSSI, SNR, capability flags, and ETX variance — giving every node the same link stability view. **Transmit path:** a local `directSignals[]` side table (sized to `NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE`, same as direct edge slots) caches the real measured RSSI/SNR from direct RX (`updateNeighborInfo()` only); topology packing reads from that table rather than approximating signal from stored ETX. **Receive path:** mirrored/downstream links remain ETX-only in RAM; merge still uses `calculateETX(reported_rssi, reported_snr)`. The `hop_limit` of every SR topology packet is capped at `cfgBroadcastMaxHops` (default `SR_BROADCAST_MAX_HOPS`), even if the user has configured a higher limit, to bound topology gossip propagation in large networks. **Multi-packet lists:** more than `MAX_SIGNAL_ROUTING_NEIGHBORS` (28) neighbours go out as several chunks of the same topology version, spaced 2× the packet airtime. Header flag bits mark them (`0x02` more chunks follow, `0x04` not the first chunk); a packet with neither flag is a complete list. The authoritative hearsUs override (below) needs the complete list, so receivers gather the listed ids across chunks and run it on the last one; a continuation whose first chunk was missed leaves the flags untouched. The periodic timer is not reset by originated packets: they prove the node is alive but carry no neighbour list. **Version acceptance:** each broadcast carries the sender's u8 topology version. A report is processed when its version repeats or moves forward from the last accepted one by less than 128 (wraparound-safe), when it is the sender's header-only boot broadcast with version 0 (the sender's counter restarted, so the tracked version is reset to 0), or when nothing has been accepted from that sender for two broadcast intervals (`2 × topology_broadcast_secs`, any version is taken as the new base). The last two rules keep a rebooted neighbour from being ignored for hours while its counter catches up; each such re-base is logged as `Topology version resync`. Anything else is logged as `Ignoring stale topology broadcast` and does not touch the graph.
 
 3. **Relayed Packet Inference**: When receiving a relayed packet, gateway relationships are inferred between the original sender and the relay node. If the relay node is a stock (Legacy) firmware node, a directed edge is also recorded from the relay to the sender — observing a successful relay proves the relay can hear the sender, regardless of the sender's firmware type. The reverse edge is not assumed.
 
@@ -581,7 +581,7 @@ The `NeighborGraph` class uses fixed-size arrays (~24 KB heap) and runs on all p
 **Memory Structure:**
 ```cpp
 class NeighborGraph {
-    NodeEdges neighbors[24];              // Direct neighbor slots (24 nodes × 24 edges each)
+    NodeEdges neighbors[32];              // Graph node slots (32 nodes × 32 edges each, ~17 KB)
     DownstreamEntry downstream[1100];     // Remote node routing table
     RelayState relayStates[32];           // Transmission tracking for contention
     Route routeCache[32];                 // Cached Dijkstra results
@@ -594,7 +594,7 @@ class NeighborGraph {
 | Struct | Purpose |
 |--------|---------|
 | `Edge` | Link to a neighbor with ETX (fixed-point ×100), variance, source (Reported/Mirrored), timestamp |
-| `NodeEdges` | A neighbor slot: nodeId + up to 24 edges + last full update time |
+| `NodeEdges` | A neighbor slot: nodeId + up to 32 edges + last full update time |
 | `DownstreamEntry` | Remote node routing: (destination, relay, cost, lastUpdate) |
 | `Route` | Cached route result: (destination, nextHop, cost, timestamp) |
 | `RelayCandidate` | Relay selection: (nodeId, coverageCount, avgCost, tier) |
@@ -604,8 +604,8 @@ class NeighborGraph {
 
 | Parameter | Default | Purpose |
 |-----------|---------|---------|
-| `NEIGHBOR_GRAPH_MAX_NEIGHBORS` | 24 | Direct neighbor slots |
-| `NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE` | 24 | Max edges per neighbor |
+| `NEIGHBOR_GRAPH_MAX_NEIGHBORS` | 32 | Graph node slots (heap; nodes run with ~42-46 KB free) |
+| `NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE` | 32 | Max edges per node (a city hub hears well over 24; at 24 real neighbours were evicted) |
 | `NEIGHBOR_GRAPH_MAX_DOWNSTREAM` | 1100 | Remote node routing entries |
 | `NEIGHBOR_GRAPH_MAX_RELAY_STATES` | 32 | Transmission tracking slots |
 | `NEIGHBOR_GRAPH_MAX_CACHED_ROUTES` | 32 | Dijkstra result cache |

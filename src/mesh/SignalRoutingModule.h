@@ -16,9 +16,28 @@ static constexpr uint8_t PACKED_NEIGHBOR_HEADER_SIZE = 5; // format_version + en
 static constexpr uint8_t PACKED_NEIGHBOR_FLAG_SR_ACTIVE = 0x01;
 static constexpr uint8_t PACKED_NEIGHBOR_FLAG_HEARS_US = 0x02;
 static constexpr uint8_t PACKED_HEADER_FLAG_SR_ACTIVE = 0x01;
+static constexpr uint8_t PACKED_HEADER_FLAG_MORE_CHUNKS = 0x02;   // more chunks of this version follow
+static constexpr uint8_t PACKED_HEADER_FLAG_CONTINUATION = 0x04;  // not the first chunk of this version
 
 // Maximum neighbors per SR broadcast packet (28 fit in 233 byte payload with packed encoding)
 #define MAX_SIGNAL_ROUTING_NEIGHBORS 28
+
+// Write the 5-byte packed header. Receivers only apply the "unlisted neighbour does not hear the
+// sender" rule once they hold the whole list, so every chunk except the last carries moreChunks and
+// every chunk except the first carries continuation.
+static inline void writePackedTopologyHeader(uint8_t *buf, uint8_t topologyVersion, bool signalRoutingActive,
+                                             bool moreChunks = false, bool continuation = false)
+{
+    buf[0] = PACKED_NEIGHBOR_FORMAT_VERSION;
+    buf[1] = PACKED_NEIGHBOR_ENTRY_SIZE;
+    buf[2] = SIGNAL_ROUTING_VERSION;
+    buf[3] = topologyVersion;
+    uint8_t flags = 0;
+    if (signalRoutingActive) flags |= PACKED_HEADER_FLAG_SR_ACTIVE;
+    if (moreChunks) flags |= PACKED_HEADER_FLAG_MORE_CHUNKS;
+    if (continuation) flags |= PACKED_HEADER_FLAG_CONTINUATION;
+    buf[4] = flags;
+}
 
 // Decoded packed neighbor entry for iteration
 struct PackedNeighborEntry {
@@ -37,6 +56,10 @@ struct PackedHeader {
     uint8_t routingVersion;
     uint8_t topologyVersion;
     bool signalRoutingActive;
+    bool moreChunks;   // set on every chunk except the last of a multi-packet list
+    bool continuation; // set on every chunk except the first of a multi-packet list
+    // A single packet (or a sender predating the chunk flags) carries the whole list.
+    bool isCompleteList() const { return !moreChunks && !continuation; }
 };
 
 // Decode packed_neighbors bytes. Returns number of entries decoded into outEntries.
@@ -56,6 +79,8 @@ static inline uint8_t decodePackedNeighbors(const uint8_t *data, size_t dataLen,
         header->routingVersion = data[2];
         header->topologyVersion = data[3];
         header->signalRoutingActive = (data[4] & PACKED_HEADER_FLAG_SR_ACTIVE) != 0;
+        header->moreChunks = (data[4] & PACKED_HEADER_FLAG_MORE_CHUNKS) != 0;
+        header->continuation = (data[4] & PACKED_HEADER_FLAG_CONTINUATION) != 0;
     }
 
     if (data[0] != PACKED_NEIGHBOR_FORMAT_VERSION) {
@@ -342,7 +367,6 @@ public:
     // Call when this node originates and sends any packet (not a relay).
     // Resets the topology-broadcast keepalive timer so we don't send redundant broadcasts
     // while we are already visible to neighbors due to recent transmissions.
-    void notifyOriginatedPacketSent();
 
     // Returns true if the packet was received directly from the sender (not relayed).
     // Checks both hop_start==hop_limit and relay_node matching the sender's last byte.
@@ -385,7 +409,7 @@ private:
     uint32_t lastBootstrapReplyMs = 0; // 0 = never
     uint8_t currentTopologyVersion = 0;
 
-    static constexpr size_t MAX_TOPOLOGY_VERSION_ENTRIES = 24;
+    static constexpr size_t MAX_TOPOLOGY_VERSION_ENTRIES = NEIGHBOR_GRAPH_MAX_NEIGHBORS;
     struct TopologyVersionEntry {
         NodeNum nodeId = 0;
         uint8_t version = 0;
@@ -395,6 +419,13 @@ private:
     uint8_t lastTopologyVersionCount = 0;
     TopologyVersionEntry lastPreProcessedVersion[MAX_TOPOLOGY_VERSION_ENTRIES];
     uint8_t lastPreProcessedVersionCount = 0;
+
+    // Neighbour ids listed so far by a multi-chunk topology report (see preProcessSignalRoutingPacket).
+    NodeNum pendingListed[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
+    uint8_t pendingListedCount = 0;
+    NodeNum pendingListedSender = 0;
+    uint8_t pendingListedVersion = 0;
+    bool pendingListedValid = false;
 
     uint8_t getTopologyVersion(const TopologyVersionEntry *table, uint8_t count, NodeNum nodeId,
                                uint32_t *lastAcceptMs = nullptr) const;
