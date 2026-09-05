@@ -198,6 +198,14 @@ static inline uint32_t computeEmptyTopologyReplyDelayMs(NodeNum senderNodeId, Pa
            ((senderNodeId ^ packetId ^ ourNodeId) % EMPTY_TOPOLOGY_REPLY_DELAY_JITTER_MS);
 }
 
+// A peer's topology version is in the accept window when it repeats the last accepted one or moves
+// forward by less than half the u8 range (wraparound-safe). Anything else is stale unless the boot-reset
+// or silence rule in preProcessSignalRoutingPacket() applies.
+static inline bool srTopologyVersionInWindow(uint8_t received, uint8_t last)
+{
+    return static_cast<uint8_t>(received - last) < 0x80;
+}
+
 static inline bool hasReportedDirectEdgeTo(const NeighborGraph *graph, NodeNum myNode, NodeNum neighborId)
 {
     if (!graph) {
@@ -381,14 +389,23 @@ private:
     struct TopologyVersionEntry {
         NodeNum nodeId = 0;
         uint8_t version = 0;
+        uint32_t lastAcceptMs = 0; // millis() of the last accepted report, 0 = never
     };
     TopologyVersionEntry lastTopologyVersion[MAX_TOPOLOGY_VERSION_ENTRIES];
     uint8_t lastTopologyVersionCount = 0;
     TopologyVersionEntry lastPreProcessedVersion[MAX_TOPOLOGY_VERSION_ENTRIES];
     uint8_t lastPreProcessedVersionCount = 0;
 
-    uint8_t getTopologyVersion(const TopologyVersionEntry *table, uint8_t count, NodeNum nodeId) const;
-    void setTopologyVersion(TopologyVersionEntry *table, uint8_t &count, NodeNum nodeId, uint8_t version);
+    uint8_t getTopologyVersion(const TopologyVersionEntry *table, uint8_t count, NodeNum nodeId,
+                               uint32_t *lastAcceptMs = nullptr) const;
+    void setTopologyVersion(TopologyVersionEntry *table, uint8_t &count, NodeNum nodeId, uint8_t version,
+                            uint32_t nowMs = 0);
+    // A peer's topology version is accepted when it moves forward by less than half the counter range
+    // (or repeats). A header-only broadcast with version 0 is the peer's boot announcement and resets
+    // what we track. After two silent broadcast intervals any version is accepted again, so a peer
+    // whose counter restarted (reboot, missed boot broadcast) is not ignored until its counter catches up.
+    static bool topologyVersionInWindow(uint8_t received, uint8_t last) { return srTopologyVersionInWindow(received, last); }
+    uint32_t topologyResyncMs() const { return 2 * cfgBroadcastSecs * 1000; }
 
     bool isSignalBasedCapable(NodeNum nodeId) const;
     uint8_t packNeighborsForBroadcast(uint8_t *outBuf, size_t bufSize);

@@ -451,6 +451,18 @@ void setUp(void) {}
 
 void tearDown(void) {}
 
+static void test_topology_version_window_is_forward_only_and_wraps()
+{
+    TEST_ASSERT_TRUE(srTopologyVersionInWindow(1, 0));     // first report from an unknown peer
+    TEST_ASSERT_TRUE(srTopologyVersionInWindow(6, 5));     // next version
+    TEST_ASSERT_TRUE(srTopologyVersionInWindow(5, 5));     // repeat / continuation chunk
+    TEST_ASSERT_TRUE(srTopologyVersionInWindow(2, 250));   // wraparound
+    TEST_ASSERT_TRUE(srTopologyVersionInWindow(132, 5));   // +127 still forward
+    TEST_ASSERT_FALSE(srTopologyVersionInWindow(4, 5));    // backwards
+    TEST_ASSERT_FALSE(srTopologyVersionInWindow(133, 5));  // +128 reads as backwards
+    TEST_ASSERT_FALSE(srTopologyVersionInWindow(1, 98));   // rebooted peer: needs boot reset or silence rule
+}
+
 void setup()
 {
     initializeTestEnvironment();
@@ -471,6 +483,7 @@ void setup()
     RUN_TEST(test_topology_listing_peer_confirms_peer_hears_sender);
     RUN_TEST(test_unique_coverage_ignores_poor_links_and_peer_owned_stock_nodes);
     RUN_TEST(test_ranking_costs_within_a_bucket_tie_on_node_id);
+    RUN_TEST(test_topology_version_window_is_forward_only_and_wraps);
 
     UNITY_END();
 }

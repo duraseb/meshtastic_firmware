@@ -17,31 +17,41 @@
 SignalRoutingModule *signalRoutingModule;
 
 // --- Fixed-size topology version table helpers ---
-uint8_t SignalRoutingModule::getTopologyVersion(const TopologyVersionEntry *table, uint8_t count, NodeNum nodeId) const
-{
-    for (uint8_t i = 0; i < count; i++) {
-        if (table[i].nodeId == nodeId) return table[i].version;
-    }
-    return 0;
-}
-
-void SignalRoutingModule::setTopologyVersion(TopologyVersionEntry *table, uint8_t &count, NodeNum nodeId, uint8_t version)
+uint8_t SignalRoutingModule::getTopologyVersion(const TopologyVersionEntry *table, uint8_t count, NodeNum nodeId,
+                                                uint32_t *lastAcceptMs) const
 {
     for (uint8_t i = 0; i < count; i++) {
         if (table[i].nodeId == nodeId) {
+            if (lastAcceptMs) *lastAcceptMs = table[i].lastAcceptMs;
+            return table[i].version;
+        }
+    }
+    if (lastAcceptMs) *lastAcceptMs = 0;
+    return 0;
+}
+
+void SignalRoutingModule::setTopologyVersion(TopologyVersionEntry *table, uint8_t &count, NodeNum nodeId, uint8_t version,
+                                             uint32_t nowMs)
+{
+    // nowMs 0 keeps the stored accept time (callers pass a non-zero millis() when a report is accepted).
+    for (uint8_t i = 0; i < count; i++) {
+        if (table[i].nodeId == nodeId) {
             table[i].version = version;
+            if (nowMs) table[i].lastAcceptMs = nowMs;
             return;
         }
     }
+    TopologyVersionEntry *slot;
     if (count < MAX_TOPOLOGY_VERSION_ENTRIES) {
-        table[count].nodeId = nodeId;
-        table[count].version = version;
+        slot = &table[count];
         count++;
     } else {
         // Overwrite oldest (slot 0) and shift isn't worth it — just overwrite first slot
-        table[0].nodeId = nodeId;
-        table[0].version = version;
+        slot = &table[0];
     }
+    slot->nodeId = nodeId;
+    slot->version = version;
+    slot->lastAcceptMs = nowMs;
 }
 
 // Helper to get node display name for logging
@@ -616,30 +626,33 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
         return;
     }
 
-    // Check version validity with wraparound logic
+    // Version acceptance: forward window, boot reset, or resync after two silent intervals
+    // (see topologyVersionInWindow in the header).
     uint8_t receivedVersion = hdr.topologyVersion;
-    uint8_t lastProcessedVersion = getTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, p->from);
+    uint32_t lastAcceptMs = 0;
+    uint8_t lastProcessedVersion =
+        getTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, p->from, &lastAcceptMs);
+    uint32_t nowMs = millis();
+    if (nowMs == 0) nowMs = 1;
 
-    bool accept = false;
-    if (receivedVersion > lastProcessedVersion) {
-        accept = true;
-    } else if (receivedVersion < lastProcessedVersion) {
-        uint8_t threshold = (lastProcessedVersion + 256 - 100) % 256;
-        if (receivedVersion >= threshold || receivedVersion < 100) {
-            accept = true;
-        }
-    } else if (receivedVersion == lastProcessedVersion) {
-        accept = true;
-    }
+    bool inWindow = topologyVersionInWindow(receivedVersion, lastProcessedVersion);
+    bool bootReset = neighborCount == 0 && receivedVersion == 0 && isDirectPacket(*p) && hdr.signalRoutingActive;
+    bool silence = lastAcceptMs != 0 && (nowMs - lastAcceptMs) >= topologyResyncMs() &&
+                   (nowMs - lastAcceptMs) < 0x80000000u;
 
-    if (!accept) {
+    if (!inWindow && !bootReset && !silence) {
         LOG_INFO("[SR] Ignoring stale topology broadcast from %08x (version %u, last processed %u)",
                  p->from, receivedVersion, lastProcessedVersion);
         return;
     }
+    if (!inWindow || (bootReset && lastProcessedVersion != 0)) {
+        LOG_INFO("[SR] Topology version resync from %08x: received %u, last %u%s", p->from, receivedVersion,
+                 lastProcessedVersion, bootReset ? " (boot broadcast)" : (silence ? " (silent peer)" : ""));
+    }
 
     bool isNewVersion = (receivedVersion != lastProcessedVersion);
-    setTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, p->from, receivedVersion);
+    // A boot broadcast restarts the peer's counter: track 0 so its first real list (version 1) is new.
+    setTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, p->from, bootReset ? 0 : receivedVersion, nowMs);
 
     // Update capability status for the sender
     CapabilityStatus newStatus = hdr.signalRoutingActive ? CapabilityStatus::SRactive : CapabilityStatus::Passive;
@@ -758,11 +771,9 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
         }
     }
 
-    // Update last processed version (minimal state tracking)
-    setTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, p->from, receivedVersion);
-
     // Record that this version was pre-processed so handleReceivedProtobuf can skip redundant work
-    setTopologyVersion(lastPreProcessedVersion, lastPreProcessedVersionCount, p->from, receivedVersion);
+    // (the accepted-version table was updated at the acceptance check above).
+    setTopologyVersion(lastPreProcessedVersion, lastPreProcessedVersionCount, p->from, receivedVersion, nowMs);
 
 }
 meshtastic_MeshPacket *SignalRoutingModule::allocReply()
@@ -838,9 +849,17 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
         LOG_INFO("[SR] Received topology from passive SR node %08x - storing edges for direct connection detection", mp.from);
     }
 
-    // Check if preProcessSignalRoutingPacket already handled edge clearing and rebuilding
+    // Check if preProcessSignalRoutingPacket already handled edge clearing and rebuilding. It runs first
+    // for every SR broadcast an active role receives, so a version it did not record was rejected as
+    // stale there — the graph must not be rebuilt from that packet here either.
     uint8_t preProcessedVer = getTopologyVersion(lastPreProcessedVersion, lastPreProcessedVersionCount, mp.from);
-    bool alreadyPreProcessed = (preProcessedVer != 0 && preProcessedVer == hdr.routingVersion);
+    uint8_t acceptedVer = getTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, mp.from);
+    bool alreadyPreProcessed = (preProcessedVer == hdr.topologyVersion);
+    if (!alreadyPreProcessed && !srTopologyVersionInWindow(hdr.topologyVersion, acceptedVer)) {
+        LOG_INFO("[SR] Stale topology from %s (version %u, last accepted %u) — graph unchanged", senderName,
+                 hdr.topologyVersion, acceptedVer);
+        return false;
+    }
 
     if (!alreadyPreProcessed) {
         // Clear inferred edges pointing TO this node that were created before we knew it was SR-capable
