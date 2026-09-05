@@ -1846,6 +1846,42 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     // would refuse the packet and SR peers would wait for a second copy from us).
     pendingUnicastNextHop = (myNextHop == myNode) ? 0 : myNextHop;
 
+    // Heard straight from the source, and the source's own topology says the destination hears it:
+    // the destination most likely has the packet already. A routing ACK on that link is never
+    // relayed (a lost ACK is covered by the sender's retransmission). Anything else waits for the
+    // destination's ACK or reply, which cancels the queued relay through the stock
+    // cancelSending(request_id) path; only silence lets the relay go. Colocated receivers lose about
+    // half the frames of a very strong neighbour, so the relay must stay available, just not be first.
+    uint32_t destAckWaitMs = 0;
+    if (heardFrom == sourceNode) {
+        const NodeEdges *srcEdges = routingGraph->getEdgesFrom(sourceNode);
+        const Edge *srcToDest = nullptr;
+        if (srcEdges) {
+            for (uint8_t i = 0; i < srcEdges->edgeCount; i++) {
+                if (srcEdges->edges[i].to == destination) {
+                    srcToDest = &srcEdges->edges[i];
+                    break;
+                }
+            }
+        }
+        if (srcToDest) {
+            if (p->decoded.portnum == meshtastic_PortNum_ROUTING_APP && p->decoded.request_id != 0) {
+                LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: from %s to %s, routing ACK retraces the link the sender heard the destination on",
+                         p->id, srcName, destName);
+                return false;
+            }
+            if (srcToDest->hearsUs) {
+                uint32_t contention = 2 * halfAirtime;
+                if (router && router->getRadioInterface()) {
+                    contention = router->getRadioInterface()->getTxDelayMsecMaxAtUtil();
+                }
+                destAckWaitMs = airtimeMs + 2 * contention;
+                LOG_INFO("[SR] Unicast pkt=0x%08x: %s hears %s directly — waiting %ums for its ACK before any relay",
+                         p->id, destName, srcName, destAckWaitMs);
+            }
+        }
+    }
+
     // Returns the candidate's cost to reach destination, in three tiers that never overlap:
     //   direct edge to destination      -> etxFixed (clamped below 0x7FFF)
     //   known downstream relay of dest  -> 0x7FFF (the downstream table is often the only knowledge
@@ -1883,7 +1919,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
 
     const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
 
-    uint32_t slotDelay = 0;
+    uint32_t slotDelay = destAckWaitMs; // every slot sits behind the destination's chance to answer
     bool shouldRelay = false;
     uint32_t myDelay = 0;
 
@@ -1895,8 +1931,9 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     if (p->next_hop != NO_NEXT_HOP_PREFERENCE) {
         uint8_t ourLastByte = nodeDB->getLastByteOfNodeNum(myNode);
         if (ourLastByte == p->next_hop) {
-            LOG_INFO("[SR-DECISION] UNICAST RELAY pkt=0x%08x: from %s to %s, we are designated next_hop (slot 0)", p->id, srcName, destName);
-            pendingRelayDelayMs = 0;
+            LOG_INFO("[SR-DECISION] UNICAST RELAY pkt=0x%08x: from %s to %s, we are designated next_hop (slot 0, after %ums)",
+                     p->id, srcName, destName, destAckWaitMs);
+            pendingRelayDelayMs = destAckWaitMs;
             routingGraph->recordNodeTransmission(myNode, p->id, currentTime);
             return true;
         }
