@@ -617,8 +617,8 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
         return;
     }
 
-    // Version acceptance: forward window, boot reset, or resync after two silent intervals
-    // (see topologyVersionInWindow in the header).
+    // Version acceptance: first contact, forward window, boot reset, or resync after two silent
+    // intervals (srTopologyVersionVerdict in the header).
     uint8_t receivedVersion = hdr.topologyVersion;
     uint32_t lastAcceptMs = 0;
     uint8_t lastProcessedVersion =
@@ -626,25 +626,23 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     uint32_t nowMs = millis();
     if (nowMs == 0) nowMs = 1;
 
-    bool inWindow = topologyVersionInWindow(receivedVersion, lastProcessedVersion);
     // Passive peers reboot too: their header-only version-0 broadcast resets the tracked version as well.
-    bool bootReset = neighborCount == 0 && receivedVersion == 0 && isDirectPacket(*p);
-    bool silence = lastAcceptMs != 0 && (nowMs - lastAcceptMs) >= topologyResyncMs() &&
-                   (nowMs - lastAcceptMs) < 0x80000000u;
-
-    if (!inWindow && !bootReset && !silence) {
+    bool bootBroadcast = neighborCount == 0 && receivedVersion == 0 && isDirectPacket(*p);
+    SrTopologyVerdict verdict = srTopologyVersionVerdict(receivedVersion, lastProcessedVersion, lastAcceptMs, nowMs,
+                                                         topologyResyncMs(), bootBroadcast);
+    if (verdict == SrTopologyVerdict::Stale) {
         LOG_INFO("[SR] Ignoring stale topology broadcast from %08x (version %u, last processed %u)",
                  p->from, receivedVersion, lastProcessedVersion);
         return;
     }
-    if (!inWindow || (bootReset && lastProcessedVersion != 0)) {
-        LOG_INFO("[SR] Topology version resync from %08x: received %u, last %u%s", p->from, receivedVersion,
-                 lastProcessedVersion, bootReset ? " (boot broadcast)" : (silence ? " (silent peer)" : ""));
+    if (verdict == SrTopologyVerdict::BootReset || verdict == SrTopologyVerdict::SilenceResync) {
+        LOG_INFO("[SR] Topology version resync from %08x: received %u, last %u (%s)", p->from, receivedVersion,
+                 lastProcessedVersion, verdict == SrTopologyVerdict::BootReset ? "boot broadcast" : "silent peer");
     }
 
     bool isNewVersion = (receivedVersion != lastProcessedVersion);
     // A boot broadcast restarts the peer's counter: track 0 so its first real list (version 1) is new.
-    setTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, p->from, bootReset ? 0 : receivedVersion, nowMs);
+    setTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, p->from, bootBroadcast ? 0 : receivedVersion, nowMs);
 
     // Update capability status for the sender
     CapabilityStatus newStatus = hdr.signalRoutingActive ? CapabilityStatus::SRactive : CapabilityStatus::Passive;
@@ -876,9 +874,11 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
     // for every SR broadcast an active role receives, so a version it did not record was rejected as
     // stale there — the graph must not be rebuilt from that packet here either.
     uint8_t preProcessedVer = getTopologyVersion(lastPreProcessedVersion, lastPreProcessedVersionCount, mp.from);
-    uint8_t acceptedVer = getTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, mp.from);
+    uint32_t acceptedAtMs = 0;
+    uint8_t acceptedVer = getTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, mp.from, &acceptedAtMs);
     bool alreadyPreProcessed = (preProcessedVer == hdr.topologyVersion);
-    if (!alreadyPreProcessed && !srTopologyVersionInWindow(hdr.topologyVersion, acceptedVer)) {
+    // Only a sender with accepted history can be stale; a first contact is never rejected here.
+    if (!alreadyPreProcessed && acceptedAtMs != 0 && !srTopologyVersionInWindow(hdr.topologyVersion, acceptedVer)) {
         LOG_INFO("[SR] Stale topology from %s (version %u, last accepted %u) — graph unchanged", senderName,
                  hdr.topologyVersion, acceptedVer);
         return false;

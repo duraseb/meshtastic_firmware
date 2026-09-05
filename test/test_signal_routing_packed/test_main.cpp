@@ -487,6 +487,28 @@ static void test_topology_header_chunk_flags_round_trip()
     TEST_ASSERT_FALSE(h.isCompleteList());
 }
 
+static void test_topology_version_verdict_rules()
+{
+    const uint32_t resync = 1200000; // 2 x 600 s
+    // First contact accepts any version, including one past the 128 window (FCM6 was at 148).
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::FirstContact, srTopologyVersionVerdict(148, 0, 0, 5000, resync, false));
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::FirstContact, srTopologyVersionVerdict(0, 0, 0, 5000, resync, true));
+    // Normal forward moves and repeats.
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::Accept, srTopologyVersionVerdict(149, 148, 5000, 6000, resync, false));
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::Accept, srTopologyVersionVerdict(148, 148, 5000, 6000, resync, false));
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::Accept, srTopologyVersionVerdict(3, 250, 5000, 6000, resync, false));
+    // Backwards is stale while the peer keeps talking...
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(1, 26, 5000, 6000, resync, false));
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(1, 26, 5000, 5000 + resync - 1, resync, false));
+    // ...until two silent intervals, or its version-0 boot broadcast.
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::SilenceResync, srTopologyVersionVerdict(2, 26, 5000, 5000 + resync, resync, false));
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::BootReset, srTopologyVersionVerdict(0, 26, 5000, 6000, resync, true));
+    // A header-only version-0 report without the boot flag semantics is just backwards.
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(0, 26, 5000, 6000, resync, false));
+    // millis() wrap: an accept just before the wrap is still recent after it.
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(1, 26, 0xFFFFF000u, 1000, resync, false));
+}
+
 void setup()
 {
     initializeTestEnvironment();
@@ -509,6 +531,7 @@ void setup()
     RUN_TEST(test_ranking_costs_within_a_bucket_tie_on_node_id);
     RUN_TEST(test_topology_version_window_is_forward_only_and_wraps);
     RUN_TEST(test_topology_header_chunk_flags_round_trip);
+    RUN_TEST(test_topology_version_verdict_rules);
 
     UNITY_END();
 }

@@ -231,6 +231,27 @@ static inline bool srTopologyVersionInWindow(uint8_t received, uint8_t last)
     return static_cast<uint8_t>(received - last) < 0x80;
 }
 
+// Why a topology report from a peer is (or is not) processed. Pure function of the tracked state so
+// the rule is unit-testable; preProcessSignalRoutingPacket() applies it.
+enum class SrTopologyVerdict : uint8_t {
+    Stale,         // backwards or too far ahead, and no reason to re-base
+    Accept,        // repeat or forward move inside the window
+    FirstContact,  // nothing accepted from this sender yet: any version is the base
+    BootReset,     // header-only version-0 broadcast: the sender's counter restarted
+    SilenceResync, // nothing accepted for two broadcast intervals: take this version as the new base
+};
+
+static inline SrTopologyVerdict srTopologyVersionVerdict(uint8_t received, uint8_t last, uint32_t lastAcceptMs,
+                                                         uint32_t nowMs, uint32_t resyncMs, bool bootBroadcast)
+{
+    if (lastAcceptMs == 0) return SrTopologyVerdict::FirstContact; // entries are only created on accept, with nowMs >= 1
+    if (bootBroadcast) return SrTopologyVerdict::BootReset;
+    if (srTopologyVersionInWindow(received, last)) return SrTopologyVerdict::Accept;
+    uint32_t silent = nowMs - lastAcceptMs;
+    if (silent >= resyncMs && silent < 0x80000000u) return SrTopologyVerdict::SilenceResync;
+    return SrTopologyVerdict::Stale;
+}
+
 static inline bool hasReportedDirectEdgeTo(const NeighborGraph *graph, NodeNum myNode, NodeNum neighborId)
 {
     if (!graph) {
@@ -435,7 +456,6 @@ private:
     // (or repeats). A header-only broadcast with version 0 is the peer's boot announcement and resets
     // what we track. After two silent broadcast intervals any version is accepted again, so a peer
     // whose counter restarted (reboot, missed boot broadcast) is not ignored until its counter catches up.
-    static bool topologyVersionInWindow(uint8_t received, uint8_t last) { return srTopologyVersionInWindow(received, last); }
     uint32_t topologyResyncMs() const { return 2 * cfgBroadcastSecs * 1000; }
 
     bool isSignalBasedCapable(NodeNum nodeId) const;
