@@ -380,15 +380,15 @@ void nrf52Setup()
     pinMode(ADC_V, INPUT);
 #endif
 
-    uint32_t why = NRF_POWER->RESETREAS;
-    // per
-    // https://infocenter.nordicsemi.com/index.jsp?topic=%2Fcom.nordic.infocenter.nrf52832.ps.v1.1%2Fpower.html
+    // The Arduino core's init() has already read RESETREAS and cleared it (wiring.c), so the
+    // register reads 0 here on every boot; the core keeps the value for us. Bits: 0 RESETPIN,
+    // 1 DOG, 2 SREQ, 3 LOCKUP, 16 OFF (wake from off); 0 means a power-on or brown-out reset.
+    // per https://infocenter.nordicsemi.com/index.jsp?topic=%2Fcom.nordic.infocenter.nrf52832.ps.v1.1%2Fpower.html
+    uint32_t why = readResetReason();
     LOG_DEBUG("Reset reason: 0x%x", why);
-    // Keep it for the periodic battery log line (a host logger reattaching after this line has
-    // gone by can still read why the last reboot happened) and clear the sticky bits so each boot
-    // reports only its own cause. Bits: 0 RESETPIN, 1 DOG, 2 SREQ, 3 LOCKUP, 16 OFF (wake from off).
+    // Kept for the periodic battery log line: a host logger reattaching after this line has gone
+    // by can still read why the last reboot happened.
     nrf52ResetReason = why;
-    NRF_POWER->RESETREAS = why;
 
 #ifdef USE_SEMIHOSTING
     nrf52InitSemiHosting();
