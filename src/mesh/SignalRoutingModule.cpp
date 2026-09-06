@@ -1715,7 +1715,10 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
             bool sourceIsSRAware = (sourceStatus == CapabilityStatus::SRactive ||
                                     sourceStatus == CapabilityStatus::Passive);
             if (hasDirectConnectionToRelay && (singleHopRelay || !sourceIsSRAware)) {
-                float inferredEtx = NeighborGraph::calculateETX(-70, 5.0f); // Default for inferred
+                // Nominal link per hop travelled: the relay's link to the source is not what we measured,
+                // and a multi-hop path must not price like a single good link.
+                uint8_t hopsUsed = mp.hop_start > mp.hop_limit ? mp.hop_start - mp.hop_limit : 1;
+                float inferredEtx = NeighborGraph::calculateETX(-70, 5.0f) * hopsUsed;
                 routingGraph->updateDownstreamExclusive(mp.from, inferredRelayer, inferredEtx, millis() / 1000);
                 if (!singleHopRelay) {
                     LOG_INFO("[SR] Multi-hop downstream inference: %08x via %08x (%d hops, stock node)",
@@ -2070,6 +2073,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     if (router && router->getRadioInterface()) {
         leaderWait = airtimeMs + router->getRadioInterface()->getTxDelayMsecMaxAtUtil();
     }
+    leaderWait += PEER_RELAY_PROCESSING_MS;
     // Deterministic per-packet jitter, ±halfAirtime/4, keeps two nodes with the same slot apart.
     const uint32_t jitterRange = std::max(halfAirtime / 2, (uint32_t)20);
     const int32_t jitter = (int32_t)(((uint32_t)(myNode ^ p->id)) % jitterRange) - (int32_t)(jitterRange / 2);

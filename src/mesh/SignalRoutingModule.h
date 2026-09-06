@@ -431,6 +431,10 @@ private:
     // contention delay and the ACK airtime. Measured: a phone-connected node ACKed a direct traceroute
     // reply 440 ms after it ended while airtime + 2x contention gave 240 ms, and a neighbour relayed it.
     static constexpr uint32_t DEST_ACK_PROCESSING_MS = 250;
+    // Extra time a designated SR next hop needs before its relay is on the air, on top of one airtime and
+    // its contention maximum. Measured: Czar relayed 511 ms after the frame naming it while airtime +
+    // contention gave 158 ms, so a ranked candidate pre-empted it and both relayed.
+    static constexpr uint32_t PEER_RELAY_PROCESSING_MS = 250;
     uint32_t lastBootstrapReplyMs = 0; // 0 = never
     uint8_t currentTopologyVersion = 0;
 
