@@ -340,6 +340,41 @@ static void test_topology_listing_peer_confirms_peer_hears_sender()
     TEST_ASSERT_NULL(graph.getEdgesFrom(stranger));
 }
 
+// An edge says who hears whom in one direction only; forwarding needs the other one. A
+// topology-publishing destination that never confirmed the relay is unreachable through it.
+static void test_route_never_uses_a_one_way_edge()
+{
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum relay = 0x11111111;
+    constexpr NodeNum dest = 0x22222222;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, relay, 1.0f, 1000, Edge::Source::Reported);
+    graph.setEdgeHearsUs(me, relay, true);
+    // The relay hears the destination; nothing says the destination hears the relay.
+    graph.updateEdge(relay, dest, 4.0f, 1000, Edge::Source::Mirrored);
+
+    auto publishes = [](NodeNum) { return true; };
+    graph.clearCache();
+    TEST_ASSERT_EQUAL_UINT32(0, graph.calculateRoute(dest, 1000, nullptr, publishes).nextHop);
+    // A destination that publishes no topology cannot be ruled out.
+    auto stockDest = [dest](NodeNum n) { return n != dest; };
+    graph.clearCache();
+    TEST_ASSERT_EQUAL_UINT32(relay, graph.calculateRoute(dest, 1000, nullptr, stockDest).nextHop);
+    // The destination confirms it hears the relay: the route is back.
+    graph.setEdgeHearsUs(relay, dest, true);
+    graph.clearCache();
+    TEST_ASSERT_EQUAL_UINT32(relay, graph.calculateRoute(dest, 1000, nullptr, publishes).nextHop);
+    // Our own direct link is judged the same way.
+    graph.updateEdge(me, dest, 1.0f, 1000, Edge::Source::Reported);
+    graph.clearCache();
+    TEST_ASSERT_EQUAL_UINT32(relay, graph.calculateRoute(dest, 1000, nullptr, publishes).nextHop);
+    graph.setEdgeHearsUs(me, dest, true);
+    graph.clearCache();
+    TEST_ASSERT_EQUAL_UINT32(dest, graph.calculateRoute(dest, 1000, nullptr, publishes).nextHop);
+}
+
 static void test_self_coverage_counts_only_reported_edges()
 {
     constexpr NodeNum me = 0x0A0B0C0D;
@@ -526,6 +561,7 @@ void setup()
     RUN_TEST(test_mirrored_edge_update_does_not_upgrade_reported_edge);
     RUN_TEST(test_topology_listing_us_confirms_sender_hears_us);
     RUN_TEST(test_self_coverage_counts_only_reported_edges);
+    RUN_TEST(test_route_never_uses_a_one_way_edge);
     RUN_TEST(test_topology_listing_peer_confirms_peer_hears_sender);
     RUN_TEST(test_unique_coverage_ignores_poor_links_and_peer_owned_stock_nodes);
     RUN_TEST(test_ranking_costs_within_a_bucket_tie_on_node_id);

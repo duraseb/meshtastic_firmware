@@ -403,7 +403,18 @@ uint8_t NeighborGraph::countDirectNeighbors() const
     return count;
 }
 
-Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, std::function<bool(NodeNum)> nodeFilter)
+bool NeighborGraph::canDeliver(NodeNum from, NodeNum to, const std::function<bool(NodeNum)> &publishesTopology) const
+{
+    const NodeEdges *fromEdges = findNeighbor(from);
+    const Edge *forward = fromEdges ? findEdge(fromEdges, to) : nullptr;
+    if (forward && forward->hearsUs) return true;
+    const NodeEdges *toEdges = findNeighbor(to);
+    if (toEdges && findEdge(toEdges, from)) return true;
+    return !(publishesTopology && publishesTopology(to));
+}
+
+Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, std::function<bool(NodeNum)> nodeFilter,
+                                    std::function<bool(NodeNum)> publishesTopology)
 {
     // Check cache first
     Route cached = getCachedRoute(destination, currentTime);
@@ -497,6 +508,7 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, s
 
             int8_t vIdx = findOrAdd(v);
             if (vIdx < 0 || nodes[vIdx].visited) continue;
+            if (!canDeliver(u, v, publishesTopology)) continue; // u hears v is not v hears u
 
             uint32_t newCost = (uint32_t)uCost + edgeCost;
             if (newCost > 0xFFFE) newCost = 0xFFFE;

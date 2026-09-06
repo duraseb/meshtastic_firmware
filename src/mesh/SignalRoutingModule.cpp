@@ -730,33 +730,34 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     // The rule needs the source's complete list: chunks of a multi-packet report are gathered in
     // pendingListed and the rule runs on the last chunk. A chunk whose first packet was missed leaves
     // the flags untouched.
+    PendingListed &pl = pendingListed[pendingListedSlot(p->from)];
     if (!hdr.continuation) {
-        pendingListedValid = true;
-        pendingListedSender = p->from;
-        pendingListedVersion = receivedVersion;
-        pendingListedCount = 0;
+        pl.valid = true;
+        pl.sender = p->from;
+        pl.version = receivedVersion;
+        pl.count = 0;
     }
     const NodeNum *listedIds = nullptr;
     uint8_t listedCount = 0;
-    if (pendingListedValid && pendingListedSender == p->from && pendingListedVersion == receivedVersion) {
+    if (pl.valid && pl.sender == p->from && pl.version == receivedVersion) {
         for (uint8_t i = 0; i < neighborCount; i++) {
-            if (pendingListedCount < NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE) {
-                pendingListed[pendingListedCount++] = neighbors[i].nodeId;
+            if (pl.count < NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE) {
+                pl.ids[pl.count++] = neighbors[i].nodeId;
             } else {
-                pendingListedValid = false;
+                pl.valid = false;
             }
         }
         if (!hdr.moreChunks) {
-            if (pendingListedValid) {
-                listedIds = pendingListed;
-                listedCount = pendingListedCount;
+            if (pl.valid) {
+                listedIds = pl.ids;
+                listedCount = pl.count;
             }
-            pendingListedValid = false;
+            pl.valid = false;
         }
     } else if (hdr.continuation) {
         LOG_INFO("[SR] Topology chunk from %08x (version %u) without its first packet — hearsUs override skipped",
                  p->from, receivedVersion);
-        pendingListedValid = false;
+        pl.valid = false;
     }
     if (routingGraph && listedIds && listedCount > 0) {
         NodeNum allNodes[NEIGHBOR_GRAPH_MAX_NEIGHBORS];
@@ -1920,7 +1921,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
                 if (router && router->getRadioInterface()) {
                     contention = router->getRadioInterface()->getTxDelayMsecMaxAtUtil();
                 }
-                destAckWaitMs = airtimeMs + 2 * contention + DEST_ACK_PROCESSING_MS;
+                destAckWaitMs = SR_PEER_TURNAROUND_MS + 2 * contention + airtimeMs;
                 LOG_INFO("[SR] Unicast pkt=0x%08x: %s hears %s directly — waiting %ums for its ACK before any relay",
                          p->id, destName, srcName, destAckWaitMs);
             }
@@ -1964,7 +1965,9 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
 
     const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
 
-    uint32_t slotDelay = destAckWaitMs; // every slot sits behind the destination's chance to answer
+    // Every slot sits behind the destination's chance to answer and never before the slot origin:
+    // a relay keyed up right after the frame it answers is lost on receivers still reading that frame.
+    uint32_t slotDelay = std::max(destAckWaitMs, (uint32_t)SR_SLOT_ORIGIN_MS);
     bool shouldRelay = false;
     uint32_t myDelay = 0;
 
@@ -1973,12 +1976,16 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     // Otherwise reserve slot 0 with a width matching the next_hop's expected timing:
     //   - SR next_hop: halfAirtime (they relay at 0ms, dupe suppression handles us)
     //   - Stock next_hop: worst-case stock CLIENT delay, so we don't fire before they do
-    if (p->next_hop != NO_NEXT_HOP_PREFERENCE) {
+    // A next hop equal to the destination's own byte names no relayer: the source expects direct
+    // delivery (stock learns the destination as its own next hop from a direct reply). Nobody owns
+    // slot 0 then; the cost ranking below decides as for an unnamed hop.
+    bool relayerNamed = p->next_hop != NO_NEXT_HOP_PREFERENCE && p->next_hop != nodeDB->getLastByteOfNodeNum(destination);
+    if (relayerNamed) {
         uint8_t ourLastByte = nodeDB->getLastByteOfNodeNum(myNode);
         if (ourLastByte == p->next_hop) {
             LOG_INFO("[SR-DECISION] UNICAST RELAY pkt=0x%08x: from %s to %s, we are designated next_hop (slot 0, after %ums)",
-                     p->id, srcName, destName, destAckWaitMs);
-            pendingRelayDelayMs = destAckWaitMs;
+                     p->id, srcName, destName, slotDelay);
+            pendingRelayDelayMs = slotDelay;
             routingGraph->recordNodeTransmission(myNode, p->id, currentTime);
             return true;
         }
@@ -2061,7 +2068,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         srCandidates[j + 1] = key;
     }
 
-    // Ordinal slot delay, as in MeshRustic.
+    // Ordinal slot delay.
     //
     // Candidates hold slots in ranked order. Slot 0 keys up at once. Every later slot first waits
     // for the leader's relay to have left the air (its contention delay at the current channel
@@ -2073,7 +2080,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     if (router && router->getRadioInterface()) {
         leaderWait = airtimeMs + router->getRadioInterface()->getTxDelayMsecMaxAtUtil();
     }
-    leaderWait += PEER_RELAY_PROCESSING_MS;
+    leaderWait += SR_PEER_TURNAROUND_MS;
     // Deterministic per-packet jitter, ±halfAirtime/4, keeps two nodes with the same slot apart.
     const uint32_t jitterRange = std::max(halfAirtime / 2, (uint32_t)20);
     const int32_t jitter = (int32_t)(((uint32_t)(myNode ^ p->id)) % jitterRange) - (int32_t)(jitterRange / 2);
@@ -2909,7 +2916,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     }
 
     bool preferHighNodeId = (p->id & 1) != 0;
-    uint32_t slotDelay = 0;
+    uint32_t slotDelay = SR_SLOT_ORIGIN_MS; // slot k fires at origin + k * halfAirtime
     bool shouldRelay = false;
     uint32_t myDelay = 0;
     const char *decisionReason = "no unique coverage";
@@ -3065,7 +3072,8 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
     getNodeDisplayName(destination, destName, sizeof(destName));
 
     Route route = routingGraph->calculateRoute(destination, currentTime,
-                        [this](NodeNum nodeId) { return isNodeRoutable(nodeId); });
+                        [this](NodeNum nodeId) { return isNodeRoutable(nodeId); },
+                        [this](NodeNum nodeId) { return publishesTopology(nodeId); });
 
     float routeCost = route.getCost();
 
@@ -3973,7 +3981,8 @@ bool SignalRoutingModule::topologyHealthyForUnicast(NodeNum destination) const
     }
 
     Route route = routingGraph->calculateRoute(destination, millis() / 1000,
-        [this](NodeNum nodeId) { return isNodeRoutable(nodeId); });
+        [this](NodeNum nodeId) { return isNodeRoutable(nodeId); },
+        [this](NodeNum nodeId) { return publishesTopology(nodeId); });
 
     if (route.nextHop != 0) {
         LOG_INFO("[SR] Node %08x is reachable through topology (nextHop=%08x, cost=%.2f)",
@@ -3986,7 +3995,8 @@ bool SignalRoutingModule::topologyHealthyForUnicast(NodeNum destination) const
     if (relay != 0) {
         // Check if we can reach the relay (relay must be routable)
         Route relayRoute = routingGraph->calculateRoute(relay, millis() / 1000,
-            [this](NodeNum nodeId) { return isNodeRoutable(nodeId); });
+            [this](NodeNum nodeId) { return isNodeRoutable(nodeId); },
+            [this](NodeNum nodeId) { return publishesTopology(nodeId); });
         if (relayRoute.nextHop != 0) {
             LOG_INFO("[SR] Node %08x is reachable via relay %08x (nextHop=%08x, cost=%.2f)",
                      destination, relay, relayRoute.nextHop, relayRoute.getCost());

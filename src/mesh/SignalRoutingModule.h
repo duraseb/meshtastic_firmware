@@ -427,14 +427,11 @@ private:
     // make every node answer each one with its list. The requester is in our graph regardless and gets
     // the next periodic broadcast.
     static constexpr uint32_t BOOTSTRAP_REPLY_MIN_INTERVAL_MS = 60000;
-    // Extra time a destination needs to turn a received packet into an ACK on the air, on top of its
-    // contention delay and the ACK airtime. Measured: a phone-connected node ACKed a direct traceroute
-    // reply 440 ms after it ended while airtime + 2x contention gave 240 ms, and a neighbour relayed it.
-    static constexpr uint32_t DEST_ACK_PROCESSING_MS = 250;
-    // Extra time a designated SR next hop needs before its relay is on the air, on top of one airtime and
-    // its contention maximum. Measured: Czar relayed 511 ms after the frame naming it while airtime +
-    // contention gave 158 ms, so a ranked candidate pre-empted it and both relayed.
-    static constexpr uint32_t PEER_RELAY_PROCESSING_MS = 250;
+    // Channel-access model: after a frame ends a
+    // receiver spends up to ~170 ms (measured here: "Packet RX" 69-172 ms) reading it out before it
+    // listens again. Every "how long does a peer need" wait and the first relay slot start from this.
+    static constexpr uint32_t SR_PEER_TURNAROUND_MS = 250;
+    static constexpr uint32_t SR_SLOT_ORIGIN_MS = SR_PEER_TURNAROUND_MS;
     uint32_t lastBootstrapReplyMs = 0; // 0 = never
     uint8_t currentTopologyVersion = 0;
 
@@ -449,12 +446,26 @@ private:
     TopologyVersionEntry lastPreProcessedVersion[MAX_TOPOLOGY_VERSION_ENTRIES];
     uint8_t lastPreProcessedVersionCount = 0;
 
-    // Neighbour ids listed so far by a multi-chunk topology report (see preProcessSignalRoutingPacket).
-    NodeNum pendingListed[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
-    uint8_t pendingListedCount = 0;
-    NodeNum pendingListedSender = 0;
-    uint8_t pendingListedVersion = 0;
-    bool pendingListedValid = false;
+    // Neighbour ids listed so far by multi-chunk topology reports, one slot per sender (see
+    // preProcessSignalRoutingPacket). A single slot let any other node's report invalidate a hub's list.
+    static constexpr uint8_t PENDING_LISTED_SLOTS = 4;
+    struct PendingListed {
+        NodeNum ids[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
+        uint8_t count = 0;
+        NodeNum sender = 0;
+        uint8_t version = 0;
+        bool valid = false;
+    };
+    PendingListed pendingListed[PENDING_LISTED_SLOTS];
+    // The slot gathering `sender`'s chunks: its open one, else a free one, else slot 0.
+    uint8_t pendingListedSlot(NodeNum sender) const
+    {
+        for (uint8_t i = 0; i < PENDING_LISTED_SLOTS; i++)
+            if (pendingListed[i].valid && pendingListed[i].sender == sender) return i;
+        for (uint8_t i = 0; i < PENDING_LISTED_SLOTS; i++)
+            if (!pendingListed[i].valid) return i;
+        return 0;
+    }
 
     uint8_t getTopologyVersion(const TopologyVersionEntry *table, uint8_t count, NodeNum nodeId,
                                uint32_t *lastAcceptMs = nullptr) const;
@@ -518,6 +529,12 @@ private:
     void trackNodeCapability(NodeNum nodeId, CapabilityStatus status);
     void pruneCapabilityCache(uint32_t nowSecs);
     CapabilityStatus getCapabilityStatus(NodeNum nodeId) const;
+    // The node broadcasts neighbour lists (SR active or passive), so its lists are evidence.
+    bool publishesTopology(NodeNum nodeId) const
+    {
+        CapabilityStatus s = getCapabilityStatus(nodeId);
+        return s == CapabilityStatus::SRactive || s == CapabilityStatus::Passive;
+    }
     bool topologyHealthyForBroadcast() const;
     bool topologyHealthyForUnicast(NodeNum destination) const;
     bool isImmediateRelayRouter(NodeNum nodeId) const;

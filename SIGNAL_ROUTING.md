@@ -225,6 +225,23 @@ bool shouldDeliverDirectToNeighbor(NodeNum destination, NodeNum heardFrom) {
 }
 ```
 
+### Edge Direction in Route Calculation
+
+An edge records hearing in one direction only: a node listing a neighbour proves that the node
+hears the neighbour. A route hop from A to B requires B to hear A, which is known when A's edge to
+B carries `hearsUs` (B confirmed it in its own list) or when B lists A. `NeighborGraph::canDeliver`
+applies this to every hop that `calculateRoute` relaxes. A node that publishes topology
+(`publishesTopology`: SR active or passive) and confirms neither does not hear A, so no route goes
+through that hop; a node that publishes no topology (stock or not yet classified) cannot be ruled
+out and is treated as before. Field case: a node hearing the city hub at -108 dBm listed it without
+`hearsUs`, the hub's own list did not contain that node, and every peer still routed to the hub
+through it.
+
+A unicast whose `next_hop` byte equals the destination's own byte names no relayer: stock's
+`NextHopRouter` learns the destination itself as next hop from a direct reply. Such a packet is
+planned as one without a next hop (the cost ranking decides, nobody owns slot 0) instead of
+reserving slot 0 for a relayer that cannot exist.
+
 ### Unicast Route Selection Priority
 
 When deciding whether to use SR coordination for unicast packets:
@@ -312,9 +329,11 @@ For each candidate (self + SR-active direct neighbors), three tiers that never o
 
 This ensures last-hop delivery nodes are always scheduled before intermediate relays, and within each tier the lower ETX wins. Costs are compared in half-ETX buckets (`SR_COST_BUCKET_FIXED`), for unicast candidates and for the broadcast ranking's average cost alike: a node prices its own link from its own measurements and a peer's link from the peer's packed report, so near-equal costs differ by a few hundredths in a direction that varies per node, and exact comparison let two colocated nodes rank each other in opposite orders and take the same slot. Within a bucket the packet-id-parity node-id tie-break decides identically everywhere.
 
-**ACK gate:** when the source's topology lists the destination with hearsUs, every candidate first waits for the destination's own ACK: the reply airtime plus twice the maximum contention delay plus `DEST_ACK_PROCESSING_MS` (250 ms, the turnaround measured on a phone-connected node was 440 ms where the first two terms gave 240 ms). The relay is cancelled if the ACK is heard.
+**Channel-access model:** a receiver spends up to ~170 ms after a frame reading it out before it listens again (`SR_PEER_TURNAROUND_MS` = 250 ms covers it). Every wait for a peer starts from that figure: the ACK gate is turnaround + twice the maximum contention delay + the reply airtime; the wait behind a designated SR next hop is turnaround + maximum contention + one airtime; and the coordinated relay ladder starts at `SR_SLOT_ORIGIN_MS` (= turnaround), slot k firing at origin + k × half airtime. A relay keyed up right after the frame it answers is lost on every receiver still busy with that frame.
 
-**Slot timing:** slots are ordinal. Slot 0 keys up at once; every later slot first waits for the leader's relay to have left the air (one airtime plus the maximum contention delay at the current channel utilization plus `PEER_RELAY_PROCESSING_MS`, 250 ms of turnaround measured on a fork node), then slots space out by half an airtime. Behind a designated next hop the ranked candidates follow its slot-0 reservation. A deterministic ±quarter-airtime jitter keeps equal slots apart. (The earlier ETX-gap formula masked the tier bit off the costs, so a downstream-tier leader made every gap zero and a node ranked last fired at 0 ms.)
+**ACK gate:** when the source's topology lists the destination with hearsUs, every candidate first waits for the destination's own ACK as above. The relay is cancelled if the ACK is heard.
+
+**Slot timing:** slots are ordinal. Slot 0 keys up at once; every later slot first waits for the leader's relay to have left the air (`SR_PEER_TURNAROUND_MS` plus the maximum contention delay at the current channel utilization plus one airtime), then slots space out by half an airtime. Behind a designated next hop the ranked candidates follow its slot-0 reservation. A deterministic ±quarter-airtime jitter keeps equal slots apart. (The earlier ETX-gap formula masked the tier bit off the costs, so a downstream-tier leader made every gap zero and a node ranked last fired at 0 ms.)
 
 **Destination heard the source directly:**
 When the unicast was heard straight from its source and the source's topology lists the destination with `hearsUs`, the destination most likely has it. A routing ACK on that link is never relayed (a lost ACK is covered by the sender's own retransmission). Any other unicast has every slot, including a designated next hop's slot 0, pushed behind a wait of one airtime plus twice the maximum contention delay at the current utilization, so the destination's ACK or reply, which cancels the queued relay via `cancelSending(request_id)`, arrives first; only silence lets a relay go. Colocated receivers were seen to lose about half the frames of a very strong neighbour, so the relay stays available rather than being suppressed outright.

@@ -897,8 +897,17 @@ void Power::readPowerStatus()
     // Notify any status instances that are observing us
     const PowerStatus powerStatus2 = PowerStatus(hasBattery, usbPowered, isChargingNow, batteryVoltageMv, batteryChargePercent);
     if (millis() > lastLogTime + 50 * 1000) {
+#ifdef ARCH_NRF52
+        // Reset reason of this boot (RESETREAS bits: 1 RESETPIN, 2 DOG, 4 SREQ, 8 LOCKUP), repeated here
+        // because the boot-time line is printed before a serial logger usually reattaches.
+        extern uint32_t nrf52ResetReason;
+        LOG_DEBUG("Battery: usbPower=%d, isCharging=%d, batMv=%d, batPct=%d, resetReason=0x%x", powerStatus2.getHasUSB(),
+                  powerStatus2.getIsCharging(), powerStatus2.getBatteryVoltageMv(), powerStatus2.getBatteryChargePercent(),
+                  nrf52ResetReason);
+#else
         LOG_DEBUG("Battery: usbPower=%d, isCharging=%d, batMv=%d, batPct=%d", powerStatus2.getHasUSB(),
                   powerStatus2.getIsCharging(), powerStatus2.getBatteryVoltageMv(), powerStatus2.getBatteryChargePercent());
+#endif
         lastLogTime = millis();
     }
     newStatus.notifyObservers(&powerStatus2);

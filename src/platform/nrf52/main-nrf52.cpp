@@ -15,6 +15,9 @@
 #include <memory.h>
 #include <nrfx_wdt.c>
 #include <nrfx_wdt.h>
+
+// RESETREAS as read at boot; see nrf52Setup(). Logged periodically by Power.cpp.
+uint32_t nrf52ResetReason = 0;
 #include <stdio.h>
 // #include <Adafruit_USBD_Device.h>
 #include "NodeDB.h"
@@ -381,6 +384,11 @@ void nrf52Setup()
     // per
     // https://infocenter.nordicsemi.com/index.jsp?topic=%2Fcom.nordic.infocenter.nrf52832.ps.v1.1%2Fpower.html
     LOG_DEBUG("Reset reason: 0x%x", why);
+    // Keep it for the periodic battery log line (a host logger reattaching after this line has
+    // gone by can still read why the last reboot happened) and clear the sticky bits so each boot
+    // reports only its own cause. Bits: 0 RESETPIN, 1 DOG, 2 SREQ, 3 LOCKUP, 16 OFF (wake from off).
+    nrf52ResetReason = why;
+    NRF_POWER->RESETREAS = why;
 
 #ifdef USE_SEMIHOSTING
     nrf52InitSemiHosting();

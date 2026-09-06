@@ -191,7 +191,17 @@ class NeighborGraph {
     // (i.e., direct neighbors we have directly received a signal from).
     uint8_t countDirectNeighbors() const;
 
-    Route calculateRoute(NodeNum destination, uint32_t currentTime, std::function<bool(NodeNum)> nodeFilter = nullptr);
+    // publishesTopology(node): the node broadcasts neighbour lists, so a missing confirmation
+    // means it does not hear the sender (see canDeliver).
+    Route calculateRoute(NodeNum destination, uint32_t currentTime, std::function<bool(NodeNum)> nodeFilter = nullptr,
+                         std::function<bool(NodeNum)> publishesTopology = nullptr);
+
+    // Can a frame transmitted by `from` be received by `to`? An edge records hearing: `from`
+    // listing `to` says `from` hears `to`. The reverse is known only when that edge carries
+    // hearsUs (`to` confirmed it hears `from`) or `to` itself lists `from`. A node that publishes
+    // topology and confirms neither does not hear `from`; one that publishes none (stock,
+    // unclassified) cannot be ruled out.
+    bool canDeliver(NodeNum from, NodeNum to, const std::function<bool(NodeNum)> &publishesTopology) const;
 
     Route getCachedRoute(NodeNum destination, uint32_t currentTime);
 
