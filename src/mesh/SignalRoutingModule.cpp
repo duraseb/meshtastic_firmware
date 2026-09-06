@@ -1917,7 +1917,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
                 if (router && router->getRadioInterface()) {
                     contention = router->getRadioInterface()->getTxDelayMsecMaxAtUtil();
                 }
-                destAckWaitMs = airtimeMs + 2 * contention;
+                destAckWaitMs = airtimeMs + 2 * contention + DEST_ACK_PROCESSING_MS;
                 LOG_INFO("[SR] Unicast pkt=0x%08x: %s hears %s directly — waiting %ums for its ACK before any relay",
                          p->id, destName, srcName, destAckWaitMs);
             }
@@ -2977,6 +2977,8 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     };
 
     // Phase 2: Iteratively pick best SR candidate, assign slots
+    LOG_INFO("[SR] Slot ranking pkt=0x%08x: %u SR candidates, %u pre-covered", p->id,
+             static_cast<unsigned>(candidates.count), static_cast<unsigned>(alreadyCovered.count));
     while (!candidates.empty()) {
         RelayCandidate best = routingGraph->findBestRelayCandidate(candidates, alreadyCovered,
                                                                     currentTime, p->id, preferHighNodeId, sourceNode,
@@ -3001,8 +3003,8 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
             break;
         }
 
-        LOG_INFO("[SR] Slot %ums: SR node %08x (coverage=%u, cost=%.2f%s)", slotDelay, best.nodeId,
-                  best.coverageCount, best.getAvgCost(), best.tier > 0 ? ", bidi" : "");
+        LOG_INFO("[SR] Slot %ums: SR node %08x (coverage=%u/%u, cost=%.2f%s)", slotDelay, best.nodeId,
+                  best.coverageCount, best.totalCoverage, best.getAvgCost(), best.tier > 0 ? ", bidi" : "");
         // An earlier slot holder is assumed to relay: subtract its coverage so later candidates
         // (and the stock-coverage fallback) only relay for nodes nobody ahead of them reaches.
         absorbRelayCoverage(best.nodeId);

@@ -131,13 +131,14 @@ struct Route {
 
 struct RelayCandidate {
     NodeNum nodeId;
-    uint8_t coverageCount;
+    uint8_t coverageCount; // unique coverage (not already covered)
     uint16_t avgCostFixed;
     uint8_t tier;
+    uint8_t totalCoverage; // coverage before pre-coverage was subtracted (diagnostics)
 
-    RelayCandidate() : nodeId(0), coverageCount(0), avgCostFixed(0), tier(0) {}
-    RelayCandidate(NodeNum node, uint8_t coverage, uint16_t cost, uint8_t t)
-        : nodeId(node), coverageCount(coverage), avgCostFixed(cost), tier(t) {}
+    RelayCandidate() : nodeId(0), coverageCount(0), avgCostFixed(0), tier(0), totalCoverage(0) {}
+    RelayCandidate(NodeNum node, uint8_t coverage, uint16_t cost, uint8_t t, uint8_t total = 0)
+        : nodeId(node), coverageCount(coverage), avgCostFixed(cost), tier(t), totalCoverage(total) {}
 
     float getAvgCost() const { return avgCostFixed / 100.0f; }
 

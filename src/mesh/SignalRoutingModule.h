@@ -427,6 +427,10 @@ private:
     // make every node answer each one with its list. The requester is in our graph regardless and gets
     // the next periodic broadcast.
     static constexpr uint32_t BOOTSTRAP_REPLY_MIN_INTERVAL_MS = 60000;
+    // Extra time a destination needs to turn a received packet into an ACK on the air, on top of its
+    // contention delay and the ACK airtime. Measured: a phone-connected node ACKed a direct traceroute
+    // reply 440 ms after it ended while airtime + 2x contention gave 240 ms, and a neighbour relayed it.
+    static constexpr uint32_t DEST_ACK_PROCESSING_MS = 250;
     uint32_t lastBootstrapReplyMs = 0; // 0 = never
     uint8_t currentTopologyVersion = 0;
 

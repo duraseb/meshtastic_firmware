@@ -1149,7 +1149,8 @@ RelayCandidate NeighborGraph::findBestRelayCandidate(const NodeSet &candidates, 
                                         : (candidate < bestCandidate.nodeId);
         }
         if (isBetter) {
-            bestCandidate = RelayCandidate(candidate, uniqueCoverageCount, avgCostFixed, candidateTier);
+            bestCandidate = RelayCandidate(candidate, uniqueCoverageCount, avgCostFixed, candidateTier,
+                                           static_cast<uint8_t>(coverageCount));
         }
     }
 
