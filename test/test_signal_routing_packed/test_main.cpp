@@ -611,6 +611,12 @@ static void test_topology_version_verdict_rules()
     TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(0, 26, 5000, 6000, resync, false));
     // millis() wrap: an accept just before the wrap is still recent after it.
     TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(1, 26, 0xFFFFF000u, 1000, resync, false));
+    // A lost boot broadcast: the second of two rejected versions climbing by one re-bases; a repeat
+    // or a jump does not.
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::RestartClimb, srTopologyVersionVerdict(2, 13, 5000, 6000, resync, false, true, 1));
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(1, 13, 5000, 6000, resync, false, true, 1));
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(5, 13, 5000, 6000, resync, false, true, 1));
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::RestartClimb, srTopologyVersionVerdict(0, 13, 5000, 6000, resync, false, true, 255));
 }
 
 void setup()

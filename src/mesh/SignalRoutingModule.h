@@ -239,16 +239,22 @@ enum class SrTopologyVerdict : uint8_t {
     FirstContact,  // nothing accepted from this sender yet: any version is the base
     BootReset,     // header-only version-0 broadcast: the sender's counter restarted
     SilenceResync, // nothing accepted for two broadcast intervals: take this version as the new base
+    RestartClimb,  // the boot broadcast was lost: two rejected versions in a row climbing by one
 };
 
+// staleValid/staleVersion: the report last rejected from this sender, if any. Late copies of old
+// reports arrive within seconds of each other, never a whole interval apart, so two rejected
+// versions climbing by one can only be a restarted counter.
 static inline SrTopologyVerdict srTopologyVersionVerdict(uint8_t received, uint8_t last, uint32_t lastAcceptMs,
-                                                         uint32_t nowMs, uint32_t resyncMs, bool bootBroadcast)
+                                                         uint32_t nowMs, uint32_t resyncMs, bool bootBroadcast,
+                                                         bool staleValid = false, uint8_t staleVersion = 0)
 {
     if (lastAcceptMs == 0) return SrTopologyVerdict::FirstContact; // entries are only created on accept, with nowMs >= 1
     if (bootBroadcast) return SrTopologyVerdict::BootReset;
     if (srTopologyVersionInWindow(received, last)) return SrTopologyVerdict::Accept;
     uint32_t silent = nowMs - lastAcceptMs;
     if (silent >= resyncMs && silent < 0x80000000u) return SrTopologyVerdict::SilenceResync;
+    if (staleValid && received == (uint8_t)(staleVersion + 1)) return SrTopologyVerdict::RestartClimb;
     return SrTopologyVerdict::Stale;
 }
 
@@ -443,6 +449,10 @@ private:
         NodeNum nodeId = 0;
         uint8_t version = 0;
         uint32_t lastAcceptMs = 0; // millis() of the last accepted report, 0 = never
+        // Version of the last report rejected as stale: a rebooted peer whose boot broadcast we
+        // missed shows as rejected versions climbing one by one.
+        uint8_t staleVersion = 0;
+        bool staleValid = false;
     };
     TopologyVersionEntry lastTopologyVersion[MAX_TOPOLOGY_VERSION_ENTRIES];
     uint8_t lastTopologyVersionCount = 0;
@@ -470,6 +480,9 @@ private:
         return 0;
     }
 
+    // The version last rejected as stale from nodeId (false when none since the last accept).
+    bool getTopologyStale(const TopologyVersionEntry *table, uint8_t count, NodeNum nodeId, uint8_t *staleVersion) const;
+    void noteTopologyStale(TopologyVersionEntry *table, uint8_t count, NodeNum nodeId, uint8_t received);
     uint8_t getTopologyVersion(const TopologyVersionEntry *table, uint8_t count, NodeNum nodeId,
                                uint32_t *lastAcceptMs = nullptr) const;
     void setTopologyVersion(TopologyVersionEntry *table, uint8_t &count, NodeNum nodeId, uint8_t version,

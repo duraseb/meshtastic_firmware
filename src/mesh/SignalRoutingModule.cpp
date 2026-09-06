@@ -30,6 +30,29 @@ uint8_t SignalRoutingModule::getTopologyVersion(const TopologyVersionEntry *tabl
     return 0;
 }
 
+bool SignalRoutingModule::getTopologyStale(const TopologyVersionEntry *table, uint8_t count, NodeNum nodeId,
+                                           uint8_t *staleVersion) const
+{
+    for (uint8_t i = 0; i < count; i++) {
+        if (table[i].nodeId == nodeId) {
+            if (staleVersion) *staleVersion = table[i].staleVersion;
+            return table[i].staleValid;
+        }
+    }
+    return false;
+}
+
+void SignalRoutingModule::noteTopologyStale(TopologyVersionEntry *table, uint8_t count, NodeNum nodeId, uint8_t received)
+{
+    for (uint8_t i = 0; i < count; i++) {
+        if (table[i].nodeId == nodeId) {
+            table[i].staleVersion = received;
+            table[i].staleValid = true;
+            return;
+        }
+    }
+}
+
 void SignalRoutingModule::setTopologyVersion(TopologyVersionEntry *table, uint8_t &count, NodeNum nodeId, uint8_t version,
                                              uint32_t nowMs)
 {
@@ -38,6 +61,7 @@ void SignalRoutingModule::setTopologyVersion(TopologyVersionEntry *table, uint8_
         if (table[i].nodeId == nodeId) {
             table[i].version = version;
             if (nowMs) table[i].lastAcceptMs = nowMs;
+            table[i].staleValid = false;
             return;
         }
     }
@@ -52,6 +76,7 @@ void SignalRoutingModule::setTopologyVersion(TopologyVersionEntry *table, uint8_
     slot->nodeId = nodeId;
     slot->version = version;
     slot->lastAcceptMs = nowMs;
+    slot->staleValid = false;
 }
 
 // Helper to get node display name for logging
@@ -628,16 +653,23 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
 
     // Passive peers reboot too: their header-only version-0 broadcast resets the tracked version as well.
     bool bootBroadcast = neighborCount == 0 && receivedVersion == 0 && isDirectPacket(*p);
+    uint8_t staleVersion = 0;
+    bool staleValid = getTopologyStale(lastTopologyVersion, lastTopologyVersionCount, p->from, &staleVersion);
     SrTopologyVerdict verdict = srTopologyVersionVerdict(receivedVersion, lastProcessedVersion, lastAcceptMs, nowMs,
-                                                         topologyResyncMs(), bootBroadcast);
+                                                         topologyResyncMs(), bootBroadcast, staleValid, staleVersion);
     if (verdict == SrTopologyVerdict::Stale) {
+        noteTopologyStale(lastTopologyVersion, lastTopologyVersionCount, p->from, receivedVersion);
         LOG_INFO("[SR] Ignoring stale topology broadcast from %08x (version %u, last processed %u)",
                  p->from, receivedVersion, lastProcessedVersion);
         return;
     }
-    if (verdict == SrTopologyVerdict::BootReset || verdict == SrTopologyVerdict::SilenceResync) {
+    if (verdict == SrTopologyVerdict::BootReset || verdict == SrTopologyVerdict::SilenceResync ||
+        verdict == SrTopologyVerdict::RestartClimb) {
         LOG_INFO("[SR] Topology version resync from %08x: received %u, last %u (%s)", p->from, receivedVersion,
-                 lastProcessedVersion, verdict == SrTopologyVerdict::BootReset ? "boot broadcast" : "silent peer");
+                 lastProcessedVersion,
+                 verdict == SrTopologyVerdict::BootReset      ? "boot broadcast"
+                 : verdict == SrTopologyVerdict::SilenceResync ? "silent peer"
+                                                               : "versions climbing after a lost boot broadcast");
     }
 
     bool isNewVersion = (receivedVersion != lastProcessedVersion);
