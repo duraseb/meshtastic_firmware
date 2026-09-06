@@ -380,11 +380,13 @@ void nrf52Setup()
     pinMode(ADC_V, INPUT);
 #endif
 
-    // The Arduino core's init() has already read RESETREAS and cleared it (wiring.c), so the
-    // register reads 0 here on every boot; the core keeps the value for us. Bits: 0 RESETPIN,
-    // 1 DOG, 2 SREQ, 3 LOCKUP, 16 OFF (wake from off); 0 means a power-on or brown-out reset.
+    // The Arduino core's init() reads RESETREAS and clears it (wiring.c) and keeps the value behind
+    // readResetReason(); take that, plus whatever the register still holds on cores that do not
+    // clear it. Bits: 0 RESETPIN, 1 DOG, 2 SREQ, 3 LOCKUP, 16 OFF (wake from off); 0 means a
+    // power-on or brown-out reset.
     // per https://infocenter.nordicsemi.com/index.jsp?topic=%2Fcom.nordic.infocenter.nrf52832.ps.v1.1%2Fpower.html
-    uint32_t why = readResetReason();
+    uint32_t why = readResetReason() | NRF_POWER->RESETREAS;
+    NRF_POWER->RESETREAS = why; // write-1-to-clear, so each boot reports only its own cause
     LOG_DEBUG("Reset reason: 0x%x", why);
     // Kept for the periodic battery log line: a host logger reattaching after this line has gone
     // by can still read why the last reboot happened.
