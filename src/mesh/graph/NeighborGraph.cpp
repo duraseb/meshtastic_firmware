@@ -403,16 +403,6 @@ uint8_t NeighborGraph::countDirectNeighbors() const
     return count;
 }
 
-bool NeighborGraph::canDeliver(NodeNum from, NodeNum to, const std::function<bool(NodeNum)> &publishesTopology) const
-{
-    const NodeEdges *fromEdges = findNeighbor(from);
-    const Edge *forward = fromEdges ? findEdge(fromEdges, to) : nullptr;
-    if (forward && forward->hearsUs) return true;
-    const NodeEdges *toEdges = findNeighbor(to);
-    if (toEdges && findEdge(toEdges, from)) return true;
-    return !(publishesTopology && publishesTopology(to));
-}
-
 Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, std::function<bool(NodeNum)> nodeFilter,
                                     std::function<bool(NodeNum)> publishesTopology)
 {
@@ -433,21 +423,19 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, s
         return result;
     }
 
-    // Dijkstra over the full edge graph.
-    // Uses fixed-size arrays sized to NEIGHBOR_GRAPH_MAX_NEIGHBORS (max nodes in graph).
-    // Each entry tracks: node, best cost, previous node (for next-hop backtrack).
+    // Dijkstra run backwards from the destination over "who hears whom" (see the declaration).
+    // `cost` is the cost of the path from a node to the destination, `prev` the node after it.
     static constexpr uint8_t MAX_DIJKSTRA = NEIGHBOR_GRAPH_MAX_NEIGHBORS;
 
     struct DNode {
         NodeNum id;
         uint16_t cost;
-        NodeNum prev; // previous node in shortest path
+        NodeNum prev; // next node toward the destination
         bool visited;
     };
     DNode nodes[MAX_DIJKSTRA];
     uint8_t nodeCount = 0;
 
-    // Helper: find index for a node, or add it
     auto findOrAdd = [&](NodeNum id) -> int8_t {
         for (uint8_t i = 0; i < nodeCount; i++) {
             if (nodes[i].id == id) return i;
@@ -460,25 +448,23 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, s
         n.visited = false;
         return nodeCount++;
     };
-
-    // Seed with our node at cost 0
-    int8_t srcIdx = findOrAdd(myNode);
-    if (srcIdx < 0) return result;
-    nodes[srcIdx].cost = 0;
-
-    // Ensure destination is in the set
-    findOrAdd(destination);
-
-    // Pre-populate all nodes that have edges in the graph so Dijkstra can explore them
-    for (uint8_t i = 0; i < neighborCount; i++) {
-        if (neighbors[i].nodeId != 0) {
-            findOrAdd(neighbors[i].nodeId);
+    // Lower cost[m] to cost + edgeCost with `via` as the next hop toward the destination.
+    auto relax = [&](NodeNum m, NodeNum via, uint16_t cost, uint16_t edgeCost) {
+        int8_t mIdx = findOrAdd(m);
+        if (mIdx < 0 || nodes[mIdx].visited) return;
+        uint32_t newCost = (uint32_t)cost + edgeCost;
+        if (newCost > 0xFFFE) newCost = 0xFFFE;
+        if ((uint16_t)newCost < nodes[mIdx].cost) {
+            nodes[mIdx].cost = (uint16_t)newCost;
+            nodes[mIdx].prev = via;
         }
-    }
+    };
 
-    // Run Dijkstra
+    int8_t dstIdx = findOrAdd(destination);
+    if (dstIdx < 0) return result;
+    nodes[dstIdx].cost = 0;
+
     for (;;) {
-        // Pick unvisited node with lowest cost
         int8_t uIdx = -1;
         uint16_t uCost = 0xFFFF;
         for (uint8_t i = 0; i < nodeCount; i++) {
@@ -487,58 +473,53 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, s
                 uIdx = i;
             }
         }
-        if (uIdx < 0 || uCost == 0xFFFF) break; // No more reachable nodes
+        if (uIdx < 0 || uCost == 0xFFFF) break; // nothing else can reach the destination
 
-        NodeNum u = nodes[uIdx].id;
+        NodeNum n = nodes[uIdx].id;
         nodes[uIdx].visited = true;
+        if (n == myNode) break;
 
-        // Early exit if we've settled the destination
-        if (u == destination) break;
+        // Every settled node other than the destination would relay on this path.
+        if (n != destination && nodeFilter && !nodeFilter(n)) continue;
 
-        // Skip filtered nodes (except source)
-        if (u != myNode && nodeFilter && !nodeFilter(u)) continue;
-
-        // Relax edges from u
-        const NodeEdges *uEdges = findNeighbor(u);
-        if (!uEdges) continue;
-
-        for (uint8_t e = 0; e < uEdges->edgeCount; e++) {
-            NodeNum v = uEdges->edges[e].to;
-            uint16_t edgeCost = uEdges->edges[e].etxFixed;
-
-            int8_t vIdx = findOrAdd(v);
-            if (vIdx < 0 || nodes[vIdx].visited) continue;
-            if (!canDeliver(u, v, publishesTopology)) continue; // u hears v is not v hears u
-
-            uint32_t newCost = (uint32_t)uCost + edgeCost;
-            if (newCost > 0xFFFE) newCost = 0xFFFE;
-
-            if ((uint16_t)newCost < nodes[vIdx].cost) {
-                nodes[vIdx].cost = (uint16_t)newCost;
-                nodes[vIdx].prev = u;
+        // The nodes N hears, at the cost N measured on their signal: the true cost of M -> N.
+        const NodeEdges *nEdges = findNeighbor(n);
+        if (nEdges) {
+            for (uint8_t e = 0; e < nEdges->edgeCount; e++) {
+                relax(nEdges->edges[e].to, n, uCost, nEdges->edges[e].etxFixed);
             }
+        }
+        // Nodes N confirmed hearing (hearsUs on their edge to N) and, for a node without lists,
+        // anyone hearing N. Priced at the sender's measurement of N, the best available.
+        bool nPublishes = publishesTopology && publishesTopology(n);
+        for (uint8_t i = 0; i < neighborCount; i++) {
+            NodeNum m = neighbors[i].nodeId;
+            if (m == 0 || m == n) continue;
+            if (nEdges && findEdge(nEdges, m)) continue; // already priced from N's own list
+            const Edge *toN = findEdge(&neighbors[i], n);
+            if (!toN) continue;
+            if (toN->hearsUs || !nPublishes) relax(m, n, uCost, toN->etxFixed);
         }
     }
 
-    // Find destination in settled nodes
     for (uint8_t i = 0; i < nodeCount; i++) {
-        if (nodes[i].id == destination && nodes[i].cost < 0xFFFF) {
+        if (nodes[i].id == myNode && nodes[i].cost < 0xFFFF && nodes[i].prev != 0) {
             result.costFixed = nodes[i].cost;
-
-            // Backtrack to find the first hop after myNode
-            NodeNum cur = destination;
-            NodeNum prev = nodes[i].prev;
-            while (prev != myNode && prev != 0) {
-                cur = prev;
-                // Find prev's entry
+            result.nextHop = nodes[i].prev;
+            NodeNum cur = nodes[i].prev;
+            uint8_t hops = 1;
+            while (cur != destination && cur != 0 && hops < MAX_DIJKSTRA) {
+                NodeNum next = 0;
                 for (uint8_t j = 0; j < nodeCount; j++) {
-                    if (nodes[j].id == prev) {
-                        prev = nodes[j].prev;
+                    if (nodes[j].id == cur) {
+                        next = nodes[j].prev;
                         break;
                     }
                 }
+                cur = next;
+                hops++;
             }
-            result.nextHop = cur;
+            result.hops = hops;
             break;
         }
     }

@@ -199,8 +199,8 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, ...) {
     for each direct neighbor:
         if (neighbor == destination) return destination; // Direct route
 
-    // 2. Find multi-hop routes using Dijkstra over the full edge graph
-    //    Traverses all known edges (direct + topology-learned) for optimal path
+    // 2. Find multi-hop routes with Dijkstra run backwards from the destination
+    //    over "who hears whom" (see Edge Direction in Route Calculation below)
     //    Falls back to downstream table only for nodes not in edge graph
     Route route = routingGraph->calculateRoute(destination, currentTime);
     if (route.nextHop != 0) {
@@ -228,14 +228,18 @@ bool shouldDeliverDirectToNeighbor(NodeNum destination, NodeNum heardFrom) {
 ### Edge Direction in Route Calculation
 
 An edge records hearing in one direction only: a node listing a neighbour proves that the node
-hears the neighbour. A route hop from A to B requires B to hear A, which is known when A's edge to
-B carries `hearsUs` (B confirmed it in its own list) or when B lists A. `NeighborGraph::canDeliver`
-applies this to every hop that `calculateRoute` relaxes. A node that publishes topology
-(`publishesTopology`: SR active or passive) and confirms neither does not hear A, so no route goes
-through that hop; a node that publishes no topology (stock or not yet classified) cannot be ruled
-out and is treated as before. Field case: a node hearing the city hub at -108 dBm listed it without
-`hearsUs`, the hub's own list did not contain that node, and every peer still routed to the hub
-through it.
+hears the neighbour, and the RSSI and SNR it lists are what it measured on that neighbour's
+signal. A route hop from A to B therefore needs B's evidence, not A's. `calculateRoute` runs
+Dijkstra backwards from the destination: a settled node N is reached by the nodes that can deliver
+to it, namely the nodes N lists (priced at the cost N measured on their signal, the true cost of
+the hop into N), the nodes whose edge to N carries `hearsUs` (N confirmed it hears them), and,
+when N publishes no topology (`publishesTopology`: neither SR active nor passive), anyone who
+hears N, since nothing better is known. An edge is never used against its direction and every hop
+is priced at its receiver. `nodeFilter` still gates intermediate hops only. The resulting `Route`
+carries `hops`, logged as `Route to X via Y (cost: C, hops: H)`.
+
+Field case: a node hearing the city hub at -108 dBm listed it without `hearsUs`, the hub's own
+list did not contain that node, and every peer still routed to the hub through it.
 
 A unicast whose `next_hop` byte equals the destination's own byte names no relayer: stock's
 `NextHopRouter` learns the destination itself as next hop from a direct reply. Such a packet is

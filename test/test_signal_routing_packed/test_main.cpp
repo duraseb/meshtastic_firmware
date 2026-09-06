@@ -375,6 +375,28 @@ static void test_route_never_uses_a_one_way_edge()
     TEST_ASSERT_EQUAL_UINT32(dest, graph.calculateRoute(dest, 1000, nullptr, publishes).nextHop);
 }
 
+// Costs are what the receiver of each hop measured: the relay hears us at ETX 3 and the
+// destination hears the relay at ETX 2, however good the relay's signal looks to us.
+static void test_route_cost_is_measured_at_the_receiver()
+{
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum relay = 0x11111111;
+    constexpr NodeNum dest = 0x22222222;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, relay, 1.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(relay, me, 3.0f, 1000, Edge::Source::Mirrored);
+    graph.updateEdge(relay, dest, 1.0f, 1000, Edge::Source::Mirrored);
+    graph.updateEdge(dest, relay, 2.0f, 1000, Edge::Source::Mirrored);
+
+    auto publishes = [](NodeNum) { return true; };
+    Route route = graph.calculateRoute(dest, 1000, nullptr, publishes);
+    TEST_ASSERT_EQUAL_UINT32(relay, route.nextHop);
+    TEST_ASSERT_EQUAL_UINT16(500, route.costFixed);
+    TEST_ASSERT_EQUAL_UINT8(2, route.hops);
+}
+
 static void test_self_coverage_counts_only_reported_edges()
 {
     constexpr NodeNum me = 0x0A0B0C0D;
@@ -562,6 +584,7 @@ void setup()
     RUN_TEST(test_topology_listing_us_confirms_sender_hears_us);
     RUN_TEST(test_self_coverage_counts_only_reported_edges);
     RUN_TEST(test_route_never_uses_a_one_way_edge);
+    RUN_TEST(test_route_cost_is_measured_at_the_receiver);
     RUN_TEST(test_topology_listing_peer_confirms_peer_hears_sender);
     RUN_TEST(test_unique_coverage_ignores_poor_links_and_peer_owned_stock_nodes);
     RUN_TEST(test_ranking_costs_within_a_bucket_tie_on_node_id);
