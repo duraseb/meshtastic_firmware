@@ -172,6 +172,9 @@ bool loopCanSleep()
 void __attribute__((noreturn)) __assert_func(const char *file, int line, const char *func, const char *failedexpr)
 {
     LOG_ERROR("assert failed %s: %d, %s, test=%s", file, line, func, failedexpr);
+    // Let the USB serial task ship that line before the reset kills it: three inno restarts read
+    // SREQ afterwards with nothing in the host log to say why.
+    if ((SCB->ICSR & SCB_ICSR_VECTACTIVE_Msk) == 0) delay(250); // thread context only
     // debugger_break(); FIXME doesn't work, possibly not for segger
     // Reboot cpu
     NVIC_SystemReset();

@@ -648,7 +648,9 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     if (nowMs == 0) nowMs = 1;
 
     // Passive peers reboot too: their header-only version-0 broadcast resets the tracked version as well.
-    bool bootBroadcast = neighborCount == 0 && receivedVersion == 0 && isDirectPacket(*p);
+    // The notice is about the sender's counter, not the link, so a relayed copy counts: angl heard
+    // Czar's restart only through a relay and called Czar stale for twenty minutes.
+    bool bootBroadcast = neighborCount == 0 && receivedVersion == 0;
     uint8_t staleVersion = 0;
     bool staleValid = getTopologyStale(lastTopologyVersion, lastTopologyVersionCount, p->from, &staleVersion);
     SrTopologyVerdict verdict = srTopologyVersionVerdict(receivedVersion, lastProcessedVersion, lastAcceptMs, nowMs,
