@@ -2139,13 +2139,13 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     return shouldRelay;
 }
 
-int8_t SignalRoutingModule::getUnicastHopLimitForDirectNeighbor(const meshtastic_MeshPacket *p)
+bool SignalRoutingModule::capsLastHop(const meshtastic_MeshPacket *p)
 {
     if (!routingGraph || !nodeDB) {
-        return -1;
+        return false;
     }
     if (isBroadcast(p->to)) {
-        return -1;
+        return false;
     }
 
     NodeNum myNode = nodeDB->getNodeNum();
@@ -2153,24 +2153,19 @@ int8_t SignalRoutingModule::getUnicastHopLimitForDirectNeighbor(const meshtastic
 
     const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
     if (!myEdges) {
-        return -1;
+        return false;
     }
 
     // Destination must be a direct neighbor confirmed to hear us.
-    // Track link quality to decide how aggressively to limit hops.
-    static constexpr float RELIABLE_ETX_CEILING = 3.0f;
-
     bool destIsDirectAndHearsUs = false;
-    float destEtx = 0;
     for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
         if (myEdges->edges[i].to == destination && myEdges->edges[i].hearsUs) {
             destIsDirectAndHearsUs = true;
-            destEtx = myEdges->edges[i].getEtx();
             break;
         }
     }
     if (!destIsDirectAndHearsUs) {
-        return -1;
+        return false;
     }
 
     // Only limit hops if at least one other direct neighbor is not SR-active (stock firmware).
@@ -2186,13 +2181,7 @@ int8_t SignalRoutingModule::getUnicastHopLimitForDirectNeighbor(const meshtastic
             break;
         }
     }
-    if (!hasStockNeighbor) {
-        return -1;
-    }
-
-    // Good link: zero hops, direct delivery only
-    // Marginal link: 1 hop, allow one retry relay if our TX is lost
-    return (destEtx < RELIABLE_ETX_CEILING) ? 0 : 1;
+    return hasStockNeighbor;
 }
 
 bool SignalRoutingModule::shouldUseSignalBasedRouting(const meshtastic_MeshPacket *p)

@@ -211,16 +211,15 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                         tosend->hop_limit = 0;
                         LOG_INFO("Traffic management: exhausting hops for 0x%08x, setting hop_limit=0", getFrom(p));
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
-                    } else if (signalRoutingModule &&
-                               signalRoutingModule->getUnicastHopLimitForDirectNeighbor(p) >= 0) {
-                        // Destination is a direct neighbor that hears us and stock neighbors are present.
-                        // Limit hops to prevent unnecessary stock relay. Adjust hop_start so
-                        // hopsAway (hop_start - hop_limit) stays correct for receivers.
-                        int8_t limitedHops = signalRoutingModule->getUnicastHopLimitForDirectNeighbor(p);
-                        tosend->hop_start = tosend->hop_start - tosend->hop_limit + limitedHops + 1;
-                        tosend->hop_limit = limitedHops;
-                        LOG_INFO("[SR] Limiting hop_limit=%d for unicast relay 0x%08x: dest is direct hearsUs neighbor, stock neighbors present",
-                                 limitedHops, p->id);
+                    } else if (signalRoutingModule && signalRoutingModule->capsLastHop(p)) {
+                        // Last hop: the destination is a direct neighbour that hears us and stock
+                        // neighbours listen. One hop, the destination named as next hop, and hop_start
+                        // rewritten so hopsAway (hop_start - hop_limit) stays correct for receivers.
+                        tosend->hop_start = tosend->hop_start - tosend->hop_limit + SR_LAST_HOP_BUDGET + 1;
+                        tosend->hop_limit = SR_LAST_HOP_BUDGET;
+                        tosend->next_hop = nodeDB->getLastByteOfNodeNum(p->to);
+                        LOG_INFO("[SR] Last hop for unicast relay 0x%08x: hop_limit=%d, next_hop=0x%02x", p->id,
+                                 tosend->hop_limit, tosend->next_hop);
 #endif
                     } else if (shouldDecrementHopLimit(p)) {
                         // Use shared logic to determine if hop_limit should be decremented

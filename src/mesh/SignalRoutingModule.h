@@ -355,6 +355,9 @@ static inline int refreshReportedDirectNeighborObservation(NeighborGraph *graph,
 // Maximum hops for SR topology broadcasts; capped at min(user config, this value)
 #define SR_BROADCAST_MAX_HOPS 5
 
+// Hop budget of a last-hop unicast (see SignalRoutingModule::capsLastHop).
+static constexpr uint8_t SR_LAST_HOP_BUDGET = 1;
+
 class SignalRoutingModule : public ProtobufModule<meshtastic_SignalRoutingInfo>, private concurrency::OSThread
 {
 public:
@@ -628,7 +631,12 @@ public:
     // neighbors are present, or -1 if no limiting should be applied.
     // Good links (ETX < 3.0): 0 hops (direct delivery, no further relay)
     // Marginal links: 1 hop (allow one retry relay if our TX is lost)
-    int8_t getUnicastHopLimitForDirectNeighbor(const meshtastic_MeshPacket *p);
+    // Is a unicast to p->to a last hop: the destination is a direct neighbour that hears us and
+    // stock neighbours are listening? Such a frame goes out with SR_LAST_HOP_BUDGET and the
+    // destination named as next hop, so stock neighbours (which relay a unicast only when the next
+    // hop is unset or their own byte) leave it alone while the destination still reads it as a
+    // direct, ACK-worthy frame with a populated hop_start.
+    bool capsLastHop(const meshtastic_MeshPacket *p);
     void maybeScheduleBroadcastRetransmit(const meshtastic_MeshPacket *p);
     void cancelBroadcastRetransmit(PacketId packetId);
 };

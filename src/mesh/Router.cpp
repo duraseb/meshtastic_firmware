@@ -376,19 +376,14 @@ ErrorCode Router::send(meshtastic_MeshPacket *p)
     // If we are the original transmitter, set the hop limit with which we start
     if (isFromUs(p)) {
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
-        // If destination is a direct hearsUs neighbor and stock neighbors are present,
-        // limit hop_limit so they don't relay a packet we're delivering directly.
-        // Good links get 0 hops; marginal links get 1 hop for retry resilience.
-        if (signalRoutingModule) {
-            int8_t limitedHops = signalRoutingModule->getUnicastHopLimitForDirectNeighbor(p);
-            if (limitedHops >= 0) {
-                p->hop_limit = limitedHops;
-                // hop_start is set to hop_limit below (line: p->hop_start = p->hop_limit),
-                // so hopsAway = hop_start - hop_limit = 0 for direct reception. If relayed,
-                // hop_limit is decremented and hopsAway increases correctly.
-                LOG_INFO("[SR] Limiting hop_limit=%d for originated unicast 0x%08x: dest is direct hearsUs neighbor, stock neighbors present",
-                         limitedHops, p->id);
-            }
+        // Last hop: the destination is a direct hearsUs neighbour and stock neighbours listen.
+        // One hop with the destination named as next hop: stock relays leave the frame alone,
+        // the destination reads hop_start == hop_limit as direct, and hop_start stays populated.
+        if (signalRoutingModule && signalRoutingModule->capsLastHop(p)) {
+            p->hop_limit = std::min<uint8_t>(p->hop_limit, SR_LAST_HOP_BUDGET);
+            p->next_hop = nodeDB->getLastByteOfNodeNum(p->to);
+            LOG_INFO("[SR] Last hop for originated unicast 0x%08x: hop_limit=%d, next_hop=0x%02x", p->id, p->hop_limit,
+                     p->next_hop);
         }
 #endif
         p->hop_start = p->hop_limit;

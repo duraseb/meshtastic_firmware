@@ -264,35 +264,26 @@ Destinations that are known through any mechanism are still relayed:
 
 `isNodeRoutable()` filters the intermediate hops Dijkstra may use: SR-passive nodes (CLIENT_MUTE, TRACKER, SENSOR, TAK, CLIENT_HIDDEN) broadcast topology but never relay, so they are never hops, and legacy nodes qualify only as ROUTER/REPEATER/ROUTER_CLIENT. The filter is not applied to the destination, so a passive node stays reachable.
 
-### Last-Hop Unicast Hop Limiting
+### Last-Hop Unicasts
 
-`getUnicastHopLimitForDirectNeighbor()` limits hops on unicasts destined for a direct `hearsUs` neighbor when stock neighbors are present, preventing unnecessary stock relay. It returns -1 (don't limit) or the hop_limit to set, based on link quality:
+`capsLastHop()` decides whether a unicast is a last hop: the destination is a direct neighbour with
+`hearsUs = true`, and at least one other direct neighbour is not SR-active (stock firmware). A
+last-hop frame carries `hop_limit = SR_LAST_HOP_BUDGET` (one hop) and the destination's own byte as
+`next_hop`, whatever the link quality. Stock's `NextHopRouter` relays a unicast only when
+`next_hop` is unset or its own byte, so stock neighbours leave the frame alone; the destination
+reads `hop_start == hop_limit` (or one hop used on a relayed frame) and acknowledges it; and
+`hop_start` stays populated, which the Meshtastic Android app requires before it shows a traceroute
+reply (a zero `hop_start` with a zero bitfield reads as a legacy frame there). When all other
+direct neighbours are SR-active the budget is left untouched: SR nodes suppress relays themselves
+through the slot algorithm.
 
-| Link quality | ETX | hop_limit | Behavior |
-|-------------|-----|-----------|----------|
-| Good | < 3.0 | 0 | Direct delivery only, no further relay |
-| Marginal | ≥ 3.0 | 1 | Allow one retry relay if our TX is lost |
-
-**Conditions** (all must be true):
-1. The packet is a unicast (not broadcast)
-2. The destination is a **direct neighbor** with `hearsUs = true`
-3. At least one other direct neighbor is **not SR-active** (stock firmware)
-
-When **all** other direct neighbors are SR-active, hop limiting is skipped — SR nodes suppress relays themselves via the slot-based algorithm.
-
-`hop_start` is adjusted to preserve correct `hopsAway` calculation (`hop_start - hop_limit`) for receivers:
+`hop_start` is adjusted to preserve `hopsAway` (`hop_start - hop_limit`) for receivers:
 - **Originated packets**: `hop_start = hop_limit` (standard convention)
-- **Relayed packets**: `hop_start = original_hops_taken + limitedHops + 1`
+- **Relayed packets**: `hop_start = original_hops_taken + SR_LAST_HOP_BUDGET + 1`
 
-The check is applied in two places:
+The rule is applied in two places:
 - **`NextHopRouter::perhapsRebroadcast()`** — when relaying a unicast we received from another node
 - **`Router::send()`** — when originating a unicast ourselves
-
-Log line emitted in both cases:
-```
-[SR] Limiting hop_limit=<N> for unicast relay 0x<id>: dest is direct hearsUs neighbor, stock neighbors present
-[SR] Limiting hop_limit=<N> for originated unicast 0x<id>: dest is direct hearsUs neighbor, stock neighbors present
-```
 
 ### Speculative Retransmission
 
