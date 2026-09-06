@@ -425,6 +425,7 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, s
 
     // Dijkstra run backwards from the destination over "who hears whom" (see the declaration).
     // `cost` is the cost of the path from a node to the destination, `prev` the node after it.
+    // Returns false when nothing confirmed (or, with allowUnverified, nothing at all) reaches us.
     static constexpr uint8_t MAX_DIJKSTRA = NEIGHBOR_GRAPH_MAX_NEIGHBORS;
 
     struct DNode {
@@ -436,91 +437,111 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, s
     DNode nodes[MAX_DIJKSTRA];
     uint8_t nodeCount = 0;
 
-    auto findOrAdd = [&](NodeNum id) -> int8_t {
-        for (uint8_t i = 0; i < nodeCount; i++) {
-            if (nodes[i].id == id) return i;
-        }
-        if (nodeCount >= MAX_DIJKSTRA) return -1;
-        DNode &n = nodes[nodeCount];
-        n.id = id;
-        n.cost = 0xFFFF;
-        n.prev = 0;
-        n.visited = false;
-        return nodeCount++;
-    };
-    // Lower cost[m] to cost + edgeCost with `via` as the next hop toward the destination.
-    auto relax = [&](NodeNum m, NodeNum via, uint16_t cost, uint16_t edgeCost) {
-        int8_t mIdx = findOrAdd(m);
-        if (mIdx < 0 || nodes[mIdx].visited) return;
-        uint32_t newCost = (uint32_t)cost + edgeCost;
-        if (newCost > 0xFFFE) newCost = 0xFFFE;
-        if ((uint16_t)newCost < nodes[mIdx].cost) {
-            nodes[mIdx].cost = (uint16_t)newCost;
-            nodes[mIdx].prev = via;
-        }
-    };
-
-    int8_t dstIdx = findOrAdd(destination);
-    if (dstIdx < 0) return result;
-    nodes[dstIdx].cost = 0;
-
-    for (;;) {
-        int8_t uIdx = -1;
-        uint16_t uCost = 0xFFFF;
-        for (uint8_t i = 0; i < nodeCount; i++) {
-            if (!nodes[i].visited && nodes[i].cost < uCost) {
-                uCost = nodes[i].cost;
-                uIdx = i;
+    auto search = [&](bool allowUnverified, uint16_t &costOut, NodeNum &nextHopOut, uint8_t &hopsOut) -> bool {
+        nodeCount = 0;
+        auto findOrAdd = [&](NodeNum id) -> int8_t {
+            for (uint8_t i = 0; i < nodeCount; i++) {
+                if (nodes[i].id == id) return i;
             }
-        }
-        if (uIdx < 0 || uCost == 0xFFFF) break; // nothing else can reach the destination
-
-        NodeNum n = nodes[uIdx].id;
-        nodes[uIdx].visited = true;
-        if (n == myNode) break;
-
-        // Every settled node other than the destination would relay on this path.
-        if (n != destination && nodeFilter && !nodeFilter(n)) continue;
-
-        // The nodes N hears, at the cost N measured on their signal: the true cost of M -> N.
-        const NodeEdges *nEdges = findNeighbor(n);
-        if (nEdges) {
-            for (uint8_t e = 0; e < nEdges->edgeCount; e++) {
-                relax(nEdges->edges[e].to, n, uCost, nEdges->edges[e].etxFixed);
+            if (nodeCount >= MAX_DIJKSTRA) return -1;
+            DNode &n = nodes[nodeCount];
+            n.id = id;
+            n.cost = 0xFFFF;
+            n.prev = 0;
+            n.visited = false;
+            return nodeCount++;
+        };
+        // Lower cost[m] to cost + edgeCost with `via` as the next hop toward the destination.
+        auto relax = [&](NodeNum m, NodeNum via, uint16_t cost, uint32_t edgeCost) {
+            int8_t mIdx = findOrAdd(m);
+            if (mIdx < 0 || nodes[mIdx].visited) return;
+            uint32_t newCost = (uint32_t)cost + edgeCost;
+            if (newCost > 0xFFFE) newCost = 0xFFFE;
+            if ((uint16_t)newCost < nodes[mIdx].cost) {
+                nodes[mIdx].cost = (uint16_t)newCost;
+                nodes[mIdx].prev = via;
             }
-        }
-        // Nodes N confirmed hearing (hearsUs on their edge to N) and, for a node without lists,
-        // anyone hearing N. Priced at the sender's measurement of N, the best available.
-        bool nPublishes = publishesTopology && publishesTopology(n);
-        for (uint8_t i = 0; i < neighborCount; i++) {
-            NodeNum m = neighbors[i].nodeId;
-            if (m == 0 || m == n) continue;
-            if (nEdges && findEdge(nEdges, m)) continue; // already priced from N's own list
-            const Edge *toN = findEdge(&neighbors[i], n);
-            if (!toN) continue;
-            if (toN->hearsUs || !nPublishes) relax(m, n, uCost, toN->etxFixed);
-        }
-    }
+        };
 
-    for (uint8_t i = 0; i < nodeCount; i++) {
-        if (nodes[i].id == myNode && nodes[i].cost < 0xFFFF && nodes[i].prev != 0) {
-            result.costFixed = nodes[i].cost;
-            result.nextHop = nodes[i].prev;
-            NodeNum cur = nodes[i].prev;
-            uint8_t hops = 1;
-            while (cur != destination && cur != 0 && hops < MAX_DIJKSTRA) {
-                NodeNum next = 0;
-                for (uint8_t j = 0; j < nodeCount; j++) {
-                    if (nodes[j].id == cur) {
-                        next = nodes[j].prev;
-                        break;
-                    }
+        int8_t dstIdx = findOrAdd(destination);
+        if (dstIdx < 0) return false;
+        nodes[dstIdx].cost = 0;
+
+        for (;;) {
+            int8_t uIdx = -1;
+            uint16_t uCost = 0xFFFF;
+            for (uint8_t i = 0; i < nodeCount; i++) {
+                if (!nodes[i].visited && nodes[i].cost < uCost) {
+                    uCost = nodes[i].cost;
+                    uIdx = i;
                 }
-                cur = next;
-                hops++;
             }
+            if (uIdx < 0 || uCost == 0xFFFF) break; // nothing else can reach the destination
+
+            NodeNum n = nodes[uIdx].id;
+            nodes[uIdx].visited = true;
+            if (n == myNode) break;
+
+            // Every settled node other than the destination would relay on this path.
+            if (n != destination && nodeFilter && !nodeFilter(n)) continue;
+
+            // The nodes N hears, at the cost N measured on their signal: the true cost of M -> N.
+            const NodeEdges *nEdges = findNeighbor(n);
+            if (nEdges) {
+                for (uint8_t e = 0; e < nEdges->edgeCount; e++) {
+                    relax(nEdges->edges[e].to, n, uCost, nEdges->edges[e].etxFixed);
+                }
+            }
+            // Nodes N confirmed hearing (hearsUs on their edge to N) and, for a node without lists,
+            // anyone hearing N. Priced at the sender's measurement of N, the best available. In the
+            // fallback pass an unconfirmed hop into a publishing node counts too, penalised.
+            bool nPublishes = publishesTopology && publishesTopology(n);
+            for (uint8_t i = 0; i < neighborCount; i++) {
+                NodeNum m = neighbors[i].nodeId;
+                if (m == 0 || m == n) continue;
+                if (nEdges && findEdge(nEdges, m)) continue; // already priced from N's own list
+                const Edge *toN = findEdge(&neighbors[i], n);
+                if (!toN) continue;
+                if (toN->hearsUs || !nPublishes) {
+                    relax(m, n, uCost, toN->etxFixed);
+                } else if (allowUnverified) {
+                    relax(m, n, uCost, (uint32_t)toN->etxFixed * UNVERIFIED_HOP_COST_FACTOR);
+                }
+            }
+        }
+
+        for (uint8_t i = 0; i < nodeCount; i++) {
+            if (nodes[i].id == myNode && nodes[i].cost < 0xFFFF && nodes[i].prev != 0) {
+                costOut = nodes[i].cost;
+                nextHopOut = nodes[i].prev;
+                NodeNum cur = nodes[i].prev;
+                uint8_t hops = 1;
+                while (cur != destination && cur != 0 && hops < MAX_DIJKSTRA) {
+                    NodeNum next = 0;
+                    for (uint8_t j = 0; j < nodeCount; j++) {
+                        if (nodes[j].id == cur) {
+                            next = nodes[j].prev;
+                            break;
+                        }
+                    }
+                    cur = next;
+                    hops++;
+                }
+                hopsOut = hops;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    {
+        uint16_t cost;
+        NodeNum nextHop;
+        uint8_t hops;
+        if (search(false, cost, nextHop, hops)) {
+            result.costFixed = cost;
+            result.nextHop = nextHop;
             result.hops = hops;
-            break;
         }
     }
 
@@ -549,8 +570,24 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, s
                 if (totalCost < result.costFixed) {
                     result.nextHop = downstream[i].relay;
                     result.costFixed = totalCost;
+                    result.verified = false;
                 }
             }
+        }
+    }
+
+    // Inbound-gateway fallback: nothing confirmed reaches the destination, so let the node that
+    // hears the far side try, at a penalty. A one-way edge is usually a marginal link or a
+    // truncated list, not silence.
+    if (result.nextHop == 0) {
+        uint16_t cost;
+        NodeNum nextHop;
+        uint8_t hops;
+        if (search(true, cost, nextHop, hops)) {
+            result.costFixed = cost;
+            result.nextHop = nextHop;
+            result.hops = hops;
+            result.verified = false;
         }
     }
 

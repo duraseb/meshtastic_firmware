@@ -118,14 +118,23 @@ struct NodeEdges {
     NodeEdges() : nodeId(0), edgeCount(0), lastFullUpdate(0) {}
 };
 
+// Cost factor of an unconfirmed hop in the fallback route search: the receiver never listed the
+// sender, so the link is marginal or one-way; a confirmed path of up to this many times the raw
+// cost is preferred.
+static constexpr uint16_t UNVERIFIED_HOP_COST_FACTOR = 4;
+
 struct Route {
     NodeNum destination;
     NodeNum nextHop;
     uint16_t costFixed; // Cost * 100 (fixed-point)
     uint32_t timestamp;
     uint8_t hops; // Path length, 1 for a direct neighbour; 0 from the downstream table or none
+    // Every hop confirmed by its receiver. False for the inbound-gateway fallback (a hop into a
+    // topology-publishing node that never confirmed the sender, at UNVERIFIED_HOP_COST_FACTOR times
+    // its cost) and for downstream-table routes.
+    bool verified;
 
-    Route() : destination(0), nextHop(0), costFixed(0), timestamp(0), hops(0) {}
+    Route() : destination(0), nextHop(0), costFixed(0), timestamp(0), hops(0), verified(true) {}
 
     float getCost() const { return costFixed / 100.0f; }
 };
@@ -197,7 +206,10 @@ class NeighborGraph {
     // hears them, priced at the cost N measured on their signal), the nodes whose edge to N carries
     // hearsUs (N confirmed it hears them), and, when N publishes no topology (publishesTopology(N)
     // false), anyone who hears N. An edge is never used against its direction and every hop is
-    // priced at its receiver. nodeFilter gates intermediate hops only.
+    // priced at its receiver. nodeFilter gates intermediate hops only. When no confirmed path
+    // exists (nor a downstream-table one), the search runs again allowing unconfirmed hops at
+    // UNVERIFIED_HOP_COST_FACTOR times their cost, so the node that hears the far side still
+    // carries the frame out; that route is marked unverified.
     Route calculateRoute(NodeNum destination, uint32_t currentTime, std::function<bool(NodeNum)> nodeFilter = nullptr,
                          std::function<bool(NodeNum)> publishesTopology = nullptr);
 

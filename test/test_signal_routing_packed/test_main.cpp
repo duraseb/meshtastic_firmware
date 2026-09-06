@@ -357,15 +357,21 @@ static void test_route_never_uses_a_one_way_edge()
 
     auto publishes = [](NodeNum) { return true; };
     graph.clearCache();
-    TEST_ASSERT_EQUAL_UINT32(0, graph.calculateRoute(dest, 1000, nullptr, publishes).nextHop);
+    // No confirmed path: the inbound-gateway fallback still tries through the relay, penalised.
+    Route fallback = graph.calculateRoute(dest, 1000, nullptr, publishes);
+    TEST_ASSERT_EQUAL_UINT32(relay, fallback.nextHop);
+    TEST_ASSERT_FALSE(fallback.verified);
+    TEST_ASSERT_EQUAL_UINT16(100 + 400 * UNVERIFIED_HOP_COST_FACTOR, fallback.costFixed);
     // A destination that publishes no topology cannot be ruled out.
     auto stockDest = [dest](NodeNum n) { return n != dest; };
     graph.clearCache();
     TEST_ASSERT_EQUAL_UINT32(relay, graph.calculateRoute(dest, 1000, nullptr, stockDest).nextHop);
-    // The destination confirms it hears the relay: the route is back.
+    // The destination confirms it hears the relay: the route is verified again.
     graph.setEdgeHearsUs(relay, dest, true);
     graph.clearCache();
-    TEST_ASSERT_EQUAL_UINT32(relay, graph.calculateRoute(dest, 1000, nullptr, publishes).nextHop);
+    Route verified = graph.calculateRoute(dest, 1000, nullptr, publishes);
+    TEST_ASSERT_EQUAL_UINT32(relay, verified.nextHop);
+    TEST_ASSERT_TRUE(verified.verified);
     // Our own direct link is judged the same way.
     graph.updateEdge(me, dest, 1.0f, 1000, Edge::Source::Reported);
     graph.clearCache();
@@ -395,6 +401,47 @@ static void test_route_cost_is_measured_at_the_receiver()
     TEST_ASSERT_EQUAL_UINT32(relay, route.nextHop);
     TEST_ASSERT_EQUAL_UINT16(500, route.costFixed);
     TEST_ASSERT_EQUAL_UINT8(2, route.hops);
+}
+
+// A confirmed path wins whenever one exists, however long; without one the node that hears the
+// far side carries the frame out, and passive nodes never do.
+static void test_inbound_gateway_is_the_fallback_only_without_a_confirmed_path()
+{
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum gateway = 0x11111111;
+    constexpr NodeNum passive = 0x22222222;
+    constexpr NodeNum hub = 0x33333333;
+    constexpr NodeNum far = 0x44444444;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, gateway, 1.0f, 1000, Edge::Source::Reported);
+    graph.setEdgeHearsUs(me, gateway, true);
+    graph.updateEdge(me, passive, 1.0f, 1000, Edge::Source::Reported);
+    graph.setEdgeHearsUs(me, passive, true);
+    // Both hear the hub; the hub confirms neither.
+    graph.updateEdge(gateway, hub, 2.0f, 1000, Edge::Source::Mirrored);
+    graph.updateEdge(passive, hub, 1.0f, 1000, Edge::Source::Mirrored);
+
+    auto publishes = [](NodeNum) { return true; };
+    auto relays = [passive](NodeNum n) { return n != passive; };
+    graph.clearCache();
+    Route route = graph.calculateRoute(hub, 1000, relays, publishes);
+    TEST_ASSERT_EQUAL_UINT32(gateway, route.nextHop);
+    TEST_ASSERT_FALSE(route.verified);
+    TEST_ASSERT_EQUAL_UINT16(100 + 200 * UNVERIFIED_HOP_COST_FACTOR, route.costFixed);
+    TEST_ASSERT_EQUAL_UINT8(2, route.hops);
+
+    // A confirmed path three hops long beats the two-hop unconfirmed one.
+    graph.updateEdge(gateway, far, 3.0f, 1000, Edge::Source::Mirrored);
+    graph.setEdgeHearsUs(gateway, far, true);
+    graph.updateEdge(hub, far, 3.0f, 1000, Edge::Source::Mirrored);
+    graph.clearCache();
+    route = graph.calculateRoute(hub, 1000, relays, publishes);
+    TEST_ASSERT_TRUE(route.verified);
+    TEST_ASSERT_EQUAL_UINT32(gateway, route.nextHop);
+    TEST_ASSERT_EQUAL_UINT8(3, route.hops);
+    TEST_ASSERT_EQUAL_UINT16(100 + 300 + 300, route.costFixed);
 }
 
 static void test_self_coverage_counts_only_reported_edges()
@@ -585,6 +632,7 @@ void setup()
     RUN_TEST(test_self_coverage_counts_only_reported_edges);
     RUN_TEST(test_route_never_uses_a_one_way_edge);
     RUN_TEST(test_route_cost_is_measured_at_the_receiver);
+    RUN_TEST(test_inbound_gateway_is_the_fallback_only_without_a_confirmed_path);
     RUN_TEST(test_topology_listing_peer_confirms_peer_hears_sender);
     RUN_TEST(test_unique_coverage_ignores_poor_links_and_peer_owned_stock_nodes);
     RUN_TEST(test_ranking_costs_within_a_bucket_tie_on_node_id);

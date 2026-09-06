@@ -3070,7 +3070,8 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
         char nextHopName[64];
         getNodeDisplayName(route.nextHop, nextHopName, sizeof(nextHopName));
 
-        LOG_INFO("[SR] Route to %s via %s (cost: %.2f, hops: %u)", destName, nextHopName, routeCost, route.hops);
+        LOG_INFO("[SR] Route to %s via %s (cost: %.2f, hops: %u%s)", destName, nextHopName, routeCost, route.hops,
+                 route.verified ? "" : ", unverified");
 
         if (routeCost > 10.0f) {
             LOG_WARN("[SR] High-cost route to %s (%.2f) - poor link quality expected",

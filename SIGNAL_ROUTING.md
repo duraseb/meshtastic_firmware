@@ -241,6 +241,13 @@ carries `hops`, logged as `Route to X via Y (cost: C, hops: H)`.
 Field case: a node hearing the city hub at -108 dBm listed it without `hearsUs`, the hub's own
 list did not contain that node, and every peer still routed to the hub through it.
 
+**Inbound-gateway fallback.** When no confirmed path exists (and the downstream table offers
+none), the search runs again allowing hops into a topology-publishing node that never confirmed
+the sender, at `UNVERIFIED_HOP_COST_FACTOR` (4) times their cost, so the node that hears the far
+side still carries the frame out: a one-way edge is usually a marginal link or a truncated list,
+not silence. The route is marked `verified = false` and logged with `unverified`; a confirmed path
+of any length wins over it, and `nodeFilter` still keeps passive nodes from being the gateway.
+
 A unicast whose `next_hop` byte equals the destination's own byte names no relayer: stock's
 `NextHopRouter` learns the destination itself as next hop from a direct reply. Such a packet is
 planned as one without a next hop (the cost ranking decides, nobody owns slot 0) instead of
