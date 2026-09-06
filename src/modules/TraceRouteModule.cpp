@@ -172,9 +172,9 @@ void TraceRouteModule::alterReceivedProtobuf(meshtastic_MeshPacket &p, meshtasti
         bool hasCompleteRoute = (r->route_count > 0 && r->route_back_count > 0) ||
                                 (containsTargetNode && (r->route_count > 0 || r->route_back_count > 0));
 
-        LOG_INFO("TracRoute packet analysis: tracingNode=0x%08x, p.from=0x%08x, p.to=0x%08x, request_id=0x%08x", tracingNode,
+        LOG_INFO("TracRoute: tracing=%08x from=%08x to=%08x req=%08x", tracingNode,
                  p.from, p.to, incoming.request_id);
-        LOG_INFO("TracRoute conditions: isResponseFromTarget=%d, isRequestToUs=%d, containsTargetNode=%d, hasCompleteRoute=%d",
+        LOG_INFO("TracRoute: fromTarget=%d toUs=%d hasTarget=%d complete=%d",
                  isResponseFromTarget, isRequestToUs, containsTargetNode, hasCompleteRoute);
 
         if (isResponseFromTarget || isRequestToUs || (containsTargetNode && hasCompleteRoute)) {

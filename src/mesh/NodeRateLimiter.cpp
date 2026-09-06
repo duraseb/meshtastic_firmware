@@ -168,8 +168,8 @@ bool NodeRateLimiter::checkAndUpdateBucket(BucketState &b, uint8_t threshold, No
     getNodeDisplayName(nodeId, nodeName, sizeof(nodeName));
 
     uint32_t windowAge = nowMs - b.windowStart;
-    LOG_INFO("[RateLimit] %s %s bucket: count=%u/%u limited=%d windowAge=%ums/%ums",
-             nodeName, bucketName, b.count, threshold, (int)b.limited, windowAge, cfgWindowMs);
+    // No per-packet status line: it was the single noisiest line in the serial log and only the
+    // transitions below carry information.
 
     if (b.limited) {
         if (windowAge >= cfgWindowMs) {

@@ -12,7 +12,6 @@
 
 #include "NodeDB.h"
 #include <cstdint>
-#include <functional>
 #include <limits>
 
 // Fixed-size node set — replaces std::unordered_set<NodeNum> to avoid heap allocations.
@@ -210,8 +209,16 @@ class NeighborGraph {
     // exists (nor a downstream-table one), the search runs again allowing unconfirmed hops at
     // UNVERIFIED_HOP_COST_FACTOR times their cost, so the node that hears the far side still
     // carries the frame out; that route is marked unverified.
-    Route calculateRoute(NodeNum destination, uint32_t currentTime, std::function<bool(NodeNum)> nodeFilter = nullptr,
-                         std::function<bool(NodeNum)> publishesTopology = nullptr);
+    // Predicates the route search asks the caller: may `node` relay (intermediate hops only), and
+    // does `node` publish topology. Plain function pointers with a context, not std::function: the
+    // image sits at the BLE OTA size limit and every std::function instantiation costs flash.
+    struct RoutePolicy {
+        void *ctx;
+        bool (*routable)(void *ctx, NodeNum node);
+        bool (*publishes)(void *ctx, NodeNum node);
+        RoutePolicy() : ctx(nullptr), routable(nullptr), publishes(nullptr) {}
+    };
+    Route calculateRoute(NodeNum destination, uint32_t currentTime, const RoutePolicy &policy = RoutePolicy());
 
     Route getCachedRoute(NodeNum destination, uint32_t currentTime);
 

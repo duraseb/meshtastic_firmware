@@ -403,8 +403,7 @@ uint8_t NeighborGraph::countDirectNeighbors() const
     return count;
 }
 
-Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, std::function<bool(NodeNum)> nodeFilter,
-                                    std::function<bool(NodeNum)> publishesTopology)
+Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, const RoutePolicy &policy)
 {
     // Check cache first
     Route cached = getCachedRoute(destination, currentTime);
@@ -483,7 +482,7 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, s
             if (n == myNode) break;
 
             // Every settled node other than the destination would relay on this path.
-            if (n != destination && nodeFilter && !nodeFilter(n)) continue;
+            if (n != destination && policy.routable && !policy.routable(policy.ctx, n)) continue;
 
             // The nodes N hears, at the cost N measured on their signal: the true cost of M -> N.
             const NodeEdges *nEdges = findNeighbor(n);
@@ -495,7 +494,7 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, s
             // Nodes N confirmed hearing (hearsUs on their edge to N) and, for a node without lists,
             // anyone hearing N. Priced at the sender's measurement of N, the best available. In the
             // fallback pass an unconfirmed hop into a publishing node counts too, penalised.
-            bool nPublishes = publishesTopology && publishesTopology(n);
+            bool nPublishes = policy.publishes && policy.publishes(policy.ctx, n);
             for (uint8_t i = 0; i < neighborCount; i++) {
                 NodeNum m = neighbors[i].nodeId;
                 if (m == 0 || m == n) continue;
@@ -552,7 +551,7 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, s
         const NodeEdges *myEdges = findNeighbor(myNode);
         for (uint16_t i = 0; i < downstreamCount; i++) {
             if (downstream[i].destination == destination) {
-                if (nodeFilter && !nodeFilter(downstream[i].relay)) continue;
+                if (policy.routable && !policy.routable(policy.ctx, downstream[i].relay)) continue;
                 if (!findNeighbor(downstream[i].relay)) continue;
 
                 uint16_t costToRelay = 0xFFFF;
@@ -1513,7 +1512,7 @@ bool NeighborGraph::shouldRelaySimpleConservative(NodeNum myNode, NodeNum source
             if (offset >= (int)sizeof(nodeList) - 1)
                 break;
         }
-        LOG_INFO("NeighborGraph: Conservative fallback - have %u uncovered neighbors [%s], relaying", totalNeighborsNotCovered, nodeList);
+        LOG_INFO("NeighborGraph: fallback, %u uncovered neighbors [%s], relaying", totalNeighborsNotCovered, nodeList);
 #endif
         return true;
     }

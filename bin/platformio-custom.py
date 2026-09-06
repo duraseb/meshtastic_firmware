@@ -82,6 +82,16 @@ def manifest_gather(source, target, env):
         f"mt-{board_mcu}-ota.bin",
         "bleota-c3.bin"
     ]
+    # nRF52840 with the Adafruit bootloader: a BLE OTA (application-only DFU zip) is refused with
+    # "data size exceeds limit" above 802816 bytes, the SoftDevice-to-bootloader region minus the
+    # bootloader's 40 KB app-data reserve. Warn while the image is still buildable over USB.
+    NRF52840_BLE_OTA_MAX_BIN = 0xF4000 - 0x26000 - 10 * 4096
+    if board_mcu == "nrf52840":
+        binf = env.File(env.subst(f"$BUILD_DIR/{progname}.bin"))
+        if binf.exists() and binf.get_size() > NRF52840_BLE_OTA_MAX_BIN:
+            print(f"WARNING: {progname}.bin is {binf.get_size()} bytes, above the BLE OTA limit of "
+                  f"{NRF52840_BLE_OTA_MAX_BIN}; this build can only be flashed over USB")
+
     for p in check_paths:
         f = env.File(env.subst(f"$BUILD_DIR/{p}"))
         if f.exists():

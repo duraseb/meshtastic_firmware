@@ -355,30 +355,34 @@ static void test_route_never_uses_a_one_way_edge()
     // The relay hears the destination; nothing says the destination hears the relay.
     graph.updateEdge(relay, dest, 4.0f, 1000, Edge::Source::Mirrored);
 
-    auto publishes = [](NodeNum) { return true; };
+    NeighborGraph::RoutePolicy publishes;
+    publishes.publishes = [](void *, NodeNum) { return true; };
     graph.clearCache();
     // No confirmed path: the inbound-gateway fallback still tries through the relay, penalised.
-    Route fallback = graph.calculateRoute(dest, 1000, nullptr, publishes);
+    Route fallback = graph.calculateRoute(dest, 1000, publishes);
     TEST_ASSERT_EQUAL_UINT32(relay, fallback.nextHop);
     TEST_ASSERT_FALSE(fallback.verified);
     TEST_ASSERT_EQUAL_UINT16(100 + 400 * UNVERIFIED_HOP_COST_FACTOR, fallback.costFixed);
     // A destination that publishes no topology cannot be ruled out.
-    auto stockDest = [dest](NodeNum n) { return n != dest; };
+    NodeNum destId = dest;
+    NeighborGraph::RoutePolicy stockDest;
+    stockDest.ctx = &destId;
+    stockDest.publishes = [](void *c, NodeNum n) { return n != *static_cast<NodeNum *>(c); };
     graph.clearCache();
-    TEST_ASSERT_EQUAL_UINT32(relay, graph.calculateRoute(dest, 1000, nullptr, stockDest).nextHop);
+    TEST_ASSERT_EQUAL_UINT32(relay, graph.calculateRoute(dest, 1000, stockDest).nextHop);
     // The destination confirms it hears the relay: the route is verified again.
     graph.setEdgeHearsUs(relay, dest, true);
     graph.clearCache();
-    Route verified = graph.calculateRoute(dest, 1000, nullptr, publishes);
+    Route verified = graph.calculateRoute(dest, 1000, publishes);
     TEST_ASSERT_EQUAL_UINT32(relay, verified.nextHop);
     TEST_ASSERT_TRUE(verified.verified);
     // Our own direct link is judged the same way.
     graph.updateEdge(me, dest, 1.0f, 1000, Edge::Source::Reported);
     graph.clearCache();
-    TEST_ASSERT_EQUAL_UINT32(relay, graph.calculateRoute(dest, 1000, nullptr, publishes).nextHop);
+    TEST_ASSERT_EQUAL_UINT32(relay, graph.calculateRoute(dest, 1000, publishes).nextHop);
     graph.setEdgeHearsUs(me, dest, true);
     graph.clearCache();
-    TEST_ASSERT_EQUAL_UINT32(dest, graph.calculateRoute(dest, 1000, nullptr, publishes).nextHop);
+    TEST_ASSERT_EQUAL_UINT32(dest, graph.calculateRoute(dest, 1000, publishes).nextHop);
 }
 
 // Costs are what the receiver of each hop measured: the relay hears us at ETX 3 and the
@@ -396,8 +400,9 @@ static void test_route_cost_is_measured_at_the_receiver()
     graph.updateEdge(relay, dest, 1.0f, 1000, Edge::Source::Mirrored);
     graph.updateEdge(dest, relay, 2.0f, 1000, Edge::Source::Mirrored);
 
-    auto publishes = [](NodeNum) { return true; };
-    Route route = graph.calculateRoute(dest, 1000, nullptr, publishes);
+    NeighborGraph::RoutePolicy publishes;
+    publishes.publishes = [](void *, NodeNum) { return true; };
+    Route route = graph.calculateRoute(dest, 1000, publishes);
     TEST_ASSERT_EQUAL_UINT32(relay, route.nextHop);
     TEST_ASSERT_EQUAL_UINT16(500, route.costFixed);
     TEST_ASSERT_EQUAL_UINT8(2, route.hops);
@@ -423,10 +428,13 @@ static void test_inbound_gateway_is_the_fallback_only_without_a_confirmed_path()
     graph.updateEdge(gateway, hub, 2.0f, 1000, Edge::Source::Mirrored);
     graph.updateEdge(passive, hub, 1.0f, 1000, Edge::Source::Mirrored);
 
-    auto publishes = [](NodeNum) { return true; };
-    auto relays = [passive](NodeNum n) { return n != passive; };
+    NodeNum passiveId = passive;
+    NeighborGraph::RoutePolicy policy;
+    policy.ctx = &passiveId;
+    policy.routable = [](void *c, NodeNum n) { return n != *static_cast<NodeNum *>(c); };
+    policy.publishes = [](void *, NodeNum) { return true; };
     graph.clearCache();
-    Route route = graph.calculateRoute(hub, 1000, relays, publishes);
+    Route route = graph.calculateRoute(hub, 1000, policy);
     TEST_ASSERT_EQUAL_UINT32(gateway, route.nextHop);
     TEST_ASSERT_FALSE(route.verified);
     TEST_ASSERT_EQUAL_UINT16(100 + 200 * UNVERIFIED_HOP_COST_FACTOR, route.costFixed);
@@ -437,7 +445,7 @@ static void test_inbound_gateway_is_the_fallback_only_without_a_confirmed_path()
     graph.setEdgeHearsUs(gateway, far, true);
     graph.updateEdge(hub, far, 3.0f, 1000, Edge::Source::Mirrored);
     graph.clearCache();
-    route = graph.calculateRoute(hub, 1000, relays, publishes);
+    route = graph.calculateRoute(hub, 1000, policy);
     TEST_ASSERT_TRUE(route.verified);
     TEST_ASSERT_EQUAL_UINT32(gateway, route.nextHop);
     TEST_ASSERT_EQUAL_UINT8(3, route.hops);

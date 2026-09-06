@@ -480,6 +480,7 @@ private:
         return 0;
     }
 
+    static TopologyVersionEntry *findTopologyEntry(TopologyVersionEntry *table, uint8_t count, NodeNum nodeId);
     // The version last rejected as stale from nodeId (false when none since the last accept).
     bool getTopologyStale(const TopologyVersionEntry *table, uint8_t count, NodeNum nodeId, uint8_t *staleVersion) const;
     void noteTopologyStale(TopologyVersionEntry *table, uint8_t count, NodeNum nodeId, uint8_t received);
@@ -550,6 +551,15 @@ private:
     {
         CapabilityStatus s = getCapabilityStatus(nodeId);
         return s == CapabilityStatus::SRactive || s == CapabilityStatus::Passive;
+    }
+    // The route search's view of this module: routable intermediate hops and topology publishers.
+    NeighborGraph::RoutePolicy routePolicy() const
+    {
+        NeighborGraph::RoutePolicy p;
+        p.ctx = const_cast<SignalRoutingModule *>(this);
+        p.routable = [](void *ctx, NodeNum n) { return static_cast<const SignalRoutingModule *>(ctx)->isNodeRoutable(n); };
+        p.publishes = [](void *ctx, NodeNum n) { return static_cast<const SignalRoutingModule *>(ctx)->publishesTopology(n); };
+        return p;
     }
     bool topologyHealthyForBroadcast() const;
     bool topologyHealthyForUnicast(NodeNum destination) const;
