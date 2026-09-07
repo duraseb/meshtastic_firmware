@@ -12,6 +12,7 @@
 
 #include "NodeDB.h"
 #include <cstdint>
+#include <functional>
 #include <limits>
 
 // Fixed-size node set — replaces std::unordered_set<NodeNum> to avoid heap allocations.
@@ -121,6 +122,10 @@ struct NodeEdges {
 // sender, so the link is marginal or one-way; a confirmed path of up to this many times the raw
 // cost is preferred.
 static constexpr uint16_t UNVERIFIED_HOP_COST_FACTOR = 4;
+
+// Bucket width (fixed-point ETX) for comparing links when picking a coverage owner: two nodes price
+// the same link a few hundredths apart, so only a real difference may change ownership.
+static constexpr uint16_t SR_OWNER_COST_BUCKET = 50;
 
 struct Route {
     NodeNum destination;
@@ -268,13 +273,33 @@ class NeighborGraph {
 
     bool shouldRelaySimpleConservative(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom, uint32_t currentTime) const;
 
+    // What the module knows about roles: which nodes publish topology, which are stock relay
+    // routers, which are SR-active, and whether we relay at all. Plain function pointers with a
+    // context, not std::function: the image sits at the BLE OTA size limit and every std::function
+    // instantiation costs flash (the same reason RoutePolicy is shaped this way).
+    struct CoveragePolicy {
+        void *ctx;
+        bool (*publishesTopology)(void *ctx, NodeNum node);
+        bool (*isStockRelayRouter)(void *ctx, NodeNum node);
+        bool (*isSrActive)(void *ctx, NodeNum node);
+        NodeNum me;
+        bool meRelays;
+        float poorLinkEtx;
+        CoveragePolicy()
+            : ctx(nullptr), publishesTopology(nullptr), isStockRelayRouter(nullptr), isSrActive(nullptr), me(0),
+              meRelays(false), poorLinkEtx(0.0f)
+        {
+        }
+        bool reports(NodeNum node) const { return publishesTopology && publishesTopology(ctx, node); }
+    };
+
     /// `selfNode` is the node running the ranking: its own coverage counts only Reported edges (what it
     /// broadcasts in its topology), so peers ranking it from their mirrored view reach the same order.
     // poorLinkEtx: coverage ceiling handed to `covers` for both the coverage sets and the cost.
     RelayCandidate findBestRelayCandidate(const NodeSet &candidates, const NodeSet &alreadyCovered,
                                           uint32_t currentTime, uint32_t packetId,
                                           bool preferHighNodeId = false, NodeNum sourceNode = 0,
-                                          NodeNum selfNode = 0, float poorLinkEtx = 0.0f) const;
+                                          NodeNum selfNode = 0, const CoveragePolicy *policy = nullptr) const;
 
     // Is `to` known to hear `from`? Edges are one-directional evidence: `from` listing `to` only
     // says `from` hears `to`. The reverse needs hearsUs on that edge (`to` confirmed it) or `to`
@@ -286,11 +311,24 @@ class NeighborGraph {
     float hopCost(NodeNum from, NodeNum to) const;
 
     // Does a transmission by `from` reach `to` well enough to relieve a bystander of relaying?
-    // The delivery direction must be evidenced (knownToHear) and the delivery-direction link must
-    // not be hopeless: hearsUs is sticky, so a peer that heard the sender once keeps the flag while
-    // its link decays (a rooftop node kept it with its antenna 20 dB down). `poorLinkEtx` 0 keeps
-    // the evidence rule without a cost ceiling.
-    bool covers(NodeNum from, NodeNum to, float poorLinkEtx) const;
+    //
+    // What counts as evidence depends on whether the receiver ever reports. `publishesTopology(to)`
+    // true: it is held to its own lists and must be known to hear the sender (knownToHear), since
+    // its silence about the sender is itself information. False (stock, mute, unclassified): it can
+    // never confirm anything, so the sender's own edge to it is all the evidence there will ever be
+    // — demanding more made every neighbour of one silent node relay for it on every frame. Either
+    // way the delivery-direction link must not be hopeless (hearsUs is sticky, so a peer that heard
+    // the sender once keeps the flag while its link decays). `poorLinkEtx` 0 drops the ceiling.
+    bool covers(NodeNum from, NodeNum to, float poorLinkEtx, const CoveragePolicy *policy = nullptr) const;
+
+    // Who relays for `target` when no transmitter can be shown to reach it? Exactly one node, or
+    // the whole branch relays the same frame for the same unconfirmed neighbour. The target never
+    // reports, so its receive path is all anyone can measure: the node hearing it best is the
+    // likeliest to be heard by it. Stock ROUTER/REPEATER/ROUTER_CLIENT first (they rebroadcast
+    // regardless of SR and already hold the earliest slots), then the best link in
+    // SR_OWNER_COST_BUCKET buckets, then the lowest node id. `meRelays` is our own eligibility:
+    // mute and passive roles never own, because they do not relay.
+    NodeNum coverageOwner(NodeNum target, const CoveragePolicy &policy) const;
 
     // May a frame from `from` be delivered to `to`? Evidenced delivery (knownToHear), or `to`
     // publishes no topology and its silence is no proof it cannot hear. The optimistic half is
@@ -298,13 +336,25 @@ class NeighborGraph {
     bool canDeliver(NodeNum from, NodeNum to, const RoutePolicy &policy) const;
 
     size_t getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, size_t maxNodes, const NodeNum *alreadyCovered,
-                               size_t alreadyCoveredCount, NodeNum selfNode = 0, float poorLinkEtx = 0.0f) const;
+                               size_t alreadyCoveredCount, NodeNum selfNode = 0,
+                               const CoveragePolicy *policy = nullptr) const;
 
     /// Do we still reach a direct neighbour none of `coveredBy` reaches? A coverer counts only when
     /// it `covers` the neighbour, the same rule pre-coverage applies at ranking time.
     /// `notOurs` lists neighbours another SR peer owns under the stock-coverage rule; they are skipped.
     bool hasUniqueCoverage(NodeNum myNode, const NodeNum *coveredBy, size_t coveredByCount, float poorLinkEtx = 0.0f,
-                           const NodeNum *notOurs = nullptr, size_t notOursCount = 0) const;
+                           const NodeNum *notOurs = nullptr, size_t notOursCount = 0,
+                           const CoveragePolicy *policy = nullptr) const
+    {
+        return uniqueCoverageNeighbor(myNode, coveredBy, coveredByCount, poorLinkEtx, notOurs, notOursCount, policy) != 0;
+    }
+
+    /// The neighbour that makes our relay worth its airtime: ours to cover and reached by none of
+    /// `coveredBy`. Returned rather than reduced to a bool so the decision can be logged — a relay
+    /// nobody needs and a relay that saves a node look identical in a field log otherwise.
+    NodeNum uniqueCoverageNeighbor(NodeNum myNode, const NodeNum *coveredBy, size_t coveredByCount,
+                                   float poorLinkEtx = 0.0f, const NodeNum *notOurs = nullptr,
+                                   size_t notOursCount = 0, const CoveragePolicy *policy = nullptr) const;
 
     bool isGatewayNode(NodeNum nodeId, NodeNum sourceNode) const;
 

@@ -1093,18 +1093,62 @@ bool NeighborGraph::canDeliver(NodeNum from, NodeNum to, const RoutePolicy &poli
     return !(policy.publishes && policy.publishes(policy.ctx, to));
 }
 
-bool NeighborGraph::covers(NodeNum from, NodeNum to, float poorLinkEtx) const
+bool NeighborGraph::covers(NodeNum from, NodeNum to, float poorLinkEtx, const CoveragePolicy *policy) const
 {
-    if (!knownToHear(from, to)) return false;
+    bool reports = policy && policy->reports(to);
+    bool evidenced = knownToHear(from, to);
+    if (!evidenced && !reports) {
+        // All anyone can ever measure about a silent node is that someone hears it.
+        const NodeEdges *fromEdges = findNeighbor(from);
+        evidenced = fromEdges && findEdge(fromEdges, to);
+    }
+    if (!evidenced) return false;
     if (poorLinkEtx <= 0.0f) return true;
     float cost = hopCost(from, to);
     return cost > 0.0f && cost < poorLinkEtx;
 }
 
+NodeNum NeighborGraph::coverageOwner(NodeNum target, const CoveragePolicy &policy) const
+{
+    NodeNum me = policy.me;
+    if (target == 0 || (target & 0xFF000000) == 0xFF000000) return 0;
+    NodeNum owner = 0;
+    uint8_t bestTier = 0xFF;
+    uint16_t bestBucket = 0xFFFF;
+    for (uint8_t i = 0; i < neighborCount; i++) {
+        NodeNum candidate = neighbors[i].nodeId;
+        if (candidate == 0 || candidate == target || (candidate & 0xFF000000) == 0xFF000000) continue;
+        // Only its own measurement counts: for a stock node the edge exists only because we
+        // watched it carry the target's traffic.
+        const Edge *edge = findEdge(&neighbors[i], target);
+        if (!edge) continue;
+        uint8_t tier;
+        if (candidate == me) {
+            if (!policy.meRelays) continue;
+            tier = 1;
+        } else if (policy.isStockRelayRouter && policy.isStockRelayRouter(policy.ctx, candidate)) {
+            tier = 0;
+        } else if (policy.isSrActive && policy.isSrActive(policy.ctx, candidate)) {
+            tier = 1;
+        } else {
+            continue;
+        }
+        uint16_t bucket = (uint16_t)(edge->etxFixed / SR_OWNER_COST_BUCKET);
+        if (tier < bestTier || (tier == bestTier && bucket < bestBucket) ||
+            (tier == bestTier && bucket == bestBucket && candidate < owner)) {
+            bestTier = tier;
+            bestBucket = bucket;
+            owner = candidate;
+        }
+    }
+    return owner;
+}
+
 size_t NeighborGraph::getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, size_t maxNodes,
                                            const NodeNum *alreadyCovered, size_t alreadyCoveredCount,
-                                           NodeNum selfNode, float poorLinkEtx) const
+                                           NodeNum selfNode, const CoveragePolicy *policy) const
 {
+    float poorLinkEtx = policy ? policy->poorLinkEtx : 0.0f;
     if (!coveredNodes || maxNodes == 0)
         return 0;
 
@@ -1120,9 +1164,14 @@ size_t NeighborGraph::getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, 
         if (relay == selfNode && selfNode != 0 && relayEdges->edges[i].source != Edge::Source::Reported)
             continue;
         NodeNum target = relayEdges->edges[i].to;
-        // A listing is not coverage: the target must be known to hear the relay over a link that
-        // is not hopeless.
-        if (!covers(relay, target, poorLinkEtx)) continue;
+        // Not coverage unless the relay is shown to reach it — or, when nobody can be shown to
+        // reach it at all, unless this relay is its owner. Counting it for everyone made the whole
+        // branch relay every frame for the same unconfirmed node.
+        if (!covers(relay, target, poorLinkEtx, policy)) {
+            if (!policy || coverageOwner(target, *policy) != relay) {
+                continue;
+            }
+        }
 
         bool isAlreadyCovered = false;
         for (size_t j = 0; j < alreadyCoveredCount; j++) {
@@ -1143,7 +1192,7 @@ size_t NeighborGraph::getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, 
 RelayCandidate NeighborGraph::findBestRelayCandidate(const NodeSet &candidates, const NodeSet &alreadyCovered,
                                                           uint32_t currentTime, uint32_t packetId,
                                                           bool preferHighNodeId, NodeNum sourceNode,
-                                                          NodeNum selfNode, float poorLinkEtx) const
+                                                          NodeNum selfNode, const CoveragePolicy *policy) const
 {
     RelayCandidate bestCandidate(0, 0, 0, 0);
 
@@ -1155,7 +1204,7 @@ RelayCandidate NeighborGraph::findBestRelayCandidate(const NodeSet &candidates, 
 
         NodeNum newCoverage[NODE_SET_MAX];
         size_t coverageCount =
-            getCoverageIfRelays(candidate, newCoverage, NODE_SET_MAX, nullptr, 0, selfNode, poorLinkEtx);
+            getCoverageIfRelays(candidate, newCoverage, NODE_SET_MAX, nullptr, 0, selfNode, policy);
 
         size_t uniqueCoverageCount = 0;
         for (size_t i = 0; i < coverageCount; i++) {
@@ -1225,12 +1274,13 @@ RelayCandidate NeighborGraph::findBestRelayCandidate(const NodeSet &candidates, 
     return bestCandidate;
 }
 
-bool NeighborGraph::hasUniqueCoverage(NodeNum myNode, const NodeNum *coveredBy, size_t coveredByCount, float poorLinkEtx,
-                                      const NodeNum *notOurs, size_t notOursCount) const
+NodeNum NeighborGraph::uniqueCoverageNeighbor(NodeNum myNode, const NodeNum *coveredBy, size_t coveredByCount,
+                                              float poorLinkEtx, const NodeNum *notOurs, size_t notOursCount,
+                                              const CoveragePolicy *policy) const
 {
     const NodeEdges *myEdges = findNeighbor(myNode);
     if (!myEdges || myEdges->edgeCount == 0) {
-        return false;
+        return 0;
     }
 
     for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
@@ -1262,20 +1312,26 @@ bool NeighborGraph::hasUniqueCoverage(NodeNum myNode, const NodeNum *coveredBy, 
         }
         if (ownedElsewhere) continue;
 
-        // A coverer counts only when the neighbour is known to hear it over a link that is not
+        // Ours to cover: it proved it hears us, or nobody can prove anything about it and we are
+        // its owner. Otherwise it is another node's responsibility, or nobody's.
+        if (!myEdges->edges[i].hearsUs && policy && coverageOwner(neighbor, *policy) != myNode) {
+            continue;
+        }
+
+        // A coverer counts only when it is shown to reach the neighbour over a link that is not
         // hopeless (the 40.0 "heard once" sentinel included).
         bool covered = false;
         for (size_t c = 0; c < coveredByCount && !covered; c++) {
-            covered = covers(coveredBy[c], neighbor, poorLinkEtx);
+            covered = covers(coveredBy[c], neighbor, poorLinkEtx, policy);
         }
 
         if (!covered) {
-            LOG_INFO("[SR] Unique coverage: neighbor %08x not covered by any coveredBy node", neighbor);
-            return true; // Found a neighbor not covered by anyone
+            LOG_INFO("[SR] Relaying for %08x (no transmitter reaches it)", neighbor);
+            return neighbor;
         }
     }
 
-    return false;
+    return 0;
 }
 
 bool NeighborGraph::isGatewayNode(NodeNum nodeId, NodeNum sourceNode) const
@@ -1497,7 +1553,7 @@ bool NeighborGraph::shouldRelaySimpleConservative(NodeNum myNode, NodeNum source
     }
 
     if (!transmittingEdges) {
-        LOG_INFO("NeighborGraph: No topology for transmitting node %08x - fallback relay", heardFrom);
+        LOG_INFO("NeighborGraph: No topology for TX node %08x - fallback relay", heardFrom);
         return true;
     }
 

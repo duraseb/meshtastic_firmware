@@ -430,6 +430,9 @@ private:
     struct PendingTopologyReply {
         bool active = false;
         uint32_t fireAfterMs = 0;
+        // When the empty bootstrap broadcast asked for our list. A list transmitted after this
+        // has already answered it, whatever triggered that list.
+        uint32_t requestedMs = 0;
     };
     PendingTopologyReply pendingTopologyReply;
     // Bootstrap replies are rate-limited: a burst of empty broadcasts (many reboots, or a rogue) must not
@@ -442,6 +445,9 @@ private:
     static constexpr uint32_t SR_PEER_TURNAROUND_MS = 250;
     static constexpr uint32_t SR_SLOT_ORIGIN_MS = SR_PEER_TURNAROUND_MS;
     uint32_t lastBootstrapReplyMs = 0; // 0 = never
+    // When we last transmitted a list that actually carried neighbours (0 = never). The
+    // header-only boot broadcast does not count: it tells a requester nothing about who we hear.
+    uint32_t lastTopologyListMs = 0;
     uint8_t currentTopologyVersion = 0;
 
     static constexpr size_t MAX_TOPOLOGY_VERSION_ENTRIES = NEIGHBOR_GRAPH_MAX_NEIGHBORS;
@@ -552,15 +558,13 @@ private:
         CapabilityStatus s = getCapabilityStatus(nodeId);
         return s == CapabilityStatus::SRactive || s == CapabilityStatus::Passive;
     }
+    // The coverage rules' view of this module: who reports, who relays, and our own eligibility.
+    NeighborGraph::CoveragePolicy coveragePolicy() const;
+
+
     // The route search's view of this module: routable intermediate hops and topology publishers.
-    NeighborGraph::RoutePolicy routePolicy() const
-    {
-        NeighborGraph::RoutePolicy p;
-        p.ctx = const_cast<SignalRoutingModule *>(this);
-        p.routable = [](void *ctx, NodeNum n) { return static_cast<const SignalRoutingModule *>(ctx)->isNodeRoutable(n); };
-        p.publishes = [](void *ctx, NodeNum n) { return static_cast<const SignalRoutingModule *>(ctx)->publishesTopology(n); };
-        return p;
-    }
+    NeighborGraph::RoutePolicy routePolicy() const;
+
     bool topologyHealthyForBroadcast() const;
     bool topologyHealthyForUnicast(NodeNum destination) const;
     bool isImmediateRelayRouter(NodeNum nodeId) const;

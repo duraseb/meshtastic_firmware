@@ -515,23 +515,29 @@ static void test_covers_requires_evidence_and_a_sound_link()
     graph.updateEdge(me, peer, 1.0f, 1000, Edge::Source::Reported);
     // The peer lists u: that only says the peer hears u.
     graph.updateEdge(peer, u, 1.5f, 1000, Edge::Source::Mirrored);
+    // u publishes topology, so its silence about the peer counts against coverage.
+    NeighborGraph::CoveragePolicy reports;
+    reports.publishesTopology = [](void *, NodeNum) { return true; };
     TEST_ASSERT_FALSE(graph.knownToHear(peer, u));
-    TEST_ASSERT_FALSE(graph.covers(peer, u, 7.0f));
+    TEST_ASSERT_FALSE(graph.covers(peer, u, 7.0f, &reports));
+    // A node that publishes nothing can never confirm anything, so the peer's own edge is all the
+    // evidence there will ever be and it counts.
+    TEST_ASSERT_TRUE(graph.covers(peer, u, 7.0f));
 
     // u confirmed hearing the peer.
     graph.setEdgeHearsUs(peer, u, true);
     TEST_ASSERT_TRUE(graph.knownToHear(peer, u));
-    TEST_ASSERT_TRUE(graph.covers(peer, u, 7.0f));
+    TEST_ASSERT_TRUE(graph.covers(peer, u, 7.0f, &reports));
 
     // Confirmed once, hopeless now: hearsUs is sticky, coverage is not.
     graph.updateEdge(peer, u, 40.0f, 1000, Edge::Source::Mirrored);
-    TEST_ASSERT_FALSE(graph.covers(peer, u, 7.0f));
-    TEST_ASSERT_TRUE(graph.covers(peer, u, 0.0f)); // no ceiling: evidence alone
+    TEST_ASSERT_FALSE(graph.covers(peer, u, 7.0f, &reports));
+    TEST_ASSERT_TRUE(graph.covers(peer, u, 0.0f, &reports)); // no ceiling: evidence alone
 
     // u's own measurement of the peer is the delivery-direction cost and wins the pricing.
     graph.updateEdge(u, peer, 1.2f, 1000, Edge::Source::Mirrored);
     TEST_ASSERT_FLOAT_WITHIN(0.01f, 1.2f, graph.hopCost(peer, u));
-    TEST_ASSERT_TRUE(graph.covers(peer, u, 7.0f));
+    TEST_ASSERT_TRUE(graph.covers(peer, u, 7.0f, &reports));
 }
 
 // Delivery is optimistic only for nodes that publish no topology; coverage never is.
@@ -551,10 +557,50 @@ static void test_can_deliver_is_optimistic_only_for_silent_nodes()
     NeighborGraph::RoutePolicy silent; // no predicate: nothing publishes
     TEST_ASSERT_FALSE(graph.canDeliver(peer, u, publishes));
     TEST_ASSERT_TRUE(graph.canDeliver(peer, u, silent));
-    TEST_ASSERT_FALSE(graph.covers(peer, u, 7.0f));
+    NeighborGraph::CoveragePolicy reports;
+    reports.publishesTopology = [](void *, NodeNum) { return true; };
+    TEST_ASSERT_FALSE(graph.covers(peer, u, 7.0f, &reports));
 
     graph.setEdgeHearsUs(peer, u, true);
     TEST_ASSERT_TRUE(graph.canDeliver(peer, u, publishes));
+}
+
+// A neighbour nobody can be shown to reach belongs to exactly one relayer: the one hearing it
+// best, in buckets, with stock relay routers given way first and the node id as the tie-break.
+static void test_coverage_owner_is_the_best_link_then_the_lowest_id()
+{
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum nearPeer = 0xEE0000EE;
+    constexpr NodeNum silent = 0x22222222;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, nearPeer, 1.0f, 1000, Edge::Source::Reported);
+    graph.setEdgeHearsUs(me, nearPeer, true);
+    graph.updateEdge(me, silent, 3.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(nearPeer, silent, 1.0f, 1000, Edge::Source::Mirrored);
+
+    static NodeNum peerId = nearPeer;
+    NeighborGraph::CoveragePolicy policy;
+    policy.me = me;
+    policy.meRelays = true;
+    policy.isSrActive = [](void *, NodeNum n) { return n == peerId; };
+    // A bucket better wins, id notwithstanding.
+    TEST_ASSERT_EQUAL_UINT32(nearPeer, graph.coverageOwner(silent, policy));
+    // Same bucket: the lowest id decides.
+    graph.updateEdge(nearPeer, silent, 3.0f, 1000, Edge::Source::Mirrored);
+    TEST_ASSERT_EQUAL_UINT32(me, graph.coverageOwner(silent, policy));
+    // A stock relay router is given way even with a worse link.
+    graph.updateEdge(nearPeer, silent, 6.0f, 1000, Edge::Source::Mirrored);
+    NeighborGraph::CoveragePolicy stockFirst = policy;
+    stockFirst.isSrActive = nullptr;
+    stockFirst.isStockRelayRouter = [](void *, NodeNum n) { return n == peerId; };
+    TEST_ASSERT_EQUAL_UINT32(nearPeer, graph.coverageOwner(silent, stockFirst));
+    // Our role does not relay: we cannot own it.
+    NeighborGraph::CoveragePolicy passive = policy;
+    passive.meRelays = false;
+    passive.isSrActive = nullptr;
+    TEST_ASSERT_EQUAL_UINT32(0, graph.coverageOwner(silent, passive));
 }
 
 static void test_unique_coverage_ignores_poor_links_and_peer_owned_stock_nodes()
@@ -720,6 +766,7 @@ void setup()
     RUN_TEST(test_topology_listing_peer_confirms_peer_hears_sender);
     RUN_TEST(test_covers_requires_evidence_and_a_sound_link);
     RUN_TEST(test_can_deliver_is_optimistic_only_for_silent_nodes);
+    RUN_TEST(test_coverage_owner_is_the_best_link_then_the_lowest_id);
     RUN_TEST(test_unique_coverage_ignores_poor_links_and_peer_owned_stock_nodes);
     RUN_TEST(test_ranking_costs_within_a_bucket_tie_on_node_id);
     RUN_TEST(test_topology_version_window_is_forward_only_and_wraps);
