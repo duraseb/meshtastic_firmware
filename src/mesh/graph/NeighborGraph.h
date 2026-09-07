@@ -270,16 +270,38 @@ class NeighborGraph {
 
     /// `selfNode` is the node running the ranking: its own coverage counts only Reported edges (what it
     /// broadcasts in its topology), so peers ranking it from their mirrored view reach the same order.
+    // poorLinkEtx: coverage ceiling handed to `covers` for both the coverage sets and the cost.
     RelayCandidate findBestRelayCandidate(const NodeSet &candidates, const NodeSet &alreadyCovered,
                                           uint32_t currentTime, uint32_t packetId,
                                           bool preferHighNodeId = false, NodeNum sourceNode = 0,
-                                          NodeNum selfNode = 0) const;
+                                          NodeNum selfNode = 0, float poorLinkEtx = 0.0f) const;
+
+    // Is `to` known to hear `from`? Edges are one-directional evidence: `from` listing `to` only
+    // says `from` hears `to`. The reverse needs hearsUs on that edge (`to` confirmed it) or `to`
+    // listing `from`.
+    bool knownToHear(NodeNum from, NodeNum to) const;
+
+    // Cost of the hop from → to, priced at the receiver when it published a measurement of the
+    // sender, else at the sender's own. 0 when neither has an edge.
+    float hopCost(NodeNum from, NodeNum to) const;
+
+    // Does a transmission by `from` reach `to` well enough to relieve a bystander of relaying?
+    // The delivery direction must be evidenced (knownToHear) and the delivery-direction link must
+    // not be hopeless: hearsUs is sticky, so a peer that heard the sender once keeps the flag while
+    // its link decays (a rooftop node kept it with its antenna 20 dB down). `poorLinkEtx` 0 keeps
+    // the evidence rule without a cost ceiling.
+    bool covers(NodeNum from, NodeNum to, float poorLinkEtx) const;
+
+    // May a frame from `from` be delivered to `to`? Evidenced delivery (knownToHear), or `to`
+    // publishes no topology and its silence is no proof it cannot hear. The optimistic half is
+    // what keeps stock destinations reachable; coverage decisions use the strict `covers` instead.
+    bool canDeliver(NodeNum from, NodeNum to, const RoutePolicy &policy) const;
 
     size_t getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, size_t maxNodes, const NodeNum *alreadyCovered,
-                               size_t alreadyCoveredCount, NodeNum selfNode = 0) const;
+                               size_t alreadyCoveredCount, NodeNum selfNode = 0, float poorLinkEtx = 0.0f) const;
 
-    /// Do we still reach a direct neighbour none of `coveredBy` reaches? A coverer's edge counts only
-    /// below `poorLinkEtx` (0 = no threshold), the same rule pre-coverage applies at ranking time.
+    /// Do we still reach a direct neighbour none of `coveredBy` reaches? A coverer counts only when
+    /// it `covers` the neighbour, the same rule pre-coverage applies at ranking time.
     /// `notOurs` lists neighbours another SR peer owns under the stock-coverage rule; they are skipped.
     bool hasUniqueCoverage(NodeNum myNode, const NodeNum *coveredBy, size_t coveredByCount, float poorLinkEtx = 0.0f,
                            const NodeNum *notOurs = nullptr, size_t notOursCount = 0) const;

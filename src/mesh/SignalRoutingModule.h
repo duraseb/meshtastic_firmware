@@ -660,7 +660,14 @@ public:
     // hop is unset or their own byte) leave it alone while the destination still reads it as a
     // direct, ACK-worthy frame with a populated hop_start.
     bool capsLastHop(const meshtastic_MeshPacket *p);
+    // T1 insurance for a broadcast we originated: if nobody relays it inside the worst-case
+    // window, resend once. A relay we committed to needs no insurance — the relay is the copy.
     void maybeScheduleBroadcastRetransmit(const meshtastic_MeshPacket *p);
+    // T1 insurance for a broadcast we deferred (no ranked slot): if nobody retransmits, a late
+    // copy still reaches the source. Every deferring node arms one, so each waits `staggerMs`
+    // past the window; firing together would collide exactly when the ranked relay went missing.
+    void armDeferredBroadcastRetransmit(const meshtastic_MeshPacket *p, uint32_t staggerMs);
+    void scheduleT1Broadcast(const meshtastic_MeshPacket *p, uint32_t staggerMs, bool deferred);
     void cancelBroadcastRetransmit(PacketId packetId);
 };
 

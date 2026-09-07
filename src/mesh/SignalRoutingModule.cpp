@@ -1866,6 +1866,14 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     getNodeDisplayName(heardFrom, heardFromName, sizeof(heardFromName));
     getNodeDisplayName(sourceNode, srcName, sizeof(srcName));
 
+    // A named next hop that is not the destination itself makes us a backup, and a backup
+    // survives every suppress reason below: those reasons say somebody else is better placed,
+    // not that the designated hop will succeed. Without this, a silent designated hop had no
+    // second chance.
+    bool relayerNamed =
+        p->next_hop != NO_NEXT_HOP_PREFERENCE && p->next_hop != nodeDB->getLastByteOfNodeNum(destination);
+    const char *suppressReason = nullptr;
+
     // If src and dst are both downstream of the same relay, that relay handles delivery.
     NodeNum sourceRelay = routingGraph->getDownstreamRelay(sourceNode);
     NodeNum destRelay = routingGraph->getDownstreamRelay(destination);
@@ -1873,29 +1881,42 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         char relayName[64];
         getNodeDisplayName(sourceRelay, relayName, sizeof(relayName));
         LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: from %s to %s, src and dst both downstream of %s", p->id, srcName, destName, relayName);
-        return false;
+        if (!relayerNamed) {
+            return false;
+        }
+        suppressReason = "src and dst share a relay";
     }
 
-    // If heardFrom already has a route to the destination, it can deliver — don't relay back.
-    if (heardFrom != 0 && heardFrom != myNode && heardFrom != sourceNode) {
-        bool heardFromCanReachDest = hasDirectConnectivity(heardFrom, destination) ||
+    // If heardFrom can finish delivery itself, it holds the packet already — don't relay back.
+    // An edge to the destination is not enough: it only says heardFrom hears the destination.
+    if (heardFrom != 0 && heardFrom != myNode && heardFrom != sourceNode && !suppressReason) {
+        bool heardFromCanReachDest = routingGraph->canDeliver(heardFrom, destination, routePolicy()) ||
                                      (routingGraph->isDownstream(destination) &&
                                       routingGraph->getDownstreamRelay(destination) == heardFrom);
         if (heardFromCanReachDest) {
             LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: from %s to %s, heardFrom %s can reach dst directly", p->id, srcName, destName, heardFromName);
-            return false;
-        }
-        if (hasBetterPositionedSRNeighbor(myNode, heardFrom, destination)) {
+            if (!relayerNamed) {
+                return false;
+            }
+            suppressReason = "heardFrom can finish";
+        } else if (hasBetterPositionedSRNeighbor(myNode, heardFrom, destination)) {
             LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: from %s to %s, SR neighbor covering %s can reach dst", p->id, srcName, destName, heardFromName);
-            return false;
+            if (!relayerNamed) {
+                return false;
+            }
+            suppressReason = "better positioned SR neighbour";
         }
     }
 
-    // No route → can't relay.
+    // No route of our own. As a named backup that is still useful: the designated hop is the route
+    // and we relay with no next hop of our own if it stays silent.
     NodeNum myNextHop = getNextHop(destination, sourceNode, heardFrom, false);
     if (myNextHop == 0) {
         LOG_INFO("[SR-DECISION] UNICAST SUPPRESS pkt=0x%08x: from %s to %s, no route via SR topology", p->id, srcName, destName);
-        return false;
+        if (!relayerNamed) {
+            return false;
+        }
+        suppressReason = "no route of our own";
     }
 
     // --- Slot-based relay coordination ---
@@ -1969,25 +1990,32 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     // nodes in opposite orders and both took the same slot. Within a bucket the node-id tie-break
     // below decides identically everywhere.
     auto bucket = [](uint16_t etxFixed) -> uint16_t { return (uint16_t)(etxFixed / SR_COST_BUCKET_FIXED * SR_COST_BUCKET_FIXED); };
+    // A listing is not a path and the lister's own ETX measures the other direction, so every
+    // tier asks canDeliver and prices the hop at its receiver.
+    auto deliveryCostFixed = [&](NodeNum from, NodeNum to) -> uint16_t {
+        if (!routingGraph->canDeliver(from, to, routePolicy())) {
+            return UINT16_MAX;
+        }
+        float cost = routingGraph->hopCost(from, to);
+        if (cost <= 0.0f) {
+            return UINT16_MAX;
+        }
+        return (uint16_t)std::min(cost * 100.0f, 32766.0f);
+    };
     auto getCandidateCost = [&](NodeNum node) -> uint16_t {
-        const NodeEdges *edges = routingGraph->getEdgesFrom(node);
-        if (edges) {
-            for (uint8_t i = 0; i < edges->edgeCount; i++) {
-                if (edges->edges[i].to == destination) {
-                    return bucket(std::min<uint16_t>(edges->edges[i].etxFixed, 0x7FFEu));
-                }
-            }
+        uint16_t direct = deliveryCostFixed(node, destination);
+        if (direct != UINT16_MAX) {
+            return bucket(std::min<uint16_t>(direct, 0x7FFEu));
         }
         NodeNum dsRelay = routingGraph->getDownstreamRelay(destination);
         if (dsRelay != 0 && dsRelay == node) {
             return 0x7FFFu;
         }
         // A neighbour reaching "us" is not a path when the route picker fell back to us.
-        if (edges && myNextHop != destination && myNextHop != myNode && myNextHop != node) {
-            for (uint8_t i = 0; i < edges->edgeCount; i++) {
-                if (edges->edges[i].to == myNextHop) {
-                    return bucket(std::min<uint16_t>(edges->edges[i].etxFixed, 0x7FFFu)) | 0x8000u;
-                }
+        if (myNextHop != 0 && myNextHop != destination && myNextHop != myNode && myNextHop != node) {
+            uint16_t shared = deliveryCostFixed(node, myNextHop);
+            if (shared != UINT16_MAX) {
+                return bucket(std::min<uint16_t>(shared, 0x7FFFu)) | 0x8000u;
             }
         }
         return UINT16_MAX;
@@ -2009,7 +2037,6 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     // A next hop equal to the destination's own byte names no relayer: the source expects direct
     // delivery (stock learns the destination as its own next hop from a direct reply). Nobody owns
     // slot 0 then; the cost ranking below decides as for an unnamed hop.
-    bool relayerNamed = p->next_hop != NO_NEXT_HOP_PREFERENCE && p->next_hop != nodeDB->getLastByteOfNodeNum(destination);
     if (relayerNamed) {
         uint8_t ourLastByte = nodeDB->getLastByteOfNodeNum(myNode);
         if (ourLastByte == p->next_hop) {
@@ -2036,6 +2063,34 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         slotDelay += reserve;
         LOG_INFO("[SR] Unicast slot 0ms: %s next_hop 0x%02x (%ums reserved)", nextHopIsSR ? "SR" : "stock/unknown",
                  p->next_hop, reserve);
+    }
+
+    // A suppressed backup does not rank: the reasons above already said peers are better placed.
+    // It waits behind the designated reserve at its own rung of the node-id ladder, so several
+    // backups do not answer a silent designated hop together.
+    if (suppressReason) {
+        uint8_t rank = 0;
+        if (myEdges) {
+            for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+                NodeNum nb = myEdges->edges[i].to;
+                if (nb == myNode || nb == heardFrom || nb == sourceNode) {
+                    continue;
+                }
+                if (getCapabilityStatus(nb) != CapabilityStatus::SRactive) {
+                    continue;
+                }
+                if (((p->id & 1) != 0) ? (nb > myNode) : (nb < myNode)) {
+                    rank++;
+                }
+            }
+        }
+        uint32_t backupDelay = slotDelay + rank * halfAirtime;
+        LOG_INFO("[SR-DECISION] UNICAST RELAY pkt=0x%08x: from %s to %s, backup for next_hop 0x%02x "
+                 "(%s, delay=%ums)",
+                 p->id, srcName, destName, p->next_hop, suppressReason, backupDelay);
+        pendingRelayDelayMs = backupDelay;
+        routingGraph->recordNodeTransmission(myNode, p->id, currentTime);
+        return true;
     }
 
     // Phase 2: SR candidates (including self) sorted by cost to destination.
@@ -2425,6 +2480,16 @@ bool SignalRoutingModule::allHearsUsNeighborsHeardPacket(PacketId packetId) cons
 
 void SignalRoutingModule::maybeScheduleBroadcastRetransmit(const meshtastic_MeshPacket *p)
 {
+    scheduleT1Broadcast(p, 0, false);
+}
+
+void SignalRoutingModule::armDeferredBroadcastRetransmit(const meshtastic_MeshPacket *p, uint32_t staggerMs)
+{
+    scheduleT1Broadcast(p, staggerMs, true);
+}
+
+void SignalRoutingModule::scheduleT1Broadcast(const meshtastic_MeshPacket *p, uint32_t staggerMs, bool deferred)
+{
     if (!routingGraph || !nodeDB || !p) {
         return;
     }
@@ -2436,11 +2501,15 @@ void SignalRoutingModule::maybeScheduleBroadcastRetransmit(const meshtastic_Mesh
         p->decoded.portnum == meshtastic_PortNum_SIGNAL_ROUTING_APP) {
         return;
     }
-    // Only schedule for broadcasts we originated or are committed to relay via SR
+    // Originated broadcasts insure themselves; a relay we committed to needs no insurance (the
+    // relay is the copy). Everything else reaches here only through the deferred path.
     NodeNum myNode = nodeDB->getNodeNum();
     bool isOriginated = (p->from == 0 || p->from == myNode);
-    bool isSRRelay = !isOriginated && isCommittedRelay(p->id);
-    if (!isOriginated && !isSRRelay) {
+    if (!deferred && !isOriginated) {
+        return;
+    }
+    // A deferred copy is a relay: it needs a hop to spend.
+    if (deferred && p->hop_limit == 0) {
         return;
     }
     // Guard: when firing T1 we re-enter send(); prevent scheduling T2
@@ -2473,13 +2542,20 @@ void SignalRoutingModule::maybeScheduleBroadcastRetransmit(const meshtastic_Mesh
         latestRelayWindowMs = 10000; // 10 s fallback
         airtimeMs = 500;
     }
-    uint32_t fireDelayMs = latestRelayWindowMs + airtimeMs;
+    uint32_t fireDelayMs = latestRelayWindowMs + airtimeMs + staggerMs;
 
     // Allocate the copy before Router::send() encrypts the original in place
     meshtastic_MeshPacket *copy = packetPool.allocCopy(*p);
     if (!copy) {
         LOG_WARN("[SR] Packet pool exhausted — skipping T1 for 0x%08x", p->id);
         return;
+    }
+    if (deferred) {
+        // The originated and committed paths store a frame already prepared for TX; a deferred
+        // copy is the frame as received, so spend the hop here or receivers read our late copy as
+        // having travelled zero hops.
+        copy->hop_limit--;
+        copy->next_hop = NO_NEXT_HOP_PREFERENCE;
     }
 
     // Find a free slot — prefer canceled/empty entries
@@ -2506,8 +2582,8 @@ void SignalRoutingModule::maybeScheduleBroadcastRetransmit(const meshtastic_Mesh
     slot->fireAfterMs = millis() + fireDelayMs;
     slot->canceled = false;
 
-    LOG_INFO("[SR] T1 scheduled for 0x%08x (%s) fires in %ums (late window %ums + airtime %ums)",
-             p->id, isOriginated ? "originated" : "SR-relay", fireDelayMs, latestRelayWindowMs, airtimeMs);
+    LOG_INFO("[SR] T1 scheduled for 0x%08x (%s) fires in %ums (window %ums + airtime %ums + stagger %ums)",
+             p->id, deferred ? "deferred" : "originated", fireDelayMs, latestRelayWindowMs, airtimeMs, staggerMs);
 
     // Ensure runOnce() wakes up in time to fire the retransmit
     setIntervalFromNow(fireDelayMs);
@@ -2866,9 +2942,8 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     const NodeEdges *heardFromEdges = routingGraph->getEdgesFrom(heardFrom);
     if (heardFromEdges) {
         for (uint8_t i = 0; i < heardFromEdges->edgeCount; i++) {
-            float etx = heardFromEdges->edges[i].getEtx();
             NodeNum neighbor = heardFromEdges->edges[i].to;
-            if (etx < cfgPoorLinkEtxThreshold) {
+            if (routingGraph->covers(heardFrom, neighbor, cfgPoorLinkEtxThreshold)) {
                 alreadyCovered.insert(neighbor);
             }
         }
@@ -2979,7 +3054,10 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
                 const NodeEdges *ne = routingGraph->getEdgesFrom(neighbor);
                 if (ne) {
                     for (uint8_t j = 0; j < ne->edgeCount; j++) {
-                        alreadyCovered.insert(ne->edges[j].to);
+                        NodeNum target = ne->edges[j].to;
+                        if (routingGraph->covers(neighbor, target, cfgPoorLinkEtxThreshold)) {
+                            alreadyCovered.insert(target);
+                        }
                     }
                 }
                 alreadyCovered.insert(neighbor);
@@ -3000,7 +3078,11 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         const NodeEdges *ne = routingGraph->getEdgesFrom(relay);
         if (ne) {
             for (uint8_t j = 0; j < ne->edgeCount; j++) {
-                alreadyCovered.insert(ne->edges[j].to);
+                NodeNum target = ne->edges[j].to;
+                // Only what this relay actually reaches: a one-way listing is not coverage.
+                if (routingGraph->covers(relay, target, cfgPoorLinkEtxThreshold)) {
+                    alreadyCovered.insert(target);
+                }
             }
         }
         alreadyCovered.insert(relay);
@@ -3012,7 +3094,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     while (!candidates.empty()) {
         RelayCandidate best = routingGraph->findBestRelayCandidate(candidates, alreadyCovered,
                                                                     currentTime, p->id, preferHighNodeId, sourceNode,
-                                                                    myNode);
+                                                                    myNode, cfgPoorLinkEtxThreshold);
         if (best.nodeId == 0) {
             break;
         }
@@ -3073,6 +3155,20 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     if (shouldRelay) {
         pendingRelayDelayMs = myDelay;
         routingGraph->recordNodeTransmission(myNode, p->id, currentTime);
+    } else if (srPeers.count > 1) {
+        // We left the ranked slots to peers, so insure the packet at our own rung of the ladder:
+        // the node-id order the slots already use, one half-airtime apart.
+        uint8_t rank = 0;
+        for (uint16_t i = 0; i < srPeers.count; i++) {
+            NodeNum peer = srPeers.nodes[i];
+            if (peer == myNode) {
+                continue;
+            }
+            if (preferHighNodeId ? (peer > myNode) : (peer < myNode)) {
+                rank++;
+            }
+        }
+        armDeferredBroadcastRetransmit(p, rank * halfAirtime);
     }
 
     return shouldRelay;

@@ -470,6 +470,13 @@ static void test_self_coverage_counts_only_reported_edges()
     graph.updateEdge(peer, a, 1.5f, 1000, Edge::Source::Reported);
     graph.updateEdge(peer, b, 1.5f, 1000, Edge::Source::Mirrored);
     graph.updateEdge(peer, c, 1.5f, 1000, Edge::Source::Mirrored);
+    // Coverage needs the delivery direction: each listed node confirmed hearing the lister.
+    for (NodeNum n : {peer, a, b}) {
+        graph.setEdgeHearsUs(me, n, true);
+    }
+    for (NodeNum n : {a, b, c}) {
+        graph.setEdgeHearsUs(peer, n, true);
+    }
 
     NodeNum out[NODE_SET_MAX];
     // Ranking ourselves: only what we report (and peers can see) counts.
@@ -496,6 +503,60 @@ static void test_self_coverage_counts_only_reported_edges()
     TEST_ASSERT_EQUAL_UINT32(me, legacy.nodeId);
 }
 
+// Coverage is evidenced delivery over a link that is not hopeless, priced at the receiver.
+static void test_covers_requires_evidence_and_a_sound_link()
+{
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum peer = 0x11111111;
+    constexpr NodeNum u = 0x22222222;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, peer, 1.0f, 1000, Edge::Source::Reported);
+    // The peer lists u: that only says the peer hears u.
+    graph.updateEdge(peer, u, 1.5f, 1000, Edge::Source::Mirrored);
+    TEST_ASSERT_FALSE(graph.knownToHear(peer, u));
+    TEST_ASSERT_FALSE(graph.covers(peer, u, 7.0f));
+
+    // u confirmed hearing the peer.
+    graph.setEdgeHearsUs(peer, u, true);
+    TEST_ASSERT_TRUE(graph.knownToHear(peer, u));
+    TEST_ASSERT_TRUE(graph.covers(peer, u, 7.0f));
+
+    // Confirmed once, hopeless now: hearsUs is sticky, coverage is not.
+    graph.updateEdge(peer, u, 40.0f, 1000, Edge::Source::Mirrored);
+    TEST_ASSERT_FALSE(graph.covers(peer, u, 7.0f));
+    TEST_ASSERT_TRUE(graph.covers(peer, u, 0.0f)); // no ceiling: evidence alone
+
+    // u's own measurement of the peer is the delivery-direction cost and wins the pricing.
+    graph.updateEdge(u, peer, 1.2f, 1000, Edge::Source::Mirrored);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 1.2f, graph.hopCost(peer, u));
+    TEST_ASSERT_TRUE(graph.covers(peer, u, 7.0f));
+}
+
+// Delivery is optimistic only for nodes that publish no topology; coverage never is.
+static void test_can_deliver_is_optimistic_only_for_silent_nodes()
+{
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum peer = 0x11111111;
+    constexpr NodeNum u = 0x22222222;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, peer, 1.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(peer, u, 1.5f, 1000, Edge::Source::Mirrored);
+
+    NeighborGraph::RoutePolicy publishes;
+    publishes.publishes = [](void *, NodeNum) { return true; };
+    NeighborGraph::RoutePolicy silent; // no predicate: nothing publishes
+    TEST_ASSERT_FALSE(graph.canDeliver(peer, u, publishes));
+    TEST_ASSERT_TRUE(graph.canDeliver(peer, u, silent));
+    TEST_ASSERT_FALSE(graph.covers(peer, u, 7.0f));
+
+    graph.setEdgeHearsUs(peer, u, true);
+    TEST_ASSERT_TRUE(graph.canDeliver(peer, u, publishes));
+}
+
 static void test_unique_coverage_ignores_poor_links_and_peer_owned_stock_nodes()
 {
     constexpr NodeNum me = 0x0A0B0C0D;
@@ -508,9 +569,15 @@ static void test_unique_coverage_ignores_poor_links_and_peer_owned_stock_nodes()
     graph.updateEdge(me, peer, 1.0f, 1000, Edge::Source::Reported);
     graph.updateEdge(me, u, 1.0f, 1000, Edge::Source::Reported);
     graph.updateEdge(me, mute, 1.0f, 1000, Edge::Source::Reported);
-    // The peer reaches u only at ETX 40 (heard once, barely) and the mute node well.
+    // The peer reaches u only at ETX 40 (heard once, barely) and the mute node well. Both
+    // confirmed hearing the peer, so only the cost separates them.
     graph.updateEdge(peer, u, 40.0f, 1000, Edge::Source::Mirrored);
     graph.updateEdge(peer, mute, 1.5f, 1000, Edge::Source::Mirrored);
+    graph.setEdgeHearsUs(peer, u, true);
+    graph.setEdgeHearsUs(peer, mute, true);
+    for (NodeNum n : {peer, u, mute}) {
+        graph.setEdgeHearsUs(me, n, true);
+    }
     const NodeNum coveredBy[] = {peer};
 
     // Legacy rule: any edge is coverage, so nothing is unique.
@@ -538,6 +605,9 @@ static void test_ranking_costs_within_a_bucket_tie_on_node_id()
     graph.updateEdge(me, peer, 1.0f, 1000, Edge::Source::Reported);
     graph.updateEdge(me, a, 1.31f, 1000, Edge::Source::Reported);
     graph.updateEdge(peer, a, 1.18f, 1000, Edge::Source::Mirrored);
+    graph.setEdgeHearsUs(me, peer, true);
+    graph.setEdgeHearsUs(me, a, true);
+    graph.setEdgeHearsUs(peer, a, true);
 
     NodeSet candidates;
     candidates.insert(me);
@@ -648,6 +718,8 @@ void setup()
     RUN_TEST(test_route_cost_is_measured_at_the_receiver);
     RUN_TEST(test_inbound_gateway_is_the_fallback_only_without_a_confirmed_path);
     RUN_TEST(test_topology_listing_peer_confirms_peer_hears_sender);
+    RUN_TEST(test_covers_requires_evidence_and_a_sound_link);
+    RUN_TEST(test_can_deliver_is_optimistic_only_for_silent_nodes);
     RUN_TEST(test_unique_coverage_ignores_poor_links_and_peer_owned_stock_nodes);
     RUN_TEST(test_ranking_costs_within_a_bucket_tie_on_node_id);
     RUN_TEST(test_topology_version_window_is_forward_only_and_wraps);

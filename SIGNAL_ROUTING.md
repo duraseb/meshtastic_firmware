@@ -248,6 +248,15 @@ side still carries the frame out: a one-way edge is usually a marginal link or a
 not silence. The route is marked `verified = false` and logged with `unverified`; a confirmed path
 of any length wins over it, and `nodeFilter` still keeps passive nodes from being the gateway.
 
+**Backups survive suppression.** The checks that suppress a unicast relay — source and destination
+downstream of the same relay, the node we heard it from can finish delivery, a better placed SR
+neighbour covers it, no route of our own — all say somebody else is better placed, not that the
+designated hop will succeed. When `next_hop` names a relayer other than the destination, we
+therefore stay in as a backup instead of going silent: no ranking, one slot behind the designated
+reserve at our own rung of the node-id ladder, so several backups do not answer a silent designated
+hop together. "heardFrom can finish delivery" asks `canDeliver`, not merely whether it lists the
+destination, and every candidate cost is the delivery-direction ETX priced at its receiver.
+
 A unicast whose `next_hop` byte equals the destination's own byte names no relayer: stock's
 `NextHopRouter` learns the destination itself as next hop from a direct reply. Such a packet is
 planned as one without a next hop (the cost ranking decides, nobody owns slot 0) instead of
@@ -359,13 +368,13 @@ SignalRouting uses a deterministic slot-based algorithm to coordinate broadcast 
 
 **Algorithm phases:**
 
-0. **Pre-coverage**: heardFrom's direct neighbors with ETX < 7.0 are marked as already covered. Poorly-linked neighbors (ETX ≥ 7.0, i.e. below noise floor) are excluded and may still need relaying. The ETX=40 sentinel marks stale/unknown edges and is always excluded.
+0. **Pre-coverage**: heardFrom's direct neighbors are marked as already covered when heardFrom actually reaches them, which `NeighborGraph::covers()` decides in two halves. First the delivery direction must be evidenced (`knownToHear`): the neighbour carries `hearsUs` on heardFrom's edge, or it lists heardFrom in its own topology. An edge alone is one-directional evidence — heardFrom listing a node only says heardFrom hears it. Second the delivery-direction cost, priced at the receiver (`hopCost`), must stay below the configured poor-link ETX (default 7.0, which excludes the ETX=40 "heard once" sentinel). `hearsUs` is sticky, so a peer that heard the transmitter once keeps the flag long after its link decayed; a rooftop node in the field kept it with its antenna 20 dB down, and treating that as coverage silences the whole neighbourhood. The same rule prices a candidate's coverage set, absorbs an earlier slot holder's coverage, and answers `hasUniqueCoverage()`.
 
 1. **Candidate filtering**: Only SR-active neighbors and stock ROUTER/REPEATER/ROUTER_CLIENT nodes are considered relay candidates. Non-SR nodes (CLIENT, CLIENT_MUTE, etc.) are excluded — they either don't relay or relay unpredictably outside SR coordination.
 
 2. **Stock routers first**: Legacy ROUTER/REPEATER/ROUTER_CLIENT neighbors that can hear the transmitter get the earliest slots since they transmit regardless of SR decisions. Stock routers with no evidence of hearing the transmitter (no edge in the topology graph) are skipped — reserving a slot for them would just delay our own TX for nothing. If they already transmitted, their coverage is absorbed.
 
-3. **SR candidate ranking**: Remaining SR-active candidates are iteratively ranked by `findBestRelayCandidate` (most unique coverage, lowest ETX, deterministic node ID tiebreak based on packet ID parity). Each candidate gets the next slot. If it's us, we schedule TX and stop. If a candidate already transmitted, we absorb its coverage without consuming a slot. An earlier slot holder that has not transmitted yet is assumed to relay, so its coverage is absorbed too before the next pick. Our own coverage counts only our **Reported** edges (what we broadcast in topology): peers rank us on what they mirrored from us, and counting our Mirrored edges made every node see more coverage for itself than its neighbours saw for it, so colocated nodes both took slot 0.
+3. **SR candidate ranking**: Remaining SR-active candidates are iteratively ranked by `findBestRelayCandidate` (most unique coverage, lowest delivery-direction ETX priced at each covered receiver, deterministic node ID tiebreak based on packet ID parity). Each candidate gets the next slot. If it's us, we schedule TX and stop. If a candidate already transmitted, we absorb its coverage without consuming a slot. An earlier slot holder that has not transmitted yet is assumed to relay, so its coverage is absorbed too before the next pick. Our own coverage counts only our **Reported** edges (what we broadcast in topology): peers rank us on what they mirrored from us, and counting our Mirrored edges made every node see more coverage for itself than its neighbours saw for it, so colocated nodes both took slot 0.
 
 4. **Overrides**: Downstream relay obligations and stock coverage needs can force a relay. The stock-coverage fallback is coordinated across the SR peers that took part in the ranking: a mute or legacy neighbour already covered by an earlier slot holder needs nobody else, and each remaining uncovered stock neighbour is owned by exactly one SR node, the lowest node id among us and the peers with an edge to it. Without that rule every SR node beside the same mute neighbour relayed in the same slot.
 
@@ -458,9 +467,18 @@ LoRa is half-duplex: a transmitting node cannot hear its own channel while sendi
 
 **Conditions for T1 to be scheduled:**
 1. The packet is a broadcast.
-2. The node originated the packet or SR committed it to relay.
+2. Either we originated it, or we **deferred** it: the ranking gave us no slot because peers cover
+   everything we reach (`armDeferredBroadcastRetransmit`). A relay we committed to arms no T1 — the
+   relay is the copy, and insuring our own transmission was never the point.
 3. At least one direct neighbor with `hearsUs=true` exists — confirms we have a known neighbor before spending airtime on the retransmit.
 4. T1 retransmit is not disabled via config (`t1_retransmit_enabled`).
+
+**Staggered insurers:** every node that deferred arms T1, so they must not fire together — that
+would collide exactly when the ranked relay is the frame that went missing. Each waits its own rung
+past the window: the node-id order the slots already use (packet-id parity), one half-airtime apart.
+The first firing is a dupe for the others and cancels them. A deferred copy is a relay, so its
+stored frame spends a hop and carries no next hop; otherwise receivers would read the late copy as
+having travelled zero hops.
 
 **Cancellation:** Most incoming dupes trigger `cancelBroadcastRetransmit()` via `perhapsCancelDupe()` — including committed relays that decide to cancel, already-relayed detection, and non-SR originator dupes. The one exception is when a committed relay has unique coverage and keeps its queued TX: T1 is also preserved in this case, since the retransmit insurance is still needed if our relay fails.
 
