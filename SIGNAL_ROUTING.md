@@ -82,7 +82,7 @@ This dual approach provides the reliability of coordinated networking with the e
 | **ReliableRouter** | Up to 3 retransmissions | For want_ack packets only |
 | **NextHopRouter** | 2 for intermediate hops, 3 for origin | Route reset on final failure |
 | **SignalRouting** | Iterative unicast route selection with fallback strategies | For SR-selected unicast routes |
-| **SignalRouting broadcast** | One T1 retransmit if no relay heard within ROUTER_LATE window | Guards against interference/CRC loss at receivers; see T1 Retransmit Insurance |
+| **SignalRouting broadcast** | At most one late copy, and only if it still has a purpose when it would go out: a neighbour nobody reached, or an unanswered `want_ack` originator that elected us | Guards against interference/CRC loss at receivers and supplies stock's implicit ACK; see T1 Retransmit Insurance |
 
 ### Passive Node Behavior
 
@@ -477,13 +477,32 @@ LoRa is half-duplex: a transmitting node cannot hear its own channel while sendi
 - The delay is `getTxDelayMsecWeightedWorst(SNR=+10) + one-packet-airtime` — this covers the longest possible ROUTER_LATE window, so any node that successfully received T0 has already had its full opportunity to relay before T1 goes out.
 - T1 only fires if no dupe relay is heard before the timer expires. If at least one neighbor relayed T0 cleanly, T1 is canceled and no extra airtime is used.
 
+**One list per pass, and ordered time comparisons.** `runOnce()` captures `millis()` once, but a
+send commits the broadcast timestamp from a fresh `millis()`, so that timestamp can be *later* than
+the pass's own. Every interval test against it is therefore signed (`sinceLastBroadcast()`, negative
+while the timestamp is ahead) and a pass that has already sent a list sends no other. Unsigned
+subtraction read a just-committed timestamp as a 49-day-old one: a bootstrap reply and the periodic
+list left 30 ms apart under consecutive versions, every receiver took both as fresh reports, every
+relayer duplicated both, and the same wrap asked for an immediate wake-up afterwards. Measured
+2026-09-07: every fork node on the branch, every time a reply fired.
+
 **Conditions for T1 to be scheduled:**
 1. The packet is a broadcast.
-2. Either we originated it, or we **deferred** it: the ranking gave us no slot because peers cover
-   everything we reach (`armDeferredBroadcastRetransmit`). A relay we committed to arms no T1 — the
-   relay is the copy, and insuring our own transmission was never the point.
-3. At least one direct neighbor with `hearsUs=true` exists — confirms we have a known neighbor before spending airtime on the retransmit.
-4. T1 retransmit is not disabled via config (`t1_retransmit_enabled`).
+2. Either we originated it, or we **deferred to an expected transmission**: the ranking gave us no
+   slot but did give one to somebody — a stock relay router or a ranked SR peer
+   (`armDeferredBroadcastRetransmit`). A relay we committed to arms no T1 — the relay is the copy,
+   and insuring our own transmission was never the point.
+3. There is at least one other SR candidate. Whether the copy is worth its airtime is not
+   predicted here — it is decided when the timer fires, from what was actually heard (see
+   **Two purposes** below).
+4. At least one direct neighbor with `hearsUs=true` exists — confirms we have a known neighbor before spending airtime on the retransmit.
+5. T1 retransmit is not disabled via config (`t1_retransmit_enabled`).
+
+**Sole candidate.** When we are the only candidate — nobody else here can carry the frame, or we
+have not classified any neighbour yet — the ranking's coverage question has nothing to weigh, and
+our copy is the only witness its transmitter can ever get. We relay immediately (`sole candidate`).
+This is the state a node is in for its first topology interval after boot, where behaving like a
+plain rebroadcaster is right, and it is what makes a two-node mesh work at all.
 
 **Staggered insurers:** every node that deferred arms T1, so they must not fire together — that
 would collide exactly when the ranked relay is the frame that went missing. Each waits its own rung
@@ -492,9 +511,16 @@ The first firing is a dupe for the others and cancels them. A deferred copy is a
 stored frame spends a hop and carries no next hop; otherwise receivers would read the late copy as
 having travelled zero hops.
 
-**Cancellation:** Most incoming dupes trigger `cancelBroadcastRetransmit()` via `perhapsCancelDupe()` — including committed relays that decide to cancel, already-relayed detection, and non-SR originator dupes. The one exception is when a committed relay has unique coverage and keeps its queued TX: T1 is also preserved in this case, since the retransmit insurance is still needed if our relay fails.
+**Cancellation:** Most incoming dupes trigger `cancelBroadcastRetransmit()` via `perhapsCancelDupe()` — including committed relays that decide to cancel, already-relayed detection, and non-SR originator dupes. The one exception is when a committed relay has unique coverage and keeps its queued TX: the queued relay is the copy, and a committed relay arms no T1.
 
-**Graph-based pre-fire cancellation:** When the T1 timer expires, `allHearsUsNeighborsHeardPacket()` checks whether every `hearsUs` neighbor already received the packet — either because they are a known transmitter themselves, or because a known transmitter has a link to them in the SR graph (edge in either direction). If all `hearsUs` neighbors are accounted for, T1 is canceled without retransmitting. This prevents unnecessary T1 retransmits in the common case where neighbors already had the packet from another path and correctly suppressed our relay as a dupe.
+**Two purposes, decided when the copy would go out.** Deferring always arms T1; at its rung the frame is transmitted only if one of these holds, and cancelled otherwise:
+
+- **Reach** — `lateCopyTarget()` finds a neighbour of ours that none of the nodes we *actually heard* transmit this packet has covered. The set is the originator, the node we heard the frame from, and every neighbour with a `recordNodeTransmission()` entry for this packet id; the coverage question itself is `uniqueCoverageNeighbor()`, the same one the dupe path asks. The peer the ranking deferred to may simply never have relayed: in 68 of 77 firings measured on 2026-09-07 the ranked peer was genuinely silent, so this is what keeps insurance working.
+- **Witness** — the frame carries `want_ack` and arrived straight from its originator (`hop_start == hop_limit`), and `witnessOwner()` elects us. Stock turns a heard rebroadcast of its own packet into an implicit ACK (`ReliableRouter::shouldFilterReceived`) and otherwise retransmits `NUM_RELIABLE_RETX` times, so one elected witness replaces three frames from the sender. A frame that arrived relayed was already witnessed — the relay's own transmission is the rebroadcast its source heard — so no witness is owed for it.
+
+Neither purpose left means the copy is airtime and nothing else. Before this was checked, the insurance was the branch's busiest transmitter: 87 T1 frames against 21 coverage relays in 42 minutes. The predicate it replaced (`allHearsUsNeighborsHeardPacket()`) asked whether every `hearsUs` neighbour had itself *relayed* the packet, which two or more neighbours can never satisfy — it cancelled nothing in those 42 minutes.
+
+**The witness election is not the coverage election.** `coverageOwner()` ranks a candidate's own edge *to* the target, which is the only evidence available for a neighbour nobody can be shown to reach. A witness needs the opposite direction: the originator must be able to hear the answer. `witnessOwner()` therefore requires positive evidence that the source hears the candidate — the source's own list naming it, or us watching the source carry its frame — and prices the link as the source measures it. Edge existence alone will not do: a direct observation writes both edge directions from one measurement, so that is our own assumption of symmetry. A source that publishes nothing leaves each node with only its own evidence, so several may elect themselves; that is still fewer than every node that heard the frame.
 
 **Guard against T2:** When T1 fires, `isRetransmitting = true` is set before calling `router->send()`. This prevents `maybeScheduleBroadcastRetransmit()` from scheduling a second retransmit when T1 re-enters the send path.
 
@@ -508,7 +534,7 @@ LoRa links are frequently asymmetric — node A can hear node B but B cannot hea
 
 **hearsUs from topology listing**: The same authority works in the positive direction. When node Y's topology broadcast lists *us* as a directly heard neighbor, SR sets `hearsUs=true` on our edge to Y. A node only packs neighbors it has a measured direct RSSI/SNR for, so being listed is proof Y heard us on RF. This is the only way an SR-passive neighbor can earn the flag — it broadcasts topology but never relays, so it can never prove bidirectionality by relaying one of our packets. SR-active neighbors gain the flag on their first topology report instead of waiting for that relay to happen.
 
-The flag matters in four places: T1 retransmit insurance (`hasAnyHearsUsNeighbor()` gates it, `allHearsUsNeighborsHeardPacket()` cancels it), last-hop unicast hop limiting, route approval when sender connectivity is otherwise unverified, and our own outbound topology — which is what gives us bidi tier-1 priority in *other* nodes' relay-slot selection when that neighbor is the packet source. It does not affect stock-neighbor coverage, which only counts `Legacy` nodes.
+The flag matters in four places: T1 retransmit insurance (`hasAnyHearsUsNeighbor()` gates it, and `witnessOwner()` reads it as the proof that an originator can hear its witness), last-hop unicast hop limiting, route approval when sender connectivity is otherwise unverified, and our own outbound topology — which is what gives us bidi tier-1 priority in *other* nodes' relay-slot selection when that neighbor is the packet source. It does not affect stock-neighbor coverage, which only counts `Legacy` nodes.
 
 Implemented by `confirmTopologySenderHearsUs()` in `SignalRoutingModule.h`, called from both topology-processing paths. Stale claims are bounded from both sides: the authoritative override clears the flag when Y's next topology omits us, and `pruneCapabilityCache()` clears it when Y stops broadcasting altogether (capability TTL).
 

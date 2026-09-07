@@ -1108,6 +1108,53 @@ bool NeighborGraph::covers(NodeNum from, NodeNum to, float poorLinkEtx, const Co
     return cost > 0.0f && cost < poorLinkEtx;
 }
 
+NodeNum NeighborGraph::witnessOwner(NodeNum source, const CoveragePolicy &policy) const
+{
+    NodeNum me = policy.me;
+    if (source == 0 || (source & 0xFF000000) == 0xFF000000) return 0;
+    NodeNum owner = 0;
+    uint8_t bestTier = 0xFF;
+    uint16_t bestBucket = 0xFFFF;
+    for (uint8_t i = 0; i < neighborCount; i++) {
+        NodeNum candidate = neighbors[i].nodeId;
+        if (candidate == 0 || candidate == source || (candidate & 0xFF000000) == 0xFF000000) continue;
+        uint8_t tier;
+        if (candidate == me) {
+            if (!policy.meRelays) continue;
+            tier = 1;
+        } else if (policy.isStockRelayRouter && policy.isStockRelayRouter(policy.ctx, candidate)) {
+            tier = 0;
+        } else if (policy.isSrActive && policy.isSrActive(policy.ctx, candidate)) {
+            tier = 1;
+        } else {
+            continue;
+        }
+        // Positive evidence that the source hears this candidate: the source's own list named
+        // it, or we watched the source carry its frame. A direct observation writes both edge
+        // directions from one measurement, so edge existence alone is our own assumption of
+        // symmetry — the one thing a witness may not assume, since a copy the originator cannot
+        // hear acknowledges nothing.
+        const Edge *edge = findEdge(&neighbors[i], source);
+        if (!edge || !edge->hearsUs) continue;
+        // Priced in the delivery direction: the source's own measurement of the candidate when
+        // it published one, our own edge otherwise.
+        uint16_t costFixed = edge->etxFixed;
+        const NodeEdges *sourceEdges = getEdgesFrom(source);
+        if (sourceEdges) {
+            const Edge *back = findEdge(sourceEdges, candidate);
+            if (back) costFixed = back->etxFixed;
+        }
+        uint16_t bucket = (uint16_t)(costFixed / SR_OWNER_COST_BUCKET);
+        if (tier < bestTier || (tier == bestTier && bucket < bestBucket) ||
+            (tier == bestTier && bucket == bestBucket && candidate < owner)) {
+            bestTier = tier;
+            bestBucket = bucket;
+            owner = candidate;
+        }
+    }
+    return owner;
+}
+
 NodeNum NeighborGraph::coverageOwner(NodeNum target, const CoveragePolicy &policy) const
 {
     NodeNum me = policy.me;
@@ -1666,9 +1713,11 @@ bool NeighborGraph::shouldRelayWithContention(NodeNum myNode, NodeNum sourceNode
 
 void NeighborGraph::recordNodeTransmission(NodeNum nodeId, uint32_t packetId, uint32_t currentTime)
 {
+    // Keyed on the pair: a node transmits many packets, and "did X put *this* packet on the
+    // air" is what the coverage tests ask. Keying on the node alone kept one packet per node,
+    // so an answer about an older packet silently became "no".
     for (uint8_t i = 0; i < relayStateCount; i++) {
-        if (relayStates[i].nodeId == nodeId) {
-            relayStates[i].packetId = packetId;
+        if (relayStates[i].nodeId == nodeId && relayStates[i].packetId == packetId) {
             relayStates[i].timestampLo = static_cast<uint16_t>(currentTime & 0xFFFF);
             return;
         }
