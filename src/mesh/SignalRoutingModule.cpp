@@ -2998,6 +2998,10 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     // Transmissions we expect ahead of ours, stock routers included. Zero means the ranking
     // handed out no slot at all, so nothing is expected for a late copy to stand in for.
     uint8_t slotsGiven = 0;
+    // Stock rebroadcasters hold the earliest slots, so they also come first on the insurance
+    // ladder: our rung is their count plus our place among the SR peers. Counting only the SR
+    // peers put two insurers on the same rung whenever a stock rebroadcaster was present.
+    uint8_t stockCandidates = 0;
 
     LOG_INFO("[SR] Slot scheduling 0x%08x: half=%ums, %u cands", p->id, halfAirtime, candidates.count);
     // We are always a candidate, so a count of one means nobody else here can carry this frame.
@@ -3035,6 +3039,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
             }
 
             candidates.erase(neighbor);
+            stockCandidates++;
 
             if (routingGraph->hasNodeTransmitted(neighbor, p->id, currentTime)) {
                 const NodeEdges *ne = routingGraph->getEdgesFrom(neighbor);
@@ -3162,8 +3167,8 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         // so our copy is the rebroadcast stock turns into its implicit ACK — one elected
         // neighbour answers instead of every one that heard it, and without it the sender
         // retransmits NUM_RELIABLE_RETX times. Our rung of the ladder is the node-id order the
-        // slots already use, one half-airtime apart.
-        uint8_t rank = 0;
+        // slots already use, one half-airtime apart, stock rebroadcasters counted first.
+        uint8_t rank = stockCandidates;
         for (uint16_t i = 0; i < srPeers.count; i++) {
             NodeNum peer = srPeers.nodes[i];
             if (peer == myNode) {

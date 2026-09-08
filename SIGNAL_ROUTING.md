@@ -505,7 +505,10 @@ plain rebroadcaster is right, and it is what makes a two-node mesh work at all.
 
 **Staggered insurers:** every node that deferred arms T1, so they must not fire together — that
 would collide exactly when the ranked relay is the frame that went missing. Each waits its own rung
-past the window: the node-id order the slots already use (packet-id parity), one half-airtime apart.
+past the window: stock rebroadcasters first (they hold the earliest relay slots too), then the
+node-id order the slots already use (packet-id parity), one half-airtime apart. A rung is shorter
+than the enqueue-to-air latency, so the ladder alone is not enough: a copy heard after our timer
+fired still pulls the queued frame back through `cancelSending()`.
 The first firing is a dupe for the others and cancels them. A deferred copy is a relay, so its
 stored frame spends a hop and carries no next hop; otherwise receivers would read the late copy as
 having travelled zero hops.
