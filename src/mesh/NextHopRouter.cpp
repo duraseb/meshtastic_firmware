@@ -177,7 +177,7 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
                     if (signalRoutingModule && signalRoutingModule->shouldUseSignalBasedRouting(p)) {
                         if (!signalRoutingModule->shouldRelay(p)) {
-                            LOG_INFO("[SR] Not relaying 0x%08x", p->id);
+                            // The decision itself logged the packet and the reason.
                             return false;
                         }
                         // Mark this packet as committed so dupe arrivals don't cancel our relay

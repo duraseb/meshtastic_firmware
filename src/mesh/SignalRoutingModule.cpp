@@ -2836,7 +2836,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     // peers put two insurers on the same rung whenever a stock rebroadcaster was present.
     uint8_t stockCandidates = 0;
 
-    LOG_INFO("[SR] Slot scheduling 0x%08x: half=%ums, %u cands", p->id, halfAirtime, candidates.count);
+
     // We are always a candidate, so a count of one means nobody else here can carry this frame.
     uint16_t initialCandidates = candidates.count;
 
@@ -2917,7 +2917,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     };
 
     // Phase 2: Iteratively pick best SR candidate, assign slots
-    LOG_INFO("[SR] Slot ranking pkt=0x%08x: %u SR candidates, %u pre-covered", p->id,
+    LOG_INFO("[SR] Slot scheduling 0x%08x: half=%ums, %u cands, %u pre-covered", p->id, halfAirtime,
              static_cast<unsigned>(candidates.count), static_cast<unsigned>(alreadyCovered.count));
     while (!candidates.empty()) {
         RelayCandidate best = routingGraph->findBestRelayCandidate(candidates, alreadyCovered,
@@ -3867,14 +3867,12 @@ bool SignalRoutingModule::isNodeRoutable(NodeNum nodeId) const {
 
 bool SignalRoutingModule::topologyHealthyForBroadcast() const
 {
-    LOG_INFO("[SR] Topology healthy for broadcast");
     if (!routingGraph || !nodeDB) {
         LOG_WARN("[SR] routingGraph or nodeDB is null, returning false");
         return false;
     }
 
     // Check if we have direct SR-capable neighbors for intelligent broadcast routing
-    LOG_INFO("[SR] Checking direct neighbors");
 
     const NodeEdges* nodeEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
     if (!nodeEdges || nodeEdges->edgeCount == 0) {
