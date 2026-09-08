@@ -1712,9 +1712,15 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
         if (currentTime - lastGraphUpdate > GRAPH_MAINTENANCE_INTERVAL_SECS) {
             uint32_t nodeCountBefore = routingGraph->getNodeCount();
             
-            // Single TTL for all nodes in the graph; SR capability expiry handles coverage separately
+            // Single TTL for all nodes in the graph; a publisher's own cadence retires our direct
+            // link to it far sooner (pruneSilentPublishers).
             uint8_t directBefore = routingGraph->countDirectNeighbors();
             routingGraph->ageEdges(currentTime, cfgNodeTtlSecs);
+            NeighborGraph::CoveragePolicy livenessPolicy = coveragePolicy();
+            if (routingGraph->pruneSilentPublishers(nodeDB->getNodeNum(), currentTime, PUBLISHER_SILENCE_SECS,
+                                                    &livenessPolicy) > 0) {
+                markTopologyDirty();
+            }
 
             uint32_t nodeCountAfter = routingGraph->getNodeCount();
             lastGraphUpdate = currentTime;

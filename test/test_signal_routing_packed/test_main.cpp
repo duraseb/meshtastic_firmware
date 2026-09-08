@@ -587,6 +587,54 @@ static void test_a_publisher_has_no_owner()
     TEST_ASSERT_EQUAL_UINT32(0, graph.coverageOwner(target, policy));
 }
 
+void test_a_silent_publisher_loses_our_direct_link()
+{
+    // A publisher promises a list every broadcast interval. Two missed intervals and our own
+    // direct claim goes, so it stops drawing a relay out of us; the node stays reachable through
+    // a peer that still hears it.
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum pub = 0x11111111;
+    constexpr NodeNum gw = 0x22222222;
+    constexpr NodeNum stock = 0x33333333;
+    constexpr uint32_t silence = 1200;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, pub, 1.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(pub, me, 1.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(me, gw, 1.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(gw, pub, 1.5f, 1000, Edge::Source::Mirrored);
+    graph.updateEdge(me, stock, 1.0f, 1000, Edge::Source::Reported);
+
+    auto hasEdge = [&](NodeNum from, NodeNum to) {
+        const NodeEdges *edges = graph.getEdgesFrom(from);
+        if (!edges) return false;
+        for (uint8_t i = 0; i < edges->edgeCount; i++) {
+            if (edges->edges[i].to == to) return true;
+        }
+        return false;
+    };
+
+    static NodeNum publisher = pub;
+    NeighborGraph::CoveragePolicy policy;
+    policy.me = me;
+    policy.meRelays = true;
+    policy.poorLinkEtx = 7.0f;
+    policy.publishesTopology = [](void *, NodeNum n) { return n == publisher; };
+
+    TEST_ASSERT_EQUAL_UINT8(0, graph.pruneSilentPublishers(me, 1000 + silence, silence, &policy));
+    TEST_ASSERT_TRUE(hasEdge(me, pub));
+
+    TEST_ASSERT_EQUAL_UINT8(1, graph.pruneSilentPublishers(me, 1001 + silence, silence, &policy));
+    TEST_ASSERT_FALSE(hasEdge(me, pub));
+    TEST_ASSERT_FALSE(hasEdge(pub, me));
+    // The stock neighbour promises no cadence, so its silence proves nothing: it keeps the TTL.
+    TEST_ASSERT_TRUE(hasEdge(me, stock));
+    // The node itself and the peer's report of it survive.
+    TEST_ASSERT_NOT_NULL(graph.getEdgesFrom(pub));
+    TEST_ASSERT_TRUE(hasEdge(gw, pub));
+}
+
 void test_admits_coverage_credits_an_owned_neighbour()
 {
     // Admission and absorb must credit the same set: a relay that owns a silent neighbour
@@ -887,6 +935,7 @@ void setup()
     RUN_TEST(test_coverage_owner_is_the_best_link_then_the_lowest_id);
     RUN_TEST(test_ownership_stops_at_the_coverage_ceiling);
     RUN_TEST(test_a_publisher_has_no_owner);
+    RUN_TEST(test_a_silent_publisher_loses_our_direct_link);
     RUN_TEST(test_admits_coverage_credits_an_owned_neighbour);
     RUN_TEST(test_a_sticky_confirmation_behind_a_decayed_link_is_not_ours);
     RUN_TEST(test_the_coverage_ceiling_is_inclusive);

@@ -1025,6 +1025,49 @@ void NeighborGraph::clearEdgesForNode(NodeNum nodeId)
     }
 }
 
+bool NeighborGraph::removeEdge(NodeNum from, NodeNum to)
+{
+    NodeEdges *node = findNeighbor(from);
+    if (!node) return false;
+    for (uint8_t e = 0; e < node->edgeCount; e++) {
+        if (node->edges[e].to != to) continue;
+        if (e < node->edgeCount - 1) {
+            node->edges[e] = node->edges[node->edgeCount - 1];
+        }
+        node->edgeCount--;
+        return true;
+    }
+    return false;
+}
+
+uint8_t NeighborGraph::pruneSilentPublishers(NodeNum myNode, uint32_t currentTimeSecs, uint32_t silenceSecs,
+                                             const CoveragePolicy *policy)
+{
+    if (!policy) return 0;
+    NodeEdges *self = findNeighbor(myNode);
+    if (!self) return 0;
+
+    NodeNum gone[NEIGHBOR_GRAPH_MAX_NEIGHBORS];
+    uint8_t count = 0;
+    for (uint8_t i = 0; i < self->edgeCount && count < NEIGHBOR_GRAPH_MAX_NEIGHBORS; i++) {
+        NodeNum target = self->edges[i].to;
+        if (target == 0 || target == myNode) continue;
+        if (!policy->reports(target)) continue;
+        // Guarded against a backwards clock: a wrap must not retract every link at once.
+        uint32_t silent = currentTimeSecs - self->edges[i].lastUpdate;
+        if (silent > silenceSecs && silent < 0x80000000u) {
+            gone[count++] = target;
+        }
+    }
+
+    for (uint8_t i = 0; i < count; i++) {
+        removeEdge(myNode, gone[i]);
+        removeEdge(gone[i], myNode);
+        LOG_INFO("[SR] %08x silent for %us — direct link retracted", gone[i], silenceSecs);
+    }
+    return count;
+}
+
 void NeighborGraph::removeEdgesTo(NodeNum nodeId)
 {
     for (uint8_t m = 0; m < neighborCount; m++) {

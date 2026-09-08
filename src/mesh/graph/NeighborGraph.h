@@ -293,6 +293,14 @@ class NeighborGraph {
         bool reports(NodeNum node) const { return publishesTopology && publishesTopology(ctx, node); }
     };
 
+    /// Retract our own direct link to a topology publisher we have heard nothing from for
+    /// `silenceSecs`. A publisher promises a list every broadcast interval, so silence is evidence
+    /// it has gone; the graph TTL is how long a topology is worth remembering, not how long we owe
+    /// a neighbour airtime. Only our own two edges go — the node stays, so a peer that still hears
+    /// it keeps it reachable. Returns the number of links retracted.
+    uint8_t pruneSilentPublishers(NodeNum myNode, uint32_t currentTimeSecs, uint32_t silenceSecs,
+                                  const CoveragePolicy *policy);
+
     /// `selfNode` is the node running the ranking: its own coverage counts only Reported edges (what it
     /// broadcasts in its topology), so peers ranking it from their mirrored view reach the same order.
     // poorLinkEtx: coverage ceiling handed to `covers` for both the coverage sets and the cost.
@@ -386,6 +394,8 @@ class NeighborGraph {
     void clearEdgesForNode(NodeNum nodeId);
 
     void removeEdgesTo(NodeNum nodeId);
+    /// Remove one directed edge, leaving both endpoints in the graph.
+    bool removeEdge(NodeNum from, NodeNum to);
 
     void clearInferredEdgesToNode(NodeNum nodeId);
 
