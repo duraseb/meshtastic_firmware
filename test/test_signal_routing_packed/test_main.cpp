@@ -567,7 +567,36 @@ static void test_can_deliver_is_optimistic_only_for_silent_nodes()
 
 // A neighbour nobody can be shown to reach belongs to exactly one relayer: the one hearing it
 // best, in buckets, with stock relay routers given way first and the node id as the tie-break.
-static void test_coverage_owner_is_the_best_link_then_the_lowest_id()
+static void test_ownership_stops_at_the_coverage_ceiling()
+{
+    // Ownership picks who carries a neighbour nobody can be shown to reach; it must not make an
+    // unreachable neighbour look reachable. Over a link past the ceiling nobody owns it, or the
+    // ranking credits unique coverage to a node that cannot deliver and hands it the first slot.
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum nearPeer = 0xEE0000EE;
+    constexpr NodeNum silent = 0x22222222;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, nearPeer, 1.0f, 1000, Edge::Source::Reported);
+    graph.setEdgeHearsUs(me, nearPeer, true);
+    graph.updateEdge(me, silent, 40.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(nearPeer, silent, 2.0f, 1000, Edge::Source::Mirrored);
+
+    static NodeNum peerId = nearPeer;
+    NeighborGraph::CoveragePolicy policy;
+    policy.me = me;
+    policy.meRelays = true;
+    policy.poorLinkEtx = 7.0f;
+    policy.isSrActive = [](void *, NodeNum n) { return n == peerId; };
+    // The sound link owns it; our own heard-once sentinel does not qualify.
+    TEST_ASSERT_EQUAL_UINT32(nearPeer, graph.coverageOwner(silent, policy));
+    // Its link decays to the sentinel too: now nobody owns it.
+    graph.updateEdge(nearPeer, silent, 40.0f, 1000, Edge::Source::Mirrored);
+    TEST_ASSERT_EQUAL_UINT32(0, graph.coverageOwner(silent, policy));
+}
+
+void test_coverage_owner_is_the_best_link_then_the_lowest_id()
 {
     constexpr NodeNum me = 0x0A0B0C0D;
     constexpr NodeNum nearPeer = 0xEE0000EE;
@@ -767,6 +796,7 @@ void setup()
     RUN_TEST(test_covers_requires_evidence_and_a_sound_link);
     RUN_TEST(test_can_deliver_is_optimistic_only_for_silent_nodes);
     RUN_TEST(test_coverage_owner_is_the_best_link_then_the_lowest_id);
+    RUN_TEST(test_ownership_stops_at_the_coverage_ceiling);
     RUN_TEST(test_unique_coverage_ignores_poor_links_and_peer_owned_stock_nodes);
     RUN_TEST(test_ranking_costs_within_a_bucket_tie_on_node_id);
     RUN_TEST(test_topology_version_window_is_forward_only_and_wraps);

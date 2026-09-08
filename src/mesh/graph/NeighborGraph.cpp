@@ -1137,13 +1137,15 @@ NodeNum NeighborGraph::witnessOwner(NodeNum source, const CoveragePolicy &policy
         const Edge *edge = findEdge(&neighbors[i], source);
         if (!edge || !edge->hearsUs) continue;
         // Priced in the delivery direction: the source's own measurement of the candidate when
-        // it published one, our own edge otherwise.
+        // it published one, our own edge otherwise. A link past the coverage ceiling carries no
+        // acknowledgement either.
         uint16_t costFixed = edge->etxFixed;
         const NodeEdges *sourceEdges = getEdgesFrom(source);
         if (sourceEdges) {
             const Edge *back = findEdge(sourceEdges, candidate);
             if (back) costFixed = back->etxFixed;
         }
+        if (policy.poorLinkEtx > 0.0f && (float)costFixed / 100.0f >= policy.poorLinkEtx) continue;
         uint16_t bucket = (uint16_t)(costFixed / SR_OWNER_COST_BUCKET);
         if (tier < bestTier || (tier == bestTier && bucket < bestBucket) ||
             (tier == bestTier && bucket == bestBucket && candidate < owner)) {
@@ -1169,6 +1171,14 @@ NodeNum NeighborGraph::coverageOwner(NodeNum target, const CoveragePolicy &polic
         // watched it carry the target's traffic.
         const Edge *edge = findEdge(&neighbors[i], target);
         if (!edge) continue;
+        // Ownership decides *who* carries a neighbour nobody can be shown to reach; it must not
+        // decide *whether* the neighbour is reachable at all. A link past the coverage ceiling
+        // (the "heard once" ETX 40 sentinel included) delivers nothing, so its holder owns
+        // nothing: the ranking would otherwise credit it with unique coverage and hand it the
+        // first slot, and the packet would wait a full defer window for a relay that cannot
+        // come. Measured 2026-09-08: 74 of 183 slots went out over links worse than the
+        // ceiling, and the branch's insurance fired to cover them.
+        if (policy.poorLinkEtx > 0.0f && edge->getEtx() >= policy.poorLinkEtx) continue;
         uint8_t tier;
         if (candidate == me) {
             if (!policy.meRelays) continue;
