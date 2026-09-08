@@ -85,7 +85,34 @@ static constexpr int EDGE_NEW = 1;
 static constexpr int EDGE_SIGNIFICANT_CHANGE = 2;
 
 struct Edge {
-    enum class Source : uint8_t { Mirrored = 0, Reported = 1 };
+    /// How much an edge is worth as evidence. `Inferred` carries no measurement at all: it was
+    /// minted because a relayed frame crossed the link, at a nominal price. Good enough to say a
+    /// path exists, never good enough to price a delivery or to displace a measurement.
+    enum class Source : uint8_t { Mirrored = 0, Reported = 1, Inferred = 2 };
+
+    /// Our own measurement beats a peer's published measurement, which beats a guess.
+    /// Deliberately not the enum value, which is wire-free and kept stable.
+    static uint8_t sourceRank(Source s)
+    {
+        switch (s) {
+        case Source::Inferred:
+            return 0;
+        case Source::Mirrored:
+            return 1;
+        case Source::Reported:
+            return 2;
+        }
+        return 0;
+    }
+    static bool isMeasured(Source s) { return s != Source::Inferred; }
+
+    /// Synthetic node id standing in for an unresolved relay byte. Owned here because the graph
+    /// itself must know which of its nodes are routing artefacts rather than real neighbours.
+    static constexpr NodeNum PLACEHOLDER_NODE_BASE = 0xFF000000;
+    static bool isPlaceholderId(NodeNum nodeId)
+    {
+        return (nodeId & PLACEHOLDER_NODE_BASE) == PLACEHOLDER_NODE_BASE;
+    }
 
     NodeNum to;
     uint16_t etxFixed;   // ETX * 100 (fixed-point, range 1.00-655.35)
@@ -394,6 +421,10 @@ class NeighborGraph {
     void clearEdgesForNode(NodeNum nodeId);
 
     void removeEdgesTo(NodeNum nodeId);
+    /// Drop `sender`'s edges to nodes its complete list no longer names. Only the sender can
+    /// report its own links, so a complete list is the whole truth about them; our own
+    /// measurements and placeholders are left alone. Returns true if anything was removed.
+    bool retainListedEdges(NodeNum sender, const NodeNum *listedIds, size_t listedCount);
     /// Remove one directed edge, leaving both endpoints in the graph.
     bool removeEdge(NodeNum from, NodeNum to);
 

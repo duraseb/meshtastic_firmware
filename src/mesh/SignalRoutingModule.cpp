@@ -868,6 +868,12 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
                 }
             }
         }
+        // The list is authoritative about the sender's own edges too, not only about who hears
+        // it: an entry that has gone is a link the sender no longer has. Without this a
+        // neighbour it dropped survived to the graph TTL and stayed in its coverage set.
+        if (routingGraph->retainListedEdges(p->from, listedIds, listedCount)) {
+            LOG_INFO("[SR] %08x dropped entries from its list: stale edges removed", p->from);
+        }
     }
 
     // Record that this version was pre-processed so handleReceivedProtobuf can skip redundant work
@@ -976,8 +982,11 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
 
             float etx = NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr);
 
+            // The sender published only that it hears this neighbour. The reverse direction is
+            // our assumption of symmetry, so it must not outrank — and permanently block — the
+            // neighbour's own published measurement of the sender, nor price the delivery.
             routingGraph->updateEdge(neighbor.nodeId, mp.from, etx, rxTime,
-                                     Edge::Source::Reported);
+                                     Edge::Source::Inferred);
             routingGraph->updateEdge(mp.from, neighbor.nodeId, etx, rxTime,
                                      Edge::Source::Mirrored);
 
@@ -1041,7 +1050,8 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
  */
 // Placeholder node system for unknown relays
 // Use high NodeNum values that won't conflict with real nodes
-#define PLACEHOLDER_BASE 0xFF000000
+// One definition, in the graph: NeighborGraph must know which node ids are routing artefacts.
+#define PLACEHOLDER_BASE Edge::PLACEHOLDER_NODE_BASE
 
 bool SignalRoutingModule::isPlaceholderNode(NodeNum nodeId) const
 {
@@ -1668,7 +1678,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                 float defaultSnr = 5.0f;  // default SNR for inferred connectivity
 
                 routingGraph->updateEdge(inferredRelayer, mp.from, NeighborGraph::calculateETX(defaultRssi, defaultSnr),
-                                         monotonicTimestamp, Edge::Source::Mirrored);
+                                         monotonicTimestamp, Edge::Source::Inferred);
             } else {
                 LOG_INFO("[SR] No inference: %08x not Legacy (%d)",
                          inferredRelayer, (int)getCapabilityStatus(inferredRelayer));
@@ -2913,7 +2923,8 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
                 NodeNum target = ne->edges[j].to;
                 // Exactly what the ranking admitted for this relay: crediting only covers()
                 // left an owned neighbour uncovered after its owner took a slot, so a later
-                // phase relayed for it a second time.
+                // phase relayed for it a second time. Edges we invented are in nobody's set.
+                if (!Edge::isMeasured(ne->edges[j].source)) continue;
                 if (routingGraph->admitsCoverage(relay, target, cfgPoorLinkEtxThreshold, &coveragePolicy)) {
                     alreadyCovered.insert(target);
                 }

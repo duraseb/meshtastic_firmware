@@ -587,6 +587,54 @@ static void test_a_publisher_has_no_owner()
     TEST_ASSERT_EQUAL_UINT32(0, graph.coverageOwner(target, policy));
 }
 
+void test_a_guess_never_outranks_or_prices_a_measurement()
+{
+    // An edge minted because a relayed frame crossed the link says a path exists and nothing
+    // about what it costs, so it must not overwrite a published measurement, must not evict one,
+    // and must not price coverage or ownership.
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum gw = 0x11111111;
+    constexpr NodeNum far = 0x22222222;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, gw, 1.0f, 1000, Edge::Source::Reported);
+    // The gateway published a hopeless link to the far node.
+    graph.updateEdge(gw, far, 15.87f, 1000, Edge::Source::Mirrored);
+
+    NeighborGraph::CoveragePolicy policy;
+    policy.me = me;
+    policy.meRelays = true;
+    policy.poorLinkEtx = 7.0f;
+
+    TEST_ASSERT_FALSE(graph.covers(gw, far, 7.0f, &policy));
+
+    // One relayed frame across that link must change nothing.
+    graph.updateEdge(gw, far, 1.57f, 2000, Edge::Source::Inferred);
+    const NodeEdges *gwEdges = graph.getEdgesFrom(gw);
+    TEST_ASSERT_NOT_NULL(gwEdges);
+    const Edge *kept = nullptr;
+    for (uint8_t i = 0; i < gwEdges->edgeCount; i++) {
+        if (gwEdges->edges[i].to == far) kept = &gwEdges->edges[i];
+    }
+    TEST_ASSERT_NOT_NULL(kept);
+    TEST_ASSERT_EQUAL_UINT16(1587, kept->etxFixed);
+    TEST_ASSERT_TRUE(Edge::Source::Mirrored == kept->source);
+    TEST_ASSERT_FALSE(graph.covers(gw, far, 7.0f, &policy));
+
+    // A link known only as a guess is nobody's coverage and nobody's to own.
+    constexpr NodeNum guessed = 0x33333333;
+    graph.updateEdge(gw, guessed, 1.57f, 2000, Edge::Source::Inferred);
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, graph.hopCost(gw, guessed));
+    TEST_ASSERT_FALSE(graph.covers(gw, guessed, 7.0f, &policy));
+    TEST_ASSERT_EQUAL_UINT32(0, graph.coverageOwner(guessed, policy));
+
+    // The sender's complete list is the whole truth about its own edges.
+    NodeNum listed[] = {far};
+    TEST_ASSERT_TRUE(graph.retainListedEdges(gw, listed, 1));
+    TEST_ASSERT_FALSE(graph.retainListedEdges(gw, listed, 1));
+}
+
 void test_a_silent_publisher_loses_our_direct_link()
 {
     // A publisher promises a list every broadcast interval. Two missed intervals and our own
@@ -935,6 +983,7 @@ void setup()
     RUN_TEST(test_coverage_owner_is_the_best_link_then_the_lowest_id);
     RUN_TEST(test_ownership_stops_at_the_coverage_ceiling);
     RUN_TEST(test_a_publisher_has_no_owner);
+    RUN_TEST(test_a_guess_never_outranks_or_prices_a_measurement);
     RUN_TEST(test_a_silent_publisher_loses_our_direct_link);
     RUN_TEST(test_admits_coverage_credits_an_owned_neighbour);
     RUN_TEST(test_a_sticky_confirmation_behind_a_decayed_link_is_not_ours);

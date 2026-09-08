@@ -181,7 +181,9 @@ int NeighborGraph::updateEdge(NodeNum from, NodeNum to, float etx, uint32_t time
 
     Edge *edge = findEdge(node, to);
     if (edge) {
-        if (edge->source == Edge::Source::Reported && source == Edge::Source::Mirrored) {
+        // A weaker class never overwrites a stronger one, whichever arrived last: that is what
+        // makes two nodes holding the same reports agree on the same number.
+        if (Edge::sourceRank(source) < Edge::sourceRank(edge->source)) {
             return EDGE_NO_CHANGE;
         }
 
@@ -227,9 +229,15 @@ int NeighborGraph::updateEdge(NodeNum from, NodeNum to, float etx, uint32_t time
     }
 
     // Edge list full - replace worst edge
-    uint8_t worstIdx = 0;
+    uint8_t worstIdx = 0xFF;
     float worstScore = 0;
     for (uint8_t i = 0; i < node->edgeCount; i++) {
+        // Only edges this write is at least as well evidenced as may be displaced: a guess at
+        // the nominal price outscores every real link and would otherwise evict the
+        // measurements the ranking depends on.
+        if (Edge::sourceRank(source) < Edge::sourceRank(node->edges[i].source)) {
+            continue;
+        }
         float edgeEtx = node->edges[i].getEtx();
         float ageSeconds = static_cast<float>(timestamp - node->edges[i].lastUpdate);
         float score = edgeEtx + ageSeconds / 300.0f;
@@ -240,7 +248,7 @@ int NeighborGraph::updateEdge(NodeNum from, NodeNum to, float etx, uint32_t time
     }
 
     float newScore = etx;
-    if (newScore < worstScore) {
+    if (worstIdx != 0xFF && newScore < worstScore) {
         edge = &node->edges[worstIdx];
         edge->to = to;
         edge->setEtx(etx);
@@ -269,10 +277,43 @@ const NodeEdges *NeighborGraph::getEdgesFrom(NodeNum node) const
 
 void NeighborGraph::updateNodeActivity(NodeNum nodeId, uint32_t timestamp)
 {
-    NodeEdges *node = findOrCreateNeighbor(nodeId);
+    // Refresh only. Creating an edgeless node here made every relayed source a graph entry that
+    // ageEdges() removed on the next pass, and that removal deletes every edge in the graph
+    // pointing at the node — including a gateway's own published measurement of it, which then
+    // only returns on that gateway's next list.
+    NodeEdges *node = findNeighbor(nodeId);
     if (node) {
         node->lastFullUpdate = timestamp;
     }
+}
+
+bool NeighborGraph::retainListedEdges(NodeNum sender, const NodeNum *listedIds, size_t listedCount)
+{
+    NodeEdges *node = findNeighbor(sender);
+    if (!node || !listedIds) return false;
+
+    uint8_t write = 0;
+    bool removed = false;
+    for (uint8_t e = 0; e < node->edgeCount; e++) {
+        const Edge &edge = node->edges[e];
+        bool listed = false;
+        for (size_t i = 0; i < listedCount; i++) {
+            if (listedIds[i] == edge.to) {
+                listed = true;
+                break;
+            }
+        }
+        bool keep = edge.to == 0 || edge.source == Edge::Source::Reported ||
+                    Edge::isPlaceholderId(edge.to) || listed;
+        if (!keep) {
+            removed = true;
+            continue;
+        }
+        if (write != e) node->edges[write] = edge;
+        write++;
+    }
+    node->edgeCount = write;
+    return removed;
 }
 
 void NeighborGraph::ageEdges(uint32_t currentTimeSecs, uint32_t ttlSecs)
@@ -386,17 +427,16 @@ void NeighborGraph::ageEdges(uint32_t currentTimeSecs, uint32_t ttlSecs)
 
 uint8_t NeighborGraph::countDirectNeighbors() const
 {
+    // Nodes we measured a direct link to — the set we publish. Counting peers that hold a
+    // Reported edge back to us instead made this depend on our own symmetry assumption.
     NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
     uint8_t count = 0;
-    for (uint8_t n = 0; n < neighborCount; n++) {
-        if (neighbors[n].nodeId == myNode) {
-            continue;
-        }
-        for (uint8_t e = 0; e < neighbors[n].edgeCount; e++) {
-            if (neighbors[n].edges[e].to == myNode &&
-                neighbors[n].edges[e].source == Edge::Source::Reported) {
+    const NodeEdges *self = findNeighbor(myNode);
+    if (self) {
+        for (uint8_t e = 0; e < self->edgeCount; e++) {
+            const Edge &edge = self->edges[e];
+            if (edge.to != 0 && edge.to != myNode && edge.source == Edge::Source::Reported) {
                 count++;
-                break;
             }
         }
     }
@@ -1119,13 +1159,19 @@ bool NeighborGraph::knownToHear(NodeNum from, NodeNum to) const
 
 float NeighborGraph::hopCost(NodeNum from, NodeNum to) const
 {
+    // An Inferred edge is skipped: it was minted at a nominal price because a frame once
+    // crossed the link, which says a path exists and nothing about what it costs. Everything
+    // that decides whether a transmission may be skipped reads this price — covers(),
+    // coverageOwner(), witnessOwner() and the slot rankings — so a guess must not produce one.
+    // The route search prices its own hops from the edges directly and keeps using inferred
+    // edges for reachability, which is what they exist for.
     const NodeEdges *toEdges = findNeighbor(to);
     if (const Edge *received = toEdges ? findEdge(toEdges, from) : nullptr) {
-        return received->getEtx();
+        if (Edge::isMeasured(received->source)) return received->getEtx();
     }
     const NodeEdges *fromEdges = findNeighbor(from);
     if (const Edge *sent = fromEdges ? findEdge(fromEdges, to) : nullptr) {
-        return sent->getEtx();
+        if (Edge::isMeasured(sent->source)) return sent->getEtx();
     }
     return 0.0f;
 }
@@ -1190,6 +1236,8 @@ NodeNum NeighborGraph::witnessOwner(NodeNum source, const CoveragePolicy &policy
         // hear acknowledges nothing.
         const Edge *edge = findEdge(&neighbors[i], source);
         if (!edge || !edge->hearsUs) continue;
+        // A guessed link carries no acknowledgement: it was never measured in either direction.
+        if (!Edge::isMeasured(edge->source)) continue;
         // Priced in the delivery direction: the source's own measurement of the candidate when
         // it published one, our own edge otherwise. A link past the coverage ceiling carries no
         // acknowledgement either.
@@ -1229,6 +1277,9 @@ NodeNum NeighborGraph::coverageOwner(NodeNum target, const CoveragePolicy &polic
         // watched it carry the target's traffic.
         const Edge *edge = findEdge(&neighbors[i], target);
         if (!edge) continue;
+        // A guessed link owns nothing: it was never measured, so its holder cannot be shown to
+        // deliver to the target at all.
+        if (!Edge::isMeasured(edge->source)) continue;
         // Ownership decides *who* carries a neighbour nobody can be shown to reach; it must not
         // decide *whether* the neighbour is reachable at all. A link past the coverage ceiling
         // (the "heard once" ETX 40 sentinel included) delivers nothing, so its holder owns
@@ -1276,6 +1327,10 @@ size_t NeighborGraph::getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, 
         // Our own Mirrored edges (nodes we only know relayed us, or that listed us) are invisible to
         // our peers: they rank us on what we report. Counting them here made every node see more
         // coverage for itself than its neighbours saw for it, and colocated nodes both took slot 0.
+        // A candidate's coverage set is what it published, and for ourselves what we publish. An
+        // edge we invented from a relayed frame is invisible to everyone, the candidate it is
+        // attributed to included, so it belongs in nobody's set.
+        if (!Edge::isMeasured(relayEdges->edges[i].source)) continue;
         if (relay == selfNode && selfNode != 0 && relayEdges->edges[i].source != Edge::Source::Reported)
             continue;
         NodeNum target = relayEdges->edges[i].to;
