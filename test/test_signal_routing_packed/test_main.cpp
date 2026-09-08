@@ -587,6 +587,39 @@ static void test_a_publisher_has_no_owner()
     TEST_ASSERT_EQUAL_UINT32(0, graph.coverageOwner(target, policy));
 }
 
+void test_routing_through_us_confirms_the_sender_hears_us()
+{
+    // A peer that names us as its next hop learned that from our traffic, so it hears us. Same
+    // evidence as it listing us, but available a broadcast interval sooner.
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum peer = 0x11111111;
+    constexpr NodeNum stranger = 0x22222222;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, peer, 1.0f, 1000, Edge::Source::Reported);
+
+    auto hearsUs = [&](NodeNum n) {
+        const NodeEdges *mine = graph.getEdgesFrom(me);
+        if (!mine) return false;
+        for (uint8_t i = 0; i < mine->edgeCount; i++) {
+            if (mine->edges[i].to == n) return mine->edges[i].hearsUs;
+        }
+        return false;
+    };
+
+    TEST_ASSERT_FALSE(hearsUs(peer));
+    TEST_ASSERT_TRUE(confirmSenderHearsUs(&graph, me, peer));
+    TEST_ASSERT_TRUE(hearsUs(peer));
+    // Idempotent: only the first tells us anything new.
+    TEST_ASSERT_FALSE(confirmSenderHearsUs(&graph, me, peer));
+    // Nothing is invented for a node we have no edge to, nor for ourselves.
+    TEST_ASSERT_FALSE(confirmSenderHearsUs(&graph, me, stranger));
+    TEST_ASSERT_FALSE(confirmSenderHearsUs(&graph, me, me));
+    // The list path still routes through the same definition.
+    TEST_ASSERT_FALSE(confirmTopologySenderHearsUs(&graph, me, peer, stranger));
+}
+
 void test_a_guess_never_outranks_or_prices_a_measurement()
 {
     // An edge minted because a relayed frame crossed the link says a path exists and nothing
@@ -983,6 +1016,7 @@ void setup()
     RUN_TEST(test_coverage_owner_is_the_best_link_then_the_lowest_id);
     RUN_TEST(test_ownership_stops_at_the_coverage_ceiling);
     RUN_TEST(test_a_publisher_has_no_owner);
+    RUN_TEST(test_routing_through_us_confirms_the_sender_hears_us);
     RUN_TEST(test_a_guess_never_outranks_or_prices_a_measurement);
     RUN_TEST(test_a_silent_publisher_loses_our_direct_link);
     RUN_TEST(test_admits_coverage_credits_an_owned_neighbour);

@@ -279,10 +279,12 @@ static inline bool hasReportedDirectEdgeTo(const NeighborGraph *graph, NodeNum m
 // SR-passive senders broadcast topology but never relay, so this is the only way they can earn
 // `hearsUs` on our edge to them (SR-active senders also earn it by relaying our packets).
 // Returns true only when the flag transitions false -> true, so callers can log the event once.
-static inline bool confirmTopologySenderHearsUs(NeighborGraph *graph, NodeNum myNode, NodeNum sender,
-                                                NodeNum listedNeighbor)
+/// Record that `sender` hears us, reporting whether that is new information. One definition for
+/// every source of the evidence: a peer listing us, a peer carrying our traffic, or a peer
+/// routing through us.
+static inline bool confirmSenderHearsUs(NeighborGraph *graph, NodeNum myNode, NodeNum sender)
 {
-    if (!graph || listedNeighbor != myNode || sender == myNode) {
+    if (!graph || sender == 0 || sender == myNode) {
         return false;
     }
     const NodeEdges *myEdges = graph->getEdgesFrom(myNode);
@@ -300,6 +302,15 @@ static inline bool confirmTopologySenderHearsUs(NeighborGraph *graph, NodeNum my
         return true;
     }
     return false;
+}
+
+static inline bool confirmTopologySenderHearsUs(NeighborGraph *graph, NodeNum myNode, NodeNum sender,
+                                                NodeNum listedNeighbor)
+{
+    if (listedNeighbor != myNode) {
+        return false;
+    }
+    return confirmSenderHearsUs(graph, myNode, sender);
 }
 
 // The same listing proves the sender hears every other node it names. If that node has reported an

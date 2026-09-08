@@ -1520,6 +1520,18 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
         rememberRelayIdentity(mp.from, fromLastByte);
         trackNodeCapability(mp.from, CapabilityStatus::Unknown);
 
+        // A frame that reached us direct and names our byte as its next hop proves the sender
+        // hears us: a next hop is learned from traffic received, so it could only have chosen us
+        // by hearing us. The sender's own list carries the same evidence, but it can be a
+        // broadcast interval away, and until then a reply to that neighbour cannot be framed as
+        // a last hop — it goes out with a spare hop and gets relayed.
+        if (mp.to != NODENUM_BROADCAST && mp.next_hop != 0 &&
+            mp.next_hop == static_cast<uint8_t>(nodeDB->getNodeNum() & 0xFF)) {
+            if (confirmSenderHearsUs(routingGraph, nodeDB->getNodeNum(), mp.from)) {
+                LOG_INFO("[SR] %08x routes through us: hearsUs confirmed", mp.from);
+            }
+        }
+
         char senderName[64];
         getNodeDisplayName(mp.from, senderName, sizeof(senderName));
 
