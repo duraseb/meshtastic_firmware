@@ -319,27 +319,6 @@ int32_t SignalRoutingModule::runOnce()
             continue;
         }
         if ((int32_t)(nowMs - pr.fireAfterMs) >= 0) {
-            // Two purposes can justify this copy, and by now the evidence for both is in.
-            // Reach: a neighbour of ours that nobody we heard transmit has covered — the peer
-            // we deferred to may simply never have relayed. Witness: the originator asked to
-            // be told (want_ack) and heard us directly, so our copy is the rebroadcast it
-            // turns into its implicit ACK; one elected neighbour answers rather than every one
-            // that heard it. Our own broadcasts keep their own timer and are not judged here.
-            if (pr.source != 0 && nodeDB && pr.source != nodeDB->getNodeNum()) {
-                NodeNum reach = lateCopyTarget(pr.packetId, pr.source, pr.heardFrom);
-                NeighborGraph::CoveragePolicy policy = coveragePolicy();
-                bool witness = pr.ackOwed && routingGraph &&
-                               routingGraph->witnessOwner(pr.source, policy) == nodeDB->getNodeNum();
-                if (reach == 0 && !witness) {
-                    LOG_INFO("[SR] T1 off 0x%08x: nothing to reach or tell", pr.packetId);
-                    if (pr.packet) {
-                        packetPool.release(pr.packet);
-                        pr.packet = nullptr;
-                    }
-                    pr.canceled = true;
-                    continue;
-                }
-            }
             LOG_INFO("[SR] T1 firing 0x%08x: no relay heard, retransmitting", pr.packetId);
             meshtastic_MeshPacket *toSend = pr.packet;
             pr.packet = nullptr;
@@ -2463,70 +2442,29 @@ bool SignalRoutingModule::hasAnyHearsUsNeighbor() const
     return false;
 }
 
-NodeNum SignalRoutingModule::lateCopyTarget(PacketId packetId, NodeNum source, NodeNum heardFrom) const
+bool SignalRoutingModule::witnessOwed(const meshtastic_MeshPacket *p, NodeNum sourceNode) const
 {
-    if (!routingGraph || !nodeDB) {
-        return 0;
-    }
-    NodeNum myNode = nodeDB->getNodeNum();
-    // Everyone we have actually heard put this packet on the air. The previous test asked
-    // whether every hearsUs neighbour had itself relayed it, which two or more neighbours can
-    // never satisfy: it cancelled nothing in 42 minutes of field logs (2026-09-07).
-    NodeNum transmitted[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE + 2];
-    const size_t maxTransmitted = sizeof(transmitted) / sizeof(transmitted[0]);
-    size_t count = 0;
-    uint32_t nowSecs = millis() / 1000;
-    // The originator put the frame on the air itself, and the node we heard it from either
-    // originated or relayed it: both are transmitters whatever our relay table remembers.
-    for (NodeNum node : {source, heardFrom}) {
-        if (node == 0 || node == myNode) {
-            continue;
-        }
-        bool seen = false;
-        for (size_t k = 0; k < count; k++) {
-            seen = seen || transmitted[k] == node;
-        }
-        if (!seen) {
-            transmitted[count++] = node;
-        }
-    }
-    const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
-    if (myEdges) {
-        for (uint8_t i = 0; i < myEdges->edgeCount && count < maxTransmitted; i++) {
-            NodeNum neighbor = myEdges->edges[i].to;
-            if (neighbor == 0) {
-                continue;
-            }
-            bool seen = false;
-            for (size_t k = 0; k < count; k++) {
-                seen = seen || transmitted[k] == neighbor;
-            }
-            if (seen) {
-                continue;
-            }
-            if (routingGraph->hasNodeTransmitted(neighbor, packetId, nowSecs)) {
-                transmitted[count++] = neighbor;
-            }
-        }
+    // A frame that arrived relayed was already witnessed: the relay's own transmission is the
+    // rebroadcast its source heard. Only a frame straight from its originator, asking to be
+    // acknowledged, still needs one from us — and only from the one node it elected.
+    if (!p || !p->want_ack || p->hop_start != p->hop_limit || !routingGraph || !nodeDB) {
+        return false;
     }
     NeighborGraph::CoveragePolicy policy = coveragePolicy();
-    return routingGraph->uniqueCoverageNeighbor(myNode, transmitted, count, cfgPoorLinkEtxThreshold, nullptr, 0,
-                                                &policy);
+    return routingGraph->witnessOwner(sourceNode, policy) == nodeDB->getNodeNum();
 }
 
 void SignalRoutingModule::maybeScheduleBroadcastRetransmit(const meshtastic_MeshPacket *p)
 {
-    scheduleT1Broadcast(p, 0, false, 0);
+    scheduleT1Broadcast(p, 0, false);
 }
 
-void SignalRoutingModule::armDeferredBroadcastRetransmit(const meshtastic_MeshPacket *p, uint32_t staggerMs,
-                                                         NodeNum heardFrom)
+void SignalRoutingModule::armDeferredBroadcastRetransmit(const meshtastic_MeshPacket *p, uint32_t staggerMs)
 {
-    scheduleT1Broadcast(p, staggerMs, true, heardFrom);
+    scheduleT1Broadcast(p, staggerMs, true);
 }
 
-void SignalRoutingModule::scheduleT1Broadcast(const meshtastic_MeshPacket *p, uint32_t staggerMs, bool deferred,
-                                              NodeNum heardFrom)
+void SignalRoutingModule::scheduleT1Broadcast(const meshtastic_MeshPacket *p, uint32_t staggerMs, bool deferred)
 {
     if (!routingGraph || !nodeDB || !p) {
         return;
@@ -2619,11 +2557,6 @@ void SignalRoutingModule::scheduleT1Broadcast(const meshtastic_MeshPacket *p, ui
     slot->packet = copy;
     slot->fireAfterMs = millis() + fireDelayMs;
     slot->canceled = false;
-    slot->source = isOriginated ? myNode : p->from;
-    slot->heardFrom = heardFrom;
-    // A frame that arrived relayed was already witnessed: the relay's own transmission is the
-    // rebroadcast its source heard. hop_limit is read before the deferred copy spends its hop.
-    slot->ackOwed = deferred && p->want_ack && p->hop_start == p->hop_limit;
 
     LOG_INFO("[SR] T1 for 0x%08x (%s) in %ums (win %ums + air %ums + stag %ums)",
              p->id, deferred ? "deferred" : "originated", fireDelayMs, latestRelayWindowMs, airtimeMs, staggerMs);
@@ -3062,6 +2995,9 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     bool shouldRelay = false;
     uint32_t myDelay = 0;
     const char *decisionReason = "no unique coverage";
+    // Transmissions we expect ahead of ours, stock routers included. Zero means the ranking
+    // handed out no slot at all, so nothing is expected for a late copy to stand in for.
+    uint8_t slotsGiven = 0;
 
     LOG_INFO("[SR] Slot scheduling 0x%08x: half=%ums, %u cands", p->id, halfAirtime, candidates.count);
     // We are always a candidate, so a count of one means nobody else here can carry this frame.
@@ -3114,6 +3050,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
                 LOG_INFO("[SR] Slot %ums: stock %08x (already TX)", slotDelay, neighbor);
             } else {
                 LOG_INFO("[SR] Slot %ums: stock %08x (expected)", slotDelay, neighbor);
+                slotsGiven++;
             }
 
             slotDelay += halfAirtime;
@@ -3168,6 +3105,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
 
         LOG_INFO("[SR] Slot %ums: SR node %08x (coverage=%u/%u, cost=%.2f%s)", slotDelay, best.nodeId,
                   best.coverageCount, best.totalCoverage, best.getAvgCost(), best.tier > 0 ? ", bidi" : "");
+        slotsGiven++;
         // An earlier slot holder is assumed to relay: subtract its coverage so later candidates
         // (and the stock-coverage fallback) only relay for nodes nobody ahead of them reaches.
         absorbRelayCoverage(best.nodeId);
@@ -3216,11 +3154,15 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     if (shouldRelay) {
         pendingRelayDelayMs = myDelay;
         routingGraph->recordNodeTransmission(myNode, p->id, currentTime);
-    } else if (srPeers.count > 1) {
-        // Arm the insurance and decide when it fires, not now: by then every copy we were
-        // going to hear has arrived, so "does this frame still have a purpose?" is answered
-        // from what happened instead of predicted. Our own rung of the ladder is the node-id
-        // order the slots already use, one half-airtime apart.
+    } else if (slotsGiven > 0 || witnessOwed(p, sourceNode)) {
+        // Two reasons can still put a late copy on the air, and both are known now. A
+        // transmission we expect: the ranking gave a slot to a stock relay router or a ranked
+        // SR peer, and if their copy never comes ours is the redundancy that covers the loss.
+        // Or a witness owed: the originator asked to be told (want_ack) and heard us directly,
+        // so our copy is the rebroadcast stock turns into its implicit ACK — one elected
+        // neighbour answers instead of every one that heard it, and without it the sender
+        // retransmits NUM_RELIABLE_RETX times. Our rung of the ladder is the node-id order the
+        // slots already use, one half-airtime apart.
         uint8_t rank = 0;
         for (uint16_t i = 0; i < srPeers.count; i++) {
             NodeNum peer = srPeers.nodes[i];
@@ -3231,7 +3173,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
                 rank++;
             }
         }
-        armDeferredBroadcastRetransmit(p, rank * halfAirtime, heardFrom);
+        armDeferredBroadcastRetransmit(p, rank * halfAirtime);
     }
 
     return shouldRelay;

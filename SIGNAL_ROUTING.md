@@ -82,7 +82,7 @@ This dual approach provides the reliability of coordinated networking with the e
 | **ReliableRouter** | Up to 3 retransmissions | For want_ack packets only |
 | **NextHopRouter** | 2 for intermediate hops, 3 for origin | Route reset on final failure |
 | **SignalRouting** | Iterative unicast route selection with fallback strategies | For SR-selected unicast routes |
-| **SignalRouting broadcast** | At most one late copy, and only if it still has a purpose when it would go out: a neighbour nobody reached, or an unanswered `want_ack` originator that elected us | Guards against interference/CRC loss at receivers and supplies stock's implicit ACK; see T1 Retransmit Insurance |
+| **SignalRouting broadcast** | At most one late copy, armed only when a transmission was expected of somebody or a `want_ack` originator elected us as its witness | Guards against interference/CRC loss at receivers and supplies stock's implicit ACK; see T1 Retransmit Insurance |
 
 ### Passive Node Behavior
 
@@ -492,9 +492,8 @@ relayer duplicated both, and the same wrap asked for an immediate wake-up afterw
    slot but did give one to somebody — a stock relay router or a ranked SR peer
    (`armDeferredBroadcastRetransmit`). A relay we committed to arms no T1 — the relay is the copy,
    and insuring our own transmission was never the point.
-3. There is at least one other SR candidate. Whether the copy is worth its airtime is not
-   predicted here — it is decided when the timer fires, from what was actually heard (see
-   **Two purposes** below).
+3. A transmission is expected (a slot was given out) or a witness is owed — see **T1 stands in
+   for a transmission** below.
 4. At least one direct neighbor with `hearsUs=true` exists — confirms we have a known neighbor before spending airtime on the retransmit.
 5. T1 retransmit is not disabled via config (`t1_retransmit_enabled`).
 
@@ -513,12 +512,15 @@ having travelled zero hops.
 
 **Cancellation:** Most incoming dupes trigger `cancelBroadcastRetransmit()` via `perhapsCancelDupe()` — including committed relays that decide to cancel, already-relayed detection, and non-SR originator dupes. The one exception is when a committed relay has unique coverage and keeps its queued TX: the queued relay is the copy, and a committed relay arms no T1.
 
-**Two purposes, decided when the copy would go out.** Deferring always arms T1; at its rung the frame is transmitted only if one of these holds, and cancelled otherwise:
+**T1 stands in for a transmission that was expected and did not happen, and for nothing else.**
+Deferring arms it when either is true, both known at that moment:
 
-- **Reach** — `lateCopyTarget()` finds a neighbour of ours that none of the nodes we *actually heard* transmit this packet has covered. The set is the originator, the node we heard the frame from, and every neighbour with a `recordNodeTransmission()` entry for this packet id; the coverage question itself is `uniqueCoverageNeighbor()`, the same one the dupe path asks. The peer the ranking deferred to may simply never have relayed: in 68 of 77 firings measured on 2026-09-07 the ranked peer was genuinely silent, so this is what keeps insurance working.
-- **Witness** — the frame carries `want_ack` and arrived straight from its originator (`hop_start == hop_limit`), and `witnessOwner()` elects us. Stock turns a heard rebroadcast of its own packet into an implicit ACK (`ReliableRouter::shouldFilterReceived`) and otherwise retransmits `NUM_RELIABLE_RETX` times, so one elected witness replaces three frames from the sender. A frame that arrived relayed was already witnessed — the relay's own transmission is the rebroadcast its source heard — so no witness is owed for it.
+- **A slot was given** — the ranking put a stock relay router (one that has not already transmitted this packet) or a ranked SR peer ahead of us. If their copy never comes, ours is the redundancy that covers the loss.
+- **A witness is owed** — `witnessOwed()`: the frame carries `want_ack`, reached us straight from its originator (`hop_start == hop_limit`), and `witnessOwner()` elects us. Stock turns a heard rebroadcast of its own packet into an implicit ACK (`ReliableRouter::shouldFilterReceived`) and otherwise retransmits `NUM_RELIABLE_RETX` times, so one elected witness replaces three frames from the sender. A frame that arrived relayed was already witnessed — the relay's own transmission is the rebroadcast its source heard.
 
-Neither purpose left means the copy is airtime and nothing else. Before this was checked, the insurance was the branch's busiest transmitter: 87 T1 frames against 21 coverage relays in 42 minutes. The predicate it replaced (`allHearsUsNeighborsHeardPacket()`) asked whether every `hearsUs` neighbour had itself *relayed* the packet, which two or more neighbours can never satisfy — it cancelled nothing in those 42 minutes.
+Neither reason means no transmission is expected and nobody is waiting to be told. Measured over 30 min on three field nodes (2026-09-08): declining those copies cut T1 traffic roughly tenfold while delivery between two colocated nodes was unchanged (3.2% asymmetric packet ids with the rule, 2.9% without).
+
+**Once armed, only a heard copy stands it down.** The coverage question is deliberately *not* asked again when the timer fires: it answers "who needs a relay", not "did the expected frame actually arrive". Two of the seven late copies measured on 2026-09-08 delivered frames to nodes the graph believed were covered, because the covering link was marginal (−84 to −93 dBm) and the frame was lost on it. Coverage is topology; per-frame loss is invisible to it, and T1 is the layer that absorbs it. An earlier revision re-tested coverage at fire time and would have cancelled both of those copies.
 
 **The witness election is not the coverage election.** `coverageOwner()` ranks a candidate's own edge *to* the target, which is the only evidence available for a neighbour nobody can be shown to reach. A witness needs the opposite direction: the originator must be able to hear the answer. `witnessOwner()` therefore requires positive evidence that the source hears the candidate — the source's own list naming it, or us watching the source carry its frame — and prices the link as the source measures it. Edge existence alone will not do: a direct observation writes both edge directions from one measurement, so that is our own assumption of symmetry. A source that publishes nothing leaves each node with only its own evidence, so several may elect themselves; that is still fewer than every node that heard the frame.
 

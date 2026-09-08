@@ -630,16 +630,7 @@ private:
         meshtastic_MeshPacket *packet = nullptr;
         uint32_t fireAfterMs = 0;
         bool canceled = false;
-        // Who originated the frame (a rebroadcast acknowledges it) and who we heard it from.
-        NodeNum source = 0;
-        NodeNum heardFrom = 0;
-        // The frame asked to be acknowledged and reached us straight from its originator, so
-        // our copy is the rebroadcast stock turns into its implicit ACK.
-        bool ackOwed = false;
-        PendingRetransmit()
-            : packetId(0), packet(nullptr), fireAfterMs(0), canceled(false), source(0), heardFrom(0), ackOwed(false)
-        {
-        }
+        PendingRetransmit() : packetId(0), packet(nullptr), fireAfterMs(0), canceled(false) {}
     };
     PendingRetransmit pendingRetransmits[MAX_PENDING_RETRANSMITS];
     bool isRetransmitting = false; // Guard: prevents T2 scheduling when T1 is being fired
@@ -654,11 +645,9 @@ private:
     bool t1RetransmitEnabled = true;
 
     bool hasAnyHearsUsNeighbor() const;
-    /// The neighbour a late copy would still reach: ours to cover, and covered by none of the
-    /// nodes we have heard transmit this packet. 0 = the frame is already everywhere our radio
-    /// can put it. Asked when the insurance fires, against what happened rather than what was
-    /// predicted when we deferred.
-    NodeNum lateCopyTarget(PacketId packetId, NodeNum source, NodeNum heardFrom) const;
+    /// Does this frame's originator still need a rebroadcast from us as its acknowledgement:
+    /// it asked (want_ack), it reached us directly, and its own evidence elects us.
+    bool witnessOwed(const meshtastic_MeshPacket *p, NodeNum sourceNode) const;
 
 public:
     uint32_t pendingRelayDelayMs = 0; // Set by shouldRelayBroadcast, consumed by commitRelay
@@ -686,8 +675,8 @@ public:
     // T1 insurance for a broadcast we deferred (no ranked slot): if nobody retransmits, a late
     // copy still reaches the source. Every deferring node arms one, so each waits `staggerMs`
     // past the window; firing together would collide exactly when the ranked relay went missing.
-    void armDeferredBroadcastRetransmit(const meshtastic_MeshPacket *p, uint32_t staggerMs, NodeNum heardFrom);
-    void scheduleT1Broadcast(const meshtastic_MeshPacket *p, uint32_t staggerMs, bool deferred, NodeNum heardFrom);
+    void armDeferredBroadcastRetransmit(const meshtastic_MeshPacket *p, uint32_t staggerMs);
+    void scheduleT1Broadcast(const meshtastic_MeshPacket *p, uint32_t staggerMs, bool deferred);
     void cancelBroadcastRetransmit(PacketId packetId);
 };
 
