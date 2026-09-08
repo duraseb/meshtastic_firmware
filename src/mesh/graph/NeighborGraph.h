@@ -330,6 +330,13 @@ class NeighborGraph {
     // mute and passive roles never own, because they do not relay.
     NodeNum coverageOwner(NodeNum target, const CoveragePolicy &policy) const;
 
+    /// Does `relay` carry `target` if it transmits: it can be shown to deliver, or `target` is a
+    /// neighbour nobody can be shown to reach and `relay` is the one node that owns it. The
+    /// ranking and the absorb step must credit the same set, or an owned neighbour is left
+    /// uncovered after its owner takes a slot and a later phase relays for it again.
+    bool admitsCoverage(NodeNum relay, NodeNum target, float poorLinkEtx,
+                        const CoveragePolicy *policy) const;
+
     /// Whose copy an originator will actually hear: among the nodes it can be shown to hear
     /// (its own published list, or us watching it carry their frame), the cheapest in the
     /// delivery direction, stock rebroadcasters given way, node id as the tie-break.
@@ -349,20 +356,17 @@ class NeighborGraph {
 
     /// Do we still reach a direct neighbour none of `coveredBy` reaches? A coverer counts only when
     /// it `covers` the neighbour, the same rule pre-coverage applies at ranking time.
-    /// `notOurs` lists neighbours another SR peer owns under the stock-coverage rule; they are skipped.
     bool hasUniqueCoverage(NodeNum myNode, const NodeNum *coveredBy, size_t coveredByCount, float poorLinkEtx = 0.0f,
-                           const NodeNum *notOurs = nullptr, size_t notOursCount = 0,
                            const CoveragePolicy *policy = nullptr) const
     {
-        return uniqueCoverageNeighbor(myNode, coveredBy, coveredByCount, poorLinkEtx, notOurs, notOursCount, policy) != 0;
+        return uniqueCoverageNeighbor(myNode, coveredBy, coveredByCount, poorLinkEtx, policy) != 0;
     }
 
     /// The neighbour that makes our relay worth its airtime: ours to cover and reached by none of
     /// `coveredBy`. Returned rather than reduced to a bool so the decision can be logged — a relay
     /// nobody needs and a relay that saves a node look identical in a field log otherwise.
     NodeNum uniqueCoverageNeighbor(NodeNum myNode, const NodeNum *coveredBy, size_t coveredByCount,
-                                   float poorLinkEtx = 0.0f, const NodeNum *notOurs = nullptr,
-                                   size_t notOursCount = 0, const CoveragePolicy *policy = nullptr) const;
+                                   float poorLinkEtx = 0.0f, const CoveragePolicy *policy = nullptr) const;
 
     bool isGatewayNode(NodeNum nodeId, NodeNum sourceNode) const;
 

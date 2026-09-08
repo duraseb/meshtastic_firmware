@@ -1093,6 +1093,14 @@ bool NeighborGraph::canDeliver(NodeNum from, NodeNum to, const RoutePolicy &poli
     return !(policy.publishes && policy.publishes(policy.ctx, to));
 }
 
+bool NeighborGraph::admitsCoverage(NodeNum relay, NodeNum target, float poorLinkEtx,
+                                   const CoveragePolicy *policy) const
+{
+    if (covers(relay, target, poorLinkEtx, policy)) return true;
+    // A neighbour nobody can be shown to reach is still worth one relay, but only from its owner.
+    return policy && coverageOwner(target, *policy) == relay;
+}
+
 bool NeighborGraph::covers(NodeNum from, NodeNum to, float poorLinkEtx, const CoveragePolicy *policy) const
 {
     bool reports = policy && policy->reports(to);
@@ -1103,9 +1111,12 @@ bool NeighborGraph::covers(NodeNum from, NodeNum to, float poorLinkEtx, const Co
         evidenced = fromEdges && findEdge(fromEdges, to);
     }
     if (!evidenced) return false;
+    // A zero threshold asks this primitive for the evidence question alone. The firmware cannot
+    // reach it: the policy carries the configured ceiling and a non-positive configuration is
+    // rejected, so only direct graph-level callers see this.
     if (poorLinkEtx <= 0.0f) return true;
     float cost = hopCost(from, to);
-    return cost > 0.0f && cost < poorLinkEtx;
+    return cost > 0.0f && cost <= poorLinkEtx;
 }
 
 NodeNum NeighborGraph::witnessOwner(NodeNum source, const CoveragePolicy &policy) const
@@ -1145,7 +1156,7 @@ NodeNum NeighborGraph::witnessOwner(NodeNum source, const CoveragePolicy &policy
             const Edge *back = findEdge(sourceEdges, candidate);
             if (back) costFixed = back->etxFixed;
         }
-        if (policy.poorLinkEtx > 0.0f && (float)costFixed / 100.0f >= policy.poorLinkEtx) continue;
+        if (policy.poorLinkEtx > 0.0f && (float)costFixed / 100.0f > policy.poorLinkEtx) continue;
         uint16_t bucket = (uint16_t)(costFixed / SR_OWNER_COST_BUCKET);
         if (tier < bestTier || (tier == bestTier && bucket < bestBucket) ||
             (tier == bestTier && bucket == bestBucket && candidate < owner)) {
@@ -1161,6 +1172,10 @@ NodeNum NeighborGraph::coverageOwner(NodeNum target, const CoveragePolicy &polic
 {
     NodeNum me = policy.me;
     if (target == 0 || (target & 0xFF000000) == 0xFF000000) return 0;
+    // Only a silent neighbour has an owner. One that publishes topology and does not list a
+    // candidate has reported that the candidate cannot reach it, and that silence is evidence:
+    // nobody owns it, and a relay spent on it would be spent against its own report.
+    if (policy.reports(target)) return 0;
     NodeNum owner = 0;
     uint8_t bestTier = 0xFF;
     uint16_t bestBucket = 0xFFFF;
@@ -1178,7 +1193,7 @@ NodeNum NeighborGraph::coverageOwner(NodeNum target, const CoveragePolicy &polic
         // first slot, and the packet would wait a full defer window for a relay that cannot
         // come. Measured 2026-09-08: 74 of 183 slots went out over links worse than the
         // ceiling, and the branch's insurance fired to cover them.
-        if (policy.poorLinkEtx > 0.0f && edge->getEtx() >= policy.poorLinkEtx) continue;
+        if (policy.poorLinkEtx > 0.0f && edge->getEtx() > policy.poorLinkEtx) continue;
         uint8_t tier;
         if (candidate == me) {
             if (!policy.meRelays) continue;
@@ -1224,10 +1239,8 @@ size_t NeighborGraph::getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, 
         // Not coverage unless the relay is shown to reach it — or, when nobody can be shown to
         // reach it at all, unless this relay is its owner. Counting it for everyone made the whole
         // branch relay every frame for the same unconfirmed node.
-        if (!covers(relay, target, poorLinkEtx, policy)) {
-            if (!policy || coverageOwner(target, *policy) != relay) {
-                continue;
-            }
+        if (!admitsCoverage(relay, target, poorLinkEtx, policy)) {
+            continue;
         }
 
         bool isAlreadyCovered = false;
@@ -1332,8 +1345,7 @@ RelayCandidate NeighborGraph::findBestRelayCandidate(const NodeSet &candidates, 
 }
 
 NodeNum NeighborGraph::uniqueCoverageNeighbor(NodeNum myNode, const NodeNum *coveredBy, size_t coveredByCount,
-                                              float poorLinkEtx, const NodeNum *notOurs, size_t notOursCount,
-                                              const CoveragePolicy *policy) const
+                                              float poorLinkEtx, const CoveragePolicy *policy) const
 {
     const NodeEdges *myEdges = findNeighbor(myNode);
     if (!myEdges || myEdges->edgeCount == 0) {
@@ -1359,19 +1371,15 @@ NodeNum NeighborGraph::uniqueCoverageNeighbor(NodeNum myNode, const NodeNum *cov
         }
         if (isCoverer) continue;
 
-        // A stock neighbour a lower-id SR peer owns is that peer's to cover, not ours.
-        bool ownedElsewhere = false;
-        for (size_t k = 0; k < notOursCount; k++) {
-            if (notOurs[k] == neighbor) {
-                ownedElsewhere = true;
-                break;
-            }
-        }
-        if (ownedElsewhere) continue;
-
         // Ours to cover: it proved it hears us, or nobody can prove anything about it and we are
         // its owner. Otherwise it is another node's responsibility, or nobody's.
         if (!myEdges->edges[i].hearsUs && policy && coverageOwner(neighbor, *policy) != myNode) {
+            continue;
+        }
+        // Confirmation or ownership says whose it is; covers() says whether a copy from us would
+        // arrive at all. hearsUs is sticky, so without this a neighbour behind a decayed link
+        // stayed "ours to cover" and kept a queued relay the ranking refuses.
+        if (!covers(myNode, neighbor, poorLinkEtx, policy)) {
             continue;
         }
 

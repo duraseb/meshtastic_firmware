@@ -253,6 +253,19 @@ side still carries the frame out: a one-way edge is usually a marginal link or a
 not silence. The route is marked `verified = false` and logged with `unverified`; a confirmed path
 of any length wins over it, and `nodeFilter` still keeps passive nodes from being the gateway.
 
+**A guessed route is never stamped, and never carried backwards.** `getNextHop()` reports the
+verdict through a `verified` out-parameter — every path other than the confirmed search
+(opportunistic neighbour, downstream relay, best-effort self relay, direct delivery) is a guess
+and reports false. A relayed unicast on a guessed route therefore goes out with no next hop: the
+node it names never proved it hears the destination, and a designation makes every other
+candidate stand down and wait for a copy that node may have no way to send. If the guess points
+back at the node that handed us the packet, the relay is dropped instead — carrying it moves the
+frame away from its destination, onto our own side of the mesh where the only path anyone knows
+is the one it arrived on — unless the frame named us as its next hop, in which case the sender is
+waiting on us specifically and its retries would designate us again, so one copy from us costs
+less than three from it. A last hop keeps its destination designation through the clear: that
+byte is what makes stock relays leave the frame alone.
+
 **Backups survive suppression.** The checks that suppress a unicast relay — source and destination
 downstream of the same relay, the node we heard it from can finish delivery, a better placed SR
 neighbour covers it, no route of our own — all say somebody else is better placed, not that the
@@ -380,7 +393,7 @@ SignalRouting uses a deterministic slot-based algorithm to coordinate broadcast 
 
    Either way the delivery-direction cost, priced at the receiver (`hopCost`), must stay below the configured poor-link ETX (default 7.0, which excludes the ETX=40 "heard once" sentinel): `hearsUs` is sticky, so a peer that heard the transmitter once keeps the flag long after its link decayed — a rooftop node kept it with its antenna 20 dB down. The same rule prices a candidate's coverage set, absorbs an earlier slot holder's coverage, and answers `uniqueCoverageNeighbor()`.
 
-   **Ownership.** A neighbour that no transmitter can be shown to reach still deserves one relay, but only one: `coverageOwner()` picks it, and both the slot ranking and unique coverage consult it. Since such a node never reports, its receive path is all anyone can measure, so the owner is the node hearing it best — stock ROUTER/REPEATER/ROUTER_CLIENT given way first (they rebroadcast regardless of SR and already hold the earliest slots), then the best link in `SR_OWNER_COST_BUCKET` buckets, then the lowest node id. Mute and passive nodes never own, because they never relay. **Ownership stops at the coverage ceiling**: a link past `cfgPoorLinkEtxThreshold` (the "heard once" ETX 40 sentinel included) delivers nothing, so its holder owns nothing and the neighbour is simply out of reach. Ownership decides *who* carries such a neighbour, never *whether* it is reachable — without that bound the ranking credited unique coverage to a node that cannot deliver and gave it the first slot, so the packet waited a full defer window for a relay that could not come. Measured 2026-09-08: 74 of 183 slots went out over links worse than the ceiling (31 of them at the sentinel), and the branch's insurance fired to carry those packets instead. `uniqueCoverageNeighbor()` returns the neighbour rather than a bool and logs `Relaying for %08x (nobody else reaches it)`: a relay nobody needs and a relay that saves a node are otherwise indistinguishable in a field log.
+   **Ownership.** A neighbour that no transmitter can be shown to reach still deserves one relay, but only one: `coverageOwner()` picks it, and both the slot ranking and unique coverage consult it. Admission and absorb share one predicate, `admitsCoverage()` — covers, or ownership naming that relay — because crediting only `covers()` on absorb left an owned neighbour uncovered after its owner took a slot, so a later phase relayed for it again. Since such a node never reports, its receive path is all anyone can measure, so the owner is the node hearing it best — stock ROUTER/REPEATER/ROUTER_CLIENT given way first (they rebroadcast regardless of SR and already hold the earliest slots), then the best link in `SR_OWNER_COST_BUCKET` buckets, then the lowest node id. Mute and passive nodes never own, because they never relay. **Only a silent neighbour has an owner**: one that publishes topology and does not list a candidate has reported that the candidate cannot reach it, and that silence is evidence, so nobody owns it. **Ownership stops at the coverage ceiling**: a link past `cfgPoorLinkEtxThreshold` (the "heard once" ETX 40 sentinel included) delivers nothing, so its holder owns nothing and the neighbour is simply out of reach. Ownership decides *who* carries such a neighbour, never *whether* it is reachable — without that bound the ranking credited unique coverage to a node that cannot deliver and gave it the first slot, so the packet waited a full defer window for a relay that could not come. Measured 2026-09-08: 74 of 183 slots went out over links worse than the ceiling (31 of them at the sentinel), and the branch's insurance fired to carry those packets instead. The separate stock-coverage phase that used to relay for a mute or legacy neighbour "nobody ranked ahead covers" is gone, together with its own owner election and legacy-role predicates. It applied no ETX ceiling and iterated the relay's Mirrored edges as well, so it relayed in exactly the states the coverage model calls undeliverable — a link past the ceiling, one at the heard-once sentinel, a neighbour never measured directly — while where the link is sound the ranking already carries it, because coverage admits a silent neighbour on the relay's own edge. A deliberate narrowing, not a no-op. The dupe path's third election went with it — one rule decides whose neighbour it is. `uniqueCoverageNeighbor()` returns the neighbour rather than a bool and logs `Relaying for %08x (no transmitter reaches it)`: a relay nobody needs and a relay that saves a node are otherwise indistinguishable in a field log.
 
 1. **Candidate filtering**: Only SR-active neighbors and stock ROUTER/REPEATER/ROUTER_CLIENT nodes are considered relay candidates. Non-SR nodes (CLIENT, CLIENT_MUTE, etc.) are excluded — they either don't relay or relay unpredictably outside SR coordination.
 
@@ -388,7 +401,7 @@ SignalRouting uses a deterministic slot-based algorithm to coordinate broadcast 
 
 3. **SR candidate ranking**: Remaining SR-active candidates are iteratively ranked by `findBestRelayCandidate` (most unique coverage, lowest delivery-direction ETX priced at each covered receiver, deterministic node ID tiebreak based on packet ID parity). Each candidate gets the next slot. If it's us, we schedule TX and stop. If a candidate already transmitted, we absorb its coverage without consuming a slot. An earlier slot holder that has not transmitted yet is assumed to relay, so its coverage is absorbed too before the next pick. Our own coverage counts only our **Reported** edges (what we broadcast in topology): peers rank us on what they mirrored from us, and counting our Mirrored edges made every node see more coverage for itself than its neighbours saw for it, so colocated nodes both took slot 0.
 
-4. **Overrides**: Downstream relay obligations and stock coverage needs can force a relay. The stock-coverage fallback is coordinated across the SR peers that took part in the ranking: a mute or legacy neighbour already covered by an earlier slot holder needs nobody else, and each remaining uncovered stock neighbour is owned by exactly one SR node, the lowest node id among us and the peers with an edge to it. Without that rule every SR node beside the same mute neighbour relayed in the same slot.
+4. **Overrides**: A downstream relay obligation can force a relay when the ranking gave us no slot. The separate stock-coverage override that used to sit here is gone: it applied no ETX ceiling and iterated our own Mirrored edges, so it relayed over links the coverage model calls undeliverable, and where the link is sound the ranking already carries the neighbour.
 
 **Post-cancellation — unique coverage re-evaluation:**
 When a dupe arrives, `FloodingRouter::perhapsCancelDupe` is called. For SR committed relays, it first checks whether the packet is still in the TX queue (`findInTxQueue`):
@@ -427,7 +440,7 @@ Mirrored edges (learned from topology broadcasts) are not cleared when a new top
 3. **Deterministic Ordering**: All nodes compute the same candidate ranking for consistent slot assignment
 4. **Coverage-Based Selection**: Candidates ranked by unique coverage count, then ETX quality
 5. **Dupe Suppression**: Existing packet deduplication cancels queued relays when earlier slots transmit
-6. **Unique Coverage Fallback**: Nodes covering areas no candidate reaches are forced to relay via downstream override or stock coverage checks
+6. **Unique Coverage Fallback**: Nodes covering areas no candidate reaches are forced to relay via a downstream override
 7. **Downstream Override**: Nodes recorded as relay for source/destination are forced to relay
 
 ### Broadcast Coordination Example
@@ -503,7 +516,7 @@ our copy is the only witness its transmitter can ever get. We relay immediately 
 This is the state a node is in for its first topology interval after boot, where behaving like a
 plain rebroadcaster is right, and it is what makes a two-node mesh work at all.
 
-**Staggered insurers:** every node that deferred arms T1, so they must not fire together — that
+**Staggered insurers:** every node that armed T1 must not fire together with the others — that
 would collide exactly when the ranked relay is the frame that went missing. Each waits its own rung
 past the window: stock rebroadcasters first (they hold the earliest relay slots too), then the
 node-id order the slots already use (packet-id parity), one half-airtime apart. A rung is shorter
@@ -654,7 +667,7 @@ SignalRouting considerations:
 **Congestion Control:**
 - Deterministic slot scheduling minimizes redundant broadcasts
 - Half-airtime spacing between slots ensures physical separation of transmissions
-- Downstream override and stock coverage checks ensure nodes with unique coverage still relay
+- A downstream override ensures nodes with unique coverage still relay
 
 ## NeighborGraph Implementation
 
@@ -910,7 +923,7 @@ SignalRouting uses a deterministic slot-based algorithm for relay coordination:
 4. **SR Candidate Ranking**: Iteratively pick best candidate (most unique coverage, lowest ETX, packet-ID-parity node ID tiebreak), assign next slot, remove from candidates
 4. **Self-Assignment**: When we're picked as best candidate, schedule TX at that slot's delay
 5. **Already-Transmitted Absorption**: Candidates that already transmitted have their coverage absorbed without consuming a slot
-6. **Forced Relay**: If not assigned a slot, downstream override or stock coverage checks may still force a relay
+6. **Forced Relay**: If not assigned a slot, a downstream override may still force a relay
 7. **Dupe Suppression**: If a relay arrives before our slot fires, existing deduplication cancels our queued TX
 
 Slot spacing is half the packet airtime, ensuring the next-slot node detects ongoing reception (`busyRx`) and holds its transmission.

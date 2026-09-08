@@ -386,7 +386,14 @@ public:
     void updateNodeActivityForPacketAndRelay(const meshtastic_MeshPacket *p);
     bool shouldRelay(const meshtastic_MeshPacket *p);
     bool shouldRelayBroadcast(const meshtastic_MeshPacket *p);
-    NodeNum getNextHop(NodeNum destination, NodeNum sourceNode = 0, NodeNum heardFrom = 0, bool allowOpportunistic = true);
+    /// The next hop to stamp on a relayed unicast. `verified`, when given, reports whether the
+    /// hop came from the confirmed backward search: an opportunistic neighbour, the downstream
+    /// table, best-effort self relay and direct delivery are all guesses and report false, so
+    /// callers can refuse to designate a node that never proved it hears the destination. A hop
+    /// the search confirmed carries the search's own verdict even when it could not be shown to
+    /// hear this particular transmitter — that is a question about this frame, not the path.
+    NodeNum getNextHop(NodeNum destination, NodeNum sourceNode = 0, NodeNum heardFrom = 0, bool allowOpportunistic = true,
+                       bool *verified = nullptr);
     NodeNum findBetterPositionedNeighbor(NodeNum destination, NodeNum sourceNode, NodeNum heardFrom,
                                        float ourRouteCost, uint32_t currentTime);
     bool shouldRelayUnicastForCoordination(const meshtastic_MeshPacket *p);
@@ -593,8 +600,6 @@ private:
     NodeNum getPlaceholderForRelay(uint8_t relayId) const;
     void replaceGatewayNode(NodeNum oldNode, NodeNum newNode);
     bool isPlaceholderConnectedToUs(NodeNum placeholderId) const;
-    bool shouldRelayForStockNeighbors(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom, uint32_t currentTime,
-                                      const NodeSet &alreadyCovered, const NodeSet &srPeers);
     bool hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum heardFrom, NodeNum destination = 0);
     bool isNodeRoutable(NodeNum nodeId) const;
     void logNetworkTopology();
@@ -604,7 +609,6 @@ private:
     void scheduleEmptyTopologyReply(NodeNum senderNodeId, PacketId packetId);
     int refreshReportedDirectNeighbor(NodeNum nodeId, int32_t rssi, float snr, uint32_t nowSecs);
     bool hasReportedDirectEdge(NodeNum neighborId) const;
-    bool isNonRelayingLegacyRole(NodeNum nodeId) const;
     void markStockNodeRelayedOurPacket(NodeNum stockNode);
 
     // Committed relay tracking — prevents dupe cancellation of SR relay decisions

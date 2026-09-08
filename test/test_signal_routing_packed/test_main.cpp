@@ -567,7 +567,90 @@ static void test_can_deliver_is_optimistic_only_for_silent_nodes()
 
 // A neighbour nobody can be shown to reach belongs to exactly one relayer: the one hearing it
 // best, in buckets, with stock relay routers given way first and the node id as the tie-break.
-static void test_ownership_stops_at_the_coverage_ceiling()
+static void test_a_publisher_has_no_owner()
+{
+    // A neighbour that publishes topology and omits a candidate has reported that the candidate
+    // cannot reach it. That silence is evidence, so nobody owns it.
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum target = 0x22222222;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+    graph.updateEdge(me, target, 2.0f, 1000, Edge::Source::Reported);
+    static bool targetReports = false;
+    NeighborGraph::CoveragePolicy policy;
+    policy.me = me;
+    policy.meRelays = true;
+    policy.poorLinkEtx = 7.0f;
+    policy.publishesTopology = [](void *, NodeNum) { return targetReports; };
+    TEST_ASSERT_EQUAL_UINT32(me, graph.coverageOwner(target, policy));
+    targetReports = true;
+    TEST_ASSERT_EQUAL_UINT32(0, graph.coverageOwner(target, policy));
+}
+
+void test_admits_coverage_credits_an_owned_neighbour()
+{
+    // Admission and absorb must credit the same set: a relay that owns a silent neighbour
+    // carries it, even though covers() alone would refuse.
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum peer = 0xEE0000EE;
+    constexpr NodeNum silent = 0x22222222;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+    graph.updateEdge(me, peer, 1.0f, 1000, Edge::Source::Reported);
+    graph.setEdgeHearsUs(me, peer, true);
+    graph.updateEdge(peer, silent, 1.0f, 1000, Edge::Source::Mirrored);
+    static NodeNum peerId = peer;
+    NeighborGraph::CoveragePolicy policy;
+    policy.me = me;
+    policy.meRelays = true;
+    policy.poorLinkEtx = 7.0f;
+    policy.isSrActive = [](void *, NodeNum n) { return n == peerId; };
+    TEST_ASSERT_EQUAL_UINT32(peer, graph.coverageOwner(silent, policy));
+    TEST_ASSERT_TRUE(graph.admitsCoverage(peer, silent, 7.0f, &policy));
+}
+
+void test_a_sticky_confirmation_behind_a_decayed_link_is_not_ours()
+{
+    // hearsUs is sticky: whose neighbour it is does not make it reachable.
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum src = 0x33333333;
+    constexpr NodeNum edge = 0xEE0000EE;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+    graph.updateEdge(me, edge, 1.0f, 1000, Edge::Source::Reported);
+    graph.setEdgeHearsUs(me, edge, true);
+    NeighborGraph::CoveragePolicy policy;
+    policy.me = me;
+    policy.meRelays = true;
+    policy.poorLinkEtx = 7.0f;
+    NodeNum coveredBy[1] = {src};
+    TEST_ASSERT_EQUAL_UINT32(edge, graph.uniqueCoverageNeighbor(me, coveredBy, 1, 7.0f, &policy));
+    // The link decays to the heard-once sentinel; the confirmation stays.
+    graph.updateEdge(me, edge, 40.0f, 2000, Edge::Source::Reported);
+    graph.updateEdge(edge, me, 40.0f, 2000, Edge::Source::Reported);
+    TEST_ASSERT_EQUAL_UINT32(0, graph.uniqueCoverageNeighbor(me, coveredBy, 1, 7.0f, &policy));
+}
+
+void test_the_coverage_ceiling_is_inclusive()
+{
+    // Exactly at the ceiling a link still counts, in coverage and in ownership alike.
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum target = 0x22222222;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+    graph.updateEdge(me, target, 7.0f, 1000, Edge::Source::Reported);
+    NeighborGraph::CoveragePolicy policy;
+    policy.me = me;
+    policy.meRelays = true;
+    policy.poorLinkEtx = 7.0f;
+    TEST_ASSERT_TRUE(graph.covers(me, target, 7.0f, &policy));
+    TEST_ASSERT_EQUAL_UINT32(me, graph.coverageOwner(target, policy));
+    graph.updateEdge(me, target, 7.01f, 2000, Edge::Source::Reported);
+    TEST_ASSERT_FALSE(graph.covers(me, target, 7.0f, &policy));
+    TEST_ASSERT_EQUAL_UINT32(0, graph.coverageOwner(target, policy));
+}
+
+void test_ownership_stops_at_the_coverage_ceiling()
 {
     // Ownership picks who carries a neighbour nobody can be shown to reach; it must not make an
     // unreachable neighbour look reachable. Over a link past the ceiling nobody owns it, or the
@@ -613,6 +696,7 @@ void test_coverage_owner_is_the_best_link_then_the_lowest_id()
     NeighborGraph::CoveragePolicy policy;
     policy.me = me;
     policy.meRelays = true;
+    policy.poorLinkEtx = 7.0f; // the shipped ceiling, so this pins production behaviour
     policy.isSrActive = [](void *, NodeNum n) { return n == peerId; };
     // A bucket better wins, id notwithstanding.
     TEST_ASSERT_EQUAL_UINT32(nearPeer, graph.coverageOwner(silent, policy));
@@ -654,19 +738,24 @@ static void test_unique_coverage_ignores_poor_links_and_peer_owned_stock_nodes()
         graph.setEdgeHearsUs(me, n, true);
     }
     const NodeNum coveredBy[] = {peer};
+    NeighborGraph::CoveragePolicy policy;
+    policy.me = me;
+    policy.meRelays = true;
+    policy.poorLinkEtx = 7.0f;
 
-    // Legacy rule: any edge is coverage, so nothing is unique.
-    TEST_ASSERT_FALSE(graph.hasUniqueCoverage(me, coveredBy, 1));
-    // With the poor-link threshold the ETX-40 edge does not cover u.
-    TEST_ASSERT_TRUE(graph.hasUniqueCoverage(me, coveredBy, 1, 7.0f));
+    // The peer's ETX-40 edge does not cover u, so u is still ours.
+    TEST_ASSERT_TRUE(graph.hasUniqueCoverage(me, coveredBy, 1, 7.0f, &policy));
     // Fix the peer's link to u: covered again.
     graph.updateEdge(peer, u, 1.5f, 1000, Edge::Source::Mirrored);
-    TEST_ASSERT_FALSE(graph.hasUniqueCoverage(me, coveredBy, 1, 7.0f));
-    // A neighbour nobody covers is unique, unless another SR peer owns it.
+    TEST_ASSERT_FALSE(graph.hasUniqueCoverage(me, coveredBy, 1, 7.0f, &policy));
+    // A neighbour nobody heard covering it is ours to cover.
     const NodeNum nobody[] = {u};
-    TEST_ASSERT_TRUE(graph.hasUniqueCoverage(me, nobody, 1, 7.0f));
-    const NodeNum notOurs[] = {mute, peer};
-    TEST_ASSERT_FALSE(graph.hasUniqueCoverage(me, nobody, 1, 7.0f, notOurs, 2));
+    TEST_ASSERT_TRUE(graph.hasUniqueCoverage(me, nobody, 1, 7.0f, &policy));
+    // Unless our own link to it cannot deliver: whose it is does not make it reachable.
+    graph.updateEdge(me, mute, 40.0f, 2000, Edge::Source::Reported);
+    graph.updateEdge(mute, me, 40.0f, 2000, Edge::Source::Reported);
+    const NodeNum allButMute[] = {u, peer};
+    TEST_ASSERT_EQUAL_UINT32(0, graph.uniqueCoverageNeighbor(me, allButMute, 2, 7.0f, &policy));
 }
 
 static void test_ranking_costs_within_a_bucket_tie_on_node_id()
@@ -797,6 +886,10 @@ void setup()
     RUN_TEST(test_can_deliver_is_optimistic_only_for_silent_nodes);
     RUN_TEST(test_coverage_owner_is_the_best_link_then_the_lowest_id);
     RUN_TEST(test_ownership_stops_at_the_coverage_ceiling);
+    RUN_TEST(test_a_publisher_has_no_owner);
+    RUN_TEST(test_admits_coverage_credits_an_owned_neighbour);
+    RUN_TEST(test_a_sticky_confirmation_behind_a_decayed_link_is_not_ours);
+    RUN_TEST(test_the_coverage_ceiling_is_inclusive);
     RUN_TEST(test_unique_coverage_ignores_poor_links_and_peer_owned_stock_nodes);
     RUN_TEST(test_ranking_costs_within_a_bucket_tie_on_node_id);
     RUN_TEST(test_topology_version_window_is_forward_only_and_wraps);

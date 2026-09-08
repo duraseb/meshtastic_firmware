@@ -210,7 +210,9 @@ SignalRoutingModule::SignalRoutingModule()
         if (srCfg.broadcast_max_hops != 0) {
             cfgBroadcastMaxHops = srCfg.broadcast_max_hops;
         }
-        if (srCfg.poor_link_etx_threshold != 0.0f) {
+        if (srCfg.poor_link_etx_threshold > 0.0f) {
+            // A non-positive threshold would disable the coverage ceiling outright; the zero
+            // sentinel exists for graph-level defaults, not as a configurable setting.
             cfgPoorLinkEtxThreshold = srCfg.poor_link_etx_threshold;
         }
         if (srCfg.etx_change_threshold != 0.0f) {
@@ -1281,169 +1283,6 @@ bool SignalRoutingModule::hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum 
     return false;
 }
 
-/// Which SR node relays for an uncovered stock neighbour: the lowest node id among `myNode` and the SR
-/// peers that have an edge to it. Every peer evaluates the same rule on the shared topology, so exactly
-/// one of them keys up instead of all of them in the same slot.
-static NodeNum stockCoverageOwner(const NeighborGraph *graph, NodeNum myNode, const NodeSet &srPeers,
-                                  NodeNum stockNeighbor)
-{
-    auto hasEdgeTo = [&](NodeNum from) {
-        const NodeEdges *edges = graph->getEdgesFrom(from);
-        if (!edges)
-            return false;
-        for (uint8_t i = 0; i < edges->edgeCount; i++) {
-            if (edges->edges[i].to == stockNeighbor)
-                return true;
-        }
-        return false;
-    };
-    NodeNum owner = hasEdgeTo(myNode) ? myNode : 0;
-    for (uint16_t i = 0; i < srPeers.count; i++) {
-        NodeNum peer = srPeers.nodes[i];
-        if (peer == myNode || !hasEdgeTo(peer))
-            continue;
-        if (owner == 0 || peer < owner)
-            owner = peer;
-    }
-    return owner;
-}
-
-bool SignalRoutingModule::shouldRelayForStockNeighbors(NodeNum myNode, NodeNum sourceNode, NodeNum heardFrom,
-                                                       uint32_t currentTime, const NodeSet &alreadyCovered,
-                                                       const NodeSet &srPeers)
-{
-    if (!routingGraph) {
-        return false;
-    }
-
-    // Find stock firmware nodes that might need coverage: direct neighbors + downstream nodes
-    NodeNum stockNeighbors[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
-    uint8_t stockCount = 0;
-
-    // Check our direct neighbors for stock firmware nodes
-    // For active stock nodes (CLIENT, ROUTER, etc.), only consider them if they've confirmed
-    // they can hear us by relaying our packets (hearsUs flag on the edge).
-    // For mute stock nodes (CLIENT_MUTE, CLIENT_HIDDEN, LOST_AND_FOUND), hearing them is enough.
-    const NodeEdges* myEdges = routingGraph->getEdgesFrom(myNode);
-    if (myEdges) {
-        for (uint8_t i = 0; i < myEdges->edgeCount && stockCount < NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE; i++) {
-            NodeNum neighbor = myEdges->edges[i].to;
-            if (getCapabilityStatus(neighbor) == CapabilityStatus::Legacy) {
-                if (isNonRelayingLegacyRole(neighbor)) {
-                    // Mute node: we hear it, so we cover it
-                    stockNeighbors[stockCount++] = neighbor;
-                } else if (myEdges->edges[i].hearsUs) {
-                    // Active stock node: only cover if it has relayed our packets (bidirectional)
-                    stockNeighbors[stockCount++] = neighbor;
-                } else {
-                    LOG_INFO("[SR] Skip active stock neighbor %08x: hearsUs=false",
-                             neighbor);
-                }
-            }
-        }
-    }
-
-    if (stockCount == 0) {
-        return false; // No stock neighbors to worry about
-    }
-
-    LOG_INFO("[SR] Checking broadcast coverage for %u stock neighbors", stockCount);
-
-    // Check if any stock neighbor needs this packet
-    // A stock neighbor needs the packet if they didn't hear it directly from the source
-    bool hasUncoveredStockNeighbor = false;
-    NodeNum bestStockNeighbor = 0;
-    float bestStockCost = std::numeric_limits<float>::max();
-
-    for (uint8_t si = 0; si < stockCount; si++) {
-        NodeNum stockNeighbor = stockNeighbors[si];
-        // Check if stock neighbor heard the transmission directly
-        // If source can reach stock neighbor directly, they already heard it
-        // Also check if heardFrom (relaying SR node) can reach them directly
-        bool heardDirectly = false;
-
-        // If the stock neighbor IS the relay node, it obviously heard the packet
-        if (stockNeighbor == heardFrom || stockNeighbor == sourceNode) {
-            heardDirectly = true;
-        }
-
-        // Covered by a node that already transmitted or holds an earlier slot: it relays, not us.
-        if (!heardDirectly && alreadyCovered.contains(stockNeighbor)) {
-            heardDirectly = true;
-            LOG_INFO("[SR] Stock %08x covered by an earlier slot", stockNeighbor);
-        }
-
-        // Check if original source can reach stock neighbor
-        if (!heardDirectly) {
-            const NodeEdges* sourceEdges = routingGraph->getEdgesFrom(sourceNode);
-            if (sourceEdges) {
-                for (uint8_t i = 0; i < sourceEdges->edgeCount; i++) {
-                    if (sourceEdges->edges[i].to == stockNeighbor) {
-                        heardDirectly = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // If not heard from source, check if heard from relaying SR node
-        if (!heardDirectly) {
-            const NodeEdges* heardFromEdges = routingGraph->getEdgesFrom(heardFrom);
-            if (heardFromEdges) {
-                for (uint8_t i = 0; i < heardFromEdges->edgeCount; i++) {
-                    if (heardFromEdges->edges[i].to == stockNeighbor) {
-                        heardDirectly = true;
-                        LOG_INFO("[SR] Stock neighbor %08x already covered by relaying SR node %08x",
-                                 stockNeighbor, heardFrom);
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (!heardDirectly) {
-            hasUncoveredStockNeighbor = true;
-            LOG_INFO("[SR] Stock neighbor %08x did not hear transmission directly", stockNeighbor);
-
-            // One SR node owns each uncovered stock neighbour; the others stay silent.
-            NodeNum owner = stockCoverageOwner(routingGraph, myNode, srPeers, stockNeighbor);
-            if (owner != myNode) {
-                LOG_INFO("[SR] Stock %08x covered by SR peer %08x",
-                         stockNeighbor, owner);
-                continue;
-            }
-
-            // Check if we're the best positioned to reach this stock neighbor
-            const NodeEdges* myEdges = routingGraph->getEdgesFrom(myNode);
-            if (myEdges) {
-                for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
-                    if (myEdges->edges[i].to == stockNeighbor) {
-                        float cost = myEdges->edges[i].getEtx();
-                        if (cost < bestStockCost) {
-                            bestStockCost = cost;
-                            bestStockNeighbor = stockNeighbor;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    if (hasUncoveredStockNeighbor && bestStockNeighbor != 0) {
-        LOG_INFO("[SR] STOCK COVERAGE: relaying for uncovered stock %08x (ETX=%.2f)",
-                 bestStockNeighbor, bestStockCost);
-        return true;
-    }
-
-    if (hasUncoveredStockNeighbor) {
-        LOG_INFO("[SR] Stock coverage: %u uncovered, no path", stockCount);
-    }
-
-    return false;
-}
-
-
 
 void SignalRoutingModule::logNetworkTopology()
 {
@@ -1971,7 +1810,8 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
 
     // No route of our own. As a named backup that is still useful: the designated hop is the route
     // and we relay with no next hop of our own if it stays silent.
-    NodeNum myNextHop = getNextHop(destination, sourceNode, heardFrom, false);
+    bool routeVerified = false;
+    NodeNum myNextHop = getNextHop(destination, sourceNode, heardFrom, false, &routeVerified);
     if (myNextHop == 0 && !weAreDesignatedHop) {
         LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: no route via SR topology", p->id, srcName, destName);
         if (!relayerNamed) {
@@ -2003,6 +1843,22 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     // picker fell back to "relay it ourselves" (our own byte must never go on the wire: legacy nodes
     // would refuse the packet and SR peers would wait for a second copy from us).
     pendingUnicastNextHop = (myNextHop == myNode) ? 0 : myNextHop;
+    // Containment. A route the search could only complete by admitting an unconfirmed hop is a
+    // guess: the node it names never proved it hears the destination, and a stamped designation
+    // makes every other candidate stand down and wait for a copy that node may have no way to
+    // send. Never stamp one. And if the guess points back at the node that handed us the packet,
+    // carrying it moves the frame away from its destination, onto our own side of the mesh where
+    // the only path anyone knows is the one it arrived on — drop it, unless the frame named us as
+    // its next hop, because then the sender is waiting on us specifically and its retries would
+    // designate us again.
+    if (!routeVerified && pendingUnicastNextHop != 0) {
+        if (pendingUnicastNextHop == heardFrom && !weAreDesignatedHop) {
+            LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: guessed route runs back", p->id, srcName, destName);
+            return false;
+        }
+        LOG_INFO("[SR] Guessed route to %s: no next hop stamped", destName);
+        pendingUnicastNextHop = 0;
+    }
     // Named as next hop while our only route runs back to the node that handed us the packet:
     // forward it, but never back the way it came. It named us because its own route points at us,
     // so stamping it would bounce the frame between the two of us until the hop limit runs out.
@@ -2687,34 +2543,11 @@ bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p)
         }
     }
 
-    // Stock neighbours (mute, or legacy nodes that hear us) are covered by exactly one SR node under
-    // the stock-coverage rule: the lowest node id among us and the SR-active peers with an edge to
-    // them. Those a lower-id peer owns are not our unique coverage.
-    NodeNum notOurs[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
-    uint8_t notOursCount = 0;
-    if (const NodeEdges *mine = routingGraph->getEdgesFrom(myNode)) {
-        for (uint8_t i = 0; i < mine->edgeCount && notOursCount < NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE; i++) {
-            NodeNum n = mine->edges[i].to;
-            if (isPlaceholderNode(n) || getCapabilityStatus(n) != CapabilityStatus::Legacy || isImmediateRelayRouter(n)) {
-                continue;
-            }
-            bool peerOwns = false;
-            for (uint8_t j = 0; j < mine->edgeCount && !peerOwns; j++) {
-                NodeNum peer = mine->edges[j].to;
-                if (peer >= myNode || !mine->edges[j].hearsUs || getCapabilityStatus(peer) != CapabilityStatus::SRactive) {
-                    continue;
-                }
-                peerOwns = hasDirectConnectivity(peer, n);
-            }
-            if (peerOwns) {
-                notOurs[notOursCount++] = n;
-            }
-        }
-    }
-
+    // One rule for whose neighbour it is: confirmation or ownership, then covers() for whether a
+    // copy from us would arrive. The separate stock-coverage election this used to consult is gone.
     NeighborGraph::CoveragePolicy policy = coveragePolicy();
     NodeNum uniqueFor = routingGraph->uniqueCoverageNeighbor(myNode, coveredBy, coveredByCount,
-                                                             cfgPoorLinkEtxThreshold, notOurs, notOursCount, &policy);
+                                                             cfgPoorLinkEtxThreshold, &policy);
     bool unique = uniqueFor != 0;
 
     if (unique) {
@@ -3072,8 +2905,10 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         if (ne) {
             for (uint8_t j = 0; j < ne->edgeCount; j++) {
                 NodeNum target = ne->edges[j].to;
-                // Only what this relay actually reaches: a one-way listing is not coverage.
-                if (routingGraph->covers(relay, target, cfgPoorLinkEtxThreshold, &coveragePolicy)) {
+                // Exactly what the ranking admitted for this relay: crediting only covers()
+                // left an owned neighbour uncovered after its owner took a slot, so a later
+                // phase relayed for it a second time.
+                if (routingGraph->admitsCoverage(relay, target, cfgPoorLinkEtxThreshold, &coveragePolicy)) {
                     alreadyCovered.insert(target);
                 }
             }
@@ -3127,17 +2962,6 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         decisionReason = "downstream relay override";
     }
 
-    // Phase 5: Check stock coverage needs
-    if (!shouldRelay) {
-        bool stockCoverageNeeded =
-            shouldRelayForStockNeighbors(myNode, sourceNode, heardFrom, relayDecisionTime, alreadyCovered, srPeers);
-        if (stockCoverageNeeded) {
-            shouldRelay = true;
-            myDelay = slotDelay;
-            decisionReason = "stock coverage";
-        }
-    }
-
     // Phase 6: sole candidate. Nobody else here can carry the frame, so there is nothing to
     // coordinate and our copy is the only witness its transmitter can ever get — the signal a
     // want_ack sender turns into its implicit ACK. This is also the state a node is in before
@@ -3184,8 +3008,10 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     return shouldRelay;
 }
 
-NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode, NodeNum heardFrom, bool allowOpportunistic)
+NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode, NodeNum heardFrom, bool allowOpportunistic,
+                                        bool *verified)
 {
+    if (verified) *verified = false;
     if (!routingGraph) {
         LOG_WARN("[SR] No graph available for routing");
         return 0;
@@ -3245,6 +3071,7 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
                 }
             }
 
+            if (verified) *verified = route.verified;
             return route.nextHop;
         }
         
@@ -3259,7 +3086,8 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
                     if (myEdges->edges[i].to == route.nextHop && myEdges->edges[i].hearsUs) {
                         LOG_INFO("[SR] Route via %s kept: unverified but hearsUs",
                                  nextHopName);
-                        return route.nextHop;
+            if (verified) *verified = route.verified;
+            return route.nextHop;
                     }
                 }
             }
@@ -3981,25 +3809,6 @@ bool SignalRoutingModule::isLegacyRouter(NodeNum nodeId) const
     }
 }
 
-/**
- * Check if a stock node has a non-relaying role (CLIENT_MUTE, CLIENT_HIDDEN, LOST_AND_FOUND).
- * These nodes never relay packets in stock firmware, so hearing them is sufficient proof of coverage.
- */
-bool SignalRoutingModule::isNonRelayingLegacyRole(NodeNum nodeId) const
-{
-    if (!nodeDB) return true;
-    const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(nodeId);
-    if (!node || !node->has_user) return true; // Unknown role — assume non-relaying (conservative)
-
-    switch (node->user.role) {
-    case meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE:
-    case meshtastic_Config_DeviceConfig_Role_CLIENT_HIDDEN:
-    case meshtastic_Config_DeviceConfig_Role_LOST_AND_FOUND:
-        return true;
-    default:
-        return false;
-    }
-}
 
 /**
  * Mark the edge to a stock node as hearsUs (confirmed bidirectional link).

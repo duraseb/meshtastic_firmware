@@ -205,6 +205,7 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                     }
 #endif
                     LOG_INFO("Rebroadcast received message coming from %x", p->relay_node);
+                    bool srLastHop = false;
 
                     // If exhausting hops, force hop_limit = 0 regardless of other logic
 		    if (exhaustHops) {
@@ -212,6 +213,7 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                         LOG_INFO("Traffic management: exhausting hops for 0x%08x, setting hop_limit=0", getFrom(p));
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
                     } else if (signalRoutingModule && signalRoutingModule->capsLastHop(p)) {
+                        srLastHop = true;
                         // Last hop: the destination is a direct neighbour that hears us and stock
                         // neighbours listen. One hop, the destination named as next hop, and hop_start
                         // rewritten so hopsAway (hop_start - hop_limit) stays correct for receivers.
@@ -241,6 +243,12 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                         // value, and never forward the incoming byte: it named us or a node that stayed
                         // silent, and legacy nodes relay a unicast only when the byte is clear or theirs.
                         uint8_t nextHopByte = srNextHop ? nodeDB->getLastByteOfNodeNum(srNextHop) : NO_NEXT_HOP_PREFERENCE;
+                        // A last hop already carries the destination as its next hop, and that is
+                        // what makes stock relays leave the frame alone. SR clearing its own
+                        // designation must not erase it.
+                        if (srLastHop) {
+                            nextHopByte = tosend->next_hop;
+                        }
                         NextHopRouter::sendRelay(tosend, nextHopByte);
                         return true;
                     }
