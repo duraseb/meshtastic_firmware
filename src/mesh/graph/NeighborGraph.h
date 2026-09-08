@@ -312,9 +312,13 @@ class NeighborGraph {
         NodeNum me;
         bool meRelays;
         float poorLinkEtx;
+        /// Now, and how long a publisher may be silent before it is nobody's coverage target.
+        /// Zero disables the test, which is what the graph-only tests want.
+        uint32_t nowSecs;
+        uint32_t publisherSilenceSecs;
         CoveragePolicy()
             : ctx(nullptr), publishesTopology(nullptr), isStockRelayRouter(nullptr), isSrActive(nullptr), me(0),
-              meRelays(false), poorLinkEtx(0.0f)
+              meRelays(false), poorLinkEtx(0.0f), nowSecs(0), publisherSilenceSecs(0)
         {
         }
         bool reports(NodeNum node) const { return publishesTopology && publishesTopology(ctx, node); }
@@ -425,6 +429,15 @@ class NeighborGraph {
     /// report its own links, so a complete list is the whole truth about them; our own
     /// measurements and placeholders are left alone. Returns true if anything was removed.
     bool retainListedEdges(NodeNum sender, const NodeNum *listedIds, size_t listedCount);
+    /// Has a topology publisher gone quiet long enough that it is nobody's coverage target?
+    /// A publisher promises a list every broadcast interval, so silence past the horizon means it
+    /// is gone. Maintenance retracts *our own* link to such a node, but a peer's published edge
+    /// to it outlives that by up to an interval — so without this test every node credits its
+    /// peers with covering a node that has gone, and each of those peers, having retracted it
+    /// under the same rule, declines the slot it was handed. Judged on when we last heard the
+    /// node itself; a peer mentioning it in a list is not hearing it.
+    bool isSilentPublisher(NodeNum node, const CoveragePolicy &policy) const;
+
     /// Remove one directed edge, leaving both endpoints in the graph.
     bool removeEdge(NodeNum from, NodeNum to);
 

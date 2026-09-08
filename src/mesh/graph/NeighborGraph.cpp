@@ -1182,9 +1182,22 @@ bool NeighborGraph::canDeliver(NodeNum from, NodeNum to, const RoutePolicy &poli
     return !(policy.publishes && policy.publishes(policy.ctx, to));
 }
 
+bool NeighborGraph::isSilentPublisher(NodeNum node, const CoveragePolicy &policy) const
+{
+    if (policy.publisherSilenceSecs == 0 || !policy.reports(node)) return false;
+    const NodeEdges *entry = findNeighbor(node);
+    if (!entry) return false;
+    uint32_t silent = policy.nowSecs - entry->lastFullUpdate;
+    return silent > policy.publisherSilenceSecs && silent < 0x80000000u;
+}
+
 bool NeighborGraph::admitsCoverage(NodeNum relay, NodeNum target, float poorLinkEtx,
                                    const CoveragePolicy *policy) const
 {
+    // A publisher that has gone quiet is nobody's target, however good the link a peer published
+    // to it: our own link to it is already retracted, and crediting peers with reaching it hands
+    // them a slot they will decline.
+    if (policy && isSilentPublisher(target, *policy)) return false;
     if (covers(relay, target, poorLinkEtx, policy)) return true;
     // A neighbour nobody can be shown to reach is still worth one relay, but only from its owner.
     return policy && coverageOwner(target, *policy) == relay;

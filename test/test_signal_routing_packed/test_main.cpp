@@ -587,6 +587,47 @@ static void test_a_publisher_has_no_owner()
     TEST_ASSERT_EQUAL_UINT32(0, graph.coverageOwner(target, policy));
 }
 
+void test_a_publisher_we_stopped_hearing_is_nobodys_target()
+{
+    // Maintenance retracts our own link to a silent publisher, but a peer's published edge to it
+    // outlives that by up to a broadcast interval. Crediting the peer with covering it hands it a
+    // slot it will decline, having retracted the node under the same rule.
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum near = 0x11111111;
+    constexpr NodeNum gone = 0x22222222;
+    constexpr uint32_t silence = 1200;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, near, 1.0f, 1000, Edge::Source::Reported);
+    graph.setEdgeHearsUs(me, near, true);
+    // The peer published a healthy link to the node, and the node published once itself.
+    graph.updateEdge(near, gone, 2.0f, 1000, Edge::Source::Mirrored);
+    graph.updateEdge(gone, near, 2.0f, 1000, Edge::Source::Mirrored);
+
+    NeighborGraph::CoveragePolicy policy;
+    policy.me = me;
+    policy.meRelays = true;
+    policy.poorLinkEtx = 7.0f;
+    policy.publishesTopology = [](void *, NodeNum) { return true; };
+    policy.publisherSilenceSecs = silence;
+
+    // Inside the horizon the peer covers it.
+    policy.nowSecs = 1000 + silence;
+    TEST_ASSERT_FALSE(graph.isSilentPublisher(gone, policy));
+    TEST_ASSERT_TRUE(graph.admitsCoverage(near, gone, 7.0f, &policy));
+
+    // Past it, no peer covers it.
+    policy.nowSecs = 1001 + silence;
+    TEST_ASSERT_TRUE(graph.isSilentPublisher(gone, policy));
+    TEST_ASSERT_FALSE(graph.admitsCoverage(near, gone, 7.0f, &policy));
+
+    // Hearing it again restores it; the node's own timestamp is the evidence.
+    graph.updateNodeActivity(gone, policy.nowSecs);
+    TEST_ASSERT_FALSE(graph.isSilentPublisher(gone, policy));
+    TEST_ASSERT_TRUE(graph.admitsCoverage(near, gone, 7.0f, &policy));
+}
+
 void test_routing_through_us_confirms_the_sender_hears_us()
 {
     // A peer that names us as its next hop learned that from our traffic, so it hears us. Same
@@ -1016,6 +1057,7 @@ void setup()
     RUN_TEST(test_coverage_owner_is_the_best_link_then_the_lowest_id);
     RUN_TEST(test_ownership_stops_at_the_coverage_ceiling);
     RUN_TEST(test_a_publisher_has_no_owner);
+    RUN_TEST(test_a_publisher_we_stopped_hearing_is_nobodys_target);
     RUN_TEST(test_routing_through_us_confirms_the_sender_hears_us);
     RUN_TEST(test_a_guess_never_outranks_or_prices_a_measurement);
     RUN_TEST(test_a_silent_publisher_loses_our_direct_link);

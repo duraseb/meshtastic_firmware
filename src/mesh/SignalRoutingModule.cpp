@@ -92,6 +92,8 @@ NeighborGraph::CoveragePolicy SignalRoutingModule::coveragePolicy() const
     p.me = nodeDB ? nodeDB->getNodeNum() : 0;
     p.meRelays = isActiveRoutingRole();
     p.poorLinkEtx = cfgPoorLinkEtxThreshold;
+    p.nowSecs = millis() / 1000;
+    p.publisherSilenceSecs = PUBLISHER_SILENCE_SECS;
     return p;
 }
 
