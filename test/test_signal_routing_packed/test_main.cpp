@@ -1031,6 +1031,43 @@ static void test_topology_version_verdict_rules()
     TEST_ASSERT_EQUAL(SrTopologyVerdict::RestartClimb, srTopologyVersionVerdict(0, 13, 5000, 6000, resync, false, true, 255));
 }
 
+/// An expired rung keeps the separation the ladder gave it, rather than redrawing at random.
+///
+/// Two nodes on adjacent rungs of the same ladder differ by a half-airtime; two on the same rung
+/// differ only by their jitter. Both differences have to survive the expiry, because the failure
+/// mode is not lateness — it is two nodes keying up at the same instant, where neither cancels the
+/// other. Field 2026-09-08: two of the three unicast double relays completed 5 ms and 6 ms apart
+/// with neither node logging the other's copy.
+void test_expired_relay_keeps_its_ladder_separation()
+{
+    const uint32_t origin = 250;
+    const uint32_t slot = 10;
+    const uint32_t half = 50;
+
+    // Adjacent rungs stay a half-airtime apart, and stay in order.
+    uint32_t rung0 = srExpiredRelayReanchorMs(origin, origin, slot);
+    uint32_t rung1 = srExpiredRelayReanchorMs(origin + half, origin, slot);
+    uint32_t rung2 = srExpiredRelayReanchorMs(origin + 2 * half, origin, slot);
+    TEST_ASSERT_EQUAL_UINT32(half, rung2 - rung1);
+    // Rung 0 with no jitter at all is the one case the floor bites: it is lifted from zero to one
+    // slot, so its gap to rung 1 is a half-airtime less that slot. Still ordered, still separated.
+    TEST_ASSERT_EQUAL_UINT32(half - slot, rung1 - rung0);
+    TEST_ASSERT_TRUE(rung0 < rung1 && rung1 < rung2);
+
+    // Two nodes on the same rung keep their jitter apart.
+    uint32_t jitterLow = srExpiredRelayReanchorMs(origin + 12, origin, slot);
+    uint32_t jitterHigh = srExpiredRelayReanchorMs(origin + 24, origin, slot);
+    TEST_ASSERT_EQUAL_UINT32(12, jitterHigh - jitterLow);
+
+    // An expired rung 0 waits one slot rather than keying up instantly.
+    TEST_ASSERT_EQUAL_UINT32(slot, rung0);
+    TEST_ASSERT_EQUAL_UINT32(slot, srExpiredRelayReanchorMs(0, origin, slot));
+    // A rung below the origin cannot go negative.
+    TEST_ASSERT_EQUAL_UINT32(slot, srExpiredRelayReanchorMs(origin - 100, origin, slot));
+    // No slot time known: still never zero.
+    TEST_ASSERT_EQUAL_UINT32(1, srExpiredRelayReanchorMs(origin, origin, 0));
+}
+
 void setup()
 {
     initializeTestEnvironment();
@@ -1069,6 +1106,7 @@ void setup()
     RUN_TEST(test_topology_version_window_is_forward_only_and_wraps);
     RUN_TEST(test_topology_header_chunk_flags_round_trip);
     RUN_TEST(test_topology_version_verdict_rules);
+    RUN_TEST(test_expired_relay_keeps_its_ladder_separation);
 
     UNITY_END();
 }

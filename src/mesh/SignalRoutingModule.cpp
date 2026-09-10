@@ -2295,6 +2295,11 @@ void SignalRoutingModule::commitRelay(PacketId packetId, NodeNum originalHeardFr
     LOG_INFO("[SR] Committed relay 0x%08x (from 0x%08x, delay %ums)", packetId, originalHeardFrom, txDelayMs);
 }
 
+uint32_t SignalRoutingModule::expiredRelayReanchorMs(PacketId packetId, uint32_t slotTimeMs) const
+{
+    return srExpiredRelayReanchorMs(getCommittedRelayDelay(packetId), SR_SLOT_ORIGIN_MS, slotTimeMs);
+}
+
 bool SignalRoutingModule::isCommittedRelay(PacketId packetId) const
 {
     for (uint8_t i = 0; i < committedRelayCount; i++) {

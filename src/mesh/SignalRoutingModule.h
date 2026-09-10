@@ -245,6 +245,24 @@ enum class SrTopologyVerdict : uint8_t {
 // staleValid/staleVersion: the report last rejected from this sender, if any. Late copies of old
 // reports arrive within seconds of each other, never a whole interval apart, so two rejected
 // versions climbing by one can only be a restarted counter.
+/**
+ * How long a committed relay whose scheduled send time has already passed should still wait.
+ *
+ * The rung it was given encodes its position among the candidates, and every node computed that
+ * ladder from the same origin. Drawing a fresh random delay discards the position: two nodes whose
+ * rungs both expired then key up at the same instant, which is worse than either transmitting
+ * late — neither cancels the other, and a third node may decode neither. What survives the expiry
+ * is the part of the rung that distinguishes us from the other candidates, its offset above the
+ * shared origin, so that is what is re-anchored to now. Floored at one slot time so an expired
+ * rung 0 does not key up instantly, which is the thrash the early-band floor exists to prevent.
+ */
+static inline uint32_t srExpiredRelayReanchorMs(uint32_t rungDelayMs, uint32_t originMs, uint32_t slotTimeMs)
+{
+    uint32_t offset = rungDelayMs > originMs ? rungDelayMs - originMs : 0;
+    uint32_t floorMs = slotTimeMs > 0 ? slotTimeMs : 1;
+    return offset > floorMs ? offset : floorMs;
+}
+
 static inline SrTopologyVerdict srTopologyVersionVerdict(uint8_t received, uint8_t last, uint32_t lastAcceptMs,
                                                          uint32_t nowMs, uint32_t resyncMs, bool bootBroadcast,
                                                          bool staleValid = false, uint8_t staleVersion = 0)
@@ -677,6 +695,18 @@ public:
     void commitRelay(PacketId packetId, NodeNum originalHeardFrom, uint32_t txDelayMs = 0);
     bool isCommittedRelay(PacketId packetId) const;
     uint32_t getCommittedRelayDelay(PacketId packetId) const;
+    /**
+     * How long a committed relay whose scheduled send time has already passed should still wait.
+     *
+     * The rung it was given encodes its position among the candidates, and every node computed
+     * that ladder the same way. Drawing a fresh random delay instead discards the position: two
+     * nodes whose rungs both expired then key up at the same instant, which is worse than either
+     * transmitting late — neither cancels the other and a third node may decode neither. What
+     * survives the expiry is the part of the rung that distinguishes us from the other
+     * candidates, its offset above the shared origin, so that is what gets re-anchored to now.
+     * Floored at one slot time so an expired rung 0 does not key up instantly.
+     */
+    uint32_t expiredRelayReanchorMs(PacketId packetId, uint32_t slotTimeMs) const;
     void clearCommittedRelay(PacketId packetId);
     bool areAllNeighborsCovered(const meshtastic_MeshPacket *p);
     // Returns the hop_limit to set for a unicast to a direct hearsUs neighbor when stock

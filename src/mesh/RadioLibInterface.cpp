@@ -3,6 +3,7 @@
 #include "NodeDB.h"
 #include "PowerMon.h"
 #include "SPILock.h"
+#include "SignalRoutingModule.h"
 #include "Throttle.h"
 #include "configuration.h"
 #include "error.h"
@@ -320,9 +321,22 @@ void RadioLibInterface::setTransmitDelay()
             // tx_after is still in the future — respect it as-is
             notifyLater(remaining, TRANSMIT_DELAY_COMPLETED, false);
         } else {
-            // tx_after is in the past — add normal CW delay from now
-            unsigned long add_delay =
-                p->rx_rssi ? getTxDelayMsecWeighted(p, TxDelayCause::ExpiredRedraw) : getTxDelayMsec();
+            // tx_after is in the past.
+            unsigned long add_delay;
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+            if (signalRoutingModule && signalRoutingModule->isCommittedRelay(p->id)) {
+                // A committed relay already holds a position on a ladder every node computed the
+                // same way. Redrawing at random throws that away, and two nodes whose rungs both
+                // expired then key up together — worse than transmitting late, because neither
+                // cancels the other. Keep the separation the ladder assigned instead.
+                add_delay = signalRoutingModule->expiredRelayReanchorMs(p->id, slotTimeMsec);
+                LOG_DEBUG("Tx delay id=0x%08x band=rung cause=expired delay=%ums", p->id, (unsigned)add_delay);
+            } else
+#endif
+            {
+                // Not on a ladder: the ordinary contention draw from now.
+                add_delay = p->rx_rssi ? getTxDelayMsecWeighted(p, TxDelayCause::ExpiredRedraw) : getTxDelayMsec();
+            }
             p->tx_after = now + add_delay;
             notifyLater(add_delay, TRANSMIT_DELAY_COMPLETED, false);
         }
