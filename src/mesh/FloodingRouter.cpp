@@ -156,6 +156,15 @@ bool FloodingRouter::roleAllowsCancelingDupe(const meshtastic_MeshPacket *p)
 
 void FloodingRouter::perhapsCancelDupe(const meshtastic_MeshPacket *p)
 {
+    // Set when the SR coverage test has decided this relay is no longer needed. That verdict is
+    // about the packet, not about our role: the nodes we would have carried have been carried by
+    // somebody else, so transmitting adds a duplicate and nothing else. It therefore overrides the
+    // role gate below, which exists to stop a router falling silent for reasons of its own.
+    // Without this a ROUTER or ROUTER_LATE cleared its committed state and its insurance and then
+    // transmitted anyway, and a ROUTER_LATE additionally had the relay pulled into the late
+    // window, destroying the rung it had been given.
+    bool srCoverageCancel = false;
+
     // If SR committed to relay this packet, check if the dupe relayer already covers our nodes
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
     if (signalRoutingModule && signalRoutingModule->isCommittedRelay(p->id)) {
@@ -169,6 +178,7 @@ void FloodingRouter::perhapsCancelDupe(const meshtastic_MeshPacket *p)
             LOG_INFO("[SR] Canceling committed relay for 0x%08x - dupe relayer covers our nodes", p->id);
             signalRoutingModule->clearCommittedRelay(p->id);
             signalRoutingModule->cancelBroadcastRetransmit(p->id);
+            srCoverageCancel = true;
             // Fall through to normal cancel logic
         } else {
             LOG_INFO("[SR] Not canceling committed relay for 0x%08x - we have unique coverage", p->id);
@@ -177,9 +187,11 @@ void FloodingRouter::perhapsCancelDupe(const meshtastic_MeshPacket *p)
     }
 #endif
 
-    if (p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA && roleAllowsCancelingDupe(p)) {
-        // cancel rebroadcast of this message *if* there was already one, unless we're a router!
-        // But only LoRa packets should be able to trigger this.
+    if (p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA &&
+        (srCoverageCancel || roleAllowsCancelingDupe(p))) {
+        // cancel rebroadcast of this message *if* there was already one, unless we're a router —
+        // or unless SR has established that the copy we heard already covers everything we would
+        // have carried, in which case the role does not enter into it.
         if (Router::cancelSending(p->from, p->id))
             txRelayCanceled++;
     }
@@ -190,10 +202,13 @@ void FloodingRouter::perhapsCancelDupe(const meshtastic_MeshPacket *p)
         signalRoutingModule->cancelBroadcastRetransmit(p->id);
     }
 #endif
-    if (config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE && iface) {
+    // Both clamps move a queued relay into the late window so it still goes out after the copy we
+    // just heard. Skipped when SR cancelled on coverage: there is no longer a relay to move, and
+    // re-scheduling one would reinstate the transmission the coverage test just declined.
+    if (!srCoverageCancel && config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE && iface) {
         iface->clampToLateRebroadcastWindow(getFrom(p), p->id);
     }
-    if (config.device.role == meshtastic_Config_DeviceConfig_Role_CLIENT_BASE && iface && nodeDB &&
+    if (!srCoverageCancel && config.device.role == meshtastic_Config_DeviceConfig_Role_CLIENT_BASE && iface && nodeDB &&
         nodeDB->isFromOrToFavoritedNode(*p)) {
         iface->clampToLateRebroadcastWindow(getFrom(p), p->id);
     }
