@@ -1875,11 +1875,11 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     // Each node independently picks the same ordering; the one assigned our slot sets
     // pendingRelayDelayMs and returns true.  Any dupe cancels our queued relay.
 
-    uint32_t halfAirtime = 150;
+    uint32_t halfAirtime = SR_FALLBACK_HALF_AIRTIME_MS;
     uint32_t airtimeMs = 300;
     if (router && router->getRadioInterface()) {
         airtimeMs = router->getRadioInterface()->getPacketTime(p);
-        halfAirtime = std::max(airtimeMs / 2, (uint32_t)50);
+        halfAirtime = std::max(airtimeMs / 2, SR_MIN_RUNG_SPACING_MS);
     }
 
     // The next hop we will stamp on our relayed copy: SR's route pick, or none when the route
@@ -2135,7 +2135,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     }
     leaderWait += SR_PEER_TURNAROUND_MS;
     // Deterministic per-packet jitter, ±halfAirtime/4, keeps two nodes with the same slot apart.
-    const uint32_t jitterRange = std::max(halfAirtime / 2, (uint32_t)20);
+    const uint32_t jitterRange = std::max(halfAirtime / 2, SR_MIN_TIE_BREAK_RANGE_MS);
     const int32_t jitter = (int32_t)(((uint32_t)(myNode ^ p->id)) % jitterRange) - (int32_t)(jitterRange / 2);
     const uint32_t MAX_UNICAST_RELAY_HOLD_MS = 2000;
 
@@ -2780,10 +2780,10 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
 
     // Half-airtime slot spacing: long enough for busyRx detection, short enough
     // for fast propagation.
-    uint32_t halfAirtime = 150; // safe default
+    uint32_t halfAirtime = SR_FALLBACK_HALF_AIRTIME_MS; // safe default
     if (router && router->getRadioInterface()) {
         uint32_t airtime = router->getRadioInterface()->getPacketTime(p);
-        halfAirtime = std::max(airtime / 2, (uint32_t)50);
+        halfAirtime = std::max(airtime / 2, SR_MIN_RUNG_SPACING_MS);
     }
 
     // What the coverage rules need to know about roles, in one place.

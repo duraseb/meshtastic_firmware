@@ -486,6 +486,26 @@ private:
     // Channel-access model: after a frame ends a
     // receiver spends up to ~170 ms (measured here: "Packet RX" 69-172 ms) reading it out before it
     // listens again. Every "how long does a peer need" wait and the first relay slot start from this.
+    /// Minimum spacing between two relay rungs, whatever the airtime says.
+    ///
+    /// Absolute, in an otherwise preset-derived geometry, and it binds about half the time: at
+    /// SHORT_SLOW it applies to every frame up to 54 bytes. Expressing it in slot times was tried
+    /// and withdrawn — the tie-break range below is derived from the *floored* half, so a
+    /// slot-time floor would shrink two colocated nodes' rung-0 separation into the band where they
+    /// demonstrably stop hearing each other. It stays, with a stated purpose rather than an
+    /// inherited number: the smallest separation at which two colocated nodes reliably hear one
+    /// another. Revisiting it needs a measurement of when a cancel actually fires.
+    static constexpr uint32_t SR_MIN_RUNG_SPACING_MS = 50;
+
+    /// Minimum de-correlation between two nodes that computed the same rung. Coupled to
+    /// SR_MIN_RUNG_SPACING_MS: it must stay strictly below the spacing, or two adjacent rungs can
+    /// swap and the earlier-ranked node transmits second — voiding the coverage absorption the
+    /// ranking performed on its behalf.
+    static constexpr uint32_t SR_MIN_TIE_BREAK_RANGE_MS = 20;
+
+    /// Fallback rung spacing when no airtime is available.
+    static constexpr uint32_t SR_FALLBACK_HALF_AIRTIME_MS = 150;
+
     static constexpr uint32_t SR_PEER_TURNAROUND_MS = 250;
     static constexpr uint32_t SR_SLOT_ORIGIN_MS = SR_PEER_TURNAROUND_MS;
     uint32_t lastBootstrapReplyMs = 0; // 0 = never
