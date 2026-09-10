@@ -2430,6 +2430,13 @@ void SignalRoutingModule::scheduleT1Broadcast(const meshtastic_MeshPacket *p, ui
         LOG_WARN("[SR] Pool exhausted: no T1 for 0x%08x", p->id);
         return;
     }
+    // The snapshot is taken before Router::send() strips want_ack from a broadcast, so the copy
+    // still carries a flag the wire never does. Firing it then re-enters ReliableRouter::send(),
+    // whose startRetransmission() calls stopRetransmission() first and so resets the originator's
+    // interval — which is why an insured broadcast went out four times, at +0, +2.8, +8.0 and
+    // +13.4 s, instead of twice. Clear it here, on the copy only: the flag is read from the
+    // original's pending record, which is untouched, so the implicit ACK to the phone still works.
+    copy->want_ack = false;
     if (deferred) {
         // The originated and committed paths store a frame already prepared for TX; a deferred
         // copy is the frame as received, so spend the hop here or receivers read our late copy as
