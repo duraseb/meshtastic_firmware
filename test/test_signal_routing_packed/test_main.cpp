@@ -1068,6 +1068,46 @@ void test_expired_relay_keeps_its_ladder_separation()
     TEST_ASSERT_EQUAL_UINT32(1, srExpiredRelayReanchorMs(origin, origin, 0));
 }
 
+/// Unicast slot waits are floors on the same instant, so they compose by max. Adding the
+/// destination's ACK wait on top of stock's contention floor delayed every relay on a confirmed
+/// link by a whole contention window and bought nothing; folding the rung spacing into the max
+/// instead of onto it drops two adjacent rungs onto one millisecond.
+void test_unicast_slot_waits_are_floors_not_addends()
+{
+    const uint32_t floorMs = 160;   // 2 * CWmax * slotTime at the fleet preset
+    const uint32_t ackWaitMs = 718; // turnaround + 2 * contention + reply airtime
+    const uint32_t leaderWait = 494;
+    const uint32_t half = 150;
+
+    // Slot 0, nothing expected of the destination: stock's contention floor exactly.
+    TEST_ASSERT_EQUAL_UINT32(floorMs, srUnicastSlotDelayMs(0, 0, floorMs, leaderWait, half));
+
+    // Slot 0 with the destination expected to answer: the longer floor alone, never the sum.
+    uint32_t earliest = ackWaitMs > floorMs ? ackWaitMs : floorMs;
+    TEST_ASSERT_EQUAL_UINT32(ackWaitMs, srUnicastSlotDelayMs(0, 0, earliest, leaderWait, half));
+    TEST_ASSERT_TRUE(srUnicastSlotDelayMs(0, 0, earliest, leaderWait, half) < floorMs + ackWaitMs);
+
+    // Later rungs clear the leader first, and keep their spacing whichever floor dominates.
+    uint32_t r1 = srUnicastSlotDelayMs(0, 1, floorMs, leaderWait, half);
+    uint32_t r2 = srUnicastSlotDelayMs(0, 2, floorMs, leaderWait, half);
+    TEST_ASSERT_EQUAL_UINT32(leaderWait, r1);
+    TEST_ASSERT_EQUAL_UINT32(half, r2 - r1);
+    uint32_t a1 = srUnicastSlotDelayMs(0, 1, earliest, leaderWait, half);
+    uint32_t a2 = srUnicastSlotDelayMs(0, 2, earliest, leaderWait, half);
+    TEST_ASSERT_EQUAL_UINT32(ackWaitMs, a1);
+    TEST_ASSERT_EQUAL_UINT32(half, a2 - a1);
+
+    // A designated next hop owns slot 0; ranked candidates queue behind its reservation and
+    // still space by a half-airtime.
+    const uint32_t reserved = 900;
+    TEST_ASSERT_EQUAL_UINT32(reserved, srUnicastSlotDelayMs(reserved, 0, earliest, leaderWait, half));
+    TEST_ASSERT_EQUAL_UINT32(reserved + half, srUnicastSlotDelayMs(reserved, 1, earliest, leaderWait, half));
+
+    // No candidate ever keys up at zero: that was the state the contention floor exists to stop.
+    TEST_ASSERT_TRUE(srUnicastSlotDelayMs(0, 0, floorMs, leaderWait, half) > 0);
+    TEST_ASSERT_TRUE(srUnicastSlotDelayMs(0, 3, floorMs, leaderWait, half) > 0);
+}
+
 void setup()
 {
     initializeTestEnvironment();
@@ -1107,6 +1147,7 @@ void setup()
     RUN_TEST(test_topology_header_chunk_flags_round_trip);
     RUN_TEST(test_topology_version_verdict_rules);
     RUN_TEST(test_expired_relay_keeps_its_ladder_separation);
+    RUN_TEST(test_unicast_slot_waits_are_floors_not_addends);
 
     UNITY_END();
 }

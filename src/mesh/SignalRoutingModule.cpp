@@ -1991,9 +1991,22 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
 
     const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
 
-    // Every slot sits behind the destination's chance to answer and never before the slot origin:
-    // a relay keyed up right after the frame it answers is lost on receivers still reading that frame.
-    uint32_t slotDelay = std::max(destAckWaitMs, (uint32_t)SR_SLOT_ORIGIN_MS);
+    // Every wait here is a floor on when our relay may key up, measured from the frame we just
+    // heard, so the floors compose by max and never by addition: waiting for the destination's
+    // own answer already carries us well past stock's contention boundary.
+    //   - stock's contention floor: below it a stock neighbour is still inside its own window,
+    //     so it cannot have heard our copy, will not cancel its own, and the duplicate we were
+    //     avoiding happens anyway.
+    //   - the destination's chance to answer, when the source's list says it hears the source.
+    const uint32_t relayFloorMs = (router && router->getRadioInterface())
+                                      ? router->getRadioInterface()->getRelayFloorMsec()
+                                      : SR_PEER_TURNAROUND_MS;
+    const uint32_t earliestMs = std::max(relayFloorMs, destAckWaitMs);
+    // The designated next hop's reservation, and zero when no next hop is named. It used to be
+    // seeded with the floor above, which made it unconditionally non-zero and left both of the
+    // branches that test it unreachable: every candidate took the reservation path, ranked slot 0
+    // never saw the contention floor, and the leader wait below was computed and never used.
+    uint32_t slotDelay = 0;
     bool shouldRelay = false;
     uint32_t myDelay = 0;
 
@@ -2009,8 +2022,8 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         uint8_t ourLastByte = nodeDB->getLastByteOfNodeNum(myNode);
         if (ourLastByte == p->next_hop) {
             LOG_INFO("[SR-DEC] UNICAST RELAY 0x%08x %s->%s: designated next_hop (slot 0, %ums)",
-                     p->id, srcName, destName, slotDelay);
-            pendingRelayDelayMs = slotDelay;
+                     p->id, srcName, destName, earliestMs);
+            pendingRelayDelayMs = earliestMs;
             routingGraph->recordNodeTransmission(myNode, p->id, currentTime);
             return true;
         }
@@ -2022,13 +2035,22 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         //   - Stock/unknown next_hop: worst-case stock CLIENT delay plus one airtime.
         NodeNum nextHopNode = resolveRelayIdentity(p->next_hop);
         bool nextHopIsSR = (nextHopNode != 0 && getCapabilityStatus(nextHopNode) == CapabilityStatus::SRactive);
+        // How long until the designated node's copy has left the air. The two cases start their
+        // clocks in different places, so they compose differently:
+        //   - an SR peer obeys this same model, keys up at the floor, and then needs its own
+        //     contention delay plus one airtime on top of it.
+        //   - a stock node knows nothing of the floor and starts contending the moment it hears
+        //     the frame, so its copy is clear after its own worst case plus one airtime. Adding
+        //     the floor on top would count the same silence twice; we simply never go earlier
+        //     than our own floor either, which is a max.
         uint32_t reserve = halfAirtime; // fallback if no radio interface
-        if (router && router->getRadioInterface()) {
+        bool haveRadio = router && router->getRadioInterface();
+        if (haveRadio) {
             RadioInterface *radio = router->getRadioInterface();
             reserve = airtimeMs + (nextHopIsSR ? radio->getTxDelayMsecMaxAtUtil()
                                                : radio->getTxDelayMsecWeightedWorst(p->rx_snr));
         }
-        slotDelay += reserve;
+        slotDelay = (nextHopIsSR || !haveRadio) ? earliestMs + reserve : std::max(earliestMs, reserve);
         LOG_INFO("[SR] Unicast slot 0ms: %s next_hop 0x%02x (%ums reserved)", nextHopIsSR ? "SR" : "stock/unknown",
                  p->next_hop, reserve);
     }
@@ -2052,7 +2074,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
                 }
             }
         }
-        uint32_t backupDelay = slotDelay + rank * halfAirtime;
+        uint32_t backupDelay = std::max(slotDelay, earliestMs) + rank * halfAirtime;
         LOG_INFO("[SR-DEC] UNICAST RELAY 0x%08x %s->%s: backup for next_hop 0x%02x "
                  "(%s, delay=%ums)",
                  p->id, srcName, destName, p->next_hop, suppressReason, backupDelay);
@@ -2123,10 +2145,11 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
 
     // Ordinal slot delay.
     //
-    // Candidates hold slots in ranked order. Slot 0 keys up at once. Every later slot first waits
-    // for the leader's relay to have left the air (its contention delay at the current channel
-    // utilization plus one airtime), then slots space out by half an airtime. When Phase 1
-    // reserved slot 0 for a designated next hop, the ranked candidates follow that reservation.
+    // Candidates hold slots in ranked order. Slot 0 keys up at the earliest floor that applies to
+    // it, never at once. Every later slot first waits for the leader's relay to have left the air
+    // (its contention delay at the current channel utilization plus one airtime), then slots space
+    // out by half an airtime. When Phase 1 reserved slot 0 for a designated next hop, the ranked
+    // candidates follow that reservation instead.
     // The earlier ETX-gap formula masked the tier bit off the costs, so with a downstream-tier
     // leader every gap clamped to zero and a node ranked last fired at 0 ms.
     uint32_t leaderWait = 2 * halfAirtime;
@@ -2163,21 +2186,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
                 continue;
             }
             int64_t totalDelay;
-            if (slotDelay > 0) {
-                // Designated next hop owns slot 0; we hold slot slotIndex+1 behind its reservation.
-                totalDelay = (int64_t)slotDelay + (int64_t)slotIndex * halfAirtime;
-            } else if (slotIndex == 0) {
-                // Stock's own contention floor, not zero. Below it we would key up while a stock
-                // neighbour is still reading out the frame we are answering: it could not hear our
-                // copy, would not cancel its own, and the duplicate we were avoiding would happen
-                // regardless. Taken from the radio interface so CWmax and the slot time are stated
-                // in one place.
-                totalDelay = router && router->getRadioInterface()
-                                 ? (int64_t)router->getRadioInterface()->getRelayFloorMsec()
-                                 : (int64_t)SR_PEER_TURNAROUND_MS;
-            } else {
-                totalDelay = (int64_t)leaderWait + (int64_t)(slotIndex - 1) * halfAirtime;
-            }
+            totalDelay = (int64_t)srUnicastSlotDelayMs(slotDelay, slotIndex, earliestMs, leaderWait, halfAirtime);
             totalDelay += (int64_t)jitter;
             if (totalDelay < 0) totalDelay = 0;
             if ((uint64_t)totalDelay > MAX_UNICAST_RELAY_HOLD_MS) totalDelay = MAX_UNICAST_RELAY_HOLD_MS;

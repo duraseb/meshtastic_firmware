@@ -263,6 +263,36 @@ static inline uint32_t srExpiredRelayReanchorMs(uint32_t rungDelayMs, uint32_t o
     return offset > floorMs ? offset : floorMs;
 }
 
+/**
+ * When a unicast relay candidate at @p slotIndex may key up.
+ *
+ * Three waits govern it, and every one is a floor measured from the frame we just heard, so they
+ * compose by max and never by addition — summing two of them delays a relay by a whole contention
+ * window and buys nothing:
+ *   - @p earliestMs: stock's contention floor, or the destination's chance to answer where the
+ *     source's own list says the destination hears it and that wait is longer.
+ *   - @p leaderWaitMs: for a candidate behind a leader, the time for the leader's copy to have
+ *     left the air.
+ *   - @p reservedBaseMs: non-zero only when a designated next hop holds slot 0, in which case
+ *     every ranked candidate queues behind that reservation instead.
+ *
+ * Rung spacing is added to the surviving floor, never folded into the max: applied the other way
+ * round a large floor would swallow the spacing and drop two adjacent rungs onto one millisecond.
+ * The caller adds its own strictly positive jitter on top.
+ */
+static inline uint32_t srUnicastSlotDelayMs(uint32_t reservedBaseMs, uint8_t slotIndex, uint32_t earliestMs,
+                                            uint32_t leaderWaitMs, uint32_t halfAirtimeMs)
+{
+    if (reservedBaseMs > 0) {
+        return reservedBaseMs + (uint32_t)slotIndex * halfAirtimeMs;
+    }
+    if (slotIndex == 0) {
+        return earliestMs;
+    }
+    uint32_t base = earliestMs > leaderWaitMs ? earliestMs : leaderWaitMs;
+    return base + ((uint32_t)slotIndex - 1) * halfAirtimeMs;
+}
+
 static inline SrTopologyVerdict srTopologyVersionVerdict(uint8_t received, uint8_t last, uint32_t lastAcceptMs,
                                                          uint32_t nowMs, uint32_t resyncMs, bool bootBroadcast,
                                                          bool staleValid = false, uint8_t staleVersion = 0)
