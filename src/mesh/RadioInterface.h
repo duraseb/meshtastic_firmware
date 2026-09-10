@@ -196,6 +196,22 @@ class RadioInterface
     [[nodiscard]] uint8_t getCWsize(float snr);
 
     /** The worst-case SNR_based packet delay */
+    /**
+     * Earliest a relay may key up: `2 * CWmax * slotTimeMsec`, the boundary between the window a
+     * ROUTER draws from and the one every other role draws from.
+     *
+     * This is stock's own number. A node relaying a packet — unicast or broadcast, there is no
+     * separate path — takes getTxDelayMsecWeighted(), which for any role but ROUTER begins at
+     * exactly this offset. So it is the floor below which no stock non-router ever transmits, and
+     * the point past which no stock ROUTER can still key up. Below it a relay goes out while a
+     * neighbour is still reading the frame it answers: that neighbour cannot hear the copy, so it
+     * does not cancel its own, and the duplicate happens anyway.
+     *
+     * Public because the routing layer needs the same boundary and must not restate CWmax or the
+     * slot time to get it.
+     */
+    [[nodiscard]] uint32_t getRelayFloorMsec() const { return 2 * CWmax * slotTimeMsec; }
+
     [[nodiscard]] uint32_t getTxDelayMsecWeightedWorst(float snr);
 
     /** Returns true if we should rebroadcast early like a ROUTER */

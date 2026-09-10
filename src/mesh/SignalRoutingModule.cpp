@@ -2167,7 +2167,14 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
                 // Designated next hop owns slot 0; we hold slot slotIndex+1 behind its reservation.
                 totalDelay = (int64_t)slotDelay + (int64_t)slotIndex * halfAirtime;
             } else if (slotIndex == 0) {
-                totalDelay = 0;
+                // Stock's own contention floor, not zero. Below it we would key up while a stock
+                // neighbour is still reading out the frame we are answering: it could not hear our
+                // copy, would not cancel its own, and the duplicate we were avoiding would happen
+                // regardless. Taken from the radio interface so CWmax and the slot time are stated
+                // in one place.
+                totalDelay = router && router->getRadioInterface()
+                                 ? (int64_t)router->getRadioInterface()->getRelayFloorMsec()
+                                 : (int64_t)SR_PEER_TURNAROUND_MS;
             } else {
                 totalDelay = (int64_t)leaderWait + (int64_t)(slotIndex - 1) * halfAirtime;
             }
