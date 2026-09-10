@@ -1472,6 +1472,14 @@ NodeNum NeighborGraph::uniqueCoverageNeighbor(NodeNum myNode, const NodeNum *cov
             continue;
         }
 
+        // A publisher we have stopped hearing is nobody's coverage target, so it cannot be ours
+        // either. admitsCoverage() has applied this since the silence rule was introduced and this
+        // path did not, so a queued relay was kept alive for a node the ranking had already agreed
+        // nobody could carry. One rule, read the same way on both sides.
+        if (policy && isSilentPublisher(neighbor, *policy)) {
+            continue;
+        }
+
         // Skip nodes that are themselves in the coveredBy set
         bool isCoverer = false;
         for (size_t c = 0; c < coveredByCount; c++) {
