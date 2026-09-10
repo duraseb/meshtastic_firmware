@@ -443,6 +443,8 @@ private:
     static constexpr uint32_t RELAY_ID_CACHE_TTL_MS = 600 * 1000;  // 10 min
 
     bool signalBasedRoutingEnabled = true;
+    /// One-shot guard for the own-role boot line (config is not loaded in the constructor).
+    bool loggedOwnRole = false;
     bool needsBootBroadcast = false;
     bool topologyDirty = false; // Set when topology changes; triggers early broadcast via runOnce
     bool topologyBroadcastActive = false; // True while sendSignalRoutingInfo() is sending

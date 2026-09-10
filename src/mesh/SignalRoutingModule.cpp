@@ -1,4 +1,5 @@
 #include "SignalRoutingModule.h"
+#include "DisplayFormatters.h"
 
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
 
@@ -311,6 +312,18 @@ int32_t SignalRoutingModule::runOnce()
 {
     uint32_t nowMs = millis();
     uint32_t nowSecs = millis() / 1000;  // Use monotonic time for aging
+
+    // Our own configured role, once, on the first pass — the constructor runs before config is
+    // loaded. Nothing logged it before, so a capture could not say which band this node draws in
+    // or whether its peers should reserve air for it, and any argument from the log about roles
+    // was circular. Also states the modem preset, since every ladder delay is derived from it.
+    if (!loggedOwnRole) {
+        loggedOwnRole = true;
+        LOG_INFO("[SR] Own role=%s (%d) preset=%s node=0x%08x", DisplayFormatters::getDeviceRole(config.device.role),
+                 (int)config.device.role,
+                 DisplayFormatters::getModemPresetDisplayName(config.lora.modem_preset, false, config.lora.use_preset),
+                 nodeDB->getNodeNum());
+    }
 
     pruneCapabilityCache(nowSecs);
     pruneRelayIdentityCache(nowMs);
@@ -2865,6 +2878,27 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     // ladder: our rung is their count plus our place among the SR peers. Counting only the SR
     // peers put two insurers on the same rung whenever a stock rebroadcaster was present.
     uint8_t stockCandidates = 0;
+    // How many of slotsGiven are reserved positions held by stock routers rather than rungs held
+    // by ranked SR peers. Two different reasons to stay quiet — one expects a node we do not
+    // coordinate with and whose firing time we cannot compute, the other a node we do — and one
+    // merged reason string cannot say which, so removing the reservation would be invisible.
+    uint8_t reservedSlots = 0;
+    // Coverage taken off the table before the ranking ran, and by whom. Absorption is why a
+    // candidate finds nothing unique; it was computed here and logged nowhere, so a suppression
+    // could not be attributed to the relay that caused it.
+    uint16_t absorbedTotal = 0;
+    NodeNum absorbedBy[4] = {0, 0, 0, 0};
+    uint8_t absorbedCredit[4] = {0, 0, 0, 0};
+    uint8_t absorbedCount = 0;
+    auto noteAbsorbed = [&](NodeNum relay, uint16_t before) {
+        uint16_t credit = alreadyCovered.count > before ? (uint16_t)(alreadyCovered.count - before) : 0;
+        absorbedTotal += credit;
+        if (absorbedCount < 4) {
+            absorbedBy[absorbedCount] = relay;
+            absorbedCredit[absorbedCount] = (uint8_t)(credit > 255 ? 255 : credit);
+            absorbedCount++;
+        }
+    };
 
 
     // We are always a candidate, so a count of one means nobody else here can carry this frame.
@@ -2905,6 +2939,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
             stockCandidates++;
 
             if (routingGraph->hasNodeTransmitted(neighbor, p->id, currentTime)) {
+                uint16_t before = alreadyCovered.count;
                 const NodeEdges *ne = routingGraph->getEdgesFrom(neighbor);
                 if (ne) {
                     for (uint8_t j = 0; j < ne->edgeCount; j++) {
@@ -2915,10 +2950,13 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
                     }
                 }
                 alreadyCovered.insert(neighbor);
-                LOG_INFO("[SR] Slot %ums: stock %08x (already TX)", slotDelay, neighbor);
+                noteAbsorbed(neighbor, before);
+                LOG_INFO("[SR] Slot %ums: stock %08x (already TX, absorbed %u)", slotDelay, neighbor,
+                         (unsigned)absorbedCredit[absorbedCount ? absorbedCount - 1 : 0]);
             } else {
                 LOG_INFO("[SR] Slot %ums: stock %08x (expected)", slotDelay, neighbor);
                 slotsGiven++;
+                reservedSlots++;
             }
 
             slotDelay += halfAirtime;
@@ -2931,6 +2969,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
 
 
     auto absorbRelayCoverage = [&](NodeNum relay) {
+        uint16_t before = alreadyCovered.count;
         const NodeEdges *ne = routingGraph->getEdgesFrom(relay);
         if (ne) {
             for (uint8_t j = 0; j < ne->edgeCount; j++) {
@@ -2945,6 +2984,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
             }
         }
         alreadyCovered.insert(relay);
+        noteAbsorbed(relay, before);
     };
 
     // Phase 2: Iteratively pick best SR candidate, assign slots
@@ -3007,9 +3047,19 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     getNodeDisplayName(sourceNode, sourceName, sizeof(sourceName));
     getNodeDisplayName(heardFrom, heardFromName, sizeof(heardFromName));
 
-    LOG_INFO("[SR-DEC] BROADCAST %s 0x%08x: from %s via %s (%s, delay=%ums)",
-             shouldRelay ? "RELAY" : "SUPPRESS", p->id, sourceName, heardFromName,
-             decisionReason, myDelay);
+    // A suppression for a reserved stock router is a different fact from one for a ranked SR
+    // peer: the first expects a node whose schedule we cannot compute, the second a node we
+    // coordinate with. Distinguish them, or the reservation's effect cannot be read from a log.
+    if (!shouldRelay && reservedSlots > 0) {
+        decisionReason = "stock router expected";
+    }
+
+    LOG_INFO("[SR-DEC] BROADCAST %s 0x%08x: from %s via %s (%s, delay=%ums, slots=%u/res=%u, abs=%u)",
+             shouldRelay ? "RELAY" : "SUPPRESS", p->id, sourceName, heardFromName, decisionReason, myDelay,
+             (unsigned)slotsGiven, (unsigned)reservedSlots, (unsigned)absorbedTotal);
+    for (uint8_t i = 0; i < absorbedCount; i++) {
+        LOG_INFO("[SR] Absorbed 0x%08x: %08x covered %u", p->id, absorbedBy[i], (unsigned)absorbedCredit[i]);
+    }
 
     if (shouldRelay) {
         pendingRelayDelayMs = myDelay;
