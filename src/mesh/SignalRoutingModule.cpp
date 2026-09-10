@@ -2346,18 +2346,6 @@ bool SignalRoutingModule::hasAnyHearsUsNeighbor() const
     return false;
 }
 
-bool SignalRoutingModule::witnessOwed(const meshtastic_MeshPacket *p, NodeNum sourceNode) const
-{
-    // A frame that arrived relayed was already witnessed: the relay's own transmission is the
-    // rebroadcast its source heard. Only a frame straight from its originator, asking to be
-    // acknowledged, still needs one from us — and only from the one node it elected.
-    if (!p || !p->want_ack || p->hop_start != p->hop_limit || !routingGraph || !nodeDB) {
-        return false;
-    }
-    NeighborGraph::CoveragePolicy policy = coveragePolicy();
-    return routingGraph->witnessOwner(sourceNode, policy) == nodeDB->getNodeNum();
-}
-
 void SignalRoutingModule::maybeScheduleBroadcastRetransmit(const meshtastic_MeshPacket *p)
 {
     scheduleT1Broadcast(p, 0, false);
@@ -3055,6 +3043,30 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         decisionReason = "sole candidate";
     }
 
+    // Nobody had coverage to offer, and the originator is waiting to be told its message reached
+    // the mesh. Stock's only delivery confirmation for a broadcast is hearing somebody rebroadcast
+    // it, so suppressing every copy removes the signal it depends on and it retransmits into
+    // silence — the phone reports a failure for a message that in fact arrived everywhere.
+    //
+    // The ranking cannot answer this: it drops a candidate with no unique coverage, because the
+    // cost it ranks on is the mean delivery cost over the unique targets and there is nothing to
+    // price. So this is a second pass with its own price, run only when the ladder came out empty.
+    //
+    // Scoped to a text message that arrived straight from its originator: that is the class whose
+    // delivery a person is shown, and a frame that reached us through a relay was rebroadcast by
+    // definition, so its originator already has its confirmation.
+    if (!shouldRelay && slotsGiven == 0 && p->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
+        p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP && isDirectPacket(*p)) {
+        uint32_t ackDelay = 0;
+        uint8_t ackAhead = 0;
+        if (planAcknowledgement(p, sourceNode, heardFrom, halfAirtime, &ackDelay, &ackAhead)) {
+            shouldRelay = true;
+            myDelay = ackDelay;
+            slotsGiven = ackAhead;
+            decisionReason = "acknowledgement";
+        }
+    }
+
     char sourceName[64], heardFromName[64];
     getNodeDisplayName(sourceNode, sourceName, sizeof(sourceName));
     getNodeDisplayName(heardFrom, heardFromName, sizeof(heardFromName));
@@ -3076,15 +3088,17 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     if (shouldRelay) {
         pendingRelayDelayMs = myDelay;
         routingGraph->recordNodeTransmission(myNode, p->id, currentTime);
-    } else if (slotsGiven > 0 || witnessOwed(p, sourceNode)) {
-        // Two reasons can still put a late copy on the air, and both are known now. A
-        // transmission we expect: the ranking gave a slot to a stock relay router or a ranked
-        // SR peer, and if their copy never comes ours is the redundancy that covers the loss.
-        // Or a witness owed: the originator asked to be told (want_ack) and heard us directly,
-        // so our copy is the rebroadcast stock turns into its implicit ACK — one elected
-        // neighbour answers instead of every one that heard it, and without it the sender
-        // retransmits NUM_RELIABLE_RETX times. Our rung of the ladder is the node-id order the
-        // slots already use, one half-airtime apart, stock rebroadcasters counted first.
+    } else if (slotsGiven > 0) {
+        // A late copy still goes on the air when a transmission is expected: the ranking gave a
+        // rung to a stock relay router or a ranked SR peer, or the acknowledgement pass put
+        // somebody ahead of us, and if their copy never comes ours is the redundancy that covers
+        // the loss. Our rung of the ladder is the node-id order the slots already use, one
+        // half-airtime apart, stock rebroadcasters counted first.
+        //
+        // The want_ack witness term that used to widen this is gone: Router::send strips that flag
+        // from every broadcast before transmission, so it was never set on the wire, and the
+        // election behind it is replaced by the acknowledgement pass, which does not need the flag
+        // to know a message is one somebody is waiting on.
         uint8_t rank = stockCandidates;
         for (uint16_t i = 0; i < srPeers.count; i++) {
             NodeNum peer = srPeers.nodes[i];
@@ -3878,6 +3892,102 @@ bool SignalRoutingModule::isImmediateRelayRouter(NodeNum nodeId) const
     return role == meshtastic_Config_DeviceConfig_Role_ROUTER ||
            role == meshtastic_Config_DeviceConfig_Role_REPEATER ||
            role == meshtastic_Config_DeviceConfig_Role_ROUTER_CLIENT;
+}
+
+bool SignalRoutingModule::willNotCancelForUs(NodeNum nodeId) const
+{
+    if (!nodeDB) return false;
+    // An SR node coordinates with us and cancels on coverage, whatever its role.
+    if (getCapabilityStatus(nodeId) == CapabilityStatus::SRactive) return false;
+    const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(nodeId);
+    if (!node || !node->has_user) return false;
+    auto role = node->user.role;
+    return role == meshtastic_Config_DeviceConfig_Role_ROUTER ||
+           role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE;
+}
+
+bool SignalRoutingModule::planAcknowledgement(const meshtastic_MeshPacket *p, NodeNum sourceNode, NodeNum heardFrom,
+                                              uint32_t halfAirtime, uint32_t *delayMsOut, uint8_t *slotsAheadOut)
+{
+    if (!p || !routingGraph || !nodeDB) return false;
+    NodeNum myNode = nodeDB->getNodeNum();
+    if (!isActiveRoutingRole()) return false;
+    const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
+    if (!myEdges) return false;
+
+    NeighborGraph::CoveragePolicy policy = coveragePolicy();
+
+    // Stand down for a neighbour that will rebroadcast regardless and will not cancel for us: its
+    // copy is the acknowledgement and ours would only add to it. A stock CLIENT is not such a
+    // node — it floods later than our rung and cancels on hearing us, so answering first removes
+    // its copy rather than adding to ours.
+    for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+        NodeNum neighbor = myEdges->edges[i].to;
+        if (neighbor == 0 || neighbor == sourceNode) continue;
+        if (!willNotCancelForUs(neighbor)) continue;
+        const NodeEdges *theirs = routingGraph->getEdgesFrom(neighbor);
+        if (!theirs) continue;
+        for (uint8_t j = 0; j < theirs->edgeCount; j++) {
+            if (theirs->edges[j].to == heardFrom) return false;
+        }
+    }
+
+    // Rank the candidates we can hear that the source can be shown to hear, ourselves included.
+    // Both halves matter: without the first, an answer we cannot hear never cancels our own rung
+    // and every candidate transmits.
+    struct Entry {
+        NodeNum node;
+        uint16_t cost;
+    };
+    Entry entries[NODE_SET_MAX];
+    uint8_t count = 0;
+    uint16_t cost = 0;
+    if (routingGraph->acknowledgementPrice(myNode, sourceNode, policy, &cost) && count < NODE_SET_MAX) {
+        entries[count++] = {myNode, cost};
+    }
+    for (uint8_t i = 0; i < myEdges->edgeCount && count < NODE_SET_MAX; i++) {
+        NodeNum neighbor = myEdges->edges[i].to;
+        if (neighbor == 0 || neighbor == sourceNode || neighbor == myNode) continue;
+        bool usable = getCapabilityStatus(neighbor) == CapabilityStatus::SRactive || isImmediateRelayRouter(neighbor);
+        if (!usable) continue;
+        if (routingGraph->acknowledgementPrice(neighbor, sourceNode, policy, &cost)) {
+            entries[count++] = {neighbor, cost};
+        }
+    }
+    if (count == 0) return false;
+
+    // Bucketed price first, then the ladder's own tie-break so the work rotates across packets
+    // rather than always falling to the same node.
+    bool preferHighNodeId = (p->id & 1) != 0;
+    for (uint8_t i = 1; i < count; i++) {
+        Entry key = entries[i];
+        int j = (int)i - 1;
+        while (j >= 0) {
+            uint16_t a = key.cost / SR_OWNER_COST_BUCKET;
+            uint16_t b = entries[j].cost / SR_OWNER_COST_BUCKET;
+            bool better = a != b ? a < b : (preferHighNodeId ? key.node > entries[j].node : key.node < entries[j].node);
+            if (!better) break;
+            entries[j + 1] = entries[j];
+            j--;
+        }
+        entries[j + 1] = key;
+    }
+
+    uint32_t delay = SR_SLOT_ORIGIN_MS;
+    uint8_t ahead = 0;
+    for (uint8_t i = 0; i < count; i++) {
+        if (entries[i].node == myNode) {
+            if (delayMsOut) *delayMsOut = delay;
+            if (slotsAheadOut) *slotsAheadOut = ahead;
+            LOG_INFO("[SR] Acknowledging 0x%08x for %08x at %ums (%u ahead of us)", p->id, sourceNode, delay,
+                     (unsigned)ahead);
+            return true;
+        }
+        // A rung ahead of ours we are waiting on, so T1 insures the answer if it never comes.
+        ahead++;
+        delay += halfAirtime;
+    }
+    return false;
 }
 
 bool SignalRoutingModule::isLegacyRouter(NodeNum nodeId) const

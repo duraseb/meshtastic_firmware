@@ -685,7 +685,27 @@ private:
     bool hasAnyHearsUsNeighbor() const;
     /// Does this frame's originator still need a rebroadcast from us as its acknowledgement:
     /// it asked (want_ack), it reached us directly, and its own evidence elects us.
-    bool witnessOwed(const meshtastic_MeshPacket *p, NodeNum sourceNode) const;
+    /**
+     * Will @p node rebroadcast regardless and *not* stand down on hearing our copy?
+     *
+     * A separate question from whether it relays early, and from whether it is a relay router at
+     * all: stock refuses to cancel a duplicate for ROUTER and ROUTER_LATE, so relaying behind one
+     * of those adds a frame rather than replacing one. Its own name rather than a narrowing of the
+     * relay-router test, which also answers candidate admission and the owner elections and must
+     * not move.
+     *
+     * CLIENT_BASE is deliberately absent. Stock also refuses to cancel there, but only for traffic
+     * involving a favourited node, and a favourite list is local configuration that never reaches
+     * the wire — no peer can evaluate it. The occasional duplicate alongside one is accepted.
+     */
+    bool willNotCancelForUs(NodeNum node) const;
+
+    /**
+     * Answer a message its originator is waiting on, when the coverage ranking had nothing to
+     * offer. Returns true when we should relay, and writes our delay to @p delayMsOut.
+     */
+    bool planAcknowledgement(const meshtastic_MeshPacket *p, NodeNum sourceNode, NodeNum heardFrom,
+                             uint32_t halfAirtime, uint32_t *delayMsOut, uint8_t *slotsAheadOut);
 
 public:
     uint32_t pendingRelayDelayMs = 0; // Set by shouldRelayBroadcast, consumed by commitRelay

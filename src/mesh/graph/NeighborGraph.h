@@ -382,7 +382,18 @@ class NeighborGraph {
     /// Deliberately not coverageOwner(): that ranks a candidate's own edge *to* the target,
     /// which is the only evidence for a neighbour nobody can be shown to reach but the wrong
     /// direction for a witness.
-    NodeNum witnessOwner(NodeNum source, const CoveragePolicy &policy) const;
+    /**
+     * What an acknowledgement from @p candidate is worth to @p source, or false if it is worth
+     * nothing.
+     *
+     * The opposite direction from coverage. Coverage asks whether a relay reaches a target; an
+     * acknowledgement asks whether the *originator* hears the relay, because a copy it cannot hear
+     * tells it nothing and its retry ladder runs anyway. Demands positive, one-directional
+     * evidence — the source's own list named the candidate, or we watched the source's traffic
+     * carried by it — and refuses a guessed link or one past the coverage ceiling.
+     */
+    bool acknowledgementPrice(NodeNum candidate, NodeNum source, const CoveragePolicy &policy,
+                              uint16_t *costFixedOut) const;
 
     // May a frame from `from` be delivered to `to`? Evidenced delivery (knownToHear), or `to`
     // publishes no topology and its silence is no proof it cannot hear. The optimistic half is

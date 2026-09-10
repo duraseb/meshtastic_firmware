@@ -1162,7 +1162,7 @@ float NeighborGraph::hopCost(NodeNum from, NodeNum to) const
     // An Inferred edge is skipped: it was minted at a nominal price because a frame once
     // crossed the link, which says a path exists and nothing about what it costs. Everything
     // that decides whether a transmission may be skipped reads this price — covers(),
-    // coverageOwner(), witnessOwner() and the slot rankings — so a guess must not produce one.
+    // coverageOwner(), acknowledgementPrice() and the slot rankings — so a guess must not produce one.
     // The route search prices its own hops from the edges directly and keeps using inferred
     // edges for reachability, which is what they exist for.
     const NodeEdges *toEdges = findNeighbor(to);
@@ -1221,55 +1221,35 @@ bool NeighborGraph::covers(NodeNum from, NodeNum to, float poorLinkEtx, const Co
     return cost > 0.0f && cost <= poorLinkEtx;
 }
 
-NodeNum NeighborGraph::witnessOwner(NodeNum source, const CoveragePolicy &policy) const
+bool NeighborGraph::acknowledgementPrice(NodeNum candidate, NodeNum source, const CoveragePolicy &policy,
+                                          uint16_t *costFixedOut) const
 {
-    NodeNum me = policy.me;
-    if (source == 0 || (source & 0xFF000000) == 0xFF000000) return 0;
-    NodeNum owner = 0;
-    uint8_t bestTier = 0xFF;
-    uint16_t bestBucket = 0xFFFF;
-    for (uint8_t i = 0; i < neighborCount; i++) {
-        NodeNum candidate = neighbors[i].nodeId;
-        if (candidate == 0 || candidate == source || (candidate & 0xFF000000) == 0xFF000000) continue;
-        uint8_t tier;
-        if (candidate == me) {
-            if (!policy.meRelays) continue;
-            tier = 1;
-        } else if (policy.isStockRelayRouter && policy.isStockRelayRouter(policy.ctx, candidate)) {
-            tier = 0;
-        } else if (policy.isSrActive && policy.isSrActive(policy.ctx, candidate)) {
-            tier = 1;
-        } else {
-            continue;
-        }
-        // Positive evidence that the source hears this candidate: the source's own list named
-        // it, or we watched the source carry its frame. A direct observation writes both edge
-        // directions from one measurement, so edge existence alone is our own assumption of
-        // symmetry — the one thing a witness may not assume, since a copy the originator cannot
-        // hear acknowledges nothing.
-        const Edge *edge = findEdge(&neighbors[i], source);
-        if (!edge || !edge->hearsUs) continue;
-        // A guessed link carries no acknowledgement: it was never measured in either direction.
-        if (!Edge::isMeasured(edge->source)) continue;
-        // Priced in the delivery direction: the source's own measurement of the candidate when
-        // it published one, our own edge otherwise. A link past the coverage ceiling carries no
-        // acknowledgement either.
-        uint16_t costFixed = edge->etxFixed;
-        const NodeEdges *sourceEdges = getEdgesFrom(source);
-        if (sourceEdges) {
-            const Edge *back = findEdge(sourceEdges, candidate);
-            if (back) costFixed = back->etxFixed;
-        }
-        if (policy.poorLinkEtx > 0.0f && (float)costFixed / 100.0f > policy.poorLinkEtx) continue;
-        uint16_t bucket = (uint16_t)(costFixed / SR_OWNER_COST_BUCKET);
-        if (tier < bestTier || (tier == bestTier && bucket < bestBucket) ||
-            (tier == bestTier && bucket == bestBucket && candidate < owner)) {
-            bestTier = tier;
-            bestBucket = bucket;
-            owner = candidate;
-        }
+    if (source == 0 || candidate == 0 || candidate == source) return false;
+    if ((source & 0xFF000000) == 0xFF000000 || (candidate & 0xFF000000) == 0xFF000000) return false;
+
+    const NodeEdges *candidateEdges = getEdgesFrom(candidate);
+    if (!candidateEdges) return false;
+    // Positive evidence that the source hears this candidate: the source's own list named it, or
+    // we watched the source carry its frame. A direct observation writes both edge directions from
+    // one measurement, so edge existence alone is our own assumption of symmetry — the one thing an
+    // acknowledgement may not assume, since a copy the originator cannot hear tells it nothing.
+    const Edge *edge = findEdge(candidateEdges, source);
+    if (!edge || !edge->hearsUs) return false;
+    // A guessed link carries no acknowledgement: it was never measured in either direction.
+    if (!Edge::isMeasured(edge->source)) return false;
+
+    // Priced in the direction the source would have to hear it: the source's own measurement where
+    // it published one, our own edge otherwise. Past the coverage ceiling nothing arrives.
+    uint16_t costFixed = edge->etxFixed;
+    const NodeEdges *sourceEdges = getEdgesFrom(source);
+    if (sourceEdges) {
+        const Edge *back = findEdge(sourceEdges, candidate);
+        if (back) costFixed = back->etxFixed;
     }
-    return owner;
+    if (policy.poorLinkEtx > 0.0f && (float)costFixed / 100.0f > policy.poorLinkEtx) return false;
+
+    if (costFixedOut) *costFixedOut = costFixed;
+    return true;
 }
 
 NodeNum NeighborGraph::coverageOwner(NodeNum target, const CoveragePolicy &policy) const
