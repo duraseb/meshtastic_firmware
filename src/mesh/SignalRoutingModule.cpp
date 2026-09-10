@@ -2134,13 +2134,17 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         leaderWait = airtimeMs + router->getRadioInterface()->getTxDelayMsecMaxAtUtil();
     }
     leaderWait += SR_PEER_TURNAROUND_MS;
-    // Deterministic per-packet jitter, ±halfAirtime/4, keeps two nodes with the same slot apart.
+    // Deterministic per-packet tie-break, strictly positive and no larger than the range, so a
+    // rung can be pushed later than its position but never earlier. Centring it on zero let a rung
+    // fire ahead of its own slot, which on the broadcast ladder is what let rung 0 fall inside the
+    // window it is meant to sit behind. Not zero either: two nodes that computed the same rung are
+    // separated by this and nothing else, and at zero neither copy cancels the other.
     const uint32_t jitterRange = std::max(halfAirtime / 2, SR_MIN_TIE_BREAK_RANGE_MS);
-    const int32_t jitter = (int32_t)(((uint32_t)(myNode ^ p->id)) % jitterRange) - (int32_t)(jitterRange / 2);
+    const uint32_t jitter = (((uint32_t)(myNode ^ p->id)) % jitterRange) + 1;
     const uint32_t MAX_UNICAST_RELAY_HOLD_MS = 2000;
 
     LOG_INFO("[SR] Uni slots 0x%08x to %s: half=%ums %u cands leader=%ums j=%dms",
-             p->id, destName, halfAirtime, srCount, leaderWait, jitter);
+             p->id, destName, halfAirtime, srCount, leaderWait, (int)jitter);
 
     uint8_t slotIndex = 0; // among candidates that have not transmitted yet
     for (uint8_t i = 0; i < srCount; i++) {
@@ -2167,7 +2171,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
             } else {
                 totalDelay = (int64_t)leaderWait + (int64_t)(slotIndex - 1) * halfAirtime;
             }
-            totalDelay += jitter;
+            totalDelay += (int64_t)jitter;
             if (totalDelay < 0) totalDelay = 0;
             if ((uint64_t)totalDelay > MAX_UNICAST_RELAY_HOLD_MS) totalDelay = MAX_UNICAST_RELAY_HOLD_MS;
             shouldRelay = true;
@@ -2901,6 +2905,14 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     };
 
 
+    // Deterministic per-packet tie-break for our own rung, strictly positive and no larger than
+    // the range. Two nodes that computed the same rung are separated by this and nothing else, and
+    // the broadcast ladder had none at all — so a pair that ranked a packet alike keyed up in the
+    // same instant, where neither copy cancels the other. Strictly positive rather than centred on
+    // zero, so a rung is never pulled ahead of its own position and into the window it sits behind.
+    const uint32_t rungJitterRange = std::max(halfAirtime / 2, SR_MIN_TIE_BREAK_RANGE_MS);
+    const uint32_t rungJitter = (((uint32_t)(myNode ^ p->id)) % rungJitterRange) + 1;
+
     // We are always a candidate, so a count of one means nobody else here can carry this frame.
     uint16_t initialCandidates = candidates.count;
 
@@ -3008,9 +3020,10 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
 
         if (best.nodeId == myNode) {
             shouldRelay = true;
-            myDelay = slotDelay;
+            myDelay = slotDelay + rungJitter;
             decisionReason = "SR slot assignment";
-            LOG_INFO("[SR] Slot %ums: US (%08x)%s", slotDelay, myNode, best.tier > 0 ? " (bidi)" : "");
+            LOG_INFO("[SR] Slot %ums: US (%08x)%s j=%ums", myDelay, myNode, best.tier > 0 ? " (bidi)" : "",
+                     rungJitter);
             break;
         }
 
@@ -3029,7 +3042,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         LOG_INFO("[SR-DEC] BROADCAST RELAY (forced) 0x%08x: for %08x (down=%u)",
                  p->id, forcedFor, static_cast<unsigned int>(downstreamCount));
         shouldRelay = true;
-        myDelay = slotDelay;
+        myDelay = slotDelay + rungJitter;
         decisionReason = "downstream relay override";
     }
 
@@ -3039,7 +3052,9 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     // it has classified any neighbour, where behaving like a plain rebroadcaster is right.
     if (!shouldRelay && initialCandidates <= 1) {
         shouldRelay = true;
-        myDelay = slotDelay;
+        // Sole candidate by our own reckoning, which another node may not share: keep the
+        // tie-break so two nodes that both believe they are alone are still separated.
+        myDelay = slotDelay + rungJitter;
         decisionReason = "sole candidate";
     }
 
@@ -3061,7 +3076,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         uint8_t ackAhead = 0;
         if (planAcknowledgement(p, sourceNode, heardFrom, halfAirtime, &ackDelay, &ackAhead)) {
             shouldRelay = true;
-            myDelay = ackDelay;
+            myDelay = ackDelay + rungJitter;
             slotsGiven = ackAhead;
             decisionReason = "acknowledgement";
         }
