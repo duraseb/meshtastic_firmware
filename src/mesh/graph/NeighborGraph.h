@@ -376,12 +376,6 @@ class NeighborGraph {
     bool admitsCoverage(NodeNum relay, NodeNum target, float poorLinkEtx,
                         const CoveragePolicy *policy) const;
 
-    /// Whose copy an originator will actually hear: among the nodes it can be shown to hear
-    /// (its own published list, or us watching it carry their frame), the cheapest in the
-    /// delivery direction, stock rebroadcasters given way, node id as the tie-break.
-    /// Deliberately not coverageOwner(): that ranks a candidate's own edge *to* the target,
-    /// which is the only evidence for a neighbour nobody can be shown to reach but the wrong
-    /// direction for a witness.
     /**
      * What an acknowledgement from @p candidate is worth to @p source, or false if it is worth
      * nothing.

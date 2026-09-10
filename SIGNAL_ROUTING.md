@@ -67,13 +67,14 @@ This dual approach provides the reliability of coordinated networking with the e
 |------|----------------|-------------------|
 | **CLIENT_MUTE** | Never rebroadcasts | **Topology broadcasts only** - Announces direct neighbors to help active SR nodes (simplified: no graph maintenance, no complex topology inference) |
 | **CLIENT** | Rebroadcasts, can cancel duplicates | Uses SR coordination for broadcasts |
-| **ROUTER/ROUTER_LATE** | Always rebroadcasts, never cancels | **Priority relays** - SR gives them highest priority as they always rebroadcast |
+| **ROUTER** | Always rebroadcasts, never cancels | **Priority relays** - reserved a window position ahead of the SR rungs, because they transmit regardless of SR (`isImmediateRelayRouter()`) |
+| **ROUTER_LATE** | Always rebroadcasts, never cancels | **Not an early relay** - it relays after everyone else by design, so it is neither a ranking candidate nor reserved a position. It does count as a node that will not cancel for us (`willNotCancelForUs()`), which is what stands the acknowledgement pass down |
 | **ROUTER_CLIENT** | Rebroadcasts, can cancel duplicates | Uses SR coordination for broadcasts |
-| **REPEATER** | Rebroadcasts, can cancel duplicates | **Priority relays** - SR gives them early slots since they typically rebroadcast |
+| **REPEATER** | Rebroadcasts, can cancel duplicates | **Priority relays** - reserved a window position like ROUTER (`isImmediateRelayRouter()`). Deprecated upstream and no longer selectable for new configurations, so this row covers existing deployments only |
 | **CLIENT_BASE** | Special: acts as ROUTER for favorited nodes | Uses SR coordination for broadcasts |
 | **TRACKER/SENSOR/TAK** | Rebroadcasts, can cancel duplicates | Treated as legacy, no SR participation |
 
-**Legacy Node Priority:** SignalRouting prioritizes ROUTER and REPEATER roles because these nodes are configured to always rebroadcast packets. CLIENT_MUTE nodes participate minimally by broadcasting their direct neighbor topology to assist active SignalRouting nodes in making informed unicast routing decisions.
+**Legacy Node Priority:** SignalRouting reserves early window positions for ROUTER, REPEATER and ROUTER_CLIENT (`isImmediateRelayRouter()`) because these nodes transmit regardless of SR coordination. ROUTER_LATE is deliberately not in that set — relaying late is the whole point of the role — and the predicate is also what admits a node as a relay candidate at all, so narrowing it would silently drop candidates as well as reservations. CLIENT_MUTE nodes participate minimally by broadcasting their direct neighbor topology to assist active SignalRouting nodes in making informed unicast routing decisions.
 
 ### Retransmission Behavior
 
@@ -82,7 +83,7 @@ This dual approach provides the reliability of coordinated networking with the e
 | **ReliableRouter** | Up to 3 retransmissions | For want_ack packets only |
 | **NextHopRouter** | 2 for intermediate hops, 3 for origin | Route reset on final failure |
 | **SignalRouting** | Iterative unicast route selection with fallback strategies | For SR-selected unicast routes |
-| **SignalRouting broadcast** | At most one late copy, armed only when a transmission was expected of somebody or a `want_ack` originator elected us as its witness | Guards against interference/CRC loss at receivers and supplies stock's implicit ACK; see T1 Retransmit Insurance |
+| **SignalRouting broadcast** | At most one late copy, armed only when a rung was given out to somebody | Guards against interference/CRC loss at receivers; the copy carries no `want_ack` of its own. See T1 Retransmit Insurance |
 
 ### Passive Node Behavior
 
@@ -104,7 +105,7 @@ Passive SR nodes (TRACKER, SENSOR, TAK, or non-active-routing configured nodes) 
 |-------------|-----------------|---------------|
 | **FloodingRouter** | SNR-based delays (poorer SNR = shorter delay) | Immediate send |
 | **NextHopRouter** | SNR-based delays + next hop preference | iface->getRetransmissionMsec() timing |
-| **SignalRouting** | Slot-based: half-airtime per slot, deterministic candidate ordering | ETX-based route selection + speculative retransmit |
+| **SignalRouting** | Rung-based: origin `SR_SLOT_ORIGIN_MS`, half-airtime per rung (floored at 50 ms), plus a strictly positive per-node jitter, deterministic candidate ordering | ETX-based route selection; undesignated slot 0 at stock's contention floor + speculative retransmit |
 
 ## Direct Neighbor Detection
 
@@ -345,7 +346,7 @@ When a unicast packet is transmitted, nodes that overhear it can participate in 
 4. **Optimal Selection**: Best-positioned relay (lowest ETX to destination) gets the earliest slot
 
 **Slot 0 — Designated Next Hop:**
-If the packet carries a `next_hop` field, slot 0 is reserved for that designated node. Any SR node whose last-byte matches `p->next_hop` relays immediately at slot 0. All other SR nodes start their candidate ranking from slot 1, after a reservation long enough for the designated node's relay to have left the air: one airtime plus the maximum contention delay at the current channel utilization for an SR next hop, or plus the worst-case stock CLIENT delay for a stock or unknown one. If `next_hop` is not set (`NO_NEXT_HOP_PREFERENCE`), SR candidates start from slot 0.
+If the packet carries a `next_hop` field, slot 0 is reserved for that designated node. Any SR node whose last-byte matches `p->next_hop` takes slot 0 itself. All other SR nodes start their candidate ranking from slot 1, after a reservation long enough for the designated node's relay to have left the air: one airtime plus the maximum contention delay at the current channel utilization for an SR next hop, or plus the worst-case stock CLIENT delay for a stock or unknown one. If `next_hop` is not set (`NO_NEXT_HOP_PREFERENCE`), SR candidates start from slot 0, which waits stock's contention floor (`getRelayFloorMsec()`) rather than keying up at once.
 
 `NextHopRouter::perhapsRebroadcast` lets SR-coordinated unicasts past the stock gate (which otherwise admits a unicast only when it names nobody or names us), so this path is reachable; nodes without SR keep the stock rule.
 
@@ -358,11 +359,15 @@ For each candidate (self + SR-active direct neighbors), three tiers that never o
 
 This ensures last-hop delivery nodes are always scheduled before intermediate relays, and within each tier the lower ETX wins. Costs are compared in half-ETX buckets (`SR_COST_BUCKET_FIXED`), for unicast candidates and for the broadcast ranking's average cost alike: a node prices its own link from its own measurements and a peer's link from the peer's packed report, so near-equal costs differ by a few hundredths in a direction that varies per node, and exact comparison let two colocated nodes rank each other in opposite orders and take the same slot. Within a bucket the packet-id-parity node-id tie-break decides identically everywhere.
 
-**Channel-access model:** a receiver spends up to ~170 ms after a frame reading it out before it listens again (`SR_PEER_TURNAROUND_MS` = 250 ms covers it). Every wait for a peer starts from that figure: the ACK gate is turnaround + twice the maximum contention delay + the reply airtime; the wait behind a designated SR next hop is turnaround + maximum contention + one airtime; and the coordinated relay ladder starts at `SR_SLOT_ORIGIN_MS` (= turnaround), slot k firing at origin + k × half airtime. A relay keyed up right after the frame it answers is lost on every receiver still busy with that frame.
+**Channel-access model:** waits are built from stock's own contention geometry (the preset's CAD slot time and its contention window), the frame airtime, and a fixed guard after somebody else's frame — the turnaround, `SR_PEER_TURNAROUND_MS` = 250 ms. The ACK gate is turnaround + twice the maximum contention delay + the reply airtime; the wait behind a designated SR next hop is turnaround + maximum contention + one airtime; the coordinated broadcast ladder starts at `SR_SLOT_ORIGIN_MS` (= turnaround), rung k firing at origin + k × half airtime; and an undesignated unicast slot 0 starts at stock's contention floor, `getRelayFloorMsec()` = 2 × CWmax × slot time.
+
+**The turnaround is margin, not a measured deaf window.** Peers take up to ~170 ms of per-packet processing between a frame ending and the decoded packet reaching their router, and that figure was once read here as time off air. It is not: the radio re-arms the receiver before delivering the frame upward, so a peer is listening again long before it has finished with the frame it just took. Nothing above depends on the 170 ms figure.
+
+**The contention window clamps its SNR.** `getCWsize()` maps SNR onto the window, and `map()` does not clamp, so an SNR outside the range it is defined over extrapolates: at +16 dB and above the window came back one step past CWmax, stretching a ROUTER's draw from 15 slots to 17 and carrying it past the point where the non-router band begins — the two bands are meant to be disjoint. Measured on this fleet, 1,163 of 88,485 receptions carry an SNR at or above +16 (maximum 17.75), so this is routine input, not a corner case.
 
 **ACK gate:** when the source's topology lists the destination with hearsUs, every candidate first waits for the destination's own ACK as above. The relay is cancelled if the ACK is heard.
 
-**Slot timing:** slots are ordinal. Slot 0 keys up at once; every later slot first waits for the leader's relay to have left the air (`SR_PEER_TURNAROUND_MS` plus the maximum contention delay at the current channel utilization plus one airtime), then slots space out by half an airtime. Behind a designated next hop the ranked candidates follow its slot-0 reservation. A deterministic ±quarter-airtime jitter keeps equal slots apart. (The earlier ETX-gap formula masked the tier bit off the costs, so a downstream-tier leader made every gap zero and a node ranked last fired at 0 ms.)
+**Slot timing:** slots are ordinal. Slot 0 waits stock's own contention floor, `getRelayFloorMsec()` — below it we would key up while a stock neighbour is still inside its own contention window, so it could not have heard our copy, would not cancel its own, and the duplicate we were avoiding would happen anyway. Every later slot first waits for the leader's relay to have left the air (`SR_PEER_TURNAROUND_MS` plus the maximum contention delay at the current channel utilization plus one airtime), then slots space out by half an airtime. Behind a designated next hop the ranked candidates follow its slot-0 reservation. A strictly positive jitter, 1 to `max(halfAirtime / 2, SR_MIN_TIE_BREAK_RANGE_MS)` ms, keeps equal slots apart; it is never signed, so a slot cannot be pulled in front of its own position. (The earlier ETX-gap formula masked the tier bit off the costs, so a downstream-tier leader made every gap zero and a node ranked last fired at 0 ms.)
 
 **Destination heard the source directly:**
 When the unicast was heard straight from its source and the source's topology lists the destination with `hearsUs`, the destination most likely has it. A routing ACK on that link is never relayed (a lost ACK is covered by the sender's own retransmission). Any other unicast has every slot, including a designated next hop's slot 0, pushed behind a wait of one airtime plus twice the maximum contention delay at the current utilization, so the destination's ACK or reply, which cancels the queued relay via `cancelSending(request_id)`, arrives first; only silence lets a relay go. Colocated receivers were seen to lose about half the frames of a very strong neighbour, so the relay stays available rather than being suppressed outright.
@@ -414,20 +419,27 @@ Note: a packet is removed from the TX queue at `dequeue()`, which happens immedi
 Because Phase 2 assigns each SR candidate a unique sequential slot, two nodes with unique coverage will never collide when both keep their relays.
 
 ```
-Slot timing example (150ms half-airtime):
+Slot timing example (150ms half-airtime, origin SR_SLOT_ORIGIN_MS = 250ms):
 
-  Slot 0 (0ms):    Stock router R1
-  Slot 1 (150ms):  Stock router R2
-  Slot 2 (300ms):  Best SR candidate (most unique coverage)
-  Slot 3 (450ms):  Next SR candidate
+  Slot 0 (250ms):  Stock router R1
+  Slot 1 (400ms):  Stock router R2
+  Slot 2 (550ms):  Best SR candidate (most unique coverage)
+  Slot 3 (700ms):  Next SR candidate
   ...
+
+Each SR node adds its own rung jitter (1..max(halfAirtime/2, 20) ms) to the rung it takes,
+so the figures above are the rung positions, not the exact keying-up times.
 ```
 
 **Deterministic tiebreak**: When two candidates have identical coverage and cost, the winner is determined by node ID direction based on packet ID parity (even → lowest ID, odd → highest ID). This distributes relay duty evenly across nodes.
 
 ### How Slot Spacing Works
 
-Slots are spaced by half the packet airtime. When slot 0 starts transmitting, slot 1's radio detects the ongoing reception (`busyRx`) and holds. After slot 0's packet is received, dupe detection cancels slot 1's queued relay if the coverage is redundant. Half-airtime spacing provides enough margin for preamble detection while keeping propagation fast.
+Slots are spaced by half the packet airtime, floored at `SR_MIN_RUNG_SPACING_MS` (50 ms). When slot 0 starts transmitting, slot 1's radio detects the ongoing reception (`busyRx`) and holds. After slot 0's packet is received, dupe detection cancels slot 1's queued relay if the coverage is redundant. Half-airtime spacing provides enough margin for preamble detection while keeping propagation fast.
+
+**Every rung carries a strictly positive jitter.** On top of its rung each node adds 1 to `max(halfAirtime / 2, SR_MIN_TIE_BREAK_RANGE_MS)` milliseconds, derived from its own node id and the packet id, applied to the ranked rung, to both fallback relays and to the acknowledgement pass alike. It is never zero: zero is what let two nodes key up together — all 38 measured broadcast doubles were separated only by this offset, mean 6.55 ms. It is never negative either, so a rung can only ever be pushed later than its own position.
+
+**Both floors are absolute, not preset-derived.** `SR_MIN_RUNG_SPACING_MS` (50 ms) floors the spacing and `SR_MIN_TIE_BREAK_RANGE_MS` (20 ms) floors the jitter range, which is itself half of the *already floored* spacing. Deriving either from the slot time instead would cut node separation into the 5–6 ms band, where colocated nodes stop hearing each other in time to cancel.
 
 ### Topology Edge Persistence
 
@@ -502,10 +514,11 @@ relayer duplicated both, and the same wrap asked for an immediate wake-up afterw
 **Conditions for T1 to be scheduled:**
 1. The packet is a broadcast.
 2. Either we originated it, or we **deferred to an expected transmission**: the ranking gave us no
-   slot but did give one to somebody — a stock relay router or a ranked SR peer
-   (`armDeferredBroadcastRetransmit`). A relay we committed to arms no T1 — the relay is the copy,
-   and insuring our own transmission was never the point.
-3. A transmission is expected (a slot was given out) or a witness is owed — see **T1 stands in
+   rung but did give one to somebody — a stock relay router, a ranked SR peer, or an answerer
+   ahead of us in the acknowledgement pass (`armDeferredBroadcastRetransmit`). A relay we
+   committed to arms no T1 — the relay is the copy, and insuring our own transmission was never
+   the point.
+3. A transmission is expected — a rung was given out (`slotsGiven > 0`) — see **T1 stands in
    for a transmission** below.
 4. At least one direct neighbor with `hearsUs=true` exists — confirms we have a known neighbor before spending airtime on the retransmit.
 5. T1 retransmit is not disabled via config (`t1_retransmit_enabled`).
@@ -529,16 +542,27 @@ having travelled zero hops.
 **Cancellation:** Most incoming dupes trigger `cancelBroadcastRetransmit()` via `perhapsCancelDupe()` — including committed relays that decide to cancel, already-relayed detection, and non-SR originator dupes. The one exception is when a committed relay has unique coverage and keeps its queued TX: the queued relay is the copy, and a committed relay arms no T1.
 
 **T1 stands in for a transmission that was expected and did not happen, and for nothing else.**
-Deferring arms it when either is true, both known at that moment:
+Deferring arms it on one condition, known at that moment:
 
-- **A slot was given** — the ranking put a stock relay router (one that has not already transmitted this packet) or a ranked SR peer ahead of us. If their copy never comes, ours is the redundancy that covers the loss.
-- **A witness is owed** — `witnessOwed()`: the frame carries `want_ack`, reached us straight from its originator (`hop_start == hop_limit`), and `witnessOwner()` elects us. Stock turns a heard rebroadcast of its own packet into an implicit ACK (`ReliableRouter::shouldFilterReceived`) and otherwise retransmits `NUM_RELIABLE_RETX` times, so one elected witness replaces three frames from the sender. A frame that arrived relayed was already witnessed — the relay's own transmission is the rebroadcast its source heard.
+- **A rung was given out** — the ranking put a stock relay router (one that has not already transmitted this packet), a ranked SR peer, or an answerer from the acknowledgement pass ahead of us. If their copy never comes, ours is the redundancy that covers the loss.
 
-Neither reason means no transmission is expected and nobody is waiting to be told. Measured over 30 min on three field nodes (2026-09-08): declining those copies cut T1 traffic roughly tenfold while delivery between two colocated nodes was unchanged (3.2% asymmetric packet ids with the rule, 2.9% without).
+No rung given means no transmission is expected and nobody is waiting to be told. Measured over 30 min on three field nodes (2026-09-08): declining those copies cut T1 traffic roughly tenfold while delivery between two colocated nodes was unchanged (3.2% asymmetric packet ids with the rule, 2.9% without).
+
+**The `want_ack` witness election is gone.** A second arm condition used to fire when a frame carrying `want_ack` reached us straight from its originator and an election named us its answerer, on the theory that stock turns a heard rebroadcast of its own packet into an implicit ACK (`ReliableRouter::shouldFilterReceived`) and otherwise retransmits `NUM_RELIABLE_RETX` times. `Router::send` strips `want_ack` from every broadcast before it reaches the air — 0 of 83,727 broadcast receptions on this fleet carry the flag — so the term could never fire, and the need behind it is met by the acknowledgement pass, which does not depend on the flag.
+
+**The insurance copy carries no `want_ack` of its own.** The flag is cleared on the snapshot T1 stores, not in the shared relay builder: a copy that kept it would invite the far side to start its own reply ladder over a frame we sent only as redundancy.
 
 **Once armed, only a heard copy stands it down.** The coverage question is deliberately *not* asked again when the timer fires: it answers "who needs a relay", not "did the expected frame actually arrive". Two of the seven late copies measured on 2026-09-08 delivered frames to nodes the graph believed were covered, because the covering link was marginal (−84 to −93 dBm) and the frame was lost on it. Coverage is topology; per-frame loss is invisible to it, and T1 is the layer that absorbs it. An earlier revision re-tested coverage at fire time and would have cancelled both of those copies.
 
-**The witness election is not the coverage election.** `coverageOwner()` ranks a candidate's own edge *to* the target, which is the only evidence available for a neighbour nobody can be shown to reach. A witness needs the opposite direction: the originator must be able to hear the answer. `witnessOwner()` therefore requires positive evidence that the source hears the candidate — the source's own list naming it, or us watching the source carry its frame — and prices the link as the source measures it. Edge existence alone will not do: a direct observation writes both edge directions from one measurement, so that is our own assumption of symmetry. A source that publishes nothing leaves each node with only its own evidence, so several may elect themselves; that is still fewer than every node that heard the frame.
+**The acknowledgement pass: when the ladder comes out empty, somebody still answers.** The ranking drops every candidate with no unique coverage, because the cost it ranks on is the mean delivery cost over the unique targets and an empty target set has nothing to price. A fully-covered broadcast therefore earns no transmission at all — correct for coverage, wrong for the sender, because the only delivery confirmation stock has for a broadcast is hearing somebody rebroadcast it. Suppress every copy and its retry ladder runs into silence: the phone reports a failure for a message that in fact arrived everywhere.
+
+So `planAcknowledgement()` runs a second pass with its own price, only when the first pass left the ladder empty and nothing was reserved. It is scoped to a text broadcast that reached us straight from its originator (`isDirectPacket()`): a frame that arrived relayed was rebroadcast by definition, so its originator already has its confirmation.
+
+**It is the opposite direction from coverage.** `coverageOwner()` ranks a candidate's own edge *to* the target, which is the only evidence available for a neighbour nobody can be shown to reach. An acknowledgement needs the reverse: the originator must be able to hear the answer, because a copy it cannot hear tells it nothing. `NeighborGraph::acknowledgementPrice()` therefore demands positive, one-directional evidence — the source's own list naming the candidate, or us watching the source's traffic carried by it — prices the link as the source measures it, and refuses a guessed link or one past the coverage ceiling. Edge existence alone will not do: a direct observation writes both edge directions from one measurement, so that is our own assumption of symmetry, and symmetry is the one thing an acknowledgement may not assume. A source that publishes nothing leaves each node with only its own evidence, so several may answer; that is still fewer than every node that heard the frame.
+
+**Candidates** are ourselves plus the neighbours we can hear that are SR-active or immediate relay routers and have a price, ordered by that price in `SR_OWNER_COST_BUCKET` buckets, then by packet-id parity and node id so the duty rotates across packets rather than always falling to the same node. Rungs start at `SR_SLOT_ORIGIN_MS` and space by half an airtime, each with the same rung jitter the ranked ladder uses; a rung ahead of ours counts toward `slotsGiven`, so T1 insures an answer that never comes.
+
+**We stand down** for a neighbour that will rebroadcast regardless and will not cancel for us (`willNotCancelForUs()` — stock ROUTER and ROUTER_LATE, never an SR node) when it can hear the transmitter: its copy is already the acknowledgement, and ours would only add to it. A stock CLIENT is deliberately not such a node — it floods later than our rung and cancels on hearing us, so answering first removes its copy rather than adding to ours.
 
 **Guard against T2:** When T1 fires, `isRetransmitting = true` is set before calling `router->send()`. This prevents `maybeScheduleBroadcastRetransmit()` from scheduling a second retransmit when T1 re-enters the send path.
 
@@ -552,7 +576,7 @@ LoRa links are frequently asymmetric — node A can hear node B but B cannot hea
 
 **hearsUs from topology listing**: The same authority works in the positive direction. When node Y's topology broadcast lists *us* as a directly heard neighbor, SR sets `hearsUs=true` on our edge to Y. A node only packs neighbors it has a measured direct RSSI/SNR for, so being listed is proof Y heard us on RF. This is the only way an SR-passive neighbor can earn the flag — it broadcasts topology but never relays, so it can never prove bidirectionality by relaying one of our packets. SR-active neighbors gain the flag on their first topology report instead of waiting for that relay to happen.
 
-The flag matters in four places: T1 retransmit insurance (`hasAnyHearsUsNeighbor()` gates it, and `witnessOwner()` reads it as the proof that an originator can hear its witness), last-hop unicast hop limiting, route approval when sender connectivity is otherwise unverified, and our own outbound topology — which is what gives us bidi tier-1 priority in *other* nodes' relay-slot selection when that neighbor is the packet source. It does not affect stock-neighbor coverage, which only counts `Legacy` nodes.
+The flag matters in four places: T1 retransmit insurance (`hasAnyHearsUsNeighbor()` gates it) and the acknowledgement pass (`acknowledgementPrice()` reads it as the proof that an originator can hear an answer), last-hop unicast hop limiting, route approval when sender connectivity is otherwise unverified, and our own outbound topology — which is what gives us bidi tier-1 priority in *other* nodes' relay-slot selection when that neighbor is the packet source. It does not affect stock-neighbor coverage, which only counts `Legacy` nodes.
 
 Implemented by `confirmTopologySenderHearsUs()` in `SignalRoutingModule.h`, called from both topology-processing paths. Stale claims are bounded from both sides: the authoritative override clears the flag when Y's next topology omits us, and `pruneCapabilityCache()` clears it when Y stops broadcasting altogether (capability TTL).
 
@@ -560,7 +584,7 @@ A neighbour proves it hears us in three ways, and they share one definition (`co
 
 Edges come in three classes, and only two of them are evidence. `Reported` is a link we measured ourselves, `Mirrored` a measurement a peer published about one of its own links, and `Inferred` a link nobody measured — minted because a relayed frame crossed it, priced at a nominal RSSI/SNR. They rank in that order, and `updateEdge()` lets a weaker class neither overwrite a stronger one nor evict it from a full edge list, whichever arrives last. Before that rule one relayed frame repriced a link its own gateway had published as hopeless (ETX 15.9) down to the nominal 1.57, and two nodes holding identical reports disagreed about coverage according to which relayed frames each happened to hear.
 
-`hopCost()` prices only measured edges and returns nothing when a link is known only as a guess, so `covers()`, `coverageOwner()`, `witnessOwner()` and the slot rankings all refuse to let a guess excuse a transmission — no price means no coverage, which means relay. The route search prices its hops straight from the edges and still travels over an inferred edge, which is what inferring one is for. A candidate's coverage set is likewise what that candidate published, and for ourselves what we publish: inferred edges are in nobody's set, in the ranking, in absorb or in `uniqueCoverageNeighbor()`.
+`hopCost()` prices only measured edges and returns nothing when a link is known only as a guess, so `covers()`, `coverageOwner()`, `acknowledgementPrice()` and the slot rankings all refuse to let a guess excuse a transmission — no price means no coverage, which means relay. The route search prices its hops straight from the edges and still travels over an inferred edge, which is what inferring one is for. A candidate's coverage set is likewise what that candidate published, and for ourselves what we publish: inferred edges are in nobody's set, in the ranking, in absorb or in `uniqueCoverageNeighbor()`.
 
 Two writes that used to claim more than they knew now say what they are. An edge `gateway → source` is invented only when the gateway is a stock (`Legacy`) node or an unresolved placeholder, because the gateway is the only node that can publish that edge; reachability learned from relayed frames lives in the downstream table, gated separately on the source and the hop count, since no publisher supplies it. And the reverse direction synthesised while merging a topology — the sender's neighbour hearing the sender — is `Inferred`, because the sender published only its own direction; recorded as `Reported` it outranked and permanently blocked that neighbour's own measurement of the sender, and priced the delivery from our assumption of symmetry.
 

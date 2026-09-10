@@ -9,20 +9,35 @@
 
 ### Relay decisions
 ```
-[SR-DECISION] BROADCAST RELAY: from <src> via <heardFrom> (<reason>, delay=<N>ms)
-[SR-DECISION] BROADCAST SUPPRESS: from <src> via <heardFrom> (<reason>, delay=0ms)
+[SR-DEC] BROADCAST <RELAY|SUPPRESS> 0x<id>: from <src> via <heardFrom> (<reason>, delay=<N>ms, slots=<S>/res=<R>, abs=<A>)
+[SR-DEC] BROADCAST RELAY (forced) 0x<id>: for <nodeId> (down=<N>)
+[SR-DEC] UNICAST SUPPRESS 0x<id> <src>-><dst>: <reason>
 ```
+
+### Own role (once per boot)
+```
+[SR] Own role=<name> (<n>) preset=<name> node=0x<id>
+```
+Printed the first time the module runs. A capture without this line was started after boot, so the
+reset reason and the boot banner are missing from it.
 
 ### Slot scheduling (per packet)
 ```
-[SR] Slot scheduling for pkt 0x<id>: halfAirtime=<N>ms, <K> candidates
-[SR] Slot 0ms: stock router <nodeId> (already transmitted)
-[SR] Slot 0ms: SR node <nodeId> (coverage=<N>, cost=<F>)
-[SR] Slot 0ms: SR node <nodeId> (coverage=<N>, cost=<F>, bidi)
-[SR] Slot <N>ms: US (<myNode>) — assigned
-[SR] Slot <N>ms: US (<myNode>) — assigned (bidi)
+[SR] Slot scheduling 0x<id>: half=<N>ms, <K> cands, <P> pre-covered
+[SR] Slot <N>ms: stock <nodeId> (expected)
+[SR] Slot <N>ms: stock <nodeId> (already TX, absorbed <C>)
+[SR] Slot --: SR <nodeId> (already TX, coverage absorbed)
+[SR] Slot <N>ms: SR node <nodeId> (coverage=<U>/<T>, cost=<F>)
+[SR] Slot <N>ms: US (<myNode>) j=<J>ms
+[SR] Absorbed 0x<id>: <nodeId> covered <C>
+[SR] Acknowledging 0x<id> for <source> at <N>ms (<K> ahead of us)
 ```
-Only the node assigned "US" will relay. All slots are computed independently by each node. The `bidi` tag indicates the candidate has a confirmed bidirectional link (`hearsUs=true`, ETX < 20.0) to the packet source, giving it tier 1 priority over non-bidi candidates regardless of coverage.
+Only the node that logs "US" will relay. All rungs are computed independently by each node.
+Rungs start at `SR_SLOT_ORIGIN_MS` (250 ms), **not** at 0, and space by half an airtime;
+`j=` is that node's own strictly positive rung jitter, already included in the rung it printed.
+A `Slot --` line means the candidate consumed no rung. `Acknowledging` is the second pass that
+runs only when the ranking left the ladder empty — see the acknowledgement pass in
+`SIGNAL_ROUTING.md`.
 
 ### Channel QoS relay gating
 ```
@@ -30,38 +45,54 @@ Only the node assigned "US" will relay. All slots are computed independently by 
 ```
 Fires when channel utilization exceeds the tier threshold. Tiers: LOW (telemetry/position, >25%), MEDIUM (non-primary text, >30%), HIGH (routing/traceroute, >38%). CRITICAL (primary text, admin) is never dropped. If no QoS messages appear, channel utilization is below all thresholds.
 
+### Contention band (per transmission)
+```
+Tx delay id=0x<id> band=early why=<role|committed> cause=<initial|expired> delay=<N>ms
+Tx delay id=0x<id> band=late cause=<initial|expired> delay=<N>ms
+```
+`band=early` is stock's ROUTER draw, `band=late` every other role's. `cause=expired` is a redraw
+after the first schedule lapsed; a committed SR relay is re-anchored rather than redrawn from
+scratch. The two bands are meant to be disjoint — an `early` delay at or above the `late` floor
+means the SNR clamp in `getCWsize()` is not doing its job.
+
 ### Committed relay & TX
 ```
-[SR] Committed relay for packet 0x<id> (heardFrom 0x<id>, delay <N>ms)
+[SR] Committed relay 0x<id> (from 0x<id>, delay <N>ms)
 Started Tx (id=0x<id> ... relay=0x<byte> ...)
 Completed sending (id=0x<id> ...)
 ```
 
 ### T1 retransmit insurance
 ```
-[SR] T1 scheduled for 0x<id> (<portnum>) — fires in <N>ms (ROUTER_LATE window <W>ms + airtime <A>ms)
-[SR] T1 firing for 0x<id> — no relay heard in window; retransmitting now
+[SR] T1 for 0x<id> (<portnum>) in <N>ms (win <W>ms + air <A>ms + stag <S>ms)
+[SR] T1 firing 0x<id>: no relay heard, retransmitting
 [SR] T1 canceled for 0x<id> — relay confirmed heard
-[SR] T1 canceled for 0x<id> — all hearsUs neighbors already heard packet
-[SR] No confirmed relay neighbors — skipping T1 for 0x<id>   ← DEBUG, hearsUs=false on all edges
-[SR] Packet pool exhausted — skipping T1 for 0x<id>           ← WARN
-[SR] All retransmit slots occupied — dropping T1 for 0x<id>   ← WARN, MAX_PENDING_RETRANSMITS full
+[SR] No hearsUs neighbor: no T1 for 0x<id>        ← hearsUs=false on every edge
+[SR] Pool exhausted: no T1 for 0x<id>             ← WARN
+[SR] Retransmit slots full: no T1 for 0x<id>      ← WARN, MAX_PENDING_RETRANSMITS full
 ```
-T1 fires only if no dupe relay is heard before the timer expires. If a relay is heard (any path through `perhapsCancelDupe`), `T1 canceled — relay confirmed heard` appears instead. At fire time, `allHearsUsNeighborsHeardPacket()` checks whether every `hearsUs` neighbor already received the packet — via direct observation (they transmitted it) or graph inference (a known transmitter has a link to them). If so, `T1 canceled — all hearsUs neighbors already heard packet` appears. If `T1 firing` appears without either cancel, the original transmission was likely lost to interference.
+T1 is armed only when the ranking gave a rung to somebody else; `stag` is this node's own rung on
+the insurers' ladder, so several insurers do not fire together. It fires only if no dupe relay is
+heard before the timer expires — any path through `perhapsCancelDupe` logs `T1 canceled — relay
+confirmed heard` instead, and a copy heard after the timer fired still pulls the frame back out of
+the TX queue. The coverage question is deliberately **not** re-asked at fire time: it answers "who
+needs a relay", not "did the expected frame actually arrive", so `T1 firing` without a preceding
+cancel means the original transmission was lost, which is exactly what the insurance is for.
 
 ### Dupe suppression (post-TX cancellation)
 ```
-[SR] Dupe relayer <name> covers all our neighbors — relay is redundant
+[SR] SR neighbor <name> hears <nodeId> and covers all our unique nodes
 [SR] Canceling committed relay for 0x<id> - dupe relayer covers our nodes
 cancelSending id=0x<id>, removed=<0|1>      ← 1=cancelled before TX, 0=already sent
 [SR] Not canceling committed relay for 0x<id> - we have unique coverage
-[SR] Unique coverage: neighbor <nodeId> not covered by any coveredBy node
+[SR] Unique coverage in relay decision: neighbor <nodeId> uncovered
+[SR] Unique coverage fallthrough: neighbor <nodeId> uncovered
 ```
 
 ### Topology propagation
 ```
-[SR] Processing topology from <name>: <N> neighbors (version <V>, new version, relay=0x<byte>)
-[SR] Empty broadcast from direct SR neighbor <name> — marking topology dirty
+[SR] Processing topology from <name>: <N> neighbors (v<V>, <verdict>, relay=0x<byte>)
+[SR] Empty broadcast from <name>: topology reply scheduled
 [SR] Topology dirty — sending early broadcast
 [SR] Network Topology: <N> nodes, <K> direct neighbors
 ```
@@ -69,7 +100,7 @@ cancelSending id=0x<id>, removed=<0|1>      ← 1=cancelled before TX, 0=already
 ### Broadcast timing
 ```
 [SR] Topology dirty — sending early broadcast     ← dirty-triggered; only fires after cfgDirtyBroadcastSecs min interval
-[SR] Sending empty boot broadcast to bootstrap topology
+[SR] Sending empty boot broadcast
 [SR] Direct neighbor lost during aging — marking topology dirty
 ```
 The dirty broadcast respects a minimum inter-broadcast interval of `cfgDirtyBroadcastSecs`. When `markTopologyDirty()` is called it schedules `runOnce()` to wake at `max(0, cfgDirtyBroadcastSecs − elapsed_since_last_broadcast)`. If no topology changes occur the periodic broadcast fires every `cfgBroadcastSecs`.
@@ -91,9 +122,12 @@ When topology arrives from node X, any of X's listed neighbors that *we* cannot 
 
 ### Authoritative hearsUs override
 ```
-[SR] Clearing hearsUs on <name> -> <source>: source topology doesn't list <name> as neighbor
+[SR] <name> lists us: hearsUs
+[SR] <nodeId> lists <nodeId>: hearsUs
+[SR] <nodeId> routes through us: hearsUs confirmed
+[SR] Capability expired for <nodeId> — cleared hearsUs
 ```
-After processing a topology broadcast from node X, SR checks all graph nodes that claim `hearsUs=true` on their edge to X. If X didn't list that node as a neighbor, the flag is cleared — X is authoritative about who it can hear. This corrects stale bidi claims from nodes that X can no longer receive.
+After processing a complete topology broadcast from node X, SR checks all graph nodes that claim `hearsUs=true` on their edge to X. If X did not list that node as a neighbor, the flag is cleared — X is authoritative about who it can hear. This corrects stale bidi claims from nodes X can no longer receive. The override runs only on a complete list: a continuation chunk arriving without its first chunk must not clear anything.
 
 **Stale downstream entries at boot**: a topology from a gateway node may arrive before the gateway's first direct packet. The gateway would be incorrectly marked as downstream of the topology sender. This self-corrects: when the first direct packet from the gateway is received, `clearDownstreamForDestination` removes all downstream entries where that node is the destination.
 
@@ -105,10 +139,8 @@ In the topology dump, each direct neighbor has two sub-sections:
 
 ### Last-hop unicast hop limiting
 ```
-[SR] Limiting hop_limit=0 for unicast relay 0x<id>: dest is direct hearsUs neighbor, stock neighbors present
-[SR] Limiting hop_limit=1 for unicast relay 0x<id>: dest is direct hearsUs neighbor, stock neighbors present
-[SR] Limiting hop_limit=0 for originated unicast 0x<id>: dest is direct hearsUs neighbor, stock neighbors present
-[SR] Limiting hop_limit=1 for originated unicast 0x<id>: dest is direct hearsUs neighbor, stock neighbors present
+[SR] Last hop for unicast relay 0x<id>: hop_limit=<N>, next_hop=0x<byte>
+[SR] Last hop for originated unicast 0x<id>: hop_limit=<N>, next_hop=0x<byte>
 ```
 These fire when the destination is a confirmed direct neighbor (`hearsUs=true`) and at least one other direct neighbor is a stock node. Good links (ETX < 3.0) get `hop_limit=0` (direct delivery, no further relay). Marginal links (ETX ≥ 3.0) get `hop_limit=1`, allowing one retry relay if our transmission is lost. If `hop_limit=1` appears frequently for a link that should be reliable, check the ETX on that edge.
 
@@ -124,7 +156,7 @@ Look for multiple `Started Tx` lines with the same packet ID across logs — tha
 For a broadcast from node X, check each other node's log for:
 1. `Slot scheduling` — what slots were assigned
 2. `Not canceling … unique coverage` — why dupe suppression failed
-3. `Unique coverage: neighbor <id> not covered` — which neighbor was missing from the relayer's edge set
+3. `Unique coverage ...: neighbor <id> uncovered` — which neighbor was missing from the relayer's edge set
 
 ### Step 3 — check topology at decision time
 Find the last topology processing line **before** the packet's `Slot scheduling` line:
@@ -147,7 +179,7 @@ Check that all expected branch nodes are in each other's direct neighbor lists. 
 - **Unicast to unknown destination suppressed**: if the destination is not in the SR graph, not in NodeDB, and not in the downstream table, SR suppresses the relay entirely (`UNICAST SUPPRESS ... unknown destination — not in SR graph or NodeDB`). This is expected — relaying for completely unknown destinations wastes airtime. If the destination should be known, check topology propagation and NodeDB state.
 - **Incorrect slot ordering**: a node picks an early slot when a better-covered node should go first. Compare coverage counts and costs in the slot schedule across both logs.
 - **Topology staleness**: relay decisions based on outdated edges. Compare topology processing timestamps against packet scheduling timestamps.
-- **Stock nodes relaying last-hop unicasts**: if you see a stock node retransmitting a unicast that was already destined for a direct neighbor, check whether `getUnicastHopLimitForDirectNeighbor` fired (look for the `Limiting hop_limit` log lines). If it did not fire, verify that `hearsUs=true` is set on the destination's edge and that the sender had at least one stock direct neighbor.
+- **Stock nodes relaying last-hop unicasts**: if you see a stock node retransmitting a unicast that was already destined for a direct neighbor, check whether `getUnicastHopLimitForDirectNeighbor` fired (look for the `Last hop for` log lines). If it did not fire, verify that `hearsUs=true` is set on the destination's edge and that the sender had at least one stock direct neighbor.
 - **T1 firing frequently**: indicates the original T0 transmission is regularly lost to interference or overlapping transmissions. If `T1 firing` appears often without a prior `T1 canceled` (either variant), investigate RF environment. If `T1 canceled — relay confirmed heard` consistently appears, a neighbor retransmitted our relay. If `T1 canceled — all hearsUs neighbors already heard packet` appears, all neighbors already had the packet from another path — graph-based inference prevented a redundant retransmit.
 - **T1 never scheduled**: check that `hearsUs=true` is set on at least one direct neighbor edge (requires that neighbor to have relayed one of our packets), and that `t1_retransmit_enabled=true` in config.
 - **Delayed topology dirty broadcast**: the early broadcast fires after at most `cfgDirtyBroadcastSecs` from the last broadcast. If it never fires, check whether `markTopologyDirty()` was actually called — it only triggers on direct-edge events (new/changed/lost direct neighbor, or SR-zero bootstrap). Remote topology changes do not trigger it by design.
