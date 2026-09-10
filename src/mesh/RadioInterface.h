@@ -202,7 +202,22 @@ class RadioInterface
     [[nodiscard]] bool shouldRebroadcastEarlyLikeRouter(meshtastic_MeshPacket *p);
 
     /** The delay to use when we want to flood a message. Use a weighted scale based on SNR */
-    [[nodiscard]] uint32_t getTxDelayMsecWeighted(meshtastic_MeshPacket *p);
+    /**
+     * Why a weighted transmit delay was drawn. The *band* is decided by the packet (a ROUTER role
+     * or a committed relay draws early, everyone else draws behind the routers); the *call path*
+     * is known only to the caller. Neither can be recovered from the other in a log, and the
+     * expired-redraw path is the only one that indicates a rung was missed — so it has to be
+     * named at the point of the draw.
+     */
+    enum class TxDelayCause {
+        /// First schedule for this packet: no send time was pending.
+        InitialSchedule,
+        /// The packet's send time had already passed, so the delay is drawn again from now. A
+        /// relay taking this path has lost the position it was given.
+        ExpiredRedraw,
+    };
+
+    [[nodiscard]] uint32_t getTxDelayMsecWeighted(meshtastic_MeshPacket *p, TxDelayCause cause);
 
     /** If the packet is not already in the late rebroadcast window, move it there */
     virtual void clampToLateRebroadcastWindow(NodeNum from, PacketId id) { return; }

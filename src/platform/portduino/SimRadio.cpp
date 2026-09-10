@@ -66,7 +66,7 @@ void SimRadio::startTransmitTimerRebroadcast(meshtastic_MeshPacket *p)
 {
     // If we have work to do and the timer wasn't already scheduled, schedule it now
     if (!txQueue.empty()) {
-        uint32_t delayMsec = getTxDelayMsecWeighted(p);
+        uint32_t delayMsec = getTxDelayMsecWeighted(p, TxDelayCause::InitialSchedule);
         // LOG_DEBUG("xmit timer %d", delay);
         notifyLater(delayMsec, TRANSMIT_DELAY_COMPLETED, false);
     }

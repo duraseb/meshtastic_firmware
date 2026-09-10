@@ -632,22 +632,28 @@ bool RadioInterface::shouldRebroadcastEarlyLikeRouter(meshtastic_MeshPacket *p)
 }
 
 /** The delay to use when we want to flood a message */
-uint32_t RadioInterface::getTxDelayMsecWeighted(meshtastic_MeshPacket *p)
+uint32_t RadioInterface::getTxDelayMsecWeighted(meshtastic_MeshPacket *p, TxDelayCause cause)
 {
     //  high SNR = large CW size (Long Delay)
     //  low SNR = small CW size (Short Delay)
     float snr = p->rx_snr;
     uint32_t delay = 0;
     uint8_t CWsize = getCWsize(snr);
+    const char *causeName = cause == TxDelayCause::ExpiredRedraw ? "expired" : "initial";
     // LOG_DEBUG("rx_snr of %f so setting CWsize to:%d", snr, CWsize);
     if (shouldRebroadcastEarlyLikeRouter(p)) {
+        // Name why the early band applies. A ROUTER draws there for every rebroadcast, a
+        // committed relay only for the packet it committed to, and the two are not the same
+        // population — one log line for both cannot say which, and only the committed case says
+        // anything about the relay ladder.
+        const char *bandReason = config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER ? "role" : "committed";
         delay = random(0, 2 * CWsize) * slotTimeMsec;
         if (delay == 0) delay = slotTimeMsec; // ensure at least one slot — prevents tight busyRx retry loops
-        LOG_DEBUG("rx_snr found in packet. Router: setting tx delay:%d", delay);
+        LOG_DEBUG("Tx delay id=0x%08x band=early why=%s cause=%s delay=%ums", p->id, bandReason, causeName, delay);
     } else {
         // offset the maximum delay for routers: (2 * CWmax * slotTimeMsec)
         delay = (2 * CWmax * slotTimeMsec) + random(0, pow_of_2(CWsize)) * slotTimeMsec;
-        LOG_DEBUG("rx_snr found in packet. Setting tx delay:%d", delay);
+        LOG_DEBUG("Tx delay id=0x%08x band=late cause=%s delay=%ums", p->id, causeName, delay);
     }
 
     return delay;

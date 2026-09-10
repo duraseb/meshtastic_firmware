@@ -321,7 +321,8 @@ void RadioLibInterface::setTransmitDelay()
             notifyLater(remaining, TRANSMIT_DELAY_COMPLETED, false);
         } else {
             // tx_after is in the past — add normal CW delay from now
-            unsigned long add_delay = p->rx_rssi ? getTxDelayMsecWeighted(p) : getTxDelayMsec();
+            unsigned long add_delay =
+                p->rx_rssi ? getTxDelayMsecWeighted(p, TxDelayCause::ExpiredRedraw) : getTxDelayMsec();
             p->tx_after = now + add_delay;
             notifyLater(add_delay, TRANSMIT_DELAY_COMPLETED, false);
         }
@@ -351,7 +352,7 @@ void RadioLibInterface::startTransmitTimerRebroadcast(meshtastic_MeshPacket *p)
 {
     // If we have work to do and the timer wasn't already scheduled, schedule it now
     if (!txQueue.empty()) {
-        uint32_t delay = getTxDelayMsecWeighted(p);
+        uint32_t delay = getTxDelayMsecWeighted(p, TxDelayCause::InitialSchedule);
         // Record the target send time on the packet so that subsequent setTransmitDelay()
         // calls triggered by ISR_RX or isChannelActive can respect the already-pending
         // deadline instead of drawing a new random delay from scratch each time.
