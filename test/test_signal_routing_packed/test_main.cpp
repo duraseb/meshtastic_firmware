@@ -2,6 +2,7 @@
 #include "mesh/NodeDB.h"
 #include "mesh/graph/NeighborGraph.h"
 #include "mesh/SignalRoutingModule.h"
+#include <cmath>
 #include <cstring>
 #include <unity.h>
 
@@ -101,8 +102,8 @@ static void test_merge_cost_from_decoded_signal()
     uint8_t count = decodePackedNeighbors(buf, packedLen, out, 1);
     TEST_ASSERT_EQUAL_UINT8(1, count);
 
-    float etx = NeighborGraph::calculateETX(out[0].rssi, out[0].snr);
-    float expected = NeighborGraph::calculateETX(rssi, snr);
+    float etx = NeighborGraph::calculateETX(out[0].rssi, out[0].snr, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST);
+    float expected = NeighborGraph::calculateETX(rssi, snr, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST);
     TEST_ASSERT_FLOAT_WITHIN(0.001f, expected, etx);
 }
 
@@ -171,14 +172,18 @@ static void test_refresh_reported_direct_neighbor_updates_cache_and_variance()
     DirectNeighborSignal signals[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE] = {};
     uint8_t signalCount = 0;
 
+    // -80/10 and -70/12 both clear LONG_FAST's decode threshold by a wide margin and saturate to
+    // the same delivery probability under the margin-dominant curve, so they no longer pin a
+    // variance change (the point of this test) — -90/-15 sits well below the margin curve's
+    // saturation point, so moving to -70/12 is a real change under the new curve too.
     int first = refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE,
-                                                         localNode, gateway, -80, 10.0f, 1000);
+                                                         localNode, gateway, -90, -15.0f, 1000);
     TEST_ASSERT_EQUAL_INT(EDGE_NEW, first);
 
     const DirectNeighborSignal *initial = lookupDirectNeighborSignal(signals, signalCount, gateway);
     TEST_ASSERT_NOT_NULL(initial);
-    TEST_ASSERT_EQUAL_INT8(-80, initial->rssi);
-    TEST_ASSERT_EQUAL_INT8(10, initial->snr);
+    TEST_ASSERT_EQUAL_INT8(-90, initial->rssi);
+    TEST_ASSERT_EQUAL_INT8(-15, initial->snr);
 
     const NodeEdges *myEdges = graph.getEdgesFrom(localNode);
     TEST_ASSERT_NOT_NULL(myEdges);
@@ -247,7 +252,7 @@ static void test_mirrored_edge_update_does_not_upgrade_reported_edge()
     refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, localNode,
                                              neighbor, -75, 8.0f, 2000);
 
-    float mirroredEtx = NeighborGraph::calculateETX(-50, 15.0f);
+    float mirroredEtx = NeighborGraph::calculateETX(-50, 15.0f, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST);
     int mirroredChange = graph.updateEdge(localNode, neighbor, mirroredEtx, 2001, Edge::Source::Mirrored);
     TEST_ASSERT_EQUAL_INT(EDGE_NO_CHANGE, mirroredChange);
 
@@ -1108,6 +1113,191 @@ void test_unicast_slot_waits_are_floors_not_addends()
     TEST_ASSERT_TRUE(srUnicastSlotDelayMs(0, 3, floorMs, leaderWait, half) > 0);
 }
 
+// The ranking inversion the recalibration exists to fix: at SHORT_SLOW (SF8, threshold -10 dB), a
+// link heard at -104 dBm/-12 dB (margin -2, below threshold) must price above the ETX 7 coverage
+// ceiling, while a link heard at -106 dBm/-5 dB (margin +5, above threshold) must clear it — even
+// though the first has 2 dB more RSSI. Both figures are from a field capture on this fleet.
+// (!046b553a and !ee594922's views of !94d4a83a).
+void test_below_threshold_link_prices_above_the_coverage_ceiling_at_short_slow()
+{
+    float etx = NeighborGraph::calculateETX(-104, -12.0f, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW);
+    TEST_ASSERT_TRUE(etx > 7.0f);
+}
+
+void test_above_threshold_link_clears_the_coverage_ceiling_at_short_slow()
+{
+    float etx = NeighborGraph::calculateETX(-106, -5.0f, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW);
+    TEST_ASSERT_TRUE(etx <= 7.0f);
+}
+
+// The same pair at LONG_SLOW (SF12, threshold -20 dB), where both clear the threshold, are both
+// usable — the recalibration should admit wrongly-excluded links, not just flip one comparison.
+void test_both_links_are_usable_at_long_slow()
+{
+    float below = NeighborGraph::calculateETX(-104, -12.0f, meshtastic_Config_LoRaConfig_ModemPreset_LONG_SLOW);
+    float above = NeighborGraph::calculateETX(-106, -5.0f, meshtastic_Config_LoRaConfig_ModemPreset_LONG_SLOW);
+    TEST_ASSERT_TRUE(below <= 7.0f);
+    TEST_ASSERT_TRUE(above <= 7.0f);
+}
+
+// +8 dB of margin or more is the saturation point; going further must not lower the ETX any more,
+// at a fast preset (SF7, threshold -7.5) or a slow one (SF12, threshold -20).
+void test_margin_saturates_at_the_top_regardless_of_preset()
+{
+    float atCap = NeighborGraph::calculateETX(-60, -7.5f + 8.0f, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_FAST);
+    float pastCap = NeighborGraph::calculateETX(-60, 20.0f, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_FAST);
+    TEST_ASSERT_EQUAL_FLOAT(atCap, pastCap);
+
+    float atCapSlow = NeighborGraph::calculateETX(-60, -20.0f + 8.0f, meshtastic_Config_LoRaConfig_ModemPreset_LONG_SLOW);
+    float pastCapSlow = NeighborGraph::calculateETX(-60, 20.0f, meshtastic_Config_LoRaConfig_ModemPreset_LONG_SLOW);
+    TEST_ASSERT_EQUAL_FLOAT(atCapSlow, pastCapSlow);
+}
+
+// Deepest negative margin at the strongest RSSI reproduces the old curve's sentinel value; at the
+// weakest RSSI it is a little higher, because RSSI is now a mild factor, not a veto.
+void test_deep_below_threshold_hits_the_curves_floor()
+{
+    float strongRssi = NeighborGraph::calculateETX(-60, -100.0f, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW);
+    float weakRssi = NeighborGraph::calculateETX(-130, -100.0f, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW);
+    TEST_ASSERT_FLOAT_WITHIN(0.05f, 40.0f, strongRssi);
+    TEST_ASSERT_TRUE(weakRssi > strongRssi);
+    TEST_ASSERT_TRUE(weakRssi < 45.0f);
+}
+
+void test_non_finite_snr_prices_as_hopeless_not_perfect()
+{
+    float etxNan = NeighborGraph::calculateETX(-60, NAN, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW);
+    TEST_ASSERT_TRUE(etxNan > 7.0f);
+    float etxInf = NeighborGraph::calculateETX(-60, INFINITY, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW);
+    TEST_ASSERT_TRUE(etxInf > 7.0f);
+}
+
+// A two-point sample (weak vs. strong) cannot see a kink between the endpoints — sweep the whole
+// domain in both dimensions instead.
+void test_curve_is_monotonic_in_rssi_and_snr()
+{
+    const meshtastic_Config_LoRaConfig_ModemPreset presets[] = {
+        meshtastic_Config_LoRaConfig_ModemPreset_SHORT_FAST,
+        meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW,
+        meshtastic_Config_LoRaConfig_ModemPreset_LONG_SLOW,
+    };
+    for (auto preset : presets) {
+        float previous = INFINITY;
+        for (int32_t rssi = -140; rssi <= -20; rssi++) {
+            float etx = NeighborGraph::calculateETX(rssi, 5.0f, preset);
+            TEST_ASSERT_TRUE(etx <= previous + 1e-4f);
+            previous = etx;
+        }
+
+        previous = INFINITY;
+        for (int tenthsOfDb = -300; tenthsOfDb <= 300; tenthsOfDb += 5) { // -30.0..+30.0 dB, 0.5 dB steps
+            float snr = static_cast<float>(tenthsOfDb) / 10.0f;
+            float etx = NeighborGraph::calculateETX(-90, snr, preset);
+            TEST_ASSERT_TRUE(etx <= previous + 1e-4f);
+            previous = etx;
+        }
+    }
+}
+
+// etxToSignal has no production caller; this pins that it round-trips through
+// calculateETX to within 10% and that it reports the fixed representative RSSI.
+// This particular sample round-trips to within 2.5% — a sanity check that the inverse is wired up
+// at all, not a claim about the function's worst case. See
+// test_round_trip_worst_case_is_bounded below for the real bound.
+void test_etx_to_signal_round_trips_within_ten_percent()
+{
+    int32_t rssi = 0;
+    int32_t snr = 0;
+    float etx = NeighborGraph::calculateETX(-75, 8.0f, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW);
+    NeighborGraph::etxToSignal(etx, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW, rssi, snr);
+    float again = NeighborGraph::calculateETX(rssi, static_cast<float>(snr), meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW);
+    float relDiff = fabsf(again - etx) / etx;
+    TEST_ASSERT_TRUE(relDiff < 0.10f);
+    TEST_ASSERT_EQUAL_INT32(-60, rssi);
+}
+
+// etxToSignal reports SNR as an integer (the wire format's own type), so recovering it from a
+// continuous margin loses up to 1 dB to truncation. Near the curve's steep transition that dB can
+// swing the recomputed ETX far from the original — the sample above (2.5% drift) is not
+// representative. Swept over ETX 1.0-50.0 in 0.01 steps at every preset whose threshold falls on a
+// whole number of dB (SF8/10/12: SHORT_SLOW, MEDIUM_SLOW, LONG_SLOW), the true worst case is
+// ~43.7% at ETX ~6.666. Pinned here, with headroom, so the 10% figure above is never mistaken for
+// a universal bound.
+void test_round_trip_worst_case_is_bounded()
+{
+    const meshtastic_Config_LoRaConfig_ModemPreset presets[] = {
+        meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW,
+        meshtastic_Config_LoRaConfig_ModemPreset_MEDIUM_SLOW,
+        meshtastic_Config_LoRaConfig_ModemPreset_LONG_SLOW,
+    };
+    for (auto preset : presets) {
+        float worst = 0.0f;
+        for (int32_t hundredthsOfEtx = 100; hundredthsOfEtx <= 5000; hundredthsOfEtx++) {
+            float etx = static_cast<float>(hundredthsOfEtx) / 100.0f;
+            int32_t rssi = 0;
+            int32_t snr = 0;
+            NeighborGraph::etxToSignal(etx, preset, rssi, snr);
+            float recomputed = NeighborGraph::calculateETX(rssi, static_cast<float>(snr), preset);
+            float relDiff = fabsf(recomputed - etx) / etx;
+            if (relDiff > worst) {
+                worst = relDiff;
+            }
+        }
+        TEST_ASSERT_TRUE(worst < 0.45f);
+    }
+}
+
+// Mutation-tested pins. A reviewer mutated four single constants in this curve and found the
+// existing suite (42/42) let every one through undetected. Each test below is designed, and was
+// verified by hand, to fail under one specific mutation: apply it, run the suite, confirm the
+// failure, then revert. Expected values are computed independently in dB/probability arithmetic
+// (see the comment on each), not by re-deriving them from this module's own interpolation code —
+// restating the implementation would not catch a wrong constant.
+
+// SHORT_SLOW's threshold is -10 dB; SNR == -10 dB is exactly zero margin — the single most
+// consequential point on the curve, because it is exactly where ETX crosses the 7.0 coverage
+// ceiling. RSSI is pinned at the RSSI factor's saturating end (-60, >= the breakpoint) so the RSSI
+// term is exactly 1.0 and cannot mask a change in the margin term. Expected:
+// 1 / (marginProb[3] * 1.0) = 1 / 0.15 = 6.6667.
+void test_margin_at_threshold_pins_the_zero_margin_probability()
+{
+    float etx = NeighborGraph::calculateETX(-60, -10.0f, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 6.6667f, etx);
+}
+
+// 1 dB below SHORT_SLOW's threshold (SNR -11.0, margin -1.0) interpolates between
+// marginBreakDb[2] = -2 (prob 0.10) and marginBreakDb[3] = 0 (prob 0.15): prob =
+// 0.10 + 0.5*(0.15-0.10) = 0.125, ETX = 8.0 exactly. Moving marginBreakDb[3] to -1.0 puts this same
+// margin exactly on the (moved) breakpoint, collapsing the result to marginProb[3] = 0.15 and ETX
+// 6.6667 instead — a large, easily-detected swing that the zero-margin test above cannot
+// distinguish from a marginProb[3] mutation on its own.
+void test_margin_one_db_below_threshold_pins_the_zero_margin_breakpoint()
+{
+    float etx = NeighborGraph::calculateETX(-60, -11.0f, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 8.0f, etx);
+}
+
+// SNR -15.0 at SHORT_SLOW is margin -5.0, exactly marginBreakDb[1]: prob = marginProb[1] = 0.05,
+// ETX = 20.0 exactly. Isolated from the other three mutations above (touches only index 1).
+void test_margin_five_db_below_threshold_pins_the_low_breakpoint_probability()
+{
+    float etx = NeighborGraph::calculateETX(-60, -15.0f, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 20.0f, etx);
+}
+
+// Margin pinned at the saturation point (SNR -2.0 at SHORT_SLOW is margin +8.0, so delivery
+// probability is flat at marginProb[5] = 0.95) isolates the RSSI term. At RSSI -110 dBm, strictly
+// between rssiFactorBreakDbm's -120 and -60: t = (-110 - (-120)) / 60 = 1/6,
+// rssiFactor = 0.90 + (1/6)*0.10 = 0.91667, prob = 0.95 * 0.91667 = 0.87083,
+// ETX = 1/0.87083 = 1.14833. Moving rssiFactorBreakDbm[0] from -120 to -100 puts -110
+// at-or-below the new breakpoint, so the RSSI factor collapses to the flat 0.90 and ETX becomes
+// 1.16959 instead.
+void test_weak_rssi_at_saturated_margin_pins_the_rssi_floor_breakpoint()
+{
+    float etx = NeighborGraph::calculateETX(-110, -2.0f, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW);
+    TEST_ASSERT_FLOAT_WITHIN(0.0005f, 1.14833f, etx);
+}
+
 void setup()
 {
     initializeTestEnvironment();
@@ -1148,6 +1338,19 @@ void setup()
     RUN_TEST(test_topology_version_verdict_rules);
     RUN_TEST(test_expired_relay_keeps_its_ladder_separation);
     RUN_TEST(test_unicast_slot_waits_are_floors_not_addends);
+    RUN_TEST(test_below_threshold_link_prices_above_the_coverage_ceiling_at_short_slow);
+    RUN_TEST(test_above_threshold_link_clears_the_coverage_ceiling_at_short_slow);
+    RUN_TEST(test_both_links_are_usable_at_long_slow);
+    RUN_TEST(test_margin_saturates_at_the_top_regardless_of_preset);
+    RUN_TEST(test_deep_below_threshold_hits_the_curves_floor);
+    RUN_TEST(test_non_finite_snr_prices_as_hopeless_not_perfect);
+    RUN_TEST(test_curve_is_monotonic_in_rssi_and_snr);
+    RUN_TEST(test_etx_to_signal_round_trips_within_ten_percent);
+    RUN_TEST(test_round_trip_worst_case_is_bounded);
+    RUN_TEST(test_margin_at_threshold_pins_the_zero_margin_probability);
+    RUN_TEST(test_margin_one_db_below_threshold_pins_the_zero_margin_breakpoint);
+    RUN_TEST(test_margin_five_db_below_threshold_pins_the_low_breakpoint_probability);
+    RUN_TEST(test_weak_rssi_at_saturated_margin_pins_the_rssi_floor_breakpoint);
 
     UNITY_END();
 }

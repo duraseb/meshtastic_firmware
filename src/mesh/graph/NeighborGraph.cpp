@@ -1,4 +1,5 @@
 #include "NeighborGraph.h"
+#include "MeshRadio.h"
 #include "configuration.h"
 
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
@@ -869,81 +870,162 @@ void NeighborGraph::clearDownstreamForDestination(NodeNum destination)
 }
 
 // --- Static methods ---
+//
+// LoRa link viability is governed by SNR clearing the demodulator's threshold for the spreading
+// factor in use, not by absolute RSSI: that threshold (the datasheet's minimum SNR) runs from about
+// -7.5 dB at SF7 to about -20 dB at SF12, well below the noise floor. Absolute RSSI mainly sets the
+// noise floor; alone it predicts little. So the curve below is built around *decode margin* —
+// reported SNR minus the current preset's spreading-factor threshold — with RSSI kept only as a
+// mild secondary term, never a veto.
 
-float NeighborGraph::calculateETX(int32_t rssi, float snr)
+// SX126x/SX127x datasheet demodulator SNR limit at SF7, dB, and the per-spreading-factor step: the
+// published table (-7.5 dB at SF7 down to -20 dB at SF12) falls on a straight line, 2.5 dB per SF.
+static constexpr float SF7_SNR_THRESHOLD_DB = -7.5f;
+static constexpr float SNR_THRESHOLD_STEP_DB_PER_SF = -2.5f;
+
+// Decode-margin breakpoints (dB above the preset's demodulator threshold) and the delivery
+// probability at each: steep across a narrow band around zero margin, because a LoRa demodulator is
+// close to a step function at its threshold, not a gradual slope over tens of dB the way path loss
+// is over distance. Flat below the first point and above the last.
+static constexpr float marginBreakDb[] = {-10.0f, -5.0f, -2.0f, 0.0f, 3.0f, 8.0f};
+static constexpr float marginProb[] = {0.025f, 0.05f, 0.10f, 0.15f, 0.50f, 0.95f};
+static constexpr int MARGIN_N = 6;
+
+// RSSI quality factor breakpoints (dBm) and the multiplier at each: a mild, monotonic secondary
+// term — capture effect, interference margin, estimate confidence — never large enough to be a veto
+// the way the old curve's RSSI term was. Flat below the first point and above the last.
+static constexpr int32_t rssiFactorBreakDbm[] = {-120, -60};
+static constexpr float rssiFactor[] = {0.90f, 1.00f};
+
+// A reported SNR that fails std::isfinite (a corrupted register read; the clamp upstream of this
+// module is not something to rely on, per design) is priced as though it were this value — far
+// enough below every preset's threshold that decode margin is deeply negative regardless of preset.
+// Without this, every comparison in the margin/RSSI curves against a NaN SNR is false, which falls
+// through to the interpolation branch and produces a NaN delivery probability; a NaN cast to
+// uint16_t is undefined behaviour in C++, a worse failure mode than simply pricing the link wrong.
+static constexpr float NON_FINITE_SNR_FALLBACK_DB = -100.0f;
+
+// Datasheet-derived demodulator SNR threshold for a spreading factor: total for any spreading
+// factor value (not just the 7..=12 range every known preset selects), by extrapolating the same
+// line rather than gating on it.
+static inline float spreadingFactorSnrThresholdDb(uint8_t spreadingFactor)
 {
-    static constexpr int32_t rssiBreak[] = {-110, -100, -90, -80, -70, -60};
-    static constexpr float probBreak[] = {0.05f, 0.15f, 0.40f, 0.65f, 0.85f, 0.95f};
-    static constexpr int N = 6;
+    return SF7_SNR_THRESHOLD_DB + SNR_THRESHOLD_STEP_DB_PER_SF * (static_cast<float>(spreadingFactor) - 7.0f);
+}
 
-    float deliveryProb;
-    if (rssi <= rssiBreak[0]) {
-        deliveryProb = probBreak[0];
-    } else if (rssi >= rssiBreak[N - 1]) {
-        deliveryProb = probBreak[N - 1];
-    } else {
-        int seg = 0;
-        for (int i = 1; i < N; i++) {
-            if (rssi < rssiBreak[i]) {
-                seg = i - 1;
-                break;
-            }
+// Delivery probability contributed by decode margin: a six-point piecewise-linear map, total over
+// any float margin (including non-finite ones, after the caller's non-finite guard has run).
+static inline float marginDeliveryProbability(float marginDb)
+{
+    if (marginDb <= marginBreakDb[0]) {
+        return marginProb[0];
+    }
+    if (marginDb >= marginBreakDb[MARGIN_N - 1]) {
+        return marginProb[MARGIN_N - 1];
+    }
+    int seg = 0;
+    for (int i = 1; i < MARGIN_N; i++) {
+        if (marginDb < marginBreakDb[i]) {
+            seg = i - 1;
+            break;
         }
-        float t = static_cast<float>(rssi - rssiBreak[seg]) / static_cast<float>(rssiBreak[seg + 1] - rssiBreak[seg]);
-        deliveryProb = probBreak[seg] + t * (probBreak[seg + 1] - probBreak[seg]);
     }
+    float t = (marginDb - marginBreakDb[seg]) / (marginBreakDb[seg + 1] - marginBreakDb[seg]);
+    return marginProb[seg] + t * (marginProb[seg + 1] - marginProb[seg]);
+}
 
-    float snrFactor;
-    if (snr <= 0.0f) {
-        snrFactor = 0.5f;
-    } else if (snr >= 10.0f) {
-        snrFactor = 1.0f;
-    } else {
-        snrFactor = 0.5f + snr * 0.05f;
+// The RSSI quality factor: total over any int32_t RSSI, including absurd inputs.
+static inline float rssiQualityFactor(int32_t rssi)
+{
+    if (rssi <= rssiFactorBreakDbm[0]) {
+        return rssiFactor[0];
     }
-    deliveryProb *= snrFactor;
+    if (rssi >= rssiFactorBreakDbm[1]) {
+        return rssiFactor[1];
+    }
+    float t =
+        static_cast<float>(rssi - rssiFactorBreakDbm[0]) / static_cast<float>(rssiFactorBreakDbm[1] - rssiFactorBreakDbm[0]);
+    return rssiFactor[0] + t * (rssiFactor[1] - rssiFactor[0]);
+}
+
+// Resolves the preset's spreading factor and delegates to the spreading-factor overload below.
+// This is only correct when the radio is actually demodulating at the preset's spreading factor —
+// i.e. config.lora.use_preset is true. When it is false the radio uses config.lora.spread_factor
+// instead (RadioInterface::applyModemConfig), so a caller in that state must call the
+// spreading-factor overload directly with the actual configured value, not this one — otherwise
+// the curve prices against a demodulator threshold the radio isn't using, by up to 12.5 dB of
+// margin (SF7 to SF12's spread). See SignalRoutingModule.h's currentCostingSpreadingFactor().
+float NeighborGraph::calculateETX(int32_t rssi, float snr, meshtastic_Config_LoRaConfig_ModemPreset preset)
+{
+    float bwKHz = 0.0f;
+    uint8_t sf = 0;
+    uint8_t cr = 0;
+    modemPresetToParams(preset, false, bwKHz, sf, cr);
+    return calculateETX(rssi, snr, sf);
+}
+
+// The spreading factor is the only preset-derived quantity the curve reads — see the datasheet
+// comment block above. Total for every (spreadingFactor, rssi, snr), including non-finite snr and
+// spreading factor values outside the 7..=12 range every known preset selects (extrapolated along
+// the same line, not gated on it).
+float NeighborGraph::calculateETX(int32_t rssi, float snr, uint8_t spreadingFactor)
+{
+    float safeSnr = std::isfinite(snr) ? snr : NON_FINITE_SNR_FALLBACK_DB;
+    float margin = safeSnr - spreadingFactorSnrThresholdDb(spreadingFactor);
+    float deliveryProb = marginDeliveryProbability(margin) * rssiQualityFactor(rssi);
 
     return (deliveryProb > 0.0f) ? (1.0f / deliveryProb) : 100.0f;
 }
 
-void NeighborGraph::etxToSignal(float etx, int32_t &rssi, int32_t &snr)
+// Resolves the preset's spreading factor and delegates to the spreading-factor overload below.
+// Correct only when config.lora.use_preset is true; see the calculateETX preset overload above for
+// why. No production caller depends on either etxToSignal overload's output.
+void NeighborGraph::etxToSignal(float etx, meshtastic_Config_LoRaConfig_ModemPreset preset, int32_t &rssi, int32_t &snr)
 {
-    static constexpr int32_t rssiBreak[] = {-110, -100, -90, -80, -70, -60};
-    static constexpr float probBreak[] = {0.05f, 0.15f, 0.40f, 0.65f, 0.85f, 0.95f};
-    static constexpr int N = 6;
+    float bwKHz = 0.0f;
+    uint8_t sf = 0;
+    uint8_t cr = 0;
+    modemPresetToParams(preset, false, bwKHz, sf, cr);
+    etxToSignal(etx, sf, rssi, snr);
+}
 
-    float prob = 1.0f / std::max(etx, 1.0f);
+// Inverse mapping for topology wire packing (approximate RSSI/SNR from ETX at a spreading factor).
+// An ETX alone cannot say how much of it was RSSI and how much was decode margin, so RSSI is fixed
+// at the top of the RSSI quality factor's domain (factor 1.0) and margin is recovered against that;
+// SNR is then the spreading factor's threshold plus the recovered margin. Total for every etx,
+// including the fixed-point extremes: recovered margin always lands inside marginBreakDb's own
+// domain.
+void NeighborGraph::etxToSignal(float etx, uint8_t spreadingFactor, int32_t &rssi, int32_t &snr)
+{
+    // std::max does not have Rust's NaN-avoiding f32::max semantics: std::max(NaN, 1.0f) returns
+    // NaN (NaN < 1.0f is false, so std::max returns its first argument unchanged), where Rust's
+    // etx.max(1.0) returns 1.0 (the non-NaN operand). Left unguarded, a NaN etx would propagate
+    // through target/margin/snr and reach static_cast<int32_t> below, which is undefined behaviour
+    // on NaN — worse than MR's defined result for the same input. Substituting NaN with 1.0 before
+    // the max reproduces Rust's result exactly and makes this function total for every etx,
+    // including non-finite ones, matching MR.
+    float safeEtx = std::isnan(etx) ? 1.0f : etx;
+    float targetProb = 1.0f / std::max(safeEtx, 1.0f);
 
-    if (prob <= probBreak[0]) {
-        rssi = rssiBreak[0];
-    } else if (prob >= probBreak[N - 1]) {
-        rssi = rssiBreak[N - 1];
+    float margin;
+    if (targetProb <= marginProb[0]) {
+        margin = marginBreakDb[0];
+    } else if (targetProb >= marginProb[MARGIN_N - 1]) {
+        margin = marginBreakDb[MARGIN_N - 1];
     } else {
         int seg = 0;
-        for (int i = 1; i < N; i++) {
-            if (prob < probBreak[i]) {
+        for (int i = 1; i < MARGIN_N; i++) {
+            if (targetProb < marginProb[i]) {
                 seg = i - 1;
                 break;
             }
         }
-        float t = (prob - probBreak[seg]) / (probBreak[seg + 1] - probBreak[seg]);
-        rssi = rssiBreak[seg] + static_cast<int32_t>(t * (rssiBreak[seg + 1] - rssiBreak[seg]));
+        float t = (targetProb - marginProb[seg]) / (marginProb[seg + 1] - marginProb[seg]);
+        margin = marginBreakDb[seg] + t * (marginBreakDb[seg + 1] - marginBreakDb[seg]);
     }
 
-    float etxAtSnr10 = calculateETX(rssi, 10.0f);
-    if (etx <= etxAtSnr10 * 1.05f) {
-        snr = 10;
-    } else {
-        float snrFactor = etxAtSnr10 / etx;
-        if (snrFactor < 0.5f)
-            snrFactor = 0.5f;
-        float snrFloat = (snrFactor - 0.5f) / 0.05f;
-        snr = static_cast<int32_t>(snrFloat);
-        if (snr < -5)
-            snr = -5;
-        if (snr > 10)
-            snr = 10;
-    }
+    rssi = rssiFactorBreakDbm[1];
+    snr = static_cast<int32_t>(spreadingFactorSnrThresholdDb(spreadingFactor) + margin);
 }
 
 uint32_t NeighborGraph::getContentionWindowMs()
@@ -1275,7 +1357,7 @@ NodeNum NeighborGraph::coverageOwner(NodeNum target, const CoveragePolicy &polic
         if (!Edge::isMeasured(edge->source)) continue;
         // Ownership decides *who* carries a neighbour nobody can be shown to reach; it must not
         // decide *whether* the neighbour is reachable at all. A link past the coverage ceiling
-        // (the "heard once" ETX 40 sentinel included) delivers nothing, so its holder owns
+        // (the curve's own floor included) delivers nothing, so its holder owns
         // nothing: the ranking would otherwise credit it with unique coverage and hand it the
         // first slot, and the packet would wait a full defer window for a relay that cannot
         // come. Measured 2026-09-08: 74 of 183 slots went out over links worse than the
@@ -1402,9 +1484,10 @@ RelayCandidate NeighborGraph::findBestRelayCandidate(const NodeSet &candidates, 
         // (hearsUs=true on their edge to sourceNode) get a higher tier. This ensures
         // nodes with confirmed round-trip connectivity relay first, so both SR and
         // stock nodes on the branch discover the correct gateway.
-        // ETX above this threshold is too poor to be considered a usable bidirectional link.
-        // ETX=40 is the worst possible calculated value (RSSI=-110, SNR<=0) and is essentially
-        // a placeholder for "heard once, barely" — not a deliverable link.
+        // ETX above this threshold is too poor to be considered a usable bidirectional link. The
+        // curve's own floor sits at 40.0 to about 44.4 (deep-negative decode margin, i.e. reported
+        // SNR far below the modem preset's spreading-factor threshold) — essentially a placeholder
+        // for "heard once, barely" — not a deliverable link, and comfortably above this ceiling.
         static constexpr float BIDI_ETX_CEILING = 20.0f;
 
         uint8_t candidateTier = 0;
@@ -1483,7 +1566,7 @@ NodeNum NeighborGraph::uniqueCoverageNeighbor(NodeNum myNode, const NodeNum *cov
         }
 
         // A coverer counts only when it is shown to reach the neighbour over a link that is not
-        // hopeless (the 40.0 "heard once" sentinel included).
+        // hopeless (the curve's own floor included).
         bool covered = false;
         for (size_t c = 0; c < coveredByCount && !covered; c++) {
             covered = covers(coveredBy[c], neighbor, poorLinkEtx, policy);

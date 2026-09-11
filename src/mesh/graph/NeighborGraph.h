@@ -256,9 +256,20 @@ class NeighborGraph {
 
     void clearCache();
 
-    static float calculateETX(int32_t rssi, float snr);
+    static float calculateETX(int32_t rssi, float snr, meshtastic_Config_LoRaConfig_ModemPreset preset);
 
-    static void etxToSignal(float etx, int32_t &rssi, int32_t &snr);
+    // The spreading factor is the only preset-derived quantity the curve reads. This overload takes
+    // it directly so a caller whose radio is running a custom (non-preset) spreading factor —
+    // config.lora.use_preset == false — can price against what the radio actually demodulates at,
+    // rather than against the preset's spreading factor, which may not match. The
+    // meshtastic_Config_LoRaConfig_ModemPreset overload above resolves the preset's spreading factor
+    // and delegates here; both share one implementation.
+    static float calculateETX(int32_t rssi, float snr, uint8_t spreadingFactor);
+
+    static void etxToSignal(float etx, meshtastic_Config_LoRaConfig_ModemPreset preset, int32_t &rssi, int32_t &snr);
+
+    // See the calculateETX(int32_t, float, uint8_t) overload above for why this exists.
+    static void etxToSignal(float etx, uint8_t spreadingFactor, int32_t &rssi, int32_t &snr);
 
     // --- Downstream methods (new) ---
 

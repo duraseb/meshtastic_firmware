@@ -609,7 +609,7 @@ void SignalRoutingModule::updateGraphWithNeighbor(NodeNum sender, NodeNum neighb
     // Add/update edge from sender to this neighbor
     if (routingGraph) {
         float etx = (rssi != 0 || snr != 0)
-                        ? NeighborGraph::calculateETX(rssi, snr)
+                        ? NeighborGraph::calculateETX(rssi, snr, currentCostingSpreadingFactor())
                         : 1.0f;
         uint32_t currentTime = millis() / 1000;
 
@@ -805,7 +805,7 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
             // to hear the topology source, otherwise the source cannot actually deliver to it.
             LOG_INFO("[SR]   -> %s: no direct connection, downstream of %s",
                     neighborName, senderNameForTopo);
-            float etxForDownstream = NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr);
+            float etxForDownstream = NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr, currentCostingSpreadingFactor());
             routingGraph->updateDownstream(neighbor.nodeId, p->from, etxForDownstream, millis() / 1000);
         } else if (!hasDirectConnection && !neighbor.hearsUs) {
             LOG_INFO("[SR]   -> %s: asymmetric (hearsUs=false), not downstream of %s",
@@ -995,7 +995,7 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
                 continue;
             }
 
-            float etx = NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr);
+            float etx = NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr, currentCostingSpreadingFactor());
 
             // The sender published only that it hears this neighbour. The reverse direction is
             // our assumption of symmetry, so it must not outrank — and permanently block — the
@@ -1024,7 +1024,7 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
         char neighborName[64];
         getNodeDisplayName(neighbor.nodeId, neighborName, sizeof(neighborName));
 
-        float etx = NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr);
+        float etx = NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr, currentCostingSpreadingFactor());
 
         const char *quality;
         if (etx < 2.0f) quality = "excellent";
@@ -1551,7 +1551,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
         getNodeDisplayName(mp.from, senderName, sizeof(senderName));
 
         float etx =
-            NeighborGraph::calculateETX(mp.rx_rssi, mp.rx_snr);
+            NeighborGraph::calculateETX(mp.rx_rssi, mp.rx_snr, currentCostingSpreadingFactor());
 
         // When a node is confirmed as a direct neighbor, clear any downstream entries that
         // listed it as a destination reachable via some other relay — those are now obsolete.
@@ -1679,7 +1679,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                 // Nominal link per hop travelled: the relay's link to the source is not what we measured,
                 // and a multi-hop path must not price like a single good link.
                 uint8_t hopsUsed = mp.hop_start > mp.hop_limit ? mp.hop_start - mp.hop_limit : 1;
-                float inferredEtx = NeighborGraph::calculateETX(-70, 5.0f) * hopsUsed;
+                float inferredEtx = NeighborGraph::calculateETX(-70, 5.0f, currentCostingSpreadingFactor()) * hopsUsed;
                 routingGraph->updateDownstreamExclusive(mp.from, inferredRelayer, inferredEtx, millis() / 1000);
                 if (!singleHopRelay) {
                     LOG_INFO("[SR] Downstream: %08x via %08x (%d hops, stock)",
@@ -1704,7 +1704,8 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                 int32_t defaultRssi = -70; // default RSSI for inferred connectivity
                 float defaultSnr = 5.0f;  // default SNR for inferred connectivity
 
-                routingGraph->updateEdge(inferredRelayer, mp.from, NeighborGraph::calculateETX(defaultRssi, defaultSnr),
+                routingGraph->updateEdge(inferredRelayer, mp.from,
+                                         NeighborGraph::calculateETX(defaultRssi, defaultSnr, currentCostingSpreadingFactor()),
                                          monotonicTimestamp, Edge::Source::Inferred);
             } else {
                 LOG_INFO("[SR] No inference: %08x not Legacy (%d)",
@@ -4299,7 +4300,7 @@ NodeNum SignalRoutingModule::resolveRelayIdentity(uint8_t relayId, int16_t rxRss
         bestDirectNode = directCandidates[0].nodeId;
     } else if (directCount > 1 && rxRssi != 0) {
         // Multiple direct neighbors share this relay byte — use packet ETX to disambiguate
-        float packetEtx = NeighborGraph::calculateETX(rxRssi, rxSnr);
+        float packetEtx = NeighborGraph::calculateETX(rxRssi, rxSnr, currentCostingSpreadingFactor());
         uint16_t packetEtxFixed = static_cast<uint16_t>(packetEtx * 100.0f);
         uint16_t bestDiff = UINT16_MAX;
         for (uint8_t i = 0; i < directCount; i++) {

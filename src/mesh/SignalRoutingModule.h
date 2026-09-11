@@ -4,6 +4,7 @@
 #include "mesh/generated/meshtastic/mesh.pb.h"
 #include "mesh/generated/meshtastic/telemetry.pb.h"
 
+#include "MeshRadio.h"
 #include "graph/NeighborGraph.h"
 
 // Routing protocol version for compatibility checking
@@ -388,6 +389,26 @@ static inline bool confirmTopologySenderHearsNeighbor(NeighborGraph *graph, Node
     return false;
 }
 
+// The spreading factor the radio is actually demodulating at, mirroring
+// RadioInterface::applyModemConfig's own derivation exactly: preset-derived only when
+// config.lora.use_preset is set, otherwise the explicitly configured custom value. Costing a link
+// against the preset's spreading factor when a custom one is in use prices against the wrong
+// demodulator threshold — up to 12.5 dB of margin error (SF7 to SF12), enough to move a link across
+// the coverage ceiling. Every NeighborGraph::calculateETX/etxToSignal call site in this module uses
+// this instead of config.lora.modem_preset directly, so costing agrees with the radio whether or
+// not a preset is in force.
+static inline uint8_t currentCostingSpreadingFactor()
+{
+    if (config.lora.use_preset) {
+        float bwKHz = 0.0f;
+        uint8_t sf = 0;
+        uint8_t cr = 0;
+        modemPresetToParams(config.lora.modem_preset, false, bwKHz, sf, cr);
+        return sf;
+    }
+    return static_cast<uint8_t>(config.lora.spread_factor);
+}
+
 // Update Reported direct-neighbor edges and the outbound topology signal cache from a local RF observation.
 static inline int refreshReportedDirectNeighborObservation(NeighborGraph *graph, DirectNeighborSignal *signals,
                                                            uint8_t &signalCount, size_t maxSignals, NodeNum myNode,
@@ -397,7 +418,7 @@ static inline int refreshReportedDirectNeighborObservation(NeighborGraph *graph,
         return EDGE_NO_CHANGE;
     }
 
-    float etx = NeighborGraph::calculateETX(rssi, snr);
+    float etx = NeighborGraph::calculateETX(rssi, snr, currentCostingSpreadingFactor());
     int changeToUs = graph->updateEdge(nodeId, myNode, etx, nowSecs, Edge::Source::Reported);
     int changeFromUs = graph->updateEdge(myNode, nodeId, etx, nowSecs, Edge::Source::Reported);
     int changeType = changeToUs;
