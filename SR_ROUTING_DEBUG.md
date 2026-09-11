@@ -49,11 +49,15 @@ Fires when channel utilization exceeds the tier threshold. Tiers: LOW (telemetry
 ```
 Tx delay id=0x<id> band=early why=<role|committed> cause=<initial|expired> delay=<N>ms
 Tx delay id=0x<id> band=late cause=<initial|expired> delay=<N>ms
+Tx delay id=0x<id> band=rung cause=expired delay=<N>ms
 ```
-`band=early` is stock's ROUTER draw, `band=late` every other role's. `cause=expired` is a redraw
-after the first schedule lapsed; a committed SR relay is re-anchored rather than redrawn from
-scratch. The two bands are meant to be disjoint — an `early` delay at or above the `late` floor
-means the SNR clamp in `getCWsize()` is not doing its job.
+`band=early` is stock's ROUTER draw and `band=late` every other role's; the two are meant to be
+disjoint, so an `early` delay at or above the `late` floor means the SNR clamp in `getCWsize()` is
+not doing its job. `band=rung` is neither: a committed SR relay whose scheduled time already
+passed keeps its ladder position and is re-anchored to now rather than redrawn, so its delay is the
+offset that distinguished it from the other candidates. Expect `rung` to be common — every relay
+that misses its scheduled rung lands here, and on the fleet it currently outnumbers `late` by
+roughly eight to one.
 
 ### Committed relay & TX
 ```
