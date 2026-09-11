@@ -1591,10 +1591,18 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
             }
         }
     } else if (notViaMqtt && !isDirectFromSender && mp.relay_node != 0) {
-        // Process relayed packets to infer network topology (skip for inactive roles - they only track direct neighbors)
-        if (!isActiveRoutingRole()) {
-            LOG_INFO("[SR] Inactive role: Skipping relayed packet topology inference");
+        // Measuring a relayer we heard is first-hand observation, not inference: the RSSI and SNR
+        // come off the relayer's own frame, exactly as they do for a frame that arrived direct. So
+        // every node that publishes topology records it, whatever its role. Only the node that
+        // hears a relayer can supply the transmit-direction evidence coverage needs about it
+        // ("does that router reach me?"), and a node that never records it stays permanently
+        // uncovered, so each of its neighbours holds unique coverage of it and relays. What the
+        // active-routing class gates is the inference below — who sits behind the gateway — which
+        // only a node that ranks relays uses.
+        if (!canSendTopology()) {
+            LOG_INFO("[SR] Publishes no topology: skipping relayed packet observation");
         } else {
+            const bool activeRouting = isActiveRoutingRole();
             NodeNum inferredRelayer = resolveRelayIdentity(mp.relay_node, mp.rx_rssi, mp.rx_snr);
 
         // If still not resolved, try known nodes (both direct neighbors and topology-known nodes)
@@ -1675,7 +1683,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
             CapabilityStatus sourceStatus = getCapabilityStatus(mp.from);
             bool sourceIsSRAware = (sourceStatus == CapabilityStatus::SRactive ||
                                     sourceStatus == CapabilityStatus::Passive);
-            if (hasDirectConnectionToRelay && (singleHopRelay || !sourceIsSRAware)) {
+            if (activeRouting && hasDirectConnectionToRelay && (singleHopRelay || !sourceIsSRAware)) {
                 // Nominal link per hop travelled: the relay's link to the source is not what we measured,
                 // and a multi-hop path must not price like a single good link.
                 uint8_t hopsUsed = mp.hop_start > mp.hop_limit ? mp.hop_start - mp.hop_limit : 1;
@@ -1685,7 +1693,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                     LOG_INFO("[SR] Downstream: %08x via %08x (%d hops, stock)",
                              mp.from, inferredRelayer, mp.hop_start - mp.hop_limit);
                 }
-            } else if (hasDirectConnectionToRelay && !singleHopRelay) {
+            } else if (activeRouting && hasDirectConnectionToRelay && !singleHopRelay) {
                 LOG_INFO("[SR] No downstream %08x via %08x: %d hops, SR",
                          mp.from, inferredRelayer, mp.hop_start - mp.hop_limit);
             }
@@ -1694,7 +1702,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
             // SR-aware nodes broadcast their topology, so we don't need to infer connectivity for them.
             // Observing a relay proves only one direction: relayer → sender. The reverse is not assumed.
             bool relayerIsLegacy = getCapabilityStatus(inferredRelayer) == CapabilityStatus::Legacy;
-            if (relayerIsLegacy) {
+            if (activeRouting && relayerIsLegacy) {
                 // Since the stock relayer successfully relayed a packet from the sender,
                 // we know the relayer can hear the sender (inferredRelayer → mp.from).
                 LOG_INFO("[SR] Inferred: stock %08x hears %08x (relay seen)",
@@ -1724,8 +1732,11 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
             // Record transmission for contention window tracking
             if (routingGraph) {
                 uint32_t currentTime = millis() / 1000;  // Use monotonic time
-                routingGraph->recordNodeTransmission(mp.from, mp.id, currentTime);
-                routingGraph->recordNodeTransmission(inferredRelayer, mp.id, currentTime);
+                // Contention-window tracking feeds the relay ranking, which only an active node runs.
+                if (activeRouting) {
+                    routingGraph->recordNodeTransmission(mp.from, mp.id, currentTime);
+                    routingGraph->recordNodeTransmission(inferredRelayer, mp.id, currentTime);
+                }
 
                 // If this node relayed a packet we originated or previously relayed,
                 // it can hear us. Mark the edge as bidirectional (hearsUs) for coverage decisions.
@@ -1735,7 +1746,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                     markStockNodeRelayedOurPacket(inferredRelayer);
                 }
             }
-        }  // End of else block for active routing roles relayed packet processing
+        }  // End of else block for topology-publishing roles' relayed packet processing
     }
     }
 

@@ -89,7 +89,7 @@ This dual approach provides the reliability of coordinated networking with the e
 
 Passive SR nodes (TRACKER, SENSOR, TAK, or non-active-routing configured nodes) participate minimally in SR:
 
-1. **Topology Maintenance**: Only track directly-heard neighbors (via `isDirectPacket()` — hopStart == hopLimit and relay_node matches sender)
+1. **Topology Maintenance**: Track directly-heard neighbors (via `isDirectPacket()` — hopStart == hopLimit and relay_node matches sender), plus a relayer heard on a relayed frame, whose RSSI and SNR are measured off that relayer's own transmission
 2. **SR Broadcasts**: Only process topology broadcasts from direct senders
 3. **Node Activity**: Only update activity for direct packets; ignore relayed packets
 4. **Graph Scope**: Limited to Level 1 neighbors - no multi-hop topology
@@ -133,9 +133,11 @@ bool SignalRoutingModule::isDirectPacket(const meshtastic_MeshPacket &mp)
 Both checks must pass for the packet to be considered direct. The hop counter alone is necessary but not sufficient because stock nodes may not always decrement `hop_limit` when relaying.
 
 **Impact on Topology:**
-- Passive nodes only add neighbors from direct packets (passing both checks) to their graph
-- Passive nodes skip all relayed packets
-- This ensures passive node topology shows only Level 1 neighbors
+- Passive nodes add neighbors from direct packets (passing both checks) to their graph
+- A passive node also records the relayer of a relayed frame: that measurement is first-hand, and
+  only the node that hears a relayer can say whether the relayer reaches it
+- Passive nodes draw no inference from a relayed frame — no `gateway → source` edge, no downstream
+  entry — so their topology still shows only Level 1 neighbors
 
 ETX measures the expected number of transmissions needed to successfully deliver a packet over a wireless link. **ETX = 1 / (Delivery Probability)**; lower ETX is a better link, ETX of 1.0 is a perfect link, and ETX above 1.0 is a lossy one requiring retransmissions.
 
@@ -187,7 +189,13 @@ Passive nodes maintain a simplified Level 1 topology containing ONLY directly-he
 
 4. **Placeholder System**: Limited to placeholders for direct relay nodes; upstream placeholder resolution skipped
 
-5. **No Gateway Inference**: Downstream relationships and multi-hop topology are not tracked
+5. **Relayer Measurement**: A relayer heard on a relayed frame is recorded and published like any
+   other measured direct link. Coverage needs transmit-direction evidence — "does that router reach
+   me?" — and only the node that hears the router can supply it. A node that recorded nothing stayed
+   permanently uncovered, so each of its neighbours held unique coverage of it and relayed. A role
+   that publishes no topology (`canSendTopology()` false) records nothing: it has nobody to tell.
+
+6. **No Gateway Inference**: Downstream relationships and multi-hop topology are not tracked
 
 **Mute Node Topology Sharing**: 
 CLIENT_MUTE nodes broadcast their direct neighbor information to help active SignalRouting nodes discover network topology, even though mute nodes don't participate in packet relaying. Active nodes learn about mute node neighbors for discovery purposes but don't consider routing paths through mute nodes since they don't relay. CLIENT_MUTE nodes maintain their direct neighbor graph (add/remove expired connections) but use simplified topology tracking.
