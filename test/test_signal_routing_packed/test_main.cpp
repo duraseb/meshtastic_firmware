@@ -1350,6 +1350,33 @@ static void test_preset_change_resets_topology_version_and_relay_identity()
     TEST_ASSERT_EQUAL_UINT32(0, module.resolveRelayIdentity(0xBB));
 }
 
+static void test_radio_reconfigured_purges_only_when_the_preset_changes()
+{
+    initGraphTestNodeDb(0xAAAAAAAA);
+    config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST;
+    SignalRoutingModule module;
+    module.rememberRelayIdentity(0xBBBB00BB, 0xBB);
+    module.radioReconfigured();
+    TEST_ASSERT_GREATER_THAN(0, module.relayIdentityCacheSize());
+    module.radioReconfigured();
+    TEST_ASSERT_GREATER_THAN(0, module.relayIdentityCacheSize());
+
+    config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW;
+    module.radioReconfigured();
+    TEST_ASSERT_EQUAL_UINT8(0, module.relayIdentityCacheSize());
+    TEST_ASSERT_TRUE(module.bootBroadcastPending());
+    TEST_ASSERT_EQUAL_UINT8(0, module.publishedTopologyVersion());
+
+    module.rememberRelayIdentity(0xBBBB00BB, 0xBB);
+    module.radioReconfigured();
+    TEST_ASSERT_GREATER_THAN(0, module.relayIdentityCacheSize());
+
+    config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST;
+    module.radioReconfigured();
+    TEST_ASSERT_EQUAL_UINT8(0, module.relayIdentityCacheSize());
+    TEST_ASSERT_TRUE(module.bootBroadcastPending());
+}
+
 void setup()
 {
     initializeTestEnvironment();
@@ -1406,6 +1433,7 @@ void setup()
     RUN_TEST(test_purge_for_preset_change_drops_neighbours_and_derived_state);
     RUN_TEST(test_modem_preset_observer_ignores_first_sighting_and_repeats);
     RUN_TEST(test_preset_change_resets_topology_version_and_relay_identity);
+    RUN_TEST(test_radio_reconfigured_purges_only_when_the_preset_changes);
 
     UNITY_END();
 }

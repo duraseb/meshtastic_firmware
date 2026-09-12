@@ -327,11 +327,7 @@ class RadioInterface
 
     int notifyDeepSleepCb(void *unused = NULL);
 
-    int reloadConfig(void *unused)
-    {
-        reconfigure();
-        return 0;
-    }
+    int reloadConfig(void *unused);
 };
 
 std::unique_ptr<RadioInterface> initLoRa();

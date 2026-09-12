@@ -739,6 +739,21 @@ bool RadioInterface::reconfigure()
     return true;
 }
 
+int RadioInterface::reloadConfig(void *unused)
+{
+    reconfigure();
+    // The radio is on the new air as soon as reconfigure() returns. The neighbour graph is
+    // still the previous preset's until something notices; the module thread may sleep until
+    // the next topology interval. Ask it now, the same moment the hardware switched.
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+    if (signalRoutingModule) {
+        signalRoutingModule->radioReconfigured();
+    }
+#endif
+    (void)unused;
+    return 0;
+}
+
 bool RadioInterface::init()
 {
     LOG_INFO("Start meshradio init");

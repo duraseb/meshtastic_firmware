@@ -183,6 +183,20 @@ static void test_applyModemConfig_customCodingRateLowerThanPreset()
     TEST_ASSERT_EQUAL_UINT8(8, testRadio->getCr());
 }
 
+static void test_reloadConfig_applies_modem_after_the_radio_is_live()
+{
+    config.lora = meshtastic_Config_LoRaConfig_init_zero;
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+    config.lora.use_preset = true;
+    config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST;
+
+    TEST_ASSERT_EQUAL(0, testRadio->reloadConfig(nullptr));
+
+    TEST_ASSERT_EQUAL_UINT8(5, testRadio->getCr());
+    TEST_ASSERT_EQUAL_UINT8(11, testRadio->getSf());
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 250.0f, testRadio->getBw());
+}
+
 void setUp(void)
 {
     mockMeshService = new MockMeshService();
@@ -223,6 +237,7 @@ void setup()
     RUN_TEST(test_applyModemConfig_codingRateMatchesPreset);
     RUN_TEST(test_applyModemConfig_customCodingRateHigherThanPreset);
     RUN_TEST(test_applyModemConfig_customCodingRateLowerThanPreset);
+    RUN_TEST(test_reloadConfig_applies_modem_after_the_radio_is_live);
     exit(UNITY_END());
 }
 

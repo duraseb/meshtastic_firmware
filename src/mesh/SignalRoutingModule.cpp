@@ -232,6 +232,12 @@ SignalRoutingModule::SignalRoutingModule()
     // We want to see all packets for signal quality updates
     isPromiscuous = true;
 
+    // The radio is already running this preset (NodeDB has loaded by the time we are
+    // constructed). Cache it so the first live apply of a *different* preset is a change,
+    // not a first sighting that would leave the old graph in place.
+    operatingPresetKnown = true;
+    operatingPreset = static_cast<uint8_t>(config.lora.modem_preset);
+
     // Send empty SR broadcast shortly after boot to announce our presence.
     // SR neighbors that receive this will trigger an early broadcast of their
     // own topology, helping us bootstrap our graph quickly.
@@ -278,6 +284,12 @@ void SignalRoutingModule::purgeGraphForPresetChange()
     topologyDirty = false;
     pendingTopologyReply.active = false;
     needsBootBroadcast = true;
+    committedRelayCount = 0;
+    pendingRelayDelayMs = 0;
+    pendingUnicastNextHop = 0;
+    for (uint8_t i = 0; i < MAX_COMMITTED_RELAYS; i++) {
+        committedRelays[i] = CommittedRelay();
+    }
     for (uint8_t i = 0; i < MAX_PENDING_RETRANSMITS; i++) {
         if (pendingRetransmits[i].packet) {
             packetPool.release(pendingRetransmits[i].packet);
@@ -286,6 +298,14 @@ void SignalRoutingModule::purgeGraphForPresetChange()
         pendingRetransmits[i] = PendingRetransmit();
     }
     setIntervalFromNow(0);
+}
+
+void SignalRoutingModule::radioReconfigured()
+{
+    if (srObserveModemPreset(operatingPresetKnown, operatingPreset, static_cast<uint8_t>(config.lora.modem_preset))) {
+        LOG_INFO("[SR] Modem preset changed — purging graph");
+        purgeGraphForPresetChange();
+    }
 }
 
 void SignalRoutingModule::scheduleEmptyTopologyReply(NodeNum senderNodeId, PacketId packetId)
@@ -352,11 +372,6 @@ int32_t SignalRoutingModule::runOnce()
                  (int)config.device.role,
                  DisplayFormatters::getModemPresetDisplayName(config.lora.modem_preset, false, config.lora.use_preset),
                  nodeDB->getNodeNum());
-    }
-
-    if (srObserveModemPreset(operatingPresetKnown, operatingPreset, static_cast<uint8_t>(config.lora.modem_preset))) {
-        LOG_INFO("[SR] Modem preset changed — purging graph");
-        purgeGraphForPresetChange();
     }
 
     pruneCapabilityCache(nowSecs);

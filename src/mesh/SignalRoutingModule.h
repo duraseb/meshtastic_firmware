@@ -708,6 +708,8 @@ public:
     NodeNum resolveRelayIdentity(uint8_t relayId, int16_t rxRssi = 0, float rxSnr = 0) const;
     /// Drop the neighbour graph and everything learned on the previous air; queue an empty boot list.
     void purgeGraphForPresetChange();
+    /// After the radio has applied current LoRa settings. Drops the graph only if the preset changed.
+    void radioReconfigured();
     uint8_t publishedTopologyVersion() const { return currentTopologyVersion; }
     bool bootBroadcastPending() const { return needsBootBroadcast; }
     uint8_t relayIdentityCacheSize() const { return relayIdentityCacheCount; }
