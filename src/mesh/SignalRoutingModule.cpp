@@ -2514,6 +2514,22 @@ void SignalRoutingModule::scheduleT1Broadcast(const meshtastic_MeshPacket *p, ui
         latestRelayWindowMs = 10000; // 10 s fallback
         airtimeMs = 500;
     }
+    // The ladder is the other thing that can still key up, and it is not bounded by the stock
+    // window: a rung is a half-airtime apart, so at a slow preset with a full-size frame the last
+    // rung passes the worst stock draw after a handful of candidates. Take whichever is later —
+    // these are floors on the same instant, so they compose by max, never by addition.
+    uint32_t ladderSpanMs = 0;
+    if (routingGraph && nodeDB) {
+        const NodeEdges *myEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
+        uint8_t rungs = 0;
+        if (myEdges && myEdges->edgeCount > 0) {
+            rungs = static_cast<uint8_t>(myEdges->edgeCount - 1);
+        }
+        ladderSpanMs = SR_SLOT_ORIGIN_MS + static_cast<uint32_t>(rungs) * (airtimeMs / 2);
+    }
+    if (ladderSpanMs > latestRelayWindowMs) {
+        latestRelayWindowMs = ladderSpanMs;
+    }
     uint32_t fireDelayMs = latestRelayWindowMs + airtimeMs + staggerMs;
 
     // Allocate the copy before Router::send() encrypts the original in place
@@ -3212,17 +3228,29 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         // A late copy still goes on the air when a transmission is expected: the ranking gave a
         // rung to a stock relay router or a ranked SR peer, or the acknowledgement pass put
         // somebody ahead of us, and if their copy never comes ours is the redundancy that covers
-        // the loss. Our rung of the ladder is the node-id order the slots already use, one
-        // half-airtime apart, stock rebroadcasters counted first.
+        // the loss. Our rung is the insurers ordered ahead of us, one half-airtime apart, in the
+        // packet-id order the relay ladder already tie-breaks on so the burden rotates rather than
+        // always falling on the same node.
+        //
+        // Stock rebroadcasters are deliberately not counted here, though they used to be. A
+        // reserved position is a slot time wide and sits inside the router window; insurance only
+        // fires once that whole window has passed, so charging a half-airtime per stock node delays
+        // every insurer for a window already behind them. A peer that has already transmitted is
+        // skipped for the same kind of reason: it is not going to insure, and counting it pushes
+        // everybody else later for nothing.
         //
         // The want_ack witness term that used to widen this is gone: Router::send strips that flag
         // from every broadcast before transmission, so it was never set on the wire, and the
         // election behind it is replaced by the acknowledgement pass, which does not need the flag
         // to know a message is one somebody is waiting on.
-        uint8_t rank = stockCandidates;
+        uint8_t rank = 0;
+        const uint32_t nowSecs = millis() / 1000;
         for (uint16_t i = 0; i < srPeers.count; i++) {
             NodeNum peer = srPeers.nodes[i];
             if (peer == myNode) {
+                continue;
+            }
+            if (routingGraph && routingGraph->hasNodeTransmitted(peer, p->id, nowSecs)) {
                 continue;
             }
             if (preferHighNodeId ? (peer > myNode) : (peer < myNode)) {
