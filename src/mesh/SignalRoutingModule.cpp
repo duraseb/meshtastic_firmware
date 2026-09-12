@@ -2808,9 +2808,14 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         preProcessSignalRoutingPacket(p, packetReceivedTimestamp);
     }
 
-    // Now check if our topology is healthy for making relay decisions
-    // If not healthy, default to relay (conservative behavior)
+    // Now check if our topology is healthy for making relay decisions.
+    // If not healthy the relay goes out unranked: delivering everywhere outranks saving a packet
+    // when the graph cannot say who else is covered. Say so — silently returning true left a
+    // capture showing a relay with no decision behind it, indistinguishable from one the ranking
+    // chose, and that cost a field diagnosis twice.
     if (!topologyHealthyForBroadcast()) {
+        LOG_INFO("[SR] Relay 0x%08x unranked: topology too thin to judge, direct=%u", p->from,
+                 (unsigned)(routingGraph ? routingGraph->countDirectNeighbors() : 0));
         return true;
     }
 
