@@ -40,6 +40,21 @@ static inline void writePackedTopologyHeader(uint8_t *buf, uint8_t topologyVersi
     buf[4] = flags;
 }
 
+/// First observation caches `current` and is not a change. A later different value is.
+inline bool srObserveModemPreset(bool &known, uint8_t &cached, uint8_t current)
+{
+    if (!known) {
+        known = true;
+        cached = current;
+        return false;
+    }
+    if (cached == current) {
+        return false;
+    }
+    cached = current;
+    return true;
+}
+
 // Decoded packed neighbor entry for iteration
 struct PackedNeighborEntry {
     NodeNum nodeId;
@@ -514,6 +529,8 @@ private:
     bool signalBasedRoutingEnabled = true;
     /// One-shot guard for the own-role boot line (config is not loaded in the constructor).
     bool loggedOwnRole = false;
+    bool operatingPresetKnown = false;
+    uint8_t operatingPreset = 0;
     bool needsBootBroadcast = false;
     bool topologyDirty = false; // Set when topology changes; triggers early broadcast via runOnce
     bool topologyBroadcastActive = false; // True while sendSignalRoutingInfo() is sending
@@ -684,11 +701,16 @@ private:
     bool topologyHealthyForUnicast(NodeNum destination) const;
     bool isImmediateRelayRouter(NodeNum nodeId) const;
     bool isLegacyRouter(NodeNum nodeId) const;
-    void rememberRelayIdentity(NodeNum nodeId, uint8_t relayId);
     void pruneRelayIdentityCache(uint32_t nowMs);
-    NodeNum resolveRelayIdentity(uint8_t relayId, int16_t rxRssi = 0, float rxSnr = 0) const;
 public:
     NodeNum resolveHeardFrom(const meshtastic_MeshPacket *p, NodeNum sourceNode) const;
+    void rememberRelayIdentity(NodeNum nodeId, uint8_t relayId);
+    NodeNum resolveRelayIdentity(uint8_t relayId, int16_t rxRssi = 0, float rxSnr = 0) const;
+    /// Drop the neighbour graph and everything learned on the previous air; queue an empty boot list.
+    void purgeGraphForPresetChange();
+    uint8_t publishedTopologyVersion() const { return currentTopologyVersion; }
+    bool bootBroadcastPending() const { return needsBootBroadcast; }
+    uint8_t relayIdentityCacheSize() const { return relayIdentityCacheCount; }
 private:
     bool isActiveRoutingRole() const;
     bool canSendTopology() const;

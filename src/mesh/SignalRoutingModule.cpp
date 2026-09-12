@@ -259,6 +259,35 @@ void SignalRoutingModule::commitTopologyTxTimestamp()
     lastBroadcast = millis();
 }
 
+void SignalRoutingModule::purgeGraphForPresetChange()
+{
+    if (routingGraph) {
+        routingGraph->purgeForPresetChange();
+    }
+    directSignalCount = 0;
+    capabilityRecordCount = 0;
+    relayIdentityCacheCount = 0;
+    lastTopologyVersionCount = 0;
+    lastPreProcessedVersionCount = 0;
+    for (uint8_t i = 0; i < PENDING_LISTED_SLOTS; i++) {
+        pendingListed[i].valid = false;
+    }
+    currentTopologyVersion = 0;
+    lastTopologyListMs = 0;
+    lastBroadcast = 0;
+    topologyDirty = false;
+    pendingTopologyReply.active = false;
+    needsBootBroadcast = true;
+    for (uint8_t i = 0; i < MAX_PENDING_RETRANSMITS; i++) {
+        if (pendingRetransmits[i].packet) {
+            packetPool.release(pendingRetransmits[i].packet);
+            pendingRetransmits[i].packet = nullptr;
+        }
+        pendingRetransmits[i] = PendingRetransmit();
+    }
+    setIntervalFromNow(0);
+}
+
 void SignalRoutingModule::scheduleEmptyTopologyReply(NodeNum senderNodeId, PacketId packetId)
 {
     if (!nodeDB || !canSendTopology()) {
@@ -323,6 +352,11 @@ int32_t SignalRoutingModule::runOnce()
                  (int)config.device.role,
                  DisplayFormatters::getModemPresetDisplayName(config.lora.modem_preset, false, config.lora.use_preset),
                  nodeDB->getNodeNum());
+    }
+
+    if (srObserveModemPreset(operatingPresetKnown, operatingPreset, static_cast<uint8_t>(config.lora.modem_preset))) {
+        LOG_INFO("[SR] Modem preset changed — purging graph");
+        purgeGraphForPresetChange();
     }
 
     pruneCapabilityCache(nowSecs);

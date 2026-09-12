@@ -463,6 +463,10 @@ class NeighborGraph {
 
     size_t getNodeCount() const { return neighborCount; }
 
+    /// Drop every neighbour, downstream route, coverage record and cached route learned on the
+    /// previous air parameters. This node has no identity stored here.
+    void purgeForPresetChange();
+
     size_t getAllNodeIds(NodeNum *outArray, size_t maxCount) const;
 
     static constexpr size_t getMemoryUsage() { return sizeof(NeighborGraph); }

@@ -9,6 +9,14 @@
 
 NeighborGraph::NeighborGraph() : neighborCount(0), downstreamCount(0), relayStateCount(0), routeCacheCount(0) {}
 
+void NeighborGraph::purgeForPresetChange()
+{
+    neighborCount = 0;
+    downstreamCount = 0;
+    relayStateCount = 0;
+    routeCacheCount = 0;
+}
+
 // --- Private helpers ---
 
 NodeEdges *NeighborGraph::findNeighbor(NodeNum nodeId)

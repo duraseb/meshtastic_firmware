@@ -1298,6 +1298,58 @@ void test_weak_rssi_at_saturated_margin_pins_the_rssi_floor_breakpoint()
     TEST_ASSERT_FLOAT_WITHIN(0.0005f, 1.14833f, etx);
 }
 
+static void test_purge_for_preset_change_drops_neighbours_and_derived_state()
+{
+    constexpr NodeNum me = 0xAAAAAAAA;
+    constexpr NodeNum peer = 0xBBBBBBBB;
+    constexpr NodeNum far = 0xCCCCCCCC;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, peer, 1.0f, 1000, Edge::Source::Reported);
+    graph.updateDownstream(far, peer, 2.0f, 1000);
+    graph.recordNodeTransmission(peer, 42, 1000);
+    Route routed = graph.calculateRoute(peer, 1000);
+    TEST_ASSERT_NOT_EQUAL(0, routed.nextHop);
+    TEST_ASSERT_GREATER_THAN(0, graph.countDirectNeighbors());
+    TEST_ASSERT_TRUE(graph.isDownstream(far));
+    TEST_ASSERT_TRUE(graph.hasNodeTransmitted(peer, 42, 1000));
+    TEST_ASSERT_NOT_EQUAL(0, graph.getCachedRoute(peer, 1000).nextHop);
+
+    graph.purgeForPresetChange();
+
+    TEST_ASSERT_EQUAL(0, graph.countDirectNeighbors());
+    TEST_ASSERT_EQUAL_UINT32(0, graph.getNodeCount());
+    TEST_ASSERT_FALSE(graph.isDownstream(far));
+    TEST_ASSERT_FALSE(graph.hasNodeTransmitted(peer, 42, 2000));
+    TEST_ASSERT_EQUAL_UINT32(0, graph.calculateRoute(peer, 2000).nextHop);
+    TEST_ASSERT_EQUAL_UINT32(0, graph.getCachedRoute(peer, 2000).nextHop);
+}
+
+static void test_modem_preset_observer_ignores_first_sighting_and_repeats()
+{
+    bool known = false;
+    uint8_t cached = 0;
+    TEST_ASSERT_FALSE(srObserveModemPreset(known, cached, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST));
+    TEST_ASSERT_FALSE(srObserveModemPreset(known, cached, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST));
+    TEST_ASSERT_TRUE(srObserveModemPreset(known, cached, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW));
+    TEST_ASSERT_FALSE(srObserveModemPreset(known, cached, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW));
+    TEST_ASSERT_TRUE(srObserveModemPreset(known, cached, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST));
+}
+
+static void test_preset_change_resets_topology_version_and_relay_identity()
+{
+    initGraphTestNodeDb(0xAAAAAAAA);
+    SignalRoutingModule module;
+    module.rememberRelayIdentity(0xBBBB00BB, 0xBB);
+    TEST_ASSERT_GREATER_THAN(0, module.relayIdentityCacheSize());
+    module.purgeGraphForPresetChange();
+    TEST_ASSERT_EQUAL_UINT8(0, module.publishedTopologyVersion());
+    TEST_ASSERT_TRUE(module.bootBroadcastPending());
+    TEST_ASSERT_EQUAL_UINT8(0, module.relayIdentityCacheSize());
+    TEST_ASSERT_EQUAL_UINT32(0, module.resolveRelayIdentity(0xBB));
+}
+
 void setup()
 {
     initializeTestEnvironment();
@@ -1351,6 +1403,9 @@ void setup()
     RUN_TEST(test_margin_one_db_below_threshold_pins_the_zero_margin_breakpoint);
     RUN_TEST(test_margin_five_db_below_threshold_pins_the_low_breakpoint_probability);
     RUN_TEST(test_weak_rssi_at_saturated_margin_pins_the_rssi_floor_breakpoint);
+    RUN_TEST(test_purge_for_preset_change_drops_neighbours_and_derived_state);
+    RUN_TEST(test_modem_preset_observer_ignores_first_sighting_and_repeats);
+    RUN_TEST(test_preset_change_resets_topology_version_and_relay_identity);
 
     UNITY_END();
 }
