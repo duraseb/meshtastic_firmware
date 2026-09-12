@@ -272,6 +272,94 @@ enum class SrTopologyVerdict : uint8_t {
  * shared origin, so that is what is re-anchored to now. Floored at one slot time so an expired
  * rung 0 does not key up instantly, which is the thrash the early-band floor exists to prevent.
  */
+/// Hands out relay positions in rank order: the stock-router window first, the ladder past the
+/// transition once the window is full.
+///
+/// A stock ROUTER's delay is a hardware-seeded draw from that window, seeded by an SNR that never
+/// reaches the wire — so a reserved position orders *our expectation* of the draw, not the draw.
+/// That is why reservations are one slot time apart, stock's own granularity here, rather than one
+/// half-airtime: spacing an expectation by the airtime of a frame we are not sending claims a
+/// precision we do not have, and it is the only spacing under which the window has a capacity.
+/// A rung of ours is the opposite — a real transmit time — so it takes a rung's separation.
+struct SrPositionAllocator {
+    uint32_t windowWidthMs = 0;
+    uint32_t slotTimeMs = 0;
+    uint32_t halfAirtimeMs = 0;
+    uint32_t originMs = 0;
+    uint32_t cursorMs = 0;
+    uint32_t lastPlacedMs = 0;
+    uint32_t ladderStartMs = 0;
+    uint8_t placed = 0;
+    uint8_t nextIdx = 0;
+    bool anyPlaced = false;
+    bool ladderFrozen = false;
+
+    /// `positions` is `2 * CWmax - 1`, the slots the window holds at stock's granularity.
+    SrPositionAllocator(uint32_t slotTime, uint32_t halfAirtime, uint32_t origin, uint8_t positions)
+        : windowWidthMs(slotTime * positions), slotTimeMs(slotTime), halfAirtimeMs(halfAirtime), originMs(origin),
+          maxPositions(positions)
+    {
+    }
+
+    /// Where the ladder's first rung goes.
+    ///
+    /// The empty case is separate on purpose: folding it into the formula leaves the last position
+    /// at zero and degenerates to a bare half-airtime, seconds of it at the slow presets on a mesh
+    /// with no router at all.
+    uint32_t firstRungMs() const
+    {
+        if (!anyPlaced) {
+            return originMs;
+        }
+        uint32_t cleared = lastPlacedMs + halfAirtimeMs;
+        return cleared > originMs ? cleared : originMs;
+    }
+
+    /// A stock relay router's position: one slot time wide, inside the window.
+    uint32_t takeReserved() { return place(slotTimeMs); }
+
+    /// A rung of ours: on the ladder, past the transition. Reserved positions can only push this
+    /// later, never earlier.
+    uint32_t takeRung()
+    {
+        uint32_t at = spill();
+        nextIdx++;
+        return at;
+    }
+
+    /// Where a transmission goes when nothing was placed ahead of it.
+    uint32_t firstFreeMs() { return anyPlaced ? spill() : originMs; }
+
+  private:
+    uint8_t maxPositions = 0;
+
+    uint32_t spill()
+    {
+        if (!ladderFrozen) {
+            ladderStartMs = firstRungMs();
+            ladderFrozen = true;
+        }
+        uint8_t rung = nextIdx > placed ? static_cast<uint8_t>(nextIdx - placed) : 0;
+        return ladderStartMs + rung * halfAirtimeMs;
+    }
+
+    uint32_t place(uint32_t widthMs)
+    {
+        if (placed >= maxPositions || cursorMs >= windowWidthMs) {
+            uint32_t at = spill();
+            nextIdx++;
+            return at;
+        }
+        uint32_t at = cursorMs;
+        cursorMs += widthMs;
+        lastPlacedMs = at;
+        anyPlaced = true;
+        placed++;
+        nextIdx++;
+        return at;
+    }
+};
+
 static inline uint32_t srExpiredRelayReanchorMs(uint32_t rungDelayMs, uint32_t originMs, uint32_t slotTimeMs)
 {
     uint32_t offset = rungDelayMs > originMs ? rungDelayMs - originMs : 0;

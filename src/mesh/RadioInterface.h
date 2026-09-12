@@ -212,6 +212,12 @@ class RadioInterface
      */
     [[nodiscard]] uint32_t getRelayFloorMsec() const { return 2 * CWmax * slotTimeMsec; }
 
+    /**
+     * One stock contention slot. Public for the same reason as the floor above: the routing layer
+     * lays reserved positions out at stock's own granularity and must not restate the number.
+     */
+    [[nodiscard]] uint32_t getSlotTimeMsec() const { return slotTimeMsec; }
+
     [[nodiscard]] uint32_t getTxDelayMsecWeightedWorst(float snr);
 
     /** Returns true if we should rebroadcast early like a ROUTER */

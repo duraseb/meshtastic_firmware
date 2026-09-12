@@ -1331,6 +1331,50 @@ static void test_purge_for_preset_change_drops_neighbours_and_derived_state()
     TEST_ASSERT_EQUAL_UINT32(0, graph.getCachedRoute(peer, nowSecs + 1).nextHop);
 }
 
+// Window positions are one slot time apart, not one half-airtime: a reservation orders our
+// expectation of a stock draw, and spacing that by an airtime we are not sending claims a
+// precision we do not have.
+static void test_reservations_sit_one_slot_apart()
+{
+    SrPositionAllocator a(10, 100, 250, 15);
+    TEST_ASSERT_EQUAL_UINT32(0, a.takeReserved());
+    TEST_ASSERT_EQUAL_UINT32(10, a.takeReserved());
+    TEST_ASSERT_EQUAL_UINT32(20, a.takeReserved());
+}
+
+// Rungs live on the ladder past the transition. Reserved positions can push the first one later,
+// never earlier.
+static void test_rungs_start_at_the_transition_and_space_by_a_half_airtime()
+{
+    SrPositionAllocator a(10, 100, 250, 15);
+    TEST_ASSERT_EQUAL_UINT32(250, a.takeRung());
+    TEST_ASSERT_EQUAL_UINT32(350, a.takeRung());
+    TEST_ASSERT_EQUAL_UINT32(450, a.takeRung());
+
+    SrPositionAllocator held(10, 100, 250, 15);
+    held.takeReserved();
+    TEST_ASSERT_TRUE(held.takeRung() >= 250);
+}
+
+// The empty case is stated separately: folding it into the formula would leave the last position
+// at zero and degenerate to a bare half-airtime.
+static void test_an_empty_window_puts_the_first_rung_at_the_transition()
+{
+    SrPositionAllocator a(89, 5702, 250, 15);
+    TEST_ASSERT_EQUAL_UINT32(250, a.firstRungMs());
+    TEST_ASSERT_EQUAL_UINT32(250, a.firstFreeMs());
+}
+
+// The window holds its positions and no more; anything further spills past the transition.
+static void test_the_window_never_holds_more_than_its_positions()
+{
+    SrPositionAllocator a(1, 100, 250, 15);
+    for (int i = 0; i < 15; i++) {
+        TEST_ASSERT_TRUE(a.takeReserved() < 15);
+    }
+    TEST_ASSERT_TRUE(a.takeReserved() >= 250);
+}
+
 static void test_modem_preset_observer_ignores_first_sighting_and_repeats()
 {
     bool known = false;
@@ -1436,6 +1480,10 @@ void setup()
     RUN_TEST(test_margin_five_db_below_threshold_pins_the_low_breakpoint_probability);
     RUN_TEST(test_weak_rssi_at_saturated_margin_pins_the_rssi_floor_breakpoint);
     RUN_TEST(test_purge_for_preset_change_drops_neighbours_and_derived_state);
+    RUN_TEST(test_reservations_sit_one_slot_apart);
+    RUN_TEST(test_rungs_start_at_the_transition_and_space_by_a_half_airtime);
+    RUN_TEST(test_an_empty_window_puts_the_first_rung_at_the_transition);
+    RUN_TEST(test_the_window_never_holds_more_than_its_positions);
     RUN_TEST(test_modem_preset_observer_ignores_first_sighting_and_repeats);
     RUN_TEST(test_preset_change_resets_topology_version_and_relay_identity);
     RUN_TEST(test_radio_reconfigured_purges_only_when_the_preset_changes);
