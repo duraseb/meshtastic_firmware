@@ -1608,19 +1608,35 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
         // If still not resolved, try known nodes (both direct neighbors and topology-known nodes)
         // We need to check ALL edges, not just Reported ones, because the relay might be
         // a node we only know through topology broadcasts (Mirrored edges)
+        // Only when the byte names exactly one of our neighbours. Two neighbours sharing a low
+        // byte are indistinguishable in a relayed frame, and the identity decides which node a
+        // measured, published edge is written to: name the wrong one and a peer credits it with
+        // covering us and stops relaying to us. No answer is the safe answer — the caller falls
+        // back to a placeholder, which is never published.
         if (inferredRelayer == 0 && routingGraph && nodeDB) {
             const NodeEdges* myEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
             if (myEdges) {
+                NodeNum onlyMatch = 0;
+                bool ambiguous = false;
                 for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
                     NodeNum neighbor = myEdges->edges[i].to;
                     if ((neighbor & 0xFF) == mp.relay_node && !isPlaceholderNode(neighbor)) {
-                        inferredRelayer = neighbor;
-                        // Remember this mapping for future use
-                        rememberRelayIdentity(neighbor, mp.relay_node);
-                        LOG_INFO("[SR] Resolved relay 0x%02x to known node %08x",
-                                 mp.relay_node, neighbor);
-                        break;
+                        if (onlyMatch != 0 && onlyMatch != neighbor) {
+                            ambiguous = true;
+                            break;
+                        }
+                        onlyMatch = neighbor;
                     }
+                }
+                if (ambiguous) {
+                    LOG_INFO("[SR] Relay 0x%02x matches more than one neighbour: not resolved",
+                             mp.relay_node);
+                } else if (onlyMatch != 0) {
+                    inferredRelayer = onlyMatch;
+                    // Remember this mapping for future use
+                    rememberRelayIdentity(onlyMatch, mp.relay_node);
+                    LOG_INFO("[SR] Resolved relay 0x%02x to known node %08x",
+                             mp.relay_node, onlyMatch);
                 }
             }
         }
@@ -1720,8 +1736,15 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                          inferredRelayer, (int)getCapabilityStatus(inferredRelayer));
             }
 
-            // Refresh Reported direct-neighbor link quality from relay-heard RF measurements.
-            if (hasSignalData && hasDirectConnectionToRelay && !isPlaceholderNode(inferredRelayer)) {
+            // A relayed frame is a direct RF transmission from its relayer, whatever originated the
+            // payload it carries, so the RSSI and SNR we took off it measure our link to that
+            // relayer as well as a frame it originated would. The measurement therefore establishes
+            // the link rather than only refreshing one: requiring an existing Reported edge meant a
+            // router that relays constantly and originates almost never was measured hundreds of
+            // times and recorded not once. What a relayed frame cannot supply is identity — it
+            // names its relayer in one byte — so an unresolved relayer stays a placeholder, and a
+            // placeholder is never recorded here and never published.
+            if (hasSignalData && !isPlaceholderNode(inferredRelayer)) {
                 uint32_t monotonicTimestamp = millis() / 1000;
                 int changeType = refreshReportedDirectNeighbor(inferredRelayer, mp.rx_rssi, mp.rx_snr, monotonicTimestamp);
                 if (changeType == EDGE_SIGNIFICANT_CHANGE) {

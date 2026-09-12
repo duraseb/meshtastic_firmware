@@ -601,6 +601,26 @@ Edges come in three classes, and only two of them are evidence. `Reported` is a 
 
 Two writes that used to claim more than they knew now say what they are. An edge `gateway → source` is invented only when the gateway is a stock (`Legacy`) node or an unresolved placeholder, because the gateway is the only node that can publish that edge; reachability learned from relayed frames lives in the downstream table, gated separately on the source and the hop count, since no publisher supplies it. And the reverse direction synthesised while merging a topology — the sender's neighbour hearing the sender — is `Inferred`, because the sender published only its own direction; recorded as `Reported` it outranked and permanently blocked that neighbour's own measurement of the sender, and priced the delivery from our assumption of symmetry.
 
+A measurement taken off a relayed frame is `Reported` for the `us → relayer` link, and it establishes
+that link rather than only refreshing one. The frame is a direct RF transmission from its relayer
+whatever originated the payload it carries, so its RSSI and SNR measure our link to that relayer
+exactly as a frame the relayer originated would. Requiring an already-`Reported` edge before
+recording it meant a stock router that relays constantly and originates almost never — 5 packets in
+840, field 2026-09-11 — was measured hundreds of times and recorded not once, so no node could say
+it reaches them and every neighbour kept unique coverage of it and relayed. Publishing it costs a
+peer nothing: `us → relayer` is our own measurement of our own link and goes out in the list we
+broadcast, so a peer recomputing our coverage from that list reaches the number we do. The `Mirrored`
+exclusion guards the other case, an edge *between other nodes* that a third party published, where
+that owner is the authority.
+
+What a relayed frame cannot supply is identity: it names its relayer in one byte. That byte is
+resolved only when it names exactly one node we have measured — two neighbours sharing a low byte
+resolve to nobody, because the identity decides which node a published, coverage-bearing edge is
+written to, and naming the wrong one has a peer credit coverage that does not exist and stop relaying
+to us. Unresolved, the relayer stays a placeholder, and a placeholder is never recorded here and
+never published. So a relayer still has to be identified by some other means before any of this
+publishes anything.
+
 `updateNodeActivity()` refreshes an existing node and never creates one: a relayed frame proves its source exists, not that we know a link to it, and an edgeless node was removed by the next `ageEdges()` pass together with every edge in the graph pointing at it — including a gateway's published measurement of that node, which then returned only on the gateway's next list. A complete non-empty list is also authoritative about the sender's own edges, not only about `hearsUs`: `retainListedEdges()` drops edges to nodes the list no longer names, leaving our own measurements and placeholders alone, so an entry a rebooted peer dropped no longer lingers in its coverage set until the graph TTL. The node-id constant for placeholders lives in the graph (`Edge::PLACEHOLDER_NODE_BASE`), which is what needs to know which of its nodes are routing artefacts.
 
 A third bound retires the link itself. A node whose lists we accept promises one every `SIGNAL_ROUTING_BROADCAST_SECS`; hear nothing at all from it for `PUBLISHER_SILENCE_SECS` (two intervals) and `pruneSilentPublishers()` retracts our own two edges to it. The graph TTL (`NODE_TTL_SECS`) is how long a topology is worth remembering, not how long we owe a neighbour airtime: until our edge goes, every coverage decision still counts that neighbour as ours to carry, so a node that has left the air draws a relay out of us for every frame whose sender we cannot show reached it. Only our own claim is retracted — the node stays in the graph, so a peer that still hears it keeps it reachable and a unicast for it still finds that route; losing a direct neighbour this way marks our topology dirty. Coverage goes further than our own edge: past the same horizon the node is nobody's coverage target (`isSilentPublisher()`, applied in `admitsCoverage()`, so the ranking and absorb both follow). A peer's published edge to it outlives our retraction by up to a broadcast interval, so without that every node credits its peers with covering a node that has gone — and each peer, having retracted it under the same rule, declines the slot it was handed. The judgement is on when we last heard the node itself; a peer naming it in a list is not hearing it. Native test: `test_a_publisher_we_stopped_hearing_is_nobodys_target`. Stock and legacy neighbours keep the full TTL, because they promise no cadence and their silence is not evidence about them. Any received frame refreshes the edge, not only a list, so a chatty neighbour is never retracted. Native test: `test_a_silent_publisher_loses_our_direct_link`.
