@@ -4168,12 +4168,16 @@ SignalRoutingModule::CapabilityStatus SignalRoutingModule::getCapabilityStatus(N
     return CapabilityStatus::Unknown;
 }
 
-// Returns true for nodes that relay immediately with no added delay (ROUTER and REPEATER).
-// Used for Phase 1 slot scheduling — we give these an early slot and assume they'll transmit.
-// ROUTER_LATE is excluded: it deliberately delays, so waiting for it would slow SR relays.
+// A stock node in a role that rebroadcasts early regardless of SR. Used for Phase 1 slot
+// reservations — we give these a window position and assume they transmit. An SR node (active or
+// passive) publishes topology and is ranked instead, never reserved for. ROUTER_LATE is excluded:
+// it deliberately delays, so waiting for it would slow SR relays.
 bool SignalRoutingModule::isImmediateRelayRouter(NodeNum nodeId) const
 {
     if (!nodeDB) return false;
+    if (publishesTopology(nodeId)) {
+        return false;
+    }
     const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(nodeId);
     if (!node || !node->has_user) return false;
     auto role = node->user.role;

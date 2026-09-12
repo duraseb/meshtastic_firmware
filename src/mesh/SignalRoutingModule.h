@@ -318,14 +318,10 @@ struct SrPositionAllocator {
     /// A stock relay router's position: one slot time wide, inside the window.
     uint32_t takeReserved() { return place(slotTimeMs); }
 
-    /// A rung of ours: on the ladder, past the transition. Reserved positions can only push this
-    /// later, never earlier.
-    uint32_t takeRung()
-    {
-        uint32_t at = spill();
-        nextIdx++;
-        return at;
-    }
+    /// A rung of ours: inside the window while a half-airtime still fits, otherwise on the ladder
+    /// past the transition. An SR node's position is a real transmit time, so it takes a rung's
+    /// separation; sitting inside the window is what makes a top-ranked SR ROUTER early.
+    uint32_t takeRung() { return place(halfAirtimeMs); }
 
     /// Where a transmission goes when nothing was placed ahead of it.
     uint32_t firstFreeMs() { return anyPlaced ? spill() : originMs; }

@@ -1342,18 +1342,41 @@ static void test_reservations_sit_one_slot_apart()
     TEST_ASSERT_EQUAL_UINT32(20, a.takeReserved());
 }
 
-// Rungs live on the ladder past the transition. Reserved positions can push the first one later,
-// never earlier.
-static void test_rungs_start_at_the_transition_and_space_by_a_half_airtime()
+// Rungs take window positions while a half-airtime still fits; when the window is full they spill
+// past the transition. An empty window therefore places the first ranked position at 0, not at
+// the origin — that is what makes a top-ranked SR ROUTER early.
+static void test_rungs_take_window_positions_while_a_half_airtime_fits()
+{
+    // Window width 150 ms (15 × 10); half-airtime 50 so three ranked positions fit.
+    SrPositionAllocator a(10, 50, 250, 15);
+    TEST_ASSERT_EQUAL_UINT32(0, a.takeRung());
+    TEST_ASSERT_EQUAL_UINT32(50, a.takeRung());
+    TEST_ASSERT_EQUAL_UINT32(100, a.takeRung());
+}
+
+// One reservation then ranked positions: they share the window in order.
+static void test_reservations_and_ranked_positions_interleave_in_the_window()
+{
+    SrPositionAllocator a(10, 50, 250, 15);
+    TEST_ASSERT_EQUAL_UINT32(0, a.takeReserved());
+    TEST_ASSERT_EQUAL_UINT32(10, a.takeRung());
+    TEST_ASSERT_EQUAL_UINT32(60, a.takeRung());
+}
+
+// Rungs live on the ladder past the transition once the window cannot hold another half-airtime.
+// Reserved positions can push the first spill later, never earlier.
+static void test_rungs_spill_past_the_transition_when_the_window_is_full()
 {
     SrPositionAllocator a(10, 100, 250, 15);
+    TEST_ASSERT_EQUAL_UINT32(0, a.takeRung());
+    // Still room in a 150 ms window for another 100 ms? cursor at 100, width 150 — yes at 100.
+    TEST_ASSERT_EQUAL_UINT32(100, a.takeRung());
+    // cursor 200 >= 150: spill. Last placed at 100, cleared by half = 200, max with origin 250.
     TEST_ASSERT_EQUAL_UINT32(250, a.takeRung());
-    TEST_ASSERT_EQUAL_UINT32(350, a.takeRung());
-    TEST_ASSERT_EQUAL_UINT32(450, a.takeRung());
 
     SrPositionAllocator held(10, 100, 250, 15);
     held.takeReserved();
-    TEST_ASSERT_TRUE(held.takeRung() >= 250);
+    TEST_ASSERT_TRUE(held.takeRung() >= 10);
 }
 
 // The empty case is stated separately: folding it into the formula would leave the last position
@@ -1517,7 +1540,9 @@ void setup()
     RUN_TEST(test_weak_rssi_at_saturated_margin_pins_the_rssi_floor_breakpoint);
     RUN_TEST(test_purge_for_preset_change_drops_neighbours_and_derived_state);
     RUN_TEST(test_reservations_sit_one_slot_apart);
-    RUN_TEST(test_rungs_start_at_the_transition_and_space_by_a_half_airtime);
+    RUN_TEST(test_rungs_take_window_positions_while_a_half_airtime_fits);
+    RUN_TEST(test_reservations_and_ranked_positions_interleave_in_the_window);
+    RUN_TEST(test_rungs_spill_past_the_transition_when_the_window_is_full);
     RUN_TEST(test_an_empty_window_puts_the_first_rung_at_the_transition);
     RUN_TEST(test_the_window_never_holds_more_than_its_positions);
     RUN_TEST(test_modem_preset_observer_ignores_first_sighting_and_repeats);
