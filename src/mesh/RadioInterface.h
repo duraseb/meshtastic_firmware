@@ -327,6 +327,10 @@ class RadioInterface
 
     int notifyDeepSleepCb(void *unused = NULL);
 
+  public:
+    /// Config-reload entry point: applies the new radio settings and tells SignalRouting the air
+    /// has changed. Public because it is invoked from outside this class — the config observer
+    /// calls it, and the native tests exercise it directly.
     int reloadConfig(void *unused);
 };
 

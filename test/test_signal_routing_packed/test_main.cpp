@@ -1305,25 +1305,30 @@ static void test_purge_for_preset_change_drops_neighbours_and_derived_state()
     constexpr NodeNum far = 0xCCCCCCCC;
     initGraphTestNodeDb(me);
 
+    // Write the downstream entry on the clock the reader uses. `updateDownstream` takes an
+    // explicit timestamp but `isDownstream` ages entries against `millis()`, so a synthetic
+    // future timestamp underflows the unsigned age and the entry reads as long expired — the
+    // setup would then assert nothing about the purge.
     NeighborGraph graph;
-    graph.updateEdge(me, peer, 1.0f, 1000, Edge::Source::Reported);
-    graph.updateDownstream(far, peer, 2.0f, 1000);
-    graph.recordNodeTransmission(peer, 42, 1000);
-    Route routed = graph.calculateRoute(peer, 1000);
+    const uint32_t nowSecs = millis() / 1000;
+    graph.updateEdge(me, peer, 1.0f, nowSecs, Edge::Source::Reported);
+    graph.updateDownstream(far, peer, 2.0f, nowSecs);
+    graph.recordNodeTransmission(peer, 42, nowSecs);
+    Route routed = graph.calculateRoute(peer, nowSecs);
     TEST_ASSERT_NOT_EQUAL(0, routed.nextHop);
     TEST_ASSERT_GREATER_THAN(0, graph.countDirectNeighbors());
     TEST_ASSERT_TRUE(graph.isDownstream(far));
-    TEST_ASSERT_TRUE(graph.hasNodeTransmitted(peer, 42, 1000));
-    TEST_ASSERT_NOT_EQUAL(0, graph.getCachedRoute(peer, 1000).nextHop);
+    TEST_ASSERT_TRUE(graph.hasNodeTransmitted(peer, 42, nowSecs));
+    TEST_ASSERT_NOT_EQUAL(0, graph.getCachedRoute(peer, nowSecs).nextHop);
 
     graph.purgeForPresetChange();
 
     TEST_ASSERT_EQUAL(0, graph.countDirectNeighbors());
     TEST_ASSERT_EQUAL_UINT32(0, graph.getNodeCount());
     TEST_ASSERT_FALSE(graph.isDownstream(far));
-    TEST_ASSERT_FALSE(graph.hasNodeTransmitted(peer, 42, 2000));
-    TEST_ASSERT_EQUAL_UINT32(0, graph.calculateRoute(peer, 2000).nextHop);
-    TEST_ASSERT_EQUAL_UINT32(0, graph.getCachedRoute(peer, 2000).nextHop);
+    TEST_ASSERT_FALSE(graph.hasNodeTransmitted(peer, 42, nowSecs + 1));
+    TEST_ASSERT_EQUAL_UINT32(0, graph.calculateRoute(peer, nowSecs + 1).nextHop);
+    TEST_ASSERT_EQUAL_UINT32(0, graph.getCachedRoute(peer, nowSecs + 1).nextHop);
 }
 
 static void test_modem_preset_observer_ignores_first_sighting_and_repeats()
