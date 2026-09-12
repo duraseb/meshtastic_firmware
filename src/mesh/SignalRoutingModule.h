@@ -518,12 +518,18 @@ static inline int refreshReportedDirectNeighborObservation(NeighborGraph *graph,
     }
 
     float etx = NeighborGraph::calculateETX(rssi, snr, currentCostingSpreadingFactor());
-    int changeToUs = graph->updateEdge(nodeId, myNode, etx, nowSecs, Edge::Source::Reported);
-    int changeFromUs = graph->updateEdge(myNode, nodeId, etx, nowSecs, Edge::Source::Reported);
-    int changeType = changeToUs;
-    if (changeFromUs == EDGE_NEW || (changeFromUs == EDGE_SIGNIFICANT_CHANGE && changeType != EDGE_NEW)) {
-        changeType = changeFromUs;
-    }
+    // We measured one direction: the frame we just received. How well the neighbour hears *us* is
+    // an assumption of symmetry, so the reverse edge is `Inferred`, the same class this module
+    // already gives the reverse direction synthesised while merging a topology. Recorded as
+    // `Reported` it took the top rank and could never be displaced — classes rank Inferred <
+    // Mirrored < Reported and a weaker one never overwrites a stronger — so the neighbour's own
+    // published measurement of us could never land, and every node credited itself with more
+    // coverage than its peers credited it with. The edge stays as evidence a link exists both ways;
+    // it simply no longer prices one. Delivery cost is unaffected: the lookup tries the receive
+    // direction first and falls back to this same observation on the forward edge.
+    (void)graph->updateEdge(nodeId, myNode, etx, nowSecs, Edge::Source::Inferred);
+    // The measured direction is what we publish, so it alone decides whether the topology changed.
+    int changeType = graph->updateEdge(myNode, nodeId, etx, nowSecs, Edge::Source::Reported);
 
     int8_t clampedSnr = static_cast<int8_t>(std::max(-128.f, std::min(127.f, snr)));
     upsertDirectNeighborSignal(signals, signalCount, maxSignals, nodeId, static_cast<int8_t>(rssi), clampedSnr, nowSecs);

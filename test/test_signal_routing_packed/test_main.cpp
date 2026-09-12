@@ -195,9 +195,13 @@ static void test_refresh_reported_direct_neighbor_updates_cache_and_variance()
         }
     }
 
+    // The return value is the verdict on the direction we publish (us -> neighbour) and nothing
+    // else. The dirty threshold is relative, so an improving link can never clear it: the change
+    // is at most the whole of the old cost, and the threshold sits above 1. The cache and the
+    // variance below still move, which is the rest of this function's job.
     int second = refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE,
                                                           localNode, gateway, -70, 12.0f, 1001);
-    TEST_ASSERT_NOT_EQUAL(EDGE_NO_CHANGE, second);
+    TEST_ASSERT_EQUAL_INT(EDGE_NO_CHANGE, second);
 
     const DirectNeighborSignal *updated = lookupDirectNeighborSignal(signals, signalCount, gateway);
     TEST_ASSERT_NOT_NULL(updated);
@@ -210,6 +214,26 @@ static void test_refresh_reported_direct_neighbor_updates_cache_and_variance()
             break;
         }
     }
+
+    // A degradation does clear the threshold, and that is the signal the caller acts on. It comes
+    // from the measured direction: the reverse edge is only inferred and never decides this.
+    int third = refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE,
+                                                         localNode, gateway, -120, -20.0f, 1002);
+    TEST_ASSERT_EQUAL_INT(EDGE_SIGNIFICANT_CHANGE, third);
+
+    // The direction we did not measure is held as an assumption of symmetry, so it must not carry
+    // the class that outranks the neighbour's own published measurement of us.
+    const NodeEdges *theirEdges = graph.getEdgesFrom(gateway);
+    TEST_ASSERT_NOT_NULL(theirEdges);
+    bool sawReverse = false;
+    for (uint8_t i = 0; i < theirEdges->edgeCount; i++) {
+        if (theirEdges->edges[i].to == localNode) {
+            TEST_ASSERT_EQUAL_INT(static_cast<int>(Edge::Source::Inferred), static_cast<int>(theirEdges->edges[i].source));
+            sawReverse = true;
+            break;
+        }
+    }
+    TEST_ASSERT_TRUE(sawReverse);
 }
 
 static void test_relay_refresh_skips_without_reported_edge()
