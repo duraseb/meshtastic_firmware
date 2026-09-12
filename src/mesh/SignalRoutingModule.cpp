@@ -2599,8 +2599,11 @@ void SignalRoutingModule::cancelBroadcastRetransmit(PacketId packetId)
     }
 }
 
-bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p)
+bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p, NodeNum *uniqueNeighbor)
 {
+    if (uniqueNeighbor) {
+        *uniqueNeighbor = 0;
+    }
     if (!routingGraph || !nodeDB || !p) {
         return false; // Can't evaluate — keep our relay
     }
@@ -2712,6 +2715,9 @@ bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p)
     NodeNum uniqueFor = routingGraph->uniqueCoverageNeighbor(myNode, coveredBy, coveredByCount,
                                                              cfgPoorLinkEtxThreshold, &policy);
     bool unique = uniqueFor != 0;
+    if (uniqueNeighbor) {
+        *uniqueNeighbor = uniqueFor;
+    }
 
     if (unique) {
         LOG_INFO("[SR] Bcast dupe 0x%08x from %s: %u TX, keeping",
@@ -3120,9 +3126,67 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         noteAbsorbed(relay, before);
     };
 
+    // Phase 2 snapshot for the scheduling line: whom we uniquely reach before ranking (unc=),
+    // and each candidate's (unique/total, cost bucket) at that moment (cand=). Logged once the
+    // decision is final so via=/slots= are known. Six unc= entries, not three: a shorter list is
+    // a prefix of each node's edge order, so two captures cannot tell a real disagreement from
+    // two truncations of the same set.
+    static constexpr uint8_t UNCOVERED_LOG = 6;
+    static constexpr uint8_t EVALUATED_LOG = 4;
+    NodeNum uncovered[UNCOVERED_LOG];
+    uint8_t uncoveredLen = 0;
+    {
+        NodeNum mine[NODE_SET_MAX];
+        size_t n = routingGraph->getCoverageIfRelays(myNode, mine, NODE_SET_MAX, nullptr, 0, myNode, &coveragePolicy);
+        for (size_t i = 0; i < n && uncoveredLen < UNCOVERED_LOG; i++) {
+            if (!alreadyCovered.contains(mine[i])) {
+                uncovered[uncoveredLen++] = mine[i];
+            }
+        }
+    }
+    struct EvalCand {
+        NodeNum id;
+        uint8_t uniqueCov;
+        uint8_t totalCov;
+        uint16_t costFixed;
+    };
+    EvalCand evaluated[EVALUATED_LOG];
+    uint8_t evaluatedLen = 0;
+    for (uint16_t ci = 0; ci < candidates.count && evaluatedLen < EVALUATED_LOG; ci++) {
+        NodeNum cand = candidates.nodes[ci];
+        if (routingGraph->hasNodeTransmitted(cand, p->id, currentTime)) {
+            continue;
+        }
+        NodeNum cov[NODE_SET_MAX];
+        size_t total =
+            routingGraph->getCoverageIfRelays(cand, cov, NODE_SET_MAX, nullptr, 0, myNode, &coveragePolicy);
+        size_t unique = 0;
+        float costSum = 0.0f;
+        size_t validCosts = 0;
+        for (size_t i = 0; i < total; i++) {
+            if (alreadyCovered.contains(cov[i])) {
+                continue;
+            }
+            unique++;
+            float c = routingGraph->hopCost(cand, cov[i]);
+            if (c > 0.0f) {
+                costSum += c;
+                validCosts++;
+            }
+        }
+        uint16_t costFixed = 0;
+        if (validCosts > 0) {
+            costFixed = static_cast<uint16_t>((costSum / validCosts) * 100.0f);
+            costFixed = static_cast<uint16_t>(costFixed / SR_COST_BUCKET_FIXED * SR_COST_BUCKET_FIXED);
+        }
+        evaluated[evaluatedLen++] = {cand, static_cast<uint8_t>(unique > 255 ? 255 : unique),
+                                     static_cast<uint8_t>(total > 255 ? 255 : total), costFixed};
+    }
+    uint8_t mySlotIndex = 0;
+    uint16_t preCoveredAtRank = alreadyCovered.count;
+    uint16_t candidatesAtRank = candidates.count;
+
     // Phase 2: Iteratively pick best SR candidate, assign slots
-    LOG_INFO("[SR] Slot scheduling 0x%08x: half=%ums, %u cands, %u pre-covered", p->id, halfAirtime,
-             static_cast<unsigned>(candidates.count), static_cast<unsigned>(alreadyCovered.count));
     while (!candidates.empty()) {
         RelayCandidate best = routingGraph->findBestRelayCandidate(candidates, alreadyCovered,
                                                                     currentTime, p->id, preferHighNodeId, sourceNode,
@@ -3142,6 +3206,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         if (best.nodeId == myNode) {
             shouldRelay = true;
             myDelay = slotDelay + rungJitter;
+            mySlotIndex = slotsGiven;
             decisionReason = "SR slot assignment";
             LOG_INFO("[SR] Slot %ums: US (%08x)%s j=%ums", myDelay, myNode, best.tier > 0 ? " (bidi)" : "",
                      rungJitter);
@@ -3212,6 +3277,49 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     // coordinate with. Distinguish them, or the reservation's effect cannot be read from a log.
     if (!shouldRelay && reservedSlots > 0) {
         decisionReason = "stock router expected";
+    }
+
+    // One scheduling line with unc= (whom we uniquely reached before ranking) and cand= (each
+    // candidate's unique/total and cost bucket). Without these a capture cannot attribute a
+    // RELAY/SUPPRESS disagreement between two nodes that held the same graph.
+    const char *viaTag = "";
+    if (strcmp(decisionReason, "SR slot assignment") == 0) {
+        viaTag = ", via=rank";
+    } else if (strcmp(decisionReason, "downstream relay override") == 0) {
+        viaTag = ", via=downstream";
+    } else if (strcmp(decisionReason, "sole candidate") == 0) {
+        viaTag = ", via=sparse";
+    } else if (strcmp(decisionReason, "acknowledgement") == 0) {
+        viaTag = ", via=ack";
+    }
+    char sched[544];
+    int sp = snprintf(sched, sizeof(sched),
+                      "[SR] Slot scheduling 0x%08x: halfAirtime=%ums, candidates=%u, pre=%u", p->id, halfAirtime,
+                      (unsigned)candidatesAtRank, (unsigned)preCoveredAtRank);
+    if (sp > 0 && uncoveredLen > 0 && (size_t)sp < sizeof(sched)) {
+        sp += snprintf(sched + sp, sizeof(sched) - (size_t)sp, ", unc=");
+        for (uint8_t i = 0; i < uncoveredLen && sp > 0 && (size_t)sp < sizeof(sched); i++) {
+            sp += snprintf(sched + sp, sizeof(sched) - (size_t)sp, "%s!%08x", i ? "," : "", uncovered[i]);
+        }
+    }
+    if (sp > 0 && (size_t)sp < sizeof(sched)) {
+        sp += snprintf(sched + sp, sizeof(sched) - (size_t)sp, ", slot=%u, slots=%u", (unsigned)mySlotIndex,
+                       (unsigned)slotsGiven);
+        if (reservedSlots > 0) {
+            sp += snprintf(sched + sp, sizeof(sched) - (size_t)sp, "(res=%u)", (unsigned)reservedSlots);
+        }
+        sp += snprintf(sched + sp, sizeof(sched) - (size_t)sp, "%s", viaTag);
+    }
+    if (sp > 0 && evaluatedLen > 0 && (size_t)sp < sizeof(sched)) {
+        sp += snprintf(sched + sp, sizeof(sched) - (size_t)sp, ", cand=");
+        for (uint8_t i = 0; i < evaluatedLen && sp > 0 && (size_t)sp < sizeof(sched); i++) {
+            sp += snprintf(sched + sp, sizeof(sched) - (size_t)sp, "%s!%08x(%u/%u,%u)", i ? "," : "",
+                           evaluated[i].id, (unsigned)evaluated[i].uniqueCov, (unsigned)evaluated[i].totalCov,
+                           (unsigned)evaluated[i].costFixed);
+        }
+    }
+    if (sp > 0) {
+        LOG_INFO("%s", sched);
     }
 
     LOG_INFO("[SR-DEC] BROADCAST %s 0x%08x: from %s via %s (%s, delay=%ums, slots=%u/res=%u, abs=%u)",

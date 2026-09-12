@@ -911,7 +911,10 @@ public:
      */
     uint32_t expiredRelayReanchorMs(PacketId packetId, uint32_t slotTimeMs) const;
     void clearCommittedRelay(PacketId packetId);
-    bool areAllNeighborsCovered(const meshtastic_MeshPacket *p);
+    // True when every neighbour we would cover is already covered by the transmitters heard for
+    // this packet (cancel the queued relay). When false and uniqueNeighbor is non-null, it is set
+    // to one neighbour we still uniquely reach — named on the keep line so a capture can say whom.
+    bool areAllNeighborsCovered(const meshtastic_MeshPacket *p, NodeNum *uniqueNeighbor = nullptr);
     // Returns the hop_limit to set for a unicast to a direct hearsUs neighbor when stock
     // neighbors are present, or -1 if no limiting should be applied.
     // Good links (ETX < 3.0): 0 hops (direct delivery, no further relay)

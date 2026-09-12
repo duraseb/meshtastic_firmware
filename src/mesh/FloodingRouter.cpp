@@ -174,14 +174,20 @@ void FloodingRouter::perhapsCancelDupe(const meshtastic_MeshPacket *p)
             signalRoutingModule->cancelBroadcastRetransmit(p->id);
             return;
         }
-        if (signalRoutingModule->areAllNeighborsCovered(p)) {
+        NodeNum uniqueFor = 0;
+        if (signalRoutingModule->areAllNeighborsCovered(p, &uniqueFor)) {
             LOG_INFO("[SR] Canceling committed relay for 0x%08x - dupe relayer covers our nodes", p->id);
             signalRoutingModule->clearCommittedRelay(p->id);
             signalRoutingModule->cancelBroadcastRetransmit(p->id);
             srCoverageCancel = true;
             // Fall through to normal cancel logic
         } else {
-            LOG_INFO("[SR] Not canceling committed relay for 0x%08x - we have unique coverage", p->id);
+            if (uniqueFor != 0) {
+                LOG_INFO("[SR] Not canceling committed relay for 0x%08x - we have unique coverage of %08x",
+                         p->id, uniqueFor);
+            } else {
+                LOG_INFO("[SR] Not canceling committed relay for 0x%08x - we have unique coverage", p->id);
+            }
             return;
         }
     }
