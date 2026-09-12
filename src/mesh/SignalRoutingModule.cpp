@@ -4398,22 +4398,37 @@ NodeNum SignalRoutingModule::resolveHeardFrom(const meshtastic_MeshPacket *p, No
         return resolved;
     }
 
-    // Check ALL known nodes (both Reported and Mirrored edges), not just direct neighbors,
-    // because the relay might be a node we only know through topology broadcasts
+    // Our own edge list — the nodes we have measured — and only when the byte names exactly one
+    // real node in it. Two of our neighbours sharing a low byte are indistinguishable in a relayed
+    // frame, and this identity decides who we treat as having transmitted, so a guess prices and
+    // publishes a link to the wrong node and has a peer credit coverage that does not exist.
+    // Ambiguity falls through to the placeholder below, which is never published.
     NodeNum placeholderMatch = 0;
     if (routingGraph && nodeDB) {
         const NodeEdges *myEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
         if (myEdges) {
+            NodeNum onlyMatch = 0;
+            bool ambiguous = false;
             for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
-                if ((myEdges->edges[i].to & 0xFF) == p->relay_node) {
-                    if (!isPlaceholderNode(myEdges->edges[i].to)) {
-                        // Remember this mapping for future use
-                        const_cast<SignalRoutingModule*>(this)->rememberRelayIdentity(myEdges->edges[i].to, p->relay_node);
-                        return myEdges->edges[i].to;
-                    }
-                    // Remember the placeholder in case no real node matches
-                    placeholderMatch = myEdges->edges[i].to;
+                NodeNum candidate = myEdges->edges[i].to;
+                if ((candidate & 0xFF) != p->relay_node) {
+                    continue;
                 }
+                if (isPlaceholderNode(candidate)) {
+                    // Remember the placeholder in case no real node matches
+                    placeholderMatch = candidate;
+                    continue;
+                }
+                if (onlyMatch != 0 && onlyMatch != candidate) {
+                    ambiguous = true;
+                    break;
+                }
+                onlyMatch = candidate;
+            }
+            if (!ambiguous && onlyMatch != 0) {
+                // Remember this mapping for future use
+                const_cast<SignalRoutingModule*>(this)->rememberRelayIdentity(onlyMatch, p->relay_node);
+                return onlyMatch;
             }
         }
     }
