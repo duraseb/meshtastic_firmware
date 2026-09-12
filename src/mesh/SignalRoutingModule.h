@@ -931,8 +931,8 @@ public:
     // T1 insurance for a broadcast we deferred (no ranked slot): if nobody retransmits, a late
     // copy still reaches the source. Every deferring node arms one, so each waits `staggerMs`
     // past the window; firing together would collide exactly when the ranked relay went missing.
-    void armDeferredBroadcastRetransmit(const meshtastic_MeshPacket *p, uint32_t staggerMs);
-    void scheduleT1Broadcast(const meshtastic_MeshPacket *p, uint32_t staggerMs, bool deferred);
+    void armDeferredBroadcastRetransmit(const meshtastic_MeshPacket *p, uint32_t staggerMs, uint8_t ladderRungs);
+    void scheduleT1Broadcast(const meshtastic_MeshPacket *p, uint32_t staggerMs, bool deferred, uint8_t ladderRungs);
     void cancelBroadcastRetransmit(PacketId packetId);
 };
 

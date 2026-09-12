@@ -1426,6 +1426,42 @@ static void test_radio_reconfigured_purges_only_when_the_preset_changes()
     TEST_ASSERT_TRUE(module.bootBroadcastPending());
 }
 
+// MeshModule::callModules only delivers undecoded frames to modules with encryptedOk. Without it,
+// a direct LoRa hearing whose payload does not decrypt never reaches handleReceived, so the sender
+// never enters the graph. Pin the admission flag and the observation path that records the sender.
+static void test_undecoded_direct_frame_is_recorded_as_a_neighbour()
+{
+    constexpr NodeNum me = 0xAAAAAAAA;
+    constexpr NodeNum stranger = 0x46ce027c;
+    initGraphTestNodeDb(me);
+
+    class ObservingModule : public SignalRoutingModule {
+    public:
+        bool admitsEncrypted() const { return encryptedOk; }
+        ProcessMessage observe(const meshtastic_MeshPacket &mp) { return handleReceived(mp); }
+    };
+    ObservingModule module;
+    TEST_ASSERT_TRUE(module.admitsEncrypted());
+
+    meshtastic_MeshPacket mp = {};
+    mp.from = stranger;
+    mp.to = NODENUM_BROADCAST;
+    mp.id = 0x9c1d4e21;
+    mp.hop_start = 0;
+    mp.hop_limit = 0;
+    mp.relay_node = static_cast<uint8_t>(stranger & 0xFF);
+    mp.rx_rssi = -80;
+    mp.rx_snr = 5.0f;
+    mp.via_mqtt = false;
+    mp.which_payload_variant = meshtastic_MeshPacket_encrypted_tag;
+    mp.channel = 0xf0;
+
+    TEST_ASSERT_TRUE(SignalRoutingModule::isDirectPacket(mp));
+    TEST_ASSERT_EQUAL_UINT32(0, module.resolveRelayIdentity(mp.relay_node));
+    module.observe(mp);
+    TEST_ASSERT_EQUAL_UINT32(stranger, module.resolveRelayIdentity(mp.relay_node));
+}
+
 void setup()
 {
     initializeTestEnvironment();
@@ -1487,6 +1523,7 @@ void setup()
     RUN_TEST(test_modem_preset_observer_ignores_first_sighting_and_repeats);
     RUN_TEST(test_preset_change_resets_topology_version_and_relay_identity);
     RUN_TEST(test_radio_reconfigured_purges_only_when_the_preset_changes);
+    RUN_TEST(test_undecoded_direct_frame_is_recorded_as_a_neighbour);
 
     UNITY_END();
 }

@@ -1506,13 +1506,21 @@ RelayCandidate NeighborGraph::findBestRelayCandidate(const NodeSet &candidates, 
             }
         }
 
+        // Role ranks above cost and below coverage: cost describes a link, the role describes the
+        // node, and two candidates reaching the same neighbours at the same price are not equally
+        // good if one of them exists for the purpose.
+        const uint8_t candidateRoleRank = policy ? policy->roleRank(candidate) : 0;
         bool isBetter = candidateTier > bestCandidate.tier ||
                         (candidateTier == bestCandidate.tier && uniqueCoverageCount > bestCandidate.coverageCount) ||
                         (candidateTier == bestCandidate.tier && uniqueCoverageCount == bestCandidate.coverageCount &&
+                         candidateRoleRank > bestCandidate.roleRank) ||
+                        (candidateTier == bestCandidate.tier && uniqueCoverageCount == bestCandidate.coverageCount &&
+                         candidateRoleRank == bestCandidate.roleRank &&
                          avgCostFixed < bestCandidate.avgCostFixed);
-        // Deterministic tiebreak on node ID when tier, coverage and cost are equal
+        // Deterministic tiebreak on node ID when tier, coverage, role and cost are equal
         if (!isBetter && candidateTier == bestCandidate.tier &&
             uniqueCoverageCount == bestCandidate.coverageCount &&
+            candidateRoleRank == bestCandidate.roleRank &&
             avgCostFixed == bestCandidate.avgCostFixed && bestCandidate.nodeId != 0) {
             isBetter = preferHighNodeId ? (candidate > bestCandidate.nodeId)
                                         : (candidate < bestCandidate.nodeId);
@@ -1520,6 +1528,7 @@ RelayCandidate NeighborGraph::findBestRelayCandidate(const NodeSet &candidates, 
         if (isBetter) {
             bestCandidate = RelayCandidate(candidate, uniqueCoverageCount, avgCostFixed, candidateTier,
                                            static_cast<uint8_t>(coverageCount));
+            bestCandidate.roleRank = candidateRoleRank;
         }
     }
 

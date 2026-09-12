@@ -90,6 +90,13 @@ NeighborGraph::CoveragePolicy SignalRoutingModule::coveragePolicy() const
     p.isSrActive = [](void *c, NodeNum n) {
         return static_cast<const SignalRoutingModule *>(c)->getCapabilityStatus(n) == CapabilityStatus::SRactive;
     };
+    p.isConfiguredRouter = [](void *, NodeNum n) {
+        if (!nodeDB) {
+            return false;
+        }
+        const meshtastic_NodeInfoLite *info = nodeDB->getMeshNode(n);
+        return info && info->has_user && info->user.role == meshtastic_Config_DeviceConfig_Role_ROUTER;
+    };
     p.me = nodeDB ? nodeDB->getNodeNum() : 0;
     p.meRelays = isActiveRoutingRole();
     p.poorLinkEtx = cfgPoorLinkEtxThreshold;
@@ -231,6 +238,10 @@ SignalRoutingModule::SignalRoutingModule()
 
     // We want to see all packets for signal quality updates
     isPromiscuous = true;
+    // Direct RF hearing is a neighbour whether or not the payload decrypts: identity and channel
+    // live in the clear header, and MeshModule skips modules with encryptedOk left false. Without
+    // this a foreign-channel or wrong-PSK frame is heard on air and never enters the graph.
+    encryptedOk = true;
 
     // The radio is already running this preset (NodeDB has loaded by the time we are
     // constructed). Cache it so the first live apply of a *different* preset is a change,
@@ -2452,15 +2463,21 @@ bool SignalRoutingModule::hasAnyHearsUsNeighbor() const
 
 void SignalRoutingModule::maybeScheduleBroadcastRetransmit(const meshtastic_MeshPacket *p)
 {
-    scheduleT1Broadcast(p, 0, false);
+    // Originated: the ladder that may carry this frame is other nodes' and we have not built a
+    // candidate set for it, so only the stock window bounds the wait. Erring short is the failure
+    // that matters here, and the stock worst case is the larger of the two at every preset until a
+    // ladder exists to compare against.
+    scheduleT1Broadcast(p, 0, false, 0);
 }
 
-void SignalRoutingModule::armDeferredBroadcastRetransmit(const meshtastic_MeshPacket *p, uint32_t staggerMs)
+void SignalRoutingModule::armDeferredBroadcastRetransmit(const meshtastic_MeshPacket *p, uint32_t staggerMs,
+                                                         uint8_t ladderRungs)
 {
-    scheduleT1Broadcast(p, staggerMs, true);
+    scheduleT1Broadcast(p, staggerMs, true, ladderRungs);
 }
 
-void SignalRoutingModule::scheduleT1Broadcast(const meshtastic_MeshPacket *p, uint32_t staggerMs, bool deferred)
+void SignalRoutingModule::scheduleT1Broadcast(const meshtastic_MeshPacket *p, uint32_t staggerMs, bool deferred,
+                                              uint8_t ladderRungs)
 {
     if (!routingGraph || !nodeDB || !p) {
         return;
@@ -2518,15 +2535,12 @@ void SignalRoutingModule::scheduleT1Broadcast(const meshtastic_MeshPacket *p, ui
     // window: a rung is a half-airtime apart, so at a slow preset with a full-size frame the last
     // rung passes the worst stock draw after a handful of candidates. Take whichever is later —
     // these are floors on the same instant, so they compose by max, never by addition.
-    uint32_t ladderSpanMs = 0;
-    if (routingGraph && nodeDB) {
-        const NodeEdges *myEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
-        uint8_t rungs = 0;
-        if (myEdges && myEdges->edgeCount > 0) {
-            rungs = static_cast<uint8_t>(myEdges->edgeCount - 1);
-        }
-        ladderSpanMs = SR_SLOT_ORIGIN_MS + static_cast<uint32_t>(rungs) * (airtimeMs / 2);
-    }
+    // Counted from the ladder itself, not estimated from the neighbour list. `ladderRungs` is the
+    // candidate set the ranking actually built — stock reservations already excluded, because the
+    // stock worst case above spans the window they sit in.
+    const uint32_t halfAirtimeMs = std::max(airtimeMs / 2, SR_MIN_RUNG_SPACING_MS);
+    const uint32_t ladderSpanMs =
+        SR_SLOT_ORIGIN_MS + static_cast<uint32_t>(ladderRungs) * halfAirtimeMs;
     if (ladderSpanMs > latestRelayWindowMs) {
         latestRelayWindowMs = ladderSpanMs;
     }
@@ -3380,7 +3394,10 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
                 rank++;
             }
         }
-        armDeferredBroadcastRetransmit(p, rank * halfAirtime);
+        // The ladder we are insuring is exactly this candidate set, so its last rung is
+        // `srPeers.count - 1` rungs past the transition.
+        const uint8_t ladderRungs = srPeers.count > 0 ? static_cast<uint8_t>(srPeers.count - 1) : 0;
+        armDeferredBroadcastRetransmit(p, rank * halfAirtime, ladderRungs);
     }
 
     return shouldRelay;

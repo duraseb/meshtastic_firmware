@@ -176,8 +176,9 @@ struct RelayCandidate {
     uint16_t avgCostFixed;
     uint8_t tier;
     uint8_t totalCoverage; // coverage before pre-coverage was subtracted (diagnostics)
+    uint8_t roleRank = 0;  // ranks above cost: see CoveragePolicy::roleRank
 
-    RelayCandidate() : nodeId(0), coverageCount(0), avgCostFixed(0), tier(0), totalCoverage(0) {}
+    RelayCandidate() : nodeId(0), coverageCount(0), avgCostFixed(0), tier(0), totalCoverage(0), roleRank(0) {}
     RelayCandidate(NodeNum node, uint8_t coverage, uint16_t cost, uint8_t t, uint8_t total = 0)
         : nodeId(node), coverageCount(coverage), avgCostFixed(cost), tier(t), totalCoverage(total) {}
 
@@ -320,6 +321,10 @@ class NeighborGraph {
         bool (*publishesTopology)(void *ctx, NodeNum node);
         bool (*isStockRelayRouter)(void *ctx, NodeNum node);
         bool (*isSrActive)(void *ctx, NodeNum node);
+        /// Is this node configured ROUTER? Ranks above cost: its operator has said it is sited and
+        /// powered to carry other people's traffic, which is a statement about the node that a link
+        /// cost cannot express.
+        bool (*isConfiguredRouter)(void *ctx, NodeNum node);
         NodeNum me;
         bool meRelays;
         float poorLinkEtx;
@@ -328,11 +333,20 @@ class NeighborGraph {
         uint32_t nowSecs;
         uint32_t publisherSilenceSecs;
         CoveragePolicy()
-            : ctx(nullptr), publishesTopology(nullptr), isStockRelayRouter(nullptr), isSrActive(nullptr), me(0),
-              meRelays(false), poorLinkEtx(0.0f), nowSecs(0), publisherSilenceSecs(0)
+            : ctx(nullptr), publishesTopology(nullptr), isStockRelayRouter(nullptr), isSrActive(nullptr),
+              isConfiguredRouter(nullptr), me(0), meRelays(false), poorLinkEtx(0.0f), nowSecs(0),
+              publisherSilenceSecs(0)
         {
         }
         bool reports(NodeNum node) const { return publishesTopology && publishesTopology(ctx, node); }
+        /// One step of ranking weight, above cost and below coverage. ROUTER_LATE earns none: its
+        /// whole meaning is to relay after everyone else, so promoting it would invert the role its
+        /// operator chose. Coverage still outranks this, so a router with nothing unique to reach
+        /// takes nothing — the zero-coverage drop happens first.
+        uint8_t roleRank(NodeNum node) const
+        {
+            return (isConfiguredRouter && isConfiguredRouter(ctx, node)) ? 1 : 0;
+        }
     };
 
     /// Retract our own direct link to a topology publisher we have heard nothing from for
