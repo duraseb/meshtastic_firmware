@@ -2998,7 +2998,23 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     }
 
     bool preferHighNodeId = (p->id & 1) != 0;
-    uint32_t slotDelay = SR_SLOT_ORIGIN_MS; // slot k fires at origin + k * halfAirtime
+    // Positions are placed by rule, not spaced by one constant. A reservation takes a slot time
+    // inside the stock-router window, because it orders our *expectation* of a hardware-seeded draw
+    // we cannot compute; a rung of ours is a real transmit time and takes a half-airtime on the
+    // ladder past the transition. The window is the slots immediately below stock's own
+    // router/contention boundary, derived from the two figures the radio already publishes rather
+    // than restating CWmax here. With no radio the window is empty and every position falls on the
+    // ladder, which is the behaviour this replaced.
+    uint32_t slotTimeMs = 0;
+    uint32_t relayFloorMs = 0;
+    if (router && router->getRadioInterface()) {
+        slotTimeMs = router->getRadioInterface()->getSlotTimeMsec();
+        relayFloorMs = router->getRadioInterface()->getRelayFloorMsec();
+    }
+    const uint8_t windowPositions = (slotTimeMs > 0 && relayFloorMs > slotTimeMs)
+                                        ? static_cast<uint8_t>(relayFloorMs / slotTimeMs - 1)
+                                        : 0;
+    SrPositionAllocator positions(slotTimeMs, halfAirtime, SR_SLOT_ORIGIN_MS, windowPositions);
     bool shouldRelay = false;
     uint32_t myDelay = 0;
     const char *decisionReason = "no unique coverage";
@@ -3077,6 +3093,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
             candidates.erase(neighbor);
             stockCandidates++;
 
+            const uint32_t reservedAt = positions.takeReserved();
             if (routingGraph->hasNodeTransmitted(neighbor, p->id, currentTime)) {
                 uint16_t before = alreadyCovered.count;
                 const NodeEdges *ne = routingGraph->getEdgesFrom(neighbor);
@@ -3090,15 +3107,13 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
                 }
                 alreadyCovered.insert(neighbor);
                 noteAbsorbed(neighbor, before);
-                LOG_INFO("[SR] Slot %ums: stock %08x (already TX, absorbed %u)", slotDelay, neighbor,
+                LOG_INFO("[SR] Slot %ums: stock %08x (already TX, absorbed %u)", reservedAt, neighbor,
                          (unsigned)absorbedCredit[absorbedCount ? absorbedCount - 1 : 0]);
             } else {
-                LOG_INFO("[SR] Slot %ums: stock %08x (expected)", slotDelay, neighbor);
+                LOG_INFO("[SR] Slot %ums: stock %08x (expected)", reservedAt, neighbor);
                 slotsGiven++;
                 reservedSlots++;
             }
-
-            slotDelay += halfAirtime;
         }
     }
 
@@ -3205,7 +3220,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
 
         if (best.nodeId == myNode) {
             shouldRelay = true;
-            myDelay = slotDelay + rungJitter;
+            myDelay = positions.takeRung() + rungJitter;
             mySlotIndex = slotsGiven;
             decisionReason = "SR slot assignment";
             LOG_INFO("[SR] Slot %ums: US (%08x)%s j=%ums", myDelay, myNode, best.tier > 0 ? " (bidi)" : "",
@@ -3213,13 +3228,13 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
             break;
         }
 
-        LOG_INFO("[SR] Slot %ums: SR node %08x (coverage=%u/%u, cost=%.2f%s)", slotDelay, best.nodeId,
+        const uint32_t peerRung = positions.takeRung();
+        LOG_INFO("[SR] Slot %ums: SR node %08x (coverage=%u/%u, cost=%.2f%s)", peerRung, best.nodeId,
                   best.coverageCount, best.totalCoverage, best.getAvgCost(), best.tier > 0 ? ", bidi" : "");
         slotsGiven++;
         // An earlier slot holder is assumed to relay: subtract its coverage so later candidates
         // (and the stock-coverage fallback) only relay for nodes nobody ahead of them reaches.
         absorbRelayCoverage(best.nodeId);
-        slotDelay += halfAirtime;
     }
 
     // Phase 3: Force relay if we are the recorded downstream relay for source
@@ -3228,7 +3243,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         LOG_INFO("[SR-DEC] BROADCAST RELAY (forced) 0x%08x: for %08x (down=%u)",
                  p->id, forcedFor, static_cast<unsigned int>(downstreamCount));
         shouldRelay = true;
-        myDelay = slotDelay + rungJitter;
+        myDelay = positions.firstFreeMs() + rungJitter;
         decisionReason = "downstream relay override";
     }
 
@@ -3240,7 +3255,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         shouldRelay = true;
         // Sole candidate by our own reckoning, which another node may not share: keep the
         // tie-break so two nodes that both believe they are alone are still separated.
-        myDelay = slotDelay + rungJitter;
+        myDelay = positions.firstFreeMs() + rungJitter;
         decisionReason = "sole candidate";
     }
 
