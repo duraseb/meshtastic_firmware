@@ -198,7 +198,10 @@ int NeighborGraph::updateEdge(NodeNum from, NodeNum to, float etx, uint32_t time
 
         float oldEtx = edge->getEtx();
         float absChange = fabs(etx - oldEtx);
-        float relChange = (oldEtx > 0.0f) ? absChange / oldEtx : 1.0f;
+        // Significance uses the variance already on the edge; this observation's change is
+        // folded in afterwards so a quiet link really does report at the 0.5 floor.
+        float dynamicThreshold = etxChangeThreshold + edge->getEtxVariance();
+        bool significant = absChange > dynamicThreshold;
 
         edge->setEtx(etx);
         if (updateTimestamp) {
@@ -210,9 +213,9 @@ int NeighborGraph::updateEdge(NodeNum from, NodeNum to, float etx, uint32_t time
         }
         edge->source = source;
 
-        // Per-edge dirty threshold: noisy links need bigger jumps to trigger dirty
-        float dynamicThreshold = etxChangeThreshold + edge->getEtxVariance();
-        return (relChange > dynamicThreshold) ? EDGE_SIGNIFICANT_CHANGE : EDGE_NO_CHANGE;
+        // Absolute ETX delta vs threshold + EWMA variance (both in ETX units). Symmetric:
+        // an improvement past the bar is as significant as a degradation past it.
+        return significant ? EDGE_SIGNIFICANT_CHANGE : EDGE_NO_CHANGE;
     }
 
     // Add new edge

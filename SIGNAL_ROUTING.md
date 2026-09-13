@@ -147,7 +147,7 @@ Delivery probability is priced from decode margin, not from absolute signal stre
 
 Every healthy link now prices into one cost bucket, and that is accepted, not a defect. Once decode margin reaches the curve's saturation point, every stronger reading — more margin, more RSSI, both — moves the price by only a few hundredths of an ETX, so at a fast preset every link with a comfortable margin lands within a single `SR_COST_BUCKET_FIXED`/`SR_OWNER_COST_BUCKET` bucket regardless of how much better one is than another. Two consequences follow, and only one of them is left as-is. Ranking among these links falls through to the node-id tie-break, which is the intended behaviour of a bucketed comparison, not a symptom: ETX means expected transmissions, and a link with 20 dB of margin and one with 10 dB both deliver on essentially the first try, so pricing them alike is the curve being honest, not imprecise — the old curve's spread across that same range was false precision the recalibration exists to remove. Cost is only the secondary ranking key behind unique coverage, and the discrimination that actually matters operationally — healthy, marginal, and hopeless — is exactly what the margin curve's shape is built to preserve; nothing here is remediated, and re-spreading the curve to manufacture ranking differences among healthy links would reintroduce the false precision this change removes.
 
-The second consequence is assessed separately: `etxChangeThreshold` is a relative comparison, and a change confined to the saturated band moves the ratio by less than its 1.2 trigger, so `markTopologyDirty` is not called and `topologyDirty` stays unset for it — the change reaches peers only on the next periodic broadcast (`cfgBroadcastSecs`, `SIGNAL_ROUTING_BROADCAST_SECS` default 600 s) rather than the shorter dirty-triggered one (`cfgDirtyBroadcastSecs`). This is judged immaterial: a change too small to cross a cost bucket can never change which candidate leads a coverage or ownership ranking, so a peer still costing the edge at its last-known-healthy value for up to one broadcast interval reaches the same routing decisions it would have reached with the update in hand immediately. Not remediated, for the same reason the ranking consequence is not: `etxChangeThreshold` stays untouched.
+The second consequence is assessed separately: `etxChangeThreshold` is an absolute ETX delta (default 0.5, "half a retransmission"), and an edge update is significant when `|new - old| > threshold + variance`, with variance the per-edge EWMA of absolute ETX changes — all three terms in ETX units. The comparison is symmetric, so an improvement past the bar marks topology dirty the same way a degradation does. Variance raises the bar on a link that swings repeatedly, which is what keeps a single unstable neighbour from driving early broadcasts; a stable link keeps reporting at the 0.5 floor. Field traffic under the margin curve is almost entirely either no change at all or a jump well above any bar between 0.2 and 1.0, so the saturated healthy band — not the threshold — is what keeps the graph quiet, and the dirty broadcast floor caps how often an early send can fire.
 
 ### Topology Graph
 
@@ -886,7 +886,7 @@ All SR tuning parameters can be set at runtime via the Meshtastic admin interfac
 | `node_ttl_secs` | uint32 | `NODE_TTL_SECS` | Node aging TTL — nodes not heard within this window are removed from the graph |
 | `broadcast_max_hops` | uint32 | `SR_BROADCAST_MAX_HOPS` | `hop_limit` cap applied to SR topology broadcast packets |
 | `poor_link_etx_threshold` | float | `7.0` | ETX above which a link is excluded from pre-coverage marking in relay decisions |
-| `etx_change_threshold` | float | `NeighborGraph::etxChangeThreshold` (default `1.0`) | Base ETX delta threshold; per-edge `etxVariance` is added so noisy links need bigger jumps to trigger dirty |
+| `etx_change_threshold` | float | `NeighborGraph::etxChangeThreshold` (default `0.5`) | Absolute ETX delta for a significant edge change; per-edge `etxVariance` is added so noisy links need bigger jumps to trigger dirty |
 
 \* proto3 booleans default to `false` on the wire. When writing any SR config, always set `enabled=true` and `t1_retransmit_enabled=true` unless you explicitly want those features off. If no SR config is stored (`has_signal_routing=false`), firmware defaults apply (both features on).
 
@@ -909,7 +909,7 @@ static constexpr uint32_t CAPABILITY_TTL_SECS = SIGNAL_ROUTING_BROADCAST_SECS * 
 static constexpr uint32_t PUBLISHER_SILENCE_SECS = SIGNAL_ROUTING_BROADCAST_SECS * 2;  // retract our direct link to a silent publisher
 
 // NeighborGraph.h (private instance variable)
-float etxChangeThreshold = 1.0f;   // minimum ETX delta for a significant edge change (base; per-edge etxVariance added)
+float etxChangeThreshold = 0.5f;   // absolute ETX delta for a significant edge change (base; per-edge etxVariance added)
 uint8_t etxVariance;               // EWMA of |ETX change| × 20 on each edge — locally computed, broadcast to all
 ```
 

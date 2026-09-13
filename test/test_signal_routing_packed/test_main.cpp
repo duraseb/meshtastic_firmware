@@ -196,12 +196,12 @@ static void test_refresh_reported_direct_neighbor_updates_cache_and_variance()
     }
 
     // The return value is the verdict on the direction we publish (us -> neighbour) and nothing
-    // else. The dirty threshold is relative, so an improving link can never clear it: the change
-    // is at most the whole of the old cost, and the threshold sits above 1. The cache and the
-    // variance below still move, which is the rest of this function's job.
+    // else. The dirty threshold is an absolute ETX delta, so an improvement past the bar is
+    // significant the same way a degradation is. The cache and the variance below still move,
+    // which is the rest of this function's job.
     int second = refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE,
                                                           localNode, gateway, -70, 12.0f, 1001);
-    TEST_ASSERT_EQUAL_INT(EDGE_NO_CHANGE, second);
+    TEST_ASSERT_EQUAL_INT(EDGE_SIGNIFICANT_CHANGE, second);
 
     const DirectNeighborSignal *updated = lookupDirectNeighborSignal(signals, signalCount, gateway);
     TEST_ASSERT_NOT_NULL(updated);
@@ -234,6 +234,92 @@ static void test_refresh_reported_direct_neighbor_updates_cache_and_variance()
         }
     }
     TEST_ASSERT_TRUE(sawReverse);
+}
+
+static void test_an_improvement_larger_than_the_bar_is_significant()
+{
+    constexpr NodeNum me = 0xAAAAAAAA;
+    constexpr NodeNum peer = 0xBBBBBBBB;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+
+    TEST_ASSERT_EQUAL_INT(EDGE_NEW, graph.updateEdge(me, peer, 3.0f, 1000, Edge::Source::Reported));
+    // Absolute drop of 1.0 ETX clears the 0.5 floor on a quiet edge.
+    TEST_ASSERT_EQUAL_INT(EDGE_SIGNIFICANT_CHANGE,
+                          graph.updateEdge(me, peer, 2.0f, 1001, Edge::Source::Reported));
+}
+
+static void test_a_degradation_larger_than_the_bar_is_significant()
+{
+    constexpr NodeNum me = 0xAAAAAAAA;
+    constexpr NodeNum peer = 0xBBBBBBBB;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+
+    TEST_ASSERT_EQUAL_INT(EDGE_NEW, graph.updateEdge(me, peer, 2.0f, 1000, Edge::Source::Reported));
+    TEST_ASSERT_EQUAL_INT(EDGE_SIGNIFICANT_CHANGE,
+                          graph.updateEdge(me, peer, 3.0f, 1001, Edge::Source::Reported));
+}
+
+static void test_a_change_just_above_half_is_significant_on_a_quiet_edge()
+{
+    // Pins that significance consults the variance already on the edge, not the value after
+    // folding this observation in: with post-update EWMA a 0.55 jump would fail (0.5+0.1375).
+    constexpr NodeNum me = 0xAAAAAAAA;
+    constexpr NodeNum peer = 0xBBBBBBBB;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+
+    graph.updateEdge(me, peer, 2.0f, 1000, Edge::Source::Reported);
+    TEST_ASSERT_EQUAL_INT(EDGE_SIGNIFICANT_CHANGE,
+                          graph.updateEdge(me, peer, 2.55f, 1001, Edge::Source::Reported));
+}
+
+static void test_a_change_smaller_than_the_bar_is_not_significant_either_way()
+{
+    constexpr NodeNum me = 0xAAAAAAAA;
+    constexpr NodeNum peer = 0xBBBBBBBB;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+
+    graph.updateEdge(me, peer, 2.0f, 1000, Edge::Source::Reported);
+    TEST_ASSERT_EQUAL_INT(EDGE_NO_CHANGE, graph.updateEdge(me, peer, 2.3f, 1001, Edge::Source::Reported));
+    TEST_ASSERT_EQUAL_INT(EDGE_NO_CHANGE, graph.updateEdge(me, peer, 2.0f, 1002, Edge::Source::Reported));
+}
+
+static void test_variance_raises_the_bar_so_a_noisy_edge_stops_reporting_small_jumps()
+{
+    constexpr NodeNum me = 0xAAAAAAAA;
+    constexpr NodeNum quiet = 0xBBBBBBBB;
+    constexpr NodeNum noisy = 0xCCCCCCCC;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+
+    graph.updateEdge(me, quiet, 2.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(me, noisy, 2.0f, 1000, Edge::Source::Reported);
+
+    float etx = 2.0f;
+    for (uint32_t i = 0; i < 8; i++) {
+        etx = (i % 2 == 0) ? 7.0f : 2.0f;
+        graph.updateEdge(me, noisy, etx, 2000 + i, Edge::Source::Reported);
+    }
+    if (etx != 2.0f) {
+        graph.updateEdge(me, noisy, 2.0f, 3000, Edge::Source::Reported);
+    }
+
+    TEST_ASSERT_EQUAL_INT(EDGE_SIGNIFICANT_CHANGE,
+                          graph.updateEdge(me, quiet, 3.0f, 4000, Edge::Source::Reported));
+    TEST_ASSERT_EQUAL_INT(EDGE_NO_CHANGE,
+                          graph.updateEdge(me, noisy, 3.0f, 4000, Edge::Source::Reported));
+}
+
+static void test_a_brand_new_edge_is_significant_unconditionally()
+{
+    constexpr NodeNum me = 0xAAAAAAAA;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+
+    TEST_ASSERT_EQUAL_INT(EDGE_NEW, graph.updateEdge(me, 0xBBBBBBBB, 1.0f, 1000, Edge::Source::Reported));
 }
 
 static void test_relay_refresh_skips_without_reported_edge()
@@ -1527,6 +1613,12 @@ void setup()
     RUN_TEST(test_direct_signal_upsert_lookup_and_prune);
     RUN_TEST(test_empty_topology_reply_delay_range_and_determinism);
     RUN_TEST(test_refresh_reported_direct_neighbor_updates_cache_and_variance);
+    RUN_TEST(test_an_improvement_larger_than_the_bar_is_significant);
+    RUN_TEST(test_a_degradation_larger_than_the_bar_is_significant);
+    RUN_TEST(test_a_change_just_above_half_is_significant_on_a_quiet_edge);
+    RUN_TEST(test_a_change_smaller_than_the_bar_is_not_significant_either_way);
+    RUN_TEST(test_variance_raises_the_bar_so_a_noisy_edge_stops_reporting_small_jumps);
+    RUN_TEST(test_a_brand_new_edge_is_significant_unconditionally);
     RUN_TEST(test_relay_refresh_skips_without_reported_edge);
     RUN_TEST(test_mirrored_edge_update_does_not_upgrade_reported_edge);
     RUN_TEST(test_topology_listing_us_confirms_sender_hears_us);
