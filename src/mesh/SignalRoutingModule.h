@@ -798,6 +798,13 @@ public:
     NodeNum resolveHeardFrom(const meshtastic_MeshPacket *p, NodeNum sourceNode) const;
     void rememberRelayIdentity(NodeNum nodeId, uint8_t relayId);
     NodeNum resolveRelayIdentity(uint8_t relayId, int16_t rxRssi = 0, float rxSnr = 0) const;
+    /// Placeholder NodeNums use Edge::PLACEHOLDER_NODE_BASE (see isPlaceholderNode).
+    static bool isPlaceholderNodeId(NodeNum nodeId) { return (nodeId & 0xFF000000u) == 0xFF000000u; }
+    bool isPlaceholderNode(NodeNum nodeId) const; // existing impl; kept public for rate limiter
+    /// Rate-limit eviction: true if node has any edge table in the routing graph.
+    bool rateLimitNodeInGraph(NodeNum nodeId) const;
+    /// Rate-limit eviction: graph hop distance (1 = direct); 0 if unknown / not routable.
+    uint8_t rateLimitGraphHops(NodeNum nodeId) const;
     /// Drop the neighbour graph and everything learned on the previous air; queue an empty boot list.
     void purgeGraphForPresetChange();
     /// After the radio has applied current LoRa settings. Drops the graph only if the preset changed.
@@ -815,7 +822,6 @@ private:
     void handleTelemetryPacket(const meshtastic_MeshPacket &mp);
     void handleRoutingControlPacket(const meshtastic_MeshPacket &mp);
 
-    bool isPlaceholderNode(NodeNum nodeId) const;
     NodeNum createPlaceholderNode(uint8_t relayId);
     bool resolvePlaceholder(NodeNum placeholderId, NodeNum realNodeId);
     NodeNum getPlaceholderForRelay(uint8_t relayId) const;

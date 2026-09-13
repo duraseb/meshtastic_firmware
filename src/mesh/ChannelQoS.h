@@ -35,6 +35,6 @@ class ChannelQoS
     Tier classifyTier(const meshtastic_MeshPacket *p);
 };
 
-#if !MESHTASTIC_EXCLUDE_CHANNEL_QOS
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
 extern ChannelQoS *channelQoS;
 #endif

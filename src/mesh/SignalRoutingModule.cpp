@@ -4512,6 +4512,55 @@ void SignalRoutingModule::pruneRelayIdentityCache(uint32_t nowMs)
     }
 }
 
+bool SignalRoutingModule::rateLimitNodeInGraph(NodeNum nodeId) const
+{
+    if (!routingGraph || nodeId == 0 || isPlaceholderNode(nodeId)) {
+        return false;
+    }
+    if (routingGraph->getEdgesFrom(nodeId) != nullptr) {
+        return true;
+    }
+    if (nodeDB) {
+        const NodeEdges *myEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
+        if (myEdges) {
+            for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+                if (myEdges->edges[i].to == nodeId) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+uint8_t SignalRoutingModule::rateLimitGraphHops(NodeNum nodeId) const
+{
+    if (!routingGraph || nodeId == 0 || isPlaceholderNode(nodeId)) {
+        return 0;
+    }
+    if (nodeDB && nodeId == nodeDB->getNodeNum()) {
+        return 0;
+    }
+    if (nodeDB) {
+        const NodeEdges *myEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
+        if (myEdges) {
+            for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+                if (myEdges->edges[i].to == nodeId) {
+                    return 1;
+                }
+            }
+        }
+    }
+    Route route = routingGraph->calculateRoute(nodeId, millis());
+    if (route.nextHop != 0 && route.hops > 0) {
+        return route.hops;
+    }
+    if (rateLimitNodeInGraph(nodeId)) {
+        return 255;
+    }
+    return 0;
+}
+
 NodeNum SignalRoutingModule::resolveRelayIdentity(uint8_t relayId, int16_t rxRssi, float rxSnr) const
 {
     uint32_t nowMs = millis();

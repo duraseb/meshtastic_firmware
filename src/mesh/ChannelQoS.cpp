@@ -1,6 +1,6 @@
 #include "configuration.h"
 
-#if !MESHTASTIC_EXCLUDE_CHANNEL_QOS
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
 
 #include "ChannelQoS.h"
 #include "NodeDB.h"
@@ -116,4 +116,4 @@ auto ChannelQoS::classifyTier(const meshtastic_MeshPacket *p) -> Tier
     }
 }
 
-#endif // !MESHTASTIC_EXCLUDE_CHANNEL_QOS
+#endif // !MESHTASTIC_EXCLUDE_SIGNALROUTING

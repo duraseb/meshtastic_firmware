@@ -5,7 +5,7 @@
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "RTC.h"
-#if !MESHTASTIC_EXCLUDE_NODE_RATE_LIMITER
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
 #include "NodeRateLimiter.h"
 #endif
 #include "SignalRoutingModule.h"
@@ -819,12 +819,10 @@ void Router::handleReceived(meshtastic_MeshPacket *p, RxSource src)
         printPacket("packet decoding failed or skipped (no PSK?)", p);
     }
 
-    // Rate-limit inbound packets from nearby misbehaving nodes.
-    // Checked after decode so decoded packets get proper bucket classification,
-    // but undecoded (wrong PSK / decode failure) packets are also counted in
-    // the OTHER bucket — they still consume airtime and relay CPU.
-    // DECODE_FATAL already sets skipHandle=true so those are skipped here.
-#if !MESHTASTIC_EXCLUDE_NODE_RATE_LIMITER
+    // Rate-limit inbound packets (SignalRouting builds only). Checked after decode
+    // so decoded packets get proper bucket classification; undecoded traffic hits
+    // UNKNOWN. Runs before callModules so SR graph observe never sees dropped frames.
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
     if (!skipHandle && nodeRateLimiter && nodeRateLimiter->shouldDrop(p)) {
         if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag) {
             LOG_WARN("[RateLimit] Dropping packet 0x%08x from 0x%08x portnum=%d hops=%d",

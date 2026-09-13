@@ -663,15 +663,20 @@ Thresholds align with stock firmware's existing channel utilization limits (25% 
 
 `ChannelQoS` is orthogonal to `NodeRateLimiter` (per-node abuse detection) and stock `AirTime` TX blocking (blocks our originations). QoS handles aggregate channel load for relay decisions.
 
-Guarded by `MESHTASTIC_EXCLUDE_CHANNEL_QOS` for memory-constrained targets.
+Guarded by `MESHTASTIC_EXCLUDE_SIGNALROUTING` (ChannelQoS is SR-only).
 
 ## Inbound Rate Limiting
 
 ### Per-Node Packet Buckets
 
-`NodeRateLimiter` protects the node from a single misbehaving or malfunctioning neighbor that floods the mesh. It is checked in `Router::handleReceived()` after decode but before `MeshModule::callModules()`, so a limited packet reaches no module: it is not relayed, not ACKed, and not delivered to the phone.
+`NodeRateLimiter` protects the node from misbehaving originators and from last-hop
+amplifiers that would rebroadcast a flood into the rest of the mesh. It is
+**SignalRouting-only** (compiled out with `MESHTASTIC_EXCLUDE_SIGNALROUTING`, same
+as ChannelQoS). It is checked in `Router::handleReceived()` after decode but before
+`MeshModule::callModules()`, so a limited packet reaches no module: it is not
+relayed, not ACKed, not delivered to the phone, and does not update the SR graph.
 
-Each tracked source node gets three independent buckets:
+Each tracked **originator** gets four independent buckets:
 
 | Bucket | Portnums | Packets per 90 s window |
 |--------|----------|------------------------|
@@ -680,17 +685,42 @@ Each tracked source node gets three independent buckets:
 | OTHER | every other decoded portnum | 4 |
 | UNKNOWN | undecodable packets: no key for the channel, PKI traffic for other nodes | 12 |
 
-A relay without the key cannot tell chat from telemetry, while a key-holding relay judges the same packets by their real port; with the OTHER threshold a private group chatting normally flowed through key holders and died at the first relay without the key, and the TEXT threshold would let encrypted admin and DM traffic for others run at chat rates. UNKNOWN sits between the two and has no `moduleConfig` override; 12 lets a relayed remote-admin Channels screen (nine sequential requests) load within one window.
+Originator clear threshold is **0**: while limited, any further packet resets the
+quiet window (must go silent for a full window to recover). Up to 16 originators
+are tracked; eviction prefers nodes not in our graph, then farthest by graph hops
+(never frame `hop_start`/`hop_limit`).
 
-Once a bucket trips, every further packet in that bucket resets the window, so the source stays limited until it goes quiet for a full window. Up to 16 sources are tracked; when full, the entry with the greatest hop distance is evicted (ties broken by oldest window).
+### RELAY bucket
 
-**Exemptions** — the limiter never acts on:
+Packets this node would consider for **rebroadcast** also charge a **RELAY**
+counter keyed by the last hop:
+
+- Resolved neighbour NodeID → one of **8** slots
+- All unresolved / forgeable `relay_node` bytes → **one shared** slot
+
+RELAY uses an **airtime budget**: trip capacity is ~`60 ×` the current frame's
+estimated airtime (so slower presets allow fewer packets before tripping), then
+tightened when local channel utilization is high, and clamped to floors/ceilings.
+While RELAY-limited, all rebroadcast candidates from that key are dropped; at
+window end, if charged airtime is below the clear budget (~15/60 of trip), the
+ban lifts. Dupe/upgrade rebroadcast paths consult `wouldDrop()` so a limited
+packet is not amplified without re-charging.
+
+Direct first-hop frames key RELAY on the originator NodeID when `relay_node` is
+absent or matches the sender; multi-hop frames use resolved last-hop identity
+(or the shared unresolved slot).
+
+### Exemptions
 
 - Packets we originated (`isFromUs`).
-- **Packets addressed to us (`isToUs`).** These are never relayed, so they cost no relay airtime, and they are the replies and requests we asked for: admin responses, DMs, ACKs. Dropping one silently kills the ACK and implicit-ACK path and the delivery to the phone. Because `ADMIN_APP` falls in the OTHER bucket, a remote node answering a burst of admin GETs tripped the limit on its 4th reply in 90 s, after which every further reply kept the window reset and remote admin never recovered.
-- Nodes marked `is_favorite` in NodeDB.
+- Packets addressed to us (`isToUs`).
+- Nodes marked `is_favorite` bypass **originator** buckets only — never RELAY.
+- `ADMIN_APP` is **not** exempt by portnum (PKI admin is opaque on the relay path
+  and lands in UNKNOWN; the destination is covered by `isToUs`).
 
-Thresholds and the window are overridable via `moduleConfig.node_rate_limiter`; guarded by `MESHTASTIC_EXCLUDE_NODE_RATE_LIMITER` for memory-constrained targets.
+Thresholds for originator text/routing/other and the window remain overridable via
+`moduleConfig.node_rate_limiter` (`enabled` is the kill-switch). RELAY budgets are
+firmware defaults only in v1.
 
 ## Benefits for Mesh Network Reliability
 

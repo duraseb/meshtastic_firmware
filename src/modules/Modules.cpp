@@ -44,11 +44,7 @@
 #include "modules/TextMessageModule.h"
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
 #include "mesh/SignalRoutingModule.h"
-#endif
-#if !MESHTASTIC_EXCLUDE_NODE_RATE_LIMITER
 #include "mesh/NodeRateLimiter.h"
-#endif
-#if !MESHTASTIC_EXCLUDE_CHANNEL_QOS
 #include "mesh/ChannelQoS.h"
 #endif
 #if !MESHTASTIC_EXCLUDE_TRACEROUTE
@@ -128,11 +124,9 @@ void setupModules()
         buzzerFeedbackThread = new BuzzerFeedbackThread();
     }
 #endif
-    // Rate limiter and QoS must be up before any packet can be received
-#if !MESHTASTIC_EXCLUDE_NODE_RATE_LIMITER
+    // Rate limiter and QoS are SignalRouting-only (absent when MESHTASTIC_EXCLUDE_SIGNALROUTING).
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
     nodeRateLimiter = new NodeRateLimiter();
-#endif
-#if !MESHTASTIC_EXCLUDE_CHANNEL_QOS
     channelQoS = new ChannelQoS();
 #endif
     statusLEDModule = new StatusLEDModule();

@@ -10,9 +10,8 @@
 #include "NodeDB.h"
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
 #include "SignalRoutingModule.h"
-#endif
-#if !MESHTASTIC_EXCLUDE_CHANNEL_QOS
 #include "ChannelQoS.h"
+#include "NodeRateLimiter.h"
 #endif
 
 NextHopRouter::NextHopRouter() {}
@@ -166,8 +165,16 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                 if (p->next_hop == NO_NEXT_HOP_PREFERENCE || p->next_hop == nodeDB->getLastByteOfNodeNum(getNodeNum()) ||
                     srCoordinatedUnicast) {
 
+                    // Do not amplify after an inbound rate-limit (dupe/upgrade paths skip handleReceived).
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+                    if (nodeRateLimiter && nodeRateLimiter->wouldDrop(p)) {
+                        LOG_WARN("[RateLimit] Skip rebroadcast of 0x%08x from 0x%08x (limited)", p->id, p->from);
+                        return false;
+                    }
+#endif
+
                     // Channel QoS: gradually drop lower priority relays when channel is congested
-#if !MESHTASTIC_EXCLUDE_CHANNEL_QOS
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
                     if (channelQoS && !channelQoS->canRelay(p)) {
                         return false;
                     }
