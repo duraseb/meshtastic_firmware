@@ -60,6 +60,26 @@ class NodeRateLimiter
      * traffic. With no SignalRouting at all there is no resolution mechanism, so the shared bucket
      * is the only defence and must still be charged.
      */
+    // Unchanged, and measured to be right: counted the way the limiter actually sees traffic —
+    // at one node, with duplicate copies of a frame already filtered out — the busiest originator
+    // in any 90 s window over 20 h reached TEXT 3, ROUTING 7, OTHER 5, UNKNOWN 18. Only a couple
+    // of originators ever brush a threshold, which matches the hub's operational experience that
+    // the limiter seldom triggers.
+    static constexpr uint8_t DEFAULT_TEXT_TRIP = 30;
+    static constexpr uint8_t DEFAULT_ROUTING_TRIP = 10;
+    static constexpr uint8_t DEFAULT_OTHER_TRIP = 4;
+    static constexpr uint8_t DEFAULT_UNKNOWN_TRIP = 12;
+    // Hysteresis: a limited originator clears once a whole window comes in under half the trip
+    // level, i.e. once it has demonstrably slowed down. Zero meant "sticky until a fully silent
+    // window", and because every packet arriving while limited reset that window, an originator
+    // that kept talking could never clear. Brushing a threshold once is common and harmless;
+    // being limited forever after is what stopped a gateway relaying anything for forty minutes.
+    //
+    // Half, not the RELAY bucket's quarter: these thresholds are small. A quarter of OTHER's 4 is
+    // 1, which would demand a completely silent window and reinstate the behaviour being fixed.
+    static constexpr uint8_t DEFAULT_CLEAR_RATIO_NUM = 1;
+    static constexpr uint8_t DEFAULT_CLEAR_RATIO_DEN = 2;
+
     static bool shouldChargeUnresolvedRelay(bool srPresent, bool graphEstablished)
     {
         return !srPresent || graphEstablished;
@@ -71,11 +91,6 @@ class NodeRateLimiter
     static constexpr uint8_t MAX_RELAY_ENTRIES = 8;
 
     static constexpr uint32_t DEFAULT_WINDOW_MS = 90u * 1000u;
-    static constexpr uint8_t DEFAULT_TEXT_TRIP = 30;
-    static constexpr uint8_t DEFAULT_ROUTING_TRIP = 10;
-    static constexpr uint8_t DEFAULT_OTHER_TRIP = 4;
-    static constexpr uint8_t DEFAULT_UNKNOWN_TRIP = 12;
-    static constexpr uint8_t DEFAULT_CLEAR = 0; // originator: quiet window required
 
     // RELAY packet-equivalent defaults at reference calibration (LONG_FAST-ish)
     static constexpr uint8_t RELAY_TRIP_PACKETS = 60;

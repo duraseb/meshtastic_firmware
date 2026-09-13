@@ -502,7 +502,10 @@ bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
             label = "other";
             break;
         }
-        if (checkAndUpdateBucket(*b, trip, DEFAULT_CLEAR, 1, nowMs, label, entry->nodeId)) {
+        // A limited originator clears when a whole window comes in under the clear level,
+        // instead of needing a fully silent one it can never get while it keeps talking.
+        const uint32_t clear = std::max<uint32_t>(1, (trip * DEFAULT_CLEAR_RATIO_NUM) / DEFAULT_CLEAR_RATIO_DEN);
+        if (checkAndUpdateBucket(*b, trip, clear, 1, nowMs, label, entry->nodeId)) {
             drop = true;
         }
     }

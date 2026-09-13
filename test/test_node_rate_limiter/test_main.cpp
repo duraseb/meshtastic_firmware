@@ -131,20 +131,22 @@ static meshtastic_MeshPacket makePacket(NodeNum from, NodeNum to, uint8_t hopLim
     return p;
 }
 
-static void test_other_bucket_trips_at_four()
+static void test_other_bucket_trips_at_its_threshold()
 {
     prepareEnv();
     NodeRateLimiter limiter;
 
+    // Driven to the configured threshold, not a literal: the number is sized from measured
+    // traffic and is expected to move again, while the rule that it trips at the threshold is not.
     // hop_limit 0 => not a rebroadcast candidate; only originator OTHER applies
-    for (uint32_t i = 0; i < 3; i++) {
+    for (uint32_t i = 0; i + 1 < NodeRateLimiter::DEFAULT_OTHER_TRIP; i++) {
         auto p = makePacket(kRemote, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 100 + i);
         TEST_ASSERT_FALSE(limiter.shouldDrop(&p));
     }
-    auto p4 = makePacket(kRemote, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 104);
-    TEST_ASSERT_TRUE(limiter.shouldDrop(&p4));
-    auto p5 = makePacket(kRemote, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 105);
-    TEST_ASSERT_TRUE(limiter.shouldDrop(&p5));
+    auto pTrip = makePacket(kRemote, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 200);
+    TEST_ASSERT_TRUE(limiter.shouldDrop(&pTrip));
+    auto pAfter = makePacket(kRemote, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 201);
+    TEST_ASSERT_TRUE(limiter.shouldDrop(&pAfter));
 }
 
 static void test_to_us_is_never_limited()
@@ -163,7 +165,7 @@ static void test_admin_app_counts_as_other_when_not_to_us()
     prepareEnv();
     NodeRateLimiter limiter;
 
-    for (uint32_t i = 0; i < 3; i++) {
+    for (uint32_t i = 0; i + 1 < NodeRateLimiter::DEFAULT_OTHER_TRIP; i++) {
         auto p = makePacket(kRemote, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_ADMIN_APP, 300 + i);
         TEST_ASSERT_FALSE(limiter.shouldDrop(&p));
     }
@@ -209,17 +211,25 @@ static void test_originator_recovers_after_quiet_window()
     prepareEnv(1); // 1 s window
     NodeRateLimiter limiter;
 
-    for (uint32_t i = 0; i < 3; i++) {
+    for (uint32_t i = 0; i + 1 < NodeRateLimiter::DEFAULT_OTHER_TRIP; i++) {
         auto p = makePacket(kRemote, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 600 + i);
         TEST_ASSERT_FALSE(limiter.shouldDrop(&p));
     }
-    auto pTrip = makePacket(kRemote, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 604);
+    auto pTrip = makePacket(kRemote, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 700);
     TEST_ASSERT_TRUE(limiter.shouldDrop(&pTrip));
 
+    // Hysteresis, not a sticky ban: the limiter has to *see* a window come in under half the trip
+    // level before it lifts. The window that just ended was the busy one, so the first packet
+    // after it is still dropped and starts a fresh window; the one after that quiet window is
+    // let through. What matters is that a node which slows down always recovers — under the
+    // previous rule every packet reset the window, so one that kept talking never could.
     testDelay(1100);
+    auto pFirstAfter = makePacket(kRemote, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 605);
+    TEST_ASSERT_TRUE_MESSAGE(limiter.shouldDrop(&pFirstAfter), "the window that just ended was the busy one");
 
-    auto pAfter = makePacket(kRemote, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 605);
-    TEST_ASSERT_FALSE_MESSAGE(limiter.shouldDrop(&pAfter), "quiet window should lift originator ban");
+    testDelay(1100);
+    auto pRecovered = makePacket(kRemote, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 606);
+    TEST_ASSERT_FALSE_MESSAGE(limiter.shouldDrop(&pRecovered), "a quiet window must lift the ban");
 }
 
 static void test_text_independent_of_other()
@@ -340,11 +350,11 @@ static void test_would_drop_without_charging()
     prepareEnv();
     NodeRateLimiter limiter;
 
-    for (uint32_t i = 0; i < 3; i++) {
+    for (uint32_t i = 0; i + 1 < NodeRateLimiter::DEFAULT_OTHER_TRIP; i++) {
         auto p = makePacket(kRemote, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 1200 + i);
         TEST_ASSERT_FALSE(limiter.shouldDrop(&p));
     }
-    auto pTrip = makePacket(kRemote, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 1204);
+    auto pTrip = makePacket(kRemote, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 1300);
     TEST_ASSERT_TRUE(limiter.shouldDrop(&pTrip));
 
     auto dupe = makePacket(kRemote, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 1204);
@@ -426,7 +436,7 @@ void setup()
 {
     UNITY_BEGIN();
     RUN_TEST(test_unresolved_relay_is_only_charged_once_resolution_is_possible);
-    RUN_TEST(test_other_bucket_trips_at_four);
+    RUN_TEST(test_other_bucket_trips_at_its_threshold);
     RUN_TEST(test_to_us_is_never_limited);
     RUN_TEST(test_admin_app_counts_as_other_when_not_to_us);
     RUN_TEST(test_favorite_bypasses_originator_not_relay);
