@@ -33,10 +33,10 @@ reset reason and the boot banner are missing from it.
 [SR] Acknowledging 0x<id> for <source> at <N>ms (<K> ahead of us)
 ```
 Only the node that logs "US" will relay. All rungs are computed independently by each node.
-Rungs start at `SR_SLOT_ORIGIN_MS` (250 ms), **not** at 0, and space by half an airtime;
-`j=` is that node's own strictly positive rung jitter, already included in the rung it printed.
-A `Slot --` line means the candidate consumed no rung. `Acknowledging` is the second pass that
-runs only when the ranking left the ladder empty — see the acknowledgement pass in
+Rungs start at `getRelayFloorMsec()` (`2·CWmax·slot_time`), **not** at 0, and space by half an
+airtime; `j=` is that node's own strictly positive rung jitter, already included in the rung it
+printed. A `Slot --` line means the candidate consumed no rung. `Acknowledging` is the second
+pass that runs only when the ranking left the ladder empty — see the acknowledgement pass in
 `SIGNAL_ROUTING.md`.
 
 ### Channel QoS relay gating

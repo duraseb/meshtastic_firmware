@@ -2412,7 +2412,14 @@ void SignalRoutingModule::commitRelay(PacketId packetId, NodeNum originalHeardFr
 
 uint32_t SignalRoutingModule::expiredRelayReanchorMs(PacketId packetId, uint32_t slotTimeMs) const
 {
-    return srExpiredRelayReanchorMs(getCommittedRelayDelay(packetId), SR_SLOT_ORIGIN_MS, slotTimeMs);
+    uint32_t transitionMs = SR_SLOT_ORIGIN_MS;
+    if (router && router->getRadioInterface()) {
+        const uint32_t relayFloorMs = router->getRadioInterface()->getRelayFloorMsec();
+        if (relayFloorMs > 0) {
+            transitionMs = relayFloorMs;
+        }
+    }
+    return srExpiredRelayReanchorMs(getCommittedRelayDelay(packetId), transitionMs, slotTimeMs);
 }
 
 bool SignalRoutingModule::isCommittedRelay(PacketId packetId) const
@@ -2539,8 +2546,17 @@ void SignalRoutingModule::scheduleT1Broadcast(const meshtastic_MeshPacket *p, ui
     // candidate set the ranking actually built — stock reservations already excluded, because the
     // stock worst case above spans the window they sit in.
     const uint32_t halfAirtimeMs = std::max(airtimeMs / 2, SR_MIN_RUNG_SPACING_MS);
+    // Same border the window ends at: stock's 2·CWmax·slot_time. Without a radio, fall back to
+    // the turnaround so T1 still has a defined origin.
+    uint32_t transitionMs = SR_SLOT_ORIGIN_MS;
+    if (router && router->getRadioInterface()) {
+        const uint32_t relayFloorMs = router->getRadioInterface()->getRelayFloorMsec();
+        if (relayFloorMs > 0) {
+            transitionMs = relayFloorMs;
+        }
+    }
     const uint32_t ladderSpanMs =
-        SR_SLOT_ORIGIN_MS + static_cast<uint32_t>(ladderRungs) * halfAirtimeMs;
+        transitionMs + static_cast<uint32_t>(ladderRungs) * halfAirtimeMs;
     if (ladderSpanMs > latestRelayWindowMs) {
         latestRelayWindowMs = ladderSpanMs;
     }
@@ -3028,7 +3044,10 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     const uint8_t windowPositions = (slotTimeMs > 0 && relayFloorMs > slotTimeMs)
                                         ? static_cast<uint8_t>(relayFloorMs / slotTimeMs - 1)
                                         : 0;
-    SrPositionAllocator positions(slotTimeMs, halfAirtime, SR_SLOT_ORIGIN_MS, windowPositions);
+    // Ladder transition is stock's router/contention border. With no radio the window is empty
+    // and every position falls on the ladder from the turnaround fallback.
+    const uint32_t transitionMs = relayFloorMs > 0 ? relayFloorMs : SR_SLOT_ORIGIN_MS;
+    SrPositionAllocator positions(slotTimeMs, halfAirtime, transitionMs, windowPositions);
     bool shouldRelay = false;
     uint32_t myDelay = 0;
     const char *decisionReason = "no unique coverage";
@@ -4266,6 +4285,12 @@ bool SignalRoutingModule::planAcknowledgement(const meshtastic_MeshPacket *p, No
     }
 
     uint32_t delay = SR_SLOT_ORIGIN_MS;
+    if (router && router->getRadioInterface()) {
+        const uint32_t relayFloorMs = router->getRadioInterface()->getRelayFloorMsec();
+        if (relayFloorMs > 0) {
+            delay = relayFloorMs;
+        }
+    }
     uint8_t ahead = 0;
     for (uint8_t i = 0; i < count; i++) {
         if (entries[i].node == myNode) {

@@ -1357,10 +1357,10 @@ static void test_purge_for_preset_change_drops_neighbours_and_derived_state()
 
 // Window positions are one slot time apart, not one half-airtime: a reservation orders our
 // expectation of a stock draw, and spacing that by an airtime we are not sending claims a
-// precision we do not have.
+// precision we do not have. Origin is 2·CWmax·slot_time (160 for slot=10).
 static void test_reservations_sit_one_slot_apart()
 {
-    SrPositionAllocator a(10, 100, 250, 15);
+    SrPositionAllocator a(10, 100, 160, 15);
     TEST_ASSERT_EQUAL_UINT32(0, a.takeReserved());
     TEST_ASSERT_EQUAL_UINT32(10, a.takeReserved());
     TEST_ASSERT_EQUAL_UINT32(20, a.takeReserved());
@@ -1372,7 +1372,7 @@ static void test_reservations_sit_one_slot_apart()
 static void test_rungs_take_window_positions_while_a_half_airtime_fits()
 {
     // Window width 150 ms (15 × 10); half-airtime 50 so three ranked positions fit.
-    SrPositionAllocator a(10, 50, 250, 15);
+    SrPositionAllocator a(10, 50, 160, 15);
     TEST_ASSERT_EQUAL_UINT32(0, a.takeRung());
     TEST_ASSERT_EQUAL_UINT32(50, a.takeRung());
     TEST_ASSERT_EQUAL_UINT32(100, a.takeRung());
@@ -1381,7 +1381,7 @@ static void test_rungs_take_window_positions_while_a_half_airtime_fits()
 // One reservation then ranked positions: they share the window in order.
 static void test_reservations_and_ranked_positions_interleave_in_the_window()
 {
-    SrPositionAllocator a(10, 50, 250, 15);
+    SrPositionAllocator a(10, 50, 160, 15);
     TEST_ASSERT_EQUAL_UINT32(0, a.takeReserved());
     TEST_ASSERT_EQUAL_UINT32(10, a.takeRung());
     TEST_ASSERT_EQUAL_UINT32(60, a.takeRung());
@@ -1391,14 +1391,14 @@ static void test_reservations_and_ranked_positions_interleave_in_the_window()
 // Reserved positions can push the first spill later, never earlier.
 static void test_rungs_spill_past_the_transition_when_the_window_is_full()
 {
-    SrPositionAllocator a(10, 100, 250, 15);
+    SrPositionAllocator a(10, 100, 160, 15);
     TEST_ASSERT_EQUAL_UINT32(0, a.takeRung());
     // Still room in a 150 ms window for another 100 ms? cursor at 100, width 150 — yes at 100.
     TEST_ASSERT_EQUAL_UINT32(100, a.takeRung());
-    // cursor 200 >= 150: spill. Last placed at 100, cleared by half = 200, max with origin 250.
-    TEST_ASSERT_EQUAL_UINT32(250, a.takeRung());
+    // cursor 200 >= 150: spill. Last placed at 100, cleared by half = 200, max with origin 160.
+    TEST_ASSERT_EQUAL_UINT32(200, a.takeRung());
 
-    SrPositionAllocator held(10, 100, 250, 15);
+    SrPositionAllocator held(10, 100, 160, 15);
     held.takeReserved();
     TEST_ASSERT_TRUE(held.takeRung() >= 10);
 }
@@ -1407,19 +1407,19 @@ static void test_rungs_spill_past_the_transition_when_the_window_is_full()
 // at zero and degenerate to a bare half-airtime.
 static void test_an_empty_window_puts_the_first_rung_at_the_transition()
 {
-    SrPositionAllocator a(89, 5702, 250, 15);
-    TEST_ASSERT_EQUAL_UINT32(250, a.firstRungMs());
-    TEST_ASSERT_EQUAL_UINT32(250, a.firstFreeMs());
+    SrPositionAllocator a(89, 5702, 1424, 15);
+    TEST_ASSERT_EQUAL_UINT32(1424, a.firstRungMs());
+    TEST_ASSERT_EQUAL_UINT32(1424, a.firstFreeMs());
 }
 
 // The window holds its positions and no more; anything further spills past the transition.
 static void test_the_window_never_holds_more_than_its_positions()
 {
-    SrPositionAllocator a(1, 100, 250, 15);
+    SrPositionAllocator a(1, 100, 16, 15);
     for (int i = 0; i < 15; i++) {
         TEST_ASSERT_TRUE(a.takeReserved() < 15);
     }
-    TEST_ASSERT_TRUE(a.takeReserved() >= 250);
+    TEST_ASSERT_TRUE(a.takeReserved() >= 16);
 }
 
 static void test_modem_preset_observer_ignores_first_sighting_and_repeats()

@@ -665,6 +665,8 @@ private:
     static constexpr uint32_t SR_FALLBACK_HALF_AIRTIME_MS = 150;
 
     static constexpr uint32_t SR_PEER_TURNAROUND_MS = 250;
+    /// Fallback ladder origin when the radio has no floor yet. Production uses
+    /// `getRelayFloorMsec()` (`2·CWmax·slot_time`) as the transition.
     static constexpr uint32_t SR_SLOT_ORIGIN_MS = SR_PEER_TURNAROUND_MS;
     uint32_t lastBootstrapReplyMs = 0; // 0 = never
     // When we last transmitted a list that actually carried neighbours (0 = never). The

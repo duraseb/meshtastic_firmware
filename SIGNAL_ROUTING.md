@@ -105,7 +105,7 @@ Passive SR nodes (TRACKER, SENSOR, TAK, or non-active-routing configured nodes) 
 |-------------|-----------------|---------------|
 | **FloodingRouter** | SNR-based delays (poorer SNR = shorter delay) | Immediate send |
 | **NextHopRouter** | SNR-based delays + next hop preference | iface->getRetransmissionMsec() timing |
-| **SignalRouting** | Rung-based: origin `SR_SLOT_ORIGIN_MS`, half-airtime per rung (floored at 50 ms), plus a strictly positive per-node jitter, deterministic candidate ordering | ETX-based route selection; undesignated slot 0 at stock's contention floor + speculative retransmit |
+| **SignalRouting** | Rung-based: origin `getRelayFloorMsec()` (`2·CWmax·slot_time`), half-airtime per rung (floored at 50 ms), plus a strictly positive per-node jitter, deterministic candidate ordering | ETX-based route selection; undesignated slot 0 at stock's contention floor + speculative retransmit |
 
 ## Direct Neighbor Detection
 
@@ -370,7 +370,7 @@ For each candidate (self + SR-active direct neighbors), three tiers that never o
 
 This ensures last-hop delivery nodes are always scheduled before intermediate relays, and within each tier the lower ETX wins. Costs are compared in half-ETX buckets (`SR_COST_BUCKET_FIXED`), for unicast candidates and for the broadcast ranking's average cost alike: a node prices its own link from its own measurements and a peer's link from the peer's packed report, so near-equal costs differ by a few hundredths in a direction that varies per node, and exact comparison let two colocated nodes rank each other in opposite orders and take the same slot. Within a bucket the packet-id-parity node-id tie-break decides identically everywhere.
 
-**Channel-access model:** waits are built from stock's own contention geometry (the preset's CAD slot time and its contention window), the frame airtime, and a fixed guard after somebody else's frame — the turnaround, `SR_PEER_TURNAROUND_MS` = 250 ms. The ACK gate is turnaround + twice the maximum contention delay + the reply airtime; the wait behind a designated SR next hop is turnaround + maximum contention + one airtime; the coordinated broadcast ladder starts at `SR_SLOT_ORIGIN_MS` (= turnaround), rung k firing at origin + k × half airtime; and an undesignated unicast slot 0 starts at stock's contention floor, `getRelayFloorMsec()` = 2 × CWmax × slot time.
+**Channel-access model:** waits are built from stock's own contention geometry (the preset's CAD slot time and its contention window), the frame airtime, and a fixed guard after somebody else's frame — the turnaround, `SR_PEER_TURNAROUND_MS` = 250 ms. The ACK gate is turnaround + twice the maximum contention delay + the reply airtime; the wait behind a designated SR next hop is turnaround + maximum contention + one airtime; the coordinated broadcast ladder and undesignated unicast slot 0 both start at stock's contention floor, `getRelayFloorMsec()` = 2 × CWmax × slot time (rung k at floor + k × half airtime). The turnaround remains the peer re-arm used by dest-ACK and peer-relay waits, not the ladder origin.
 
 **The turnaround is margin, not a measured deaf window.** Peers take up to ~170 ms of per-packet processing between a frame ending and the decoded packet reaching their router, and that figure was once read here as time off air. It is not: the radio re-arms the receiver before delivering the frame upward, so a peer is listening again long before it has finished with the frame it just took. Nothing above depends on the 170 ms figure.
 
@@ -432,12 +432,10 @@ Note: a packet is removed from the TX queue at `dequeue()`, which happens immedi
 Because Phase 2 assigns each SR candidate a unique sequential slot, two nodes with unique coverage will never collide when both keep their relays.
 
 ```
-Slot timing example (150ms half-airtime, origin SR_SLOT_ORIGIN_MS = 250ms):
+Slot timing example (150ms half-airtime, SHORT_SLOW: floor = 2·8·10 = 160ms):
 
-  Slot 0 (250ms):  Stock router R1
-  Slot 1 (400ms):  Stock router R2
-  Slot 2 (550ms):  Best SR candidate (most unique coverage)
-  Slot 3 (700ms):  Next SR candidate
+  Window positions (0…150ms): stock reservations and ranked SR rungs while a half-airtime fits
+  First ladder spill (≥160ms): past the transition once the window is full
   ...
 
 Each SR node adds its own rung jitter (1..max(halfAirtime/2, 20) ms) to the rung it takes,
@@ -573,7 +571,7 @@ So `planAcknowledgement()` runs a second pass with its own price, only when the 
 
 **It is the opposite direction from coverage.** `coverageOwner()` ranks a candidate's own edge *to* the target, which is the only evidence available for a neighbour nobody can be shown to reach. An acknowledgement needs the reverse: the originator must be able to hear the answer, because a copy it cannot hear tells it nothing. `NeighborGraph::acknowledgementPrice()` therefore demands positive, one-directional evidence — the source's own list naming the candidate, or us watching the source's traffic carried by it — prices the link as the source measures it, and refuses a guessed link or one past the coverage ceiling. Edge existence alone will not do: a direct observation writes both edge directions from one measurement, so that is our own assumption of symmetry, and symmetry is the one thing an acknowledgement may not assume. A source that publishes nothing leaves each node with only its own evidence, so several may answer; that is still fewer than every node that heard the frame.
 
-**Candidates** are ourselves plus the neighbours we can hear that are SR-active or immediate relay routers and have a price, ordered by that price in `SR_OWNER_COST_BUCKET` buckets, then by packet-id parity and node id so the duty rotates across packets rather than always falling to the same node. Rungs start at `SR_SLOT_ORIGIN_MS` and space by half an airtime, each with the same rung jitter the ranked ladder uses; a rung ahead of ours counts toward `slotsGiven`, so T1 insures an answer that never comes.
+**Candidates** are ourselves plus the neighbours we can hear that are SR-active or immediate relay routers and have a price, ordered by that price in `SR_OWNER_COST_BUCKET` buckets, then by packet-id parity and node id so the duty rotates across packets rather than always falling to the same node. Rungs start at `getRelayFloorMsec()` and space by half an airtime, each with the same rung jitter the ranked ladder uses; a rung ahead of ours counts toward `slotsGiven`, so T1 insures an answer that never comes.
 
 **We stand down** for a neighbour that will rebroadcast regardless and will not cancel for us (`willNotCancelForUs()` — stock ROUTER and ROUTER_LATE, never an SR node) when it can hear the transmitter: its copy is already the acknowledgement, and ours would only add to it. A stock CLIENT is deliberately not such a node — it floods later than our rung and cancels on hearing us, so answering first removes its copy rather than adding to ours.
 
