@@ -543,7 +543,8 @@ bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
             if (checkAndUpdateBucket(re->relay, tripMs, clearMs, airMs, nowMs, "relay", re->nodeId)) {
                 drop = true;
             }
-        } else {
+        } else if (shouldChargeUnresolvedRelay(signalRoutingModule != nullptr,
+                                               signalRoutingModule && signalRoutingModule->hasEstablishedGraph())) {
             if (checkAndUpdateBucket(unresolvedRelay, tripMs, clearMs, airMs, nowMs, "relay-unresolved", 0)) {
                 drop = true;
             }

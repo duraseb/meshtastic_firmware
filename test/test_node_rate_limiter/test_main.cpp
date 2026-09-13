@@ -407,9 +407,25 @@ static void test_preset_airtime_scales_budget()
 void setUp(void) {}
 void tearDown(void) {}
 
+// An unresolvable relay byte is only evidence when resolution could have worked. After a reboot
+// the graph holds no direct neighbours, so nothing resolves — charging the shared bucket then
+// trips it on ordinary traffic, and because the limiter drops before the graph observes, the graph
+// can never fill and the node never recovers. That loop is what this guard exists to prevent.
+static void test_unresolved_relay_is_only_charged_once_resolution_is_possible()
+{
+    // SignalRouting present, graph still empty: nothing to resolve against, so do not charge.
+    TEST_ASSERT_FALSE(NodeRateLimiter::shouldChargeUnresolvedRelay(true, false));
+    // SignalRouting present with direct neighbours: an unresolved byte now means something.
+    TEST_ASSERT_TRUE(NodeRateLimiter::shouldChargeUnresolvedRelay(true, true));
+    // No SignalRouting at all: no resolution mechanism exists, so the shared bucket is the only
+    // defence and must still be charged.
+    TEST_ASSERT_TRUE(NodeRateLimiter::shouldChargeUnresolvedRelay(false, false));
+}
+
 void setup()
 {
     UNITY_BEGIN();
+    RUN_TEST(test_unresolved_relay_is_only_charged_once_resolution_is_possible);
     RUN_TEST(test_other_bucket_trips_at_four);
     RUN_TEST(test_to_us_is_never_limited);
     RUN_TEST(test_admin_app_counts_as_other_when_not_to_us);

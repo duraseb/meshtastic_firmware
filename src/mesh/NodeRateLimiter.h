@@ -51,6 +51,21 @@ class NodeRateLimiter
     uint8_t debugRelayCount() const { return relayCount; }
 #endif
 
+    /**
+     * Whether an unresolvable relay byte should be charged to the shared bucket.
+     *
+     * Only when resolution could have worked. With SignalRouting present but no direct neighbours
+     * in the graph yet — the first minutes after a reboot — every byte is unresolvable because
+     * there is nothing to resolve against, and charging then trips the shared bucket on ordinary
+     * traffic. With no SignalRouting at all there is no resolution mechanism, so the shared bucket
+     * is the only defence and must still be charged.
+     */
+    static bool shouldChargeUnresolvedRelay(bool srPresent, bool graphEstablished)
+    {
+        return !srPresent || graphEstablished;
+    }
+
+
   private:
     static constexpr uint8_t MAX_ORIGINATOR_ENTRIES = 16;
     static constexpr uint8_t MAX_RELAY_ENTRIES = 8;

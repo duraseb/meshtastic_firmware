@@ -2407,6 +2407,28 @@ void SignalRoutingModule::commitRelay(PacketId packetId, NodeNum originalHeardFr
     LOG_INFO("[SR] Committed relay 0x%08x (from 0x%08x, delay %ums)", packetId, originalHeardFrom, txDelayMs);
 }
 
+void SignalRoutingModule::observeForGraph(const meshtastic_MeshPacket &mp)
+{
+    if (!routingGraph || mp.via_mqtt) {
+        return;
+    }
+    // Same test the receive path uses: a frame with no signal reading did not come off our radio,
+    // and one that has been relayed measures somebody else's link, not ours.
+    if (mp.rx_rssi == 0 && mp.rx_snr == 0) {
+        return;
+    }
+    if (!isDirectPacket(mp)) {
+        return;
+    }
+    updateNeighborInfo(mp.from, mp.rx_rssi, mp.rx_snr, mp.rx_time);
+    routingGraph->clearDownstreamForDestination(mp.from);
+}
+
+bool SignalRoutingModule::hasEstablishedGraph() const
+{
+    return routingGraph && routingGraph->countDirectNeighbors() > 0;
+}
+
 uint32_t SignalRoutingModule::ladderTransitionMs() const
 {
     if (router && router->getRadioInterface()) {

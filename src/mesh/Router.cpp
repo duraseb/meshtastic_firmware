@@ -824,6 +824,14 @@ void Router::handleReceived(meshtastic_MeshPacket *p, RxSource src)
     // UNKNOWN. Runs before callModules so SR graph observe never sees dropped frames.
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
     if (!skipHandle && nodeRateLimiter && nodeRateLimiter->shouldDrop(p)) {
+        // The graph still observes it. Resolving a relay byte needs direct neighbours in the
+        // graph, so dropping before the graph sees anything leaves a rebooted node unable to
+        // resolve, charging every relayed frame to the one shared unresolved bucket and dropping
+        // the very traffic that would have filled the graph. Observing costs nothing the limiter
+        // is trying to prevent: it neither relays, replies, nor reaches the phone.
+        if (signalRoutingModule) {
+            signalRoutingModule->observeForGraph(*p);
+        }
         if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag) {
             LOG_WARN("[RateLimit] Dropping packet 0x%08x from 0x%08x portnum=%d hops=%d",
                      p->id, p->from, p->decoded.portnum,

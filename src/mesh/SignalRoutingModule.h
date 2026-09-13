@@ -801,6 +801,24 @@ public:
     /// Placeholder NodeNums use Edge::PLACEHOLDER_NODE_BASE (see isPlaceholderNode).
     static bool isPlaceholderNodeId(NodeNum nodeId) { return (nodeId & 0xFF000000u) == 0xFF000000u; }
     bool isPlaceholderNode(NodeNum nodeId) const; // existing impl; kept public for rate limiter
+
+    /**
+     * Record what a frame says about our own direct links, without running anything else.
+     *
+     * The inbound rate limiter drops frames before the modules run, so without this the graph
+     * never sees the traffic the limiter is judging. That matters because resolving a relay byte
+     * needs direct neighbours in the graph: after a reboot nothing resolves, every relayed frame
+     * charges the one shared unresolved bucket, and the drops then stop the graph ever filling.
+     * The limiter starves the thing it depends on. Calling this on the drop path breaks that loop.
+     */
+    void observeForGraph(const meshtastic_MeshPacket &mp);
+
+    /**
+     * True once the graph holds at least one direct neighbour, i.e. once a relay byte has
+     * something to resolve against. Before that, an unresolved byte says nothing about the sender.
+     */
+    bool hasEstablishedGraph() const;
+
     /// Rate-limit eviction: true if node has any edge table in the routing graph.
     bool rateLimitNodeInGraph(NodeNum nodeId) const;
     /// Rate-limit eviction: graph hop distance (1 = direct); 0 if unknown / not routable.
