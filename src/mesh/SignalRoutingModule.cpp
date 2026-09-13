@@ -2093,10 +2093,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     //     so it cannot have heard our copy, will not cancel its own, and the duplicate we were
     //     avoiding happens anyway.
     //   - the destination's chance to answer, when the source's list says it hears the source.
-    const uint32_t relayFloorMs = (router && router->getRadioInterface())
-                                      ? router->getRadioInterface()->getRelayFloorMsec()
-                                      : SR_PEER_TURNAROUND_MS;
-    const uint32_t earliestMs = std::max(relayFloorMs, destAckWaitMs);
+    const uint32_t earliestMs = std::max(ladderTransitionMs(), destAckWaitMs);
     // The designated next hop's reservation, and zero when no next hop is named. It used to be
     // seeded with the floor above, which made it unconditionally non-zero and left both of the
     // branches that test it unreachable: every candidate took the reservation path, ranked slot 0
@@ -2410,16 +2407,20 @@ void SignalRoutingModule::commitRelay(PacketId packetId, NodeNum originalHeardFr
     LOG_INFO("[SR] Committed relay 0x%08x (from 0x%08x, delay %ums)", packetId, originalHeardFrom, txDelayMs);
 }
 
-uint32_t SignalRoutingModule::expiredRelayReanchorMs(PacketId packetId, uint32_t slotTimeMs) const
+uint32_t SignalRoutingModule::ladderTransitionMs() const
 {
-    uint32_t transitionMs = SR_SLOT_ORIGIN_MS;
     if (router && router->getRadioInterface()) {
         const uint32_t relayFloorMs = router->getRadioInterface()->getRelayFloorMsec();
         if (relayFloorMs > 0) {
-            transitionMs = relayFloorMs;
+            return relayFloorMs;
         }
     }
-    return srExpiredRelayReanchorMs(getCommittedRelayDelay(packetId), transitionMs, slotTimeMs);
+    return SR_SLOT_ORIGIN_MS;
+}
+
+uint32_t SignalRoutingModule::expiredRelayReanchorMs(PacketId packetId, uint32_t slotTimeMs) const
+{
+    return srExpiredRelayReanchorMs(getCommittedRelayDelay(packetId), ladderTransitionMs(), slotTimeMs);
 }
 
 bool SignalRoutingModule::isCommittedRelay(PacketId packetId) const
@@ -2546,17 +2547,8 @@ void SignalRoutingModule::scheduleT1Broadcast(const meshtastic_MeshPacket *p, ui
     // candidate set the ranking actually built — stock reservations already excluded, because the
     // stock worst case above spans the window they sit in.
     const uint32_t halfAirtimeMs = std::max(airtimeMs / 2, SR_MIN_RUNG_SPACING_MS);
-    // Same border the window ends at: stock's 2·CWmax·slot_time. Without a radio, fall back to
-    // the turnaround so T1 still has a defined origin.
-    uint32_t transitionMs = SR_SLOT_ORIGIN_MS;
-    if (router && router->getRadioInterface()) {
-        const uint32_t relayFloorMs = router->getRadioInterface()->getRelayFloorMsec();
-        if (relayFloorMs > 0) {
-            transitionMs = relayFloorMs;
-        }
-    }
     const uint32_t ladderSpanMs =
-        transitionMs + static_cast<uint32_t>(ladderRungs) * halfAirtimeMs;
+        ladderTransitionMs() + static_cast<uint32_t>(ladderRungs) * halfAirtimeMs;
     if (ladderSpanMs > latestRelayWindowMs) {
         latestRelayWindowMs = ladderSpanMs;
     }
@@ -3044,10 +3036,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     const uint8_t windowPositions = (slotTimeMs > 0 && relayFloorMs > slotTimeMs)
                                         ? static_cast<uint8_t>(relayFloorMs / slotTimeMs - 1)
                                         : 0;
-    // Ladder transition is stock's router/contention border. With no radio the window is empty
-    // and every position falls on the ladder from the turnaround fallback.
-    const uint32_t transitionMs = relayFloorMs > 0 ? relayFloorMs : SR_SLOT_ORIGIN_MS;
-    SrPositionAllocator positions(slotTimeMs, halfAirtime, transitionMs, windowPositions);
+    SrPositionAllocator positions(slotTimeMs, halfAirtime, ladderTransitionMs(), windowPositions);
     bool shouldRelay = false;
     uint32_t myDelay = 0;
     const char *decisionReason = "no unique coverage";
@@ -4284,13 +4273,7 @@ bool SignalRoutingModule::planAcknowledgement(const meshtastic_MeshPacket *p, No
         entries[j + 1] = key;
     }
 
-    uint32_t delay = SR_SLOT_ORIGIN_MS;
-    if (router && router->getRadioInterface()) {
-        const uint32_t relayFloorMs = router->getRadioInterface()->getRelayFloorMsec();
-        if (relayFloorMs > 0) {
-            delay = relayFloorMs;
-        }
-    }
+    uint32_t delay = ladderTransitionMs();
     uint8_t ahead = 0;
     for (uint8_t i = 0; i < count; i++) {
         if (entries[i].node == myNode) {

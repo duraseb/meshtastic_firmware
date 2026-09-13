@@ -913,6 +913,14 @@ public:
      * candidates, its offset above the shared origin, so that is what gets re-anchored to now.
      * Floored at one slot time so an expired rung 0 does not key up instantly.
      */
+    /**
+     * Where the relay ladder starts: stock's border between the router window and the
+     * contention window every other role draws from, `2*CWmax*slot_time`, which the radio
+     * publishes as `getRelayFloorMsec()`. The window of reservations ends exactly there, so
+     * the two are one geometry. Falls back to the peer turnaround when no radio is attached
+     * (host tests), which leaves the window empty and every position on the ladder.
+     */
+    uint32_t ladderTransitionMs() const;
     uint32_t expiredRelayReanchorMs(PacketId packetId, uint32_t slotTimeMs) const;
     void clearCommittedRelay(PacketId packetId);
     // True when every neighbour we would cover is already covered by the transmitters heard for

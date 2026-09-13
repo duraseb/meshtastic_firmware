@@ -1398,9 +1398,14 @@ static void test_rungs_spill_past_the_transition_when_the_window_is_full()
     // cursor 200 >= 150: spill. Last placed at 100, cleared by half = 200, max with origin 160.
     TEST_ASSERT_EQUAL_UINT32(200, a.takeRung());
 
+    // The same ladder with a reservation ahead of it. Admission is by cursor position, not by
+    // fit, so the reservation's own slot time shifts every position after it by 10 ms and the
+    // spill lands at 210 rather than the 200 above: a reservation pushes the ladder out, never in.
     SrPositionAllocator held(10, 100, 160, 15);
-    held.takeReserved();
-    TEST_ASSERT_TRUE(held.takeRung() >= 10);
+    TEST_ASSERT_EQUAL_UINT32(0, held.takeReserved());
+    TEST_ASSERT_EQUAL_UINT32(10, held.takeRung());
+    TEST_ASSERT_EQUAL_UINT32(110, held.takeRung());
+    TEST_ASSERT_EQUAL_UINT32(210, held.takeRung());
 }
 
 // The empty case is stated separately: folding it into the formula would leave the last position
