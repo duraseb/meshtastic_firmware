@@ -522,7 +522,11 @@ void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
 
     // Pack all neighbors into a large buffer (header placeholder + entries)
     static constexpr size_t MAX_TOTAL_PACKED = MAX_SIGNAL_ROUTING_NEIGHBORS * 6 * PACKED_NEIGHBOR_ENTRY_SIZE + PACKED_NEIGHBOR_HEADER_SIZE;
-    uint8_t allPacked[MAX_TOTAL_PACKED];
+    // Static, not a local: this is 1349 bytes and the nRF52 Arduino loop task has a 4 KB stack
+    // in total (LOOP_STACK_SZ, 1024 words). Both this function and the relay decision run on
+    // that one thread and neither recurses, so a shared buffer is safe and keeps the deepest
+    // call chain clear of the limit. Nothing here relies on zero-initialisation.
+    static uint8_t allPacked[MAX_TOTAL_PACKED];
     uint8_t totalNeighbors = packNeighborsForBroadcast(allPacked, sizeof(allPacked));
 
     uint8_t topologyVersion = currentTopologyVersion++;
@@ -568,7 +572,7 @@ void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
         uint8_t count = std::min((uint8_t)MAX_SIGNAL_ROUTING_NEIGHBORS, (uint8_t)(totalNeighbors - startNeighbor));
 
         // Build per-packet packed buffer: 5-byte header + this chunk's entries
-        uint8_t chunkBuf[PACKED_NEIGHBOR_HEADER_SIZE + MAX_SIGNAL_ROUTING_NEIGHBORS * PACKED_NEIGHBOR_ENTRY_SIZE];
+        static uint8_t chunkBuf[PACKED_NEIGHBOR_HEADER_SIZE + MAX_SIGNAL_ROUTING_NEIGHBORS * PACKED_NEIGHBOR_ENTRY_SIZE];
         writePackedHeader(chunkBuf, topologyVersion, srActive, packetIndex + 1 < packetsNeeded, packetIndex > 0);
         size_t dataOffset = PACKED_NEIGHBOR_HEADER_SIZE + startNeighbor * PACKED_NEIGHBOR_ENTRY_SIZE;
         memcpy(&chunkBuf[PACKED_NEIGHBOR_HEADER_SIZE], &allPacked[dataOffset], count * PACKED_NEIGHBOR_ENTRY_SIZE);
@@ -2972,7 +2976,13 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     // Only mark heardFrom's neighbors as already-covered if the link is good.
     // Poor-quality links (high ETX) should NOT be pre-covered: if our link to
     // that node is much better, we should still relay and get an earlier slot.
-    NodeSet alreadyCovered;
+    // Three NodeSets live here and each is 196 bytes (48 node ids plus a count), which is the
+    // bulk of this function's stack frame -- and this function sits on the deepest call chain on
+    // a thread with a 4 KB stack. They are static and explicitly cleared: unlike a local, a static
+    // keeps last call's contents, so the clear is what makes each call start empty. Safe because
+    // the relay decision runs only on the loop thread and never re-enters itself.
+    static NodeSet alreadyCovered;
+    alreadyCovered.clear();
     alreadyCovered.insert(sourceNode);
     alreadyCovered.insert(heardFrom);
     const NodeEdges *heardFromEdges = routingGraph->getEdgesFrom(heardFrom);
@@ -2986,7 +2996,8 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     }
 
     // Build candidates: our direct SR-active neighbors (plus stock routers handled in Phase 1)
-    NodeSet candidates;
+    static NodeSet candidates;
+    candidates.clear();
     const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
 
     // Log any of our own neighbors excluded from pre-coverage due to poor heardFrom link
@@ -3167,7 +3178,8 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
 
     // The SR peers that took part in the ranking: the stock-coverage fallback coordinates
     // ownership of uncovered mute neighbours across exactly this set.
-    NodeSet srPeers = candidates;
+    static NodeSet srPeers;
+    srPeers = candidates;
 
 
     auto absorbRelayCoverage = [&](NodeNum relay) {
@@ -3199,7 +3211,8 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     NodeNum uncovered[UNCOVERED_LOG];
     uint8_t uncoveredLen = 0;
     {
-        NodeNum mine[NODE_SET_MAX];
+        // Static for the same reason as allPacked above: 192 bytes each, on the deepest chain.
+        static NodeNum mine[NODE_SET_MAX];
         size_t n = routingGraph->getCoverageIfRelays(myNode, mine, NODE_SET_MAX, nullptr, 0, myNode, &coveragePolicy);
         for (size_t i = 0; i < n && uncoveredLen < UNCOVERED_LOG; i++) {
             if (!alreadyCovered.contains(mine[i])) {
@@ -3220,7 +3233,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         if (routingGraph->hasNodeTransmitted(cand, p->id, currentTime)) {
             continue;
         }
-        NodeNum cov[NODE_SET_MAX];
+        static NodeNum cov[NODE_SET_MAX];
         size_t total =
             routingGraph->getCoverageIfRelays(cand, cov, NODE_SET_MAX, nullptr, 0, myNode, &coveragePolicy);
         size_t unique = 0;
