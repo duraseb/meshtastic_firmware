@@ -15,7 +15,10 @@
  *
  * Uniform hysteresis: trip_threshold / clear_threshold / fixed window; while limited,
  * drop matching traffic; lift at window end when count is below clear (clear==0 means
- * a quiet window with count==0).
+ * a quiet window with count==0). RELAY and YOUNG use a clear threshold below trip.
+ *
+ * Young path: one shared packet-count bucket for originators first heard less than
+ * 30 minutes ago, so a flood of minted identities buys one slot, not one each.
  */
 class NodeRateLimiter
 {
@@ -49,6 +52,16 @@ class NodeRateLimiter
     void debugRelayBudgets(uint32_t airMs, uint32_t &tripMs, uint32_t &clearMs) const;
     uint8_t debugOriginatorCount() const { return originatorCount; }
     uint8_t debugRelayCount() const { return relayCount; }
+    bool debugTracksYoung(NodeNum nodeId) const;
+    uint8_t debugYoungCount() const { return youngCount; }
+    bool debugIsYoung(NodeNum nodeId) const;
+    bool debugYoungLimited() const { return youngBucket.limited; }
+    uint32_t debugYoungCharge() const { return youngBucket.count; }
+    void debugSetBootMs(uint32_t bootMs);
+    void debugSeedYoung(NodeNum nodeId, uint32_t firstSeenMs);
+    bool debugTakeAnnounce(NodeNum *ids, uint8_t &count);
+    void debugSetAnnounceBroadcast(bool enabled) { cfgAnnounceBroadcast = enabled; }
+    static int64_t testNowOverride; // < 0 => millis()
 #endif
 
     /**
@@ -84,6 +97,26 @@ class NodeRateLimiter
     {
         return !srPresent || graphEstablished;
     }
+
+    /// A node whose traffic the young bucket is currently dropping is not a coverage target.
+    bool isDroppedCoverageTarget(NodeNum nodeId) const;
+
+    /// Diagnostic IDs from the last young-bucket trip that was allowed to announce.
+    bool takeYoungAnnounce(NodeNum *ids, uint8_t &count);
+
+    /// Mesh broadcast of the diagnostic. Stays false until a config bit exists.
+    bool announceBroadcastEnabled() const { return cfgAnnounceBroadcast; }
+
+    static constexpr uint8_t MAX_YOUNG_ENTRIES = 32;
+    static constexpr uint32_t YOUNG_AGE_MS = 30u * 60u * 1000u;
+    static constexpr uint32_t WARMUP_MS = 30u * 60u * 1000u;
+    // 48 is 2× the measured 24-packet / 90 s legitimate peak of young traffic; 12 is
+    // the RELAY-style quarter-of-trip clear. Thirty minutes is a commitment, not a knob.
+    static constexpr uint8_t YOUNG_TRIP = 48;
+    static constexpr uint8_t YOUNG_CLEAR = 12;
+    static constexpr uint32_t ANNOUNCE_REFRACTORY_MS = 30u * 60u * 1000u;
+    static constexpr float ANNOUNCE_CHUTIL_HIGH = 25.0f;
+    static constexpr uint8_t ANNOUNCE_MAX_IDS = 4;
 
 
   private:
@@ -136,6 +169,24 @@ class NodeRateLimiter
     uint8_t relayCount = 0;
     BucketState unresolvedRelay; // shared "+1" for forgeable/unresolved relay bytes
 
+    struct YoungSighting {
+        NodeNum nodeId = 0;
+        uint32_t firstSeenMs = 0;
+    };
+    YoungSighting young[MAX_YOUNG_ENTRIES];
+    uint8_t youngCount = 0;
+    NodeNum alumni[MAX_YOUNG_ENTRIES] = {};
+    uint8_t alumniCount = 0;
+    BucketState youngBucket;
+    uint32_t bootMs = 0;
+    bool bootKnown = false;
+    bool cfgAnnounceBroadcast = false;
+    uint32_t lastAnnounceMs = 0;
+    bool announceEver = false;
+    NodeNum pendingAnnounceIds[ANNOUNCE_MAX_IDS] = {};
+    uint8_t pendingAnnounceCount = 0;
+    bool pendingAnnounce = false;
+
     static Bucket classifyBucket(meshtastic_PortNum portnum);
     static bool isRebroadcastCandidate(const meshtastic_MeshPacket *p);
     static uint32_t packetAirtimeMs(const meshtastic_MeshPacket *p);
@@ -156,6 +207,19 @@ class NodeRateLimiter
     // Eviction helpers (observed graph proximity; never frame hop fields)
     static bool nodeInGraph(NodeNum nodeId);
     static uint8_t graphHopsAway(NodeNum nodeId); // 0 = unknown / not in graph
+
+    uint32_t nowMs() const;
+    void noteBoot(uint32_t now);
+    bool warmedUp(uint32_t now) const;
+    int findYoung(NodeNum nodeId) const;
+    bool inAlumni(NodeNum nodeId) const;
+    void addAlumni(NodeNum nodeId);
+    void removeYoungAt(uint8_t idx);
+    void expireIfOld(NodeNum nodeId, uint32_t now);
+    void noteOriginator(NodeNum nodeId, uint32_t now);
+    bool isYoung(NodeNum nodeId, uint32_t now) const;
+    bool relayAnyLimited() const;
+    void maybeAnnounce(uint32_t now, float chutil);
 };
 
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING

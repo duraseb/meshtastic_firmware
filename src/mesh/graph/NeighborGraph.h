@@ -332,10 +332,11 @@ class NeighborGraph {
         /// Zero disables the test, which is what the graph-only tests want.
         uint32_t nowSecs;
         uint32_t publisherSilenceSecs;
+        bool (*isDroppedCoverageTarget)(void *ctx, NodeNum node);
         CoveragePolicy()
             : ctx(nullptr), publishesTopology(nullptr), isStockRelayRouter(nullptr), isSrActive(nullptr),
               isConfiguredRouter(nullptr), me(0), meRelays(false), poorLinkEtx(0.0f), nowSecs(0),
-              publisherSilenceSecs(0)
+              publisherSilenceSecs(0), isDroppedCoverageTarget(nullptr)
         {
         }
         bool reports(NodeNum node) const { return publishesTopology && publishesTopology(ctx, node); }

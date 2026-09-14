@@ -841,6 +841,35 @@ void Router::handleReceived(meshtastic_MeshPacket *p, RxSource src)
                      p->id, p->from,
                      p->hop_start > p->hop_limit ? p->hop_start - p->hop_limit : 0);
         }
+        NodeNum youngIds[NodeRateLimiter::ANNOUNCE_MAX_IDS];
+        uint8_t youngN = 0;
+        if (nodeRateLimiter->takeYoungAnnounce(youngIds, youngN)) {
+            char msg[48];
+            int pos = 0;
+            pos += snprintf(msg + pos, sizeof(msg) - (size_t)pos, "Y");
+            for (uint8_t i = 0; i < youngN && pos > 0; i++) {
+                pos += snprintf(msg + pos, sizeof(msg) - (size_t)pos, " !%08x", youngIds[i]);
+            }
+            LOG_WARN("[RateLimit] young %s", msg);
+            if (service) {
+                meshtastic_MeshPacket *ann = allocForSending();
+                if (ann) {
+                    ann->to = NODENUM_BROADCAST;
+                    ann->hop_limit = 1;
+                    ann->want_ack = false;
+                    ann->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+                    size_t len = strlen(msg);
+                    ann->decoded.payload.size = len;
+                    memcpy(ann->decoded.payload.bytes, msg, len);
+                    service->sendToPhone(packetPool.allocCopy(*ann));
+                    if (nodeRateLimiter->announceBroadcastEnabled()) {
+                        service->sendToMesh(ann);
+                    } else {
+                        packetPool.release(ann);
+                    }
+                }
+            }
+        }
         cancelSending(p->from, p->id);
         skipHandle = true;
     }

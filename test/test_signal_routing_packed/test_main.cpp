@@ -894,6 +894,28 @@ void test_admits_coverage_credits_an_owned_neighbour()
     TEST_ASSERT_TRUE(graph.admitsCoverage(peer, silent, 7.0f, &policy));
 }
 
+void test_a_dropped_young_node_is_not_a_coverage_target()
+{
+    // A young node publishes no topology, so coverage treats it as stock and may elect an
+    // owner. If the limiter is dropping that traffic, the owner is not a coverage target.
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum silent = 0x22222222;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+    graph.updateEdge(me, silent, 1.5f, 1000, Edge::Source::Reported);
+    static NodeNum blocked = silent;
+    NeighborGraph::CoveragePolicy policy;
+    policy.me = me;
+    policy.meRelays = true;
+    policy.poorLinkEtx = 7.0f;
+    TEST_ASSERT_TRUE(graph.admitsCoverage(me, silent, 7.0f, &policy));
+    policy.isDroppedCoverageTarget = [](void *, NodeNum n) { return n == blocked; };
+    TEST_ASSERT_FALSE_MESSAGE(graph.admitsCoverage(me, silent, 7.0f, &policy),
+                              "dropped traffic is nobody's to carry");
+    NodeNum coveredBy[1] = {0x33333333};
+    TEST_ASSERT_EQUAL_UINT32(0, graph.uniqueCoverageNeighbor(me, coveredBy, 1, 7.0f, &policy));
+}
+
 void test_a_sticky_confirmation_behind_a_decayed_link_is_not_ours()
 {
     // hearsUs is sticky: whose neighbour it is does not make it reachable.
@@ -1637,6 +1659,7 @@ void setup()
     RUN_TEST(test_a_guess_never_outranks_or_prices_a_measurement);
     RUN_TEST(test_a_silent_publisher_loses_our_direct_link);
     RUN_TEST(test_admits_coverage_credits_an_owned_neighbour);
+    RUN_TEST(test_a_dropped_young_node_is_not_a_coverage_target);
     RUN_TEST(test_a_sticky_confirmation_behind_a_decayed_link_is_not_ours);
     RUN_TEST(test_the_coverage_ceiling_is_inclusive);
     RUN_TEST(test_unique_coverage_ignores_poor_links_and_peer_owned_stock_nodes);

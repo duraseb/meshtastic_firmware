@@ -85,6 +85,7 @@ static void prepareEnv(uint32_t windowSecs = 1)
     NodeRateLimiter::testNodeInGraphHook = nullptr;
     NodeRateLimiter::testGraphHopsHook = nullptr;
     NodeRateLimiter::testChutilOverride = -1.0f;
+    NodeRateLimiter::testNowOverride = -1;
 #endif
 }
 
@@ -412,6 +413,196 @@ static void test_preset_airtime_scales_budget()
     TEST_ASSERT_EQUAL_UINT32(3000, trip50);
 }
 
+static meshtastic_MeshPacket textFrom(NodeNum from, uint32_t id)
+{
+    return makePacket(from, NODENUM_BROADCAST, 3, 3, 0, meshtastic_PortNum_TEXT_MESSAGE_APP, id);
+}
+
+static bool dropText(NodeRateLimiter &limiter, NodeNum from, uint32_t id)
+{
+    meshtastic_MeshPacket p = textFrom(from, id);
+    return limiter.shouldDrop(&p);
+}
+
+static void test_established_originator_is_never_charged_to_young()
+{
+    prepareEnv();
+    NodeRateLimiter::testNowOverride = NodeRateLimiter::WARMUP_MS;
+    NodeRateLimiter limiter;
+    limiter.debugSetBootMs(0);
+    const NodeNum from = 0xAE000001;
+    limiter.debugSeedYoung(from, 0);
+    TEST_ASSERT_TRUE(limiter.debugTracksYoung(from));
+    TEST_ASSERT_FALSE(dropText(limiter, from, 1));
+    TEST_ASSERT_FALSE_MESSAGE(limiter.debugTracksYoung(from), "record released at 30 min");
+    for (uint32_t i = 0; i < NodeRateLimiter::YOUNG_TRIP; i++) {
+        NodeRateLimiter::testNowOverride = NodeRateLimiter::WARMUP_MS + 1 + i;
+        TEST_ASSERT_FALSE(limiter.debugIsYoung(from));
+        TEST_ASSERT_EQUAL_UINT32(0, limiter.debugYoungCharge());
+        dropText(limiter, from, 2 + i);
+    }
+    TEST_ASSERT_FALSE(limiter.debugYoungLimited());
+}
+
+static void test_forged_identities_share_one_young_bucket()
+{
+    prepareEnv();
+    NodeRateLimiter::testNowOverride = NodeRateLimiter::WARMUP_MS;
+    NodeRateLimiter limiter;
+    limiter.debugSetBootMs(0);
+    for (uint32_t i = 0; i + 1 < NodeRateLimiter::YOUNG_TRIP; i++) {
+        TEST_ASSERT_FALSE(dropText(limiter, 0xF1000000 + i, i + 1));
+    }
+    TEST_ASSERT_TRUE_MESSAGE(dropText(limiter, 0xF1000000 + NodeRateLimiter::YOUNG_TRIP - 1, 99),
+                             "a flood of distinct young originators trips the shared bucket");
+    TEST_ASSERT_TRUE(limiter.debugYoungLimited());
+
+    NodeRateLimiter established;
+    established.debugSetBootMs(0);
+    for (uint32_t i = 0; i < NodeRateLimiter::YOUNG_TRIP; i++) {
+        established.debugSeedYoung(0xE1000000 + i, 0);
+        TEST_ASSERT_FALSE_MESSAGE(dropText(established, 0xE1000000 + i, i + 1),
+                                  "the same volume from established originators must not trip young");
+    }
+    TEST_ASSERT_FALSE(established.debugYoungLimited());
+}
+
+static void test_young_record_is_released_after_thirty_minutes()
+{
+    prepareEnv();
+    NodeRateLimiter::testNowOverride = NodeRateLimiter::WARMUP_MS;
+    NodeRateLimiter limiter;
+    limiter.debugSetBootMs(0);
+    const NodeNum from = 0xAA0000AA;
+    TEST_ASSERT_FALSE(dropText(limiter, from, 1));
+    TEST_ASSERT_TRUE(limiter.debugTracksYoung(from));
+    TEST_ASSERT_EQUAL_UINT8(1, limiter.debugYoungCount());
+    NodeRateLimiter::testNowOverride = NodeRateLimiter::WARMUP_MS + NodeRateLimiter::YOUNG_AGE_MS;
+    TEST_ASSERT_FALSE(dropText(limiter, from, 2));
+    TEST_ASSERT_FALSE_MESSAGE(limiter.debugTracksYoung(from), "first-sighting record is deleted once the node is no longer young");
+    TEST_ASSERT_EQUAL_UINT8(0, limiter.debugYoungCount());
+}
+
+static void test_no_record_fails_open_with_room_and_closed_when_full()
+{
+    prepareEnv();
+    NodeRateLimiter::testNowOverride = NodeRateLimiter::WARMUP_MS;
+    NodeRateLimiter limiter;
+    limiter.debugSetBootMs(0);
+    TEST_ASSERT_FALSE_MESSAGE(limiter.debugIsYoung(0xB1000001), "no record and room in the table means established");
+    for (uint8_t i = 0; i < NodeRateLimiter::MAX_YOUNG_ENTRIES; i++) {
+        limiter.debugSeedYoung(0xB2000000 + i, NodeRateLimiter::WARMUP_MS);
+    }
+    TEST_ASSERT_TRUE(limiter.debugYoungCount() == NodeRateLimiter::MAX_YOUNG_ENTRIES);
+    TEST_ASSERT_TRUE_MESSAGE(limiter.debugIsYoung(0xB3000001), "no record and a full table means young");
+    TEST_ASSERT_FALSE(limiter.debugTracksYoung(0xB3000001));
+}
+
+static void test_young_bucket_is_not_enforced_during_warmup()
+{
+    prepareEnv();
+    NodeRateLimiter::testNowOverride = 0;
+    NodeRateLimiter limiter;
+    for (uint32_t i = 0; i < NodeRateLimiter::YOUNG_TRIP + 4; i++) {
+        NodeRateLimiter::testNowOverride = i;
+        TEST_ASSERT_FALSE_MESSAGE(dropText(limiter, 0xC1000000 + i, i + 1),
+                                  "warmup replaces persistence: do not drop the mesh as young after boot");
+    }
+    TEST_ASSERT_FALSE(limiter.debugYoungLimited());
+}
+
+static void test_young_bucket_clears_below_clear_without_a_silent_window()
+{
+    prepareEnv();
+    NodeRateLimiter::testNowOverride = NodeRateLimiter::WARMUP_MS;
+    NodeRateLimiter limiter;
+    limiter.debugSetBootMs(0);
+    for (uint32_t i = 0; i < NodeRateLimiter::YOUNG_TRIP; i++) {
+        dropText(limiter, 0xD1000000 + i, i + 1);
+    }
+    TEST_ASSERT_TRUE(limiter.debugYoungLimited());
+    const uint32_t windowMs = 1000; // prepareEnv window_secs=1
+    const uint32_t busy = NodeRateLimiter::WARMUP_MS + NodeRateLimiter::YOUNG_TRIP;
+    for (uint32_t i = 0; i < 20; i++) {
+        NodeRateLimiter::testNowOverride = busy + i;
+        dropText(limiter, 0xD2000000 + i, 100 + i);
+    }
+    const uint32_t roll = busy + 20 + windowMs;
+    NodeRateLimiter::testNowOverride = roll;
+    TEST_ASSERT_TRUE(dropText(limiter, 0xD3000001, 200));
+    for (uint32_t i = 0; i < 5; i++) {
+        NodeRateLimiter::testNowOverride = roll + 1 + i;
+        dropText(limiter, 0xD4000000 + i, 300 + i);
+    }
+    NodeRateLimiter::testNowOverride = roll + 1 + windowMs;
+    TEST_ASSERT_FALSE_MESSAGE(dropText(limiter, 0xD5000001, 400),
+                              "young bucket must lift when the prior window is under the clear threshold");
+    TEST_ASSERT_FALSE(limiter.debugYoungLimited());
+}
+
+static void test_undecodable_traffic_does_not_charge_young()
+{
+    prepareEnv();
+    NodeRateLimiter::testNowOverride = NodeRateLimiter::WARMUP_MS;
+    NodeRateLimiter limiter;
+    limiter.debugSetBootMs(0);
+    for (uint32_t i = 0; i < NodeRateLimiter::YOUNG_TRIP; i++) {
+        meshtastic_MeshPacket p = makePacket(0x11000000 + i, NODENUM_BROADCAST, 3, 3, 0, meshtastic_PortNum_TEXT_MESSAGE_APP, i);
+        p.which_payload_variant = meshtastic_MeshPacket_encrypted_tag;
+        TEST_ASSERT_FALSE_MESSAGE(limiter.shouldDrop(&p), "undecodable frames belong to UNKNOWN, not young");
+    }
+    TEST_ASSERT_FALSE(limiter.debugYoungLimited());
+    TEST_ASSERT_EQUAL_UINT8(0, limiter.debugYoungCount());
+}
+
+static void test_young_announce_respects_refractory_and_congestion()
+{
+    prepareEnv();
+    NodeRateLimiter::testNowOverride = NodeRateLimiter::WARMUP_MS;
+    NodeRateLimiter limiter;
+    limiter.debugSetBootMs(0);
+    for (uint32_t i = 0; i < NodeRateLimiter::YOUNG_TRIP; i++) {
+        dropText(limiter, 0xA1000000 + i, i + 1);
+    }
+    NodeNum ids[4] = {};
+    uint8_t n = 0;
+    TEST_ASSERT_TRUE(limiter.debugTakeAnnounce(ids, n));
+    TEST_ASSERT_TRUE(n <= 4);
+
+    NodeRateLimiter::testNowOverride = NodeRateLimiter::WARMUP_MS + 1000 + 10;
+    for (uint32_t i = 0; i < NodeRateLimiter::YOUNG_TRIP; i++) {
+        dropText(limiter, 0xA2000000 + i, 50 + i);
+    }
+    TEST_ASSERT_FALSE_MESSAGE(limiter.debugTakeAnnounce(ids, n), "refractory is independent of how often the bucket trips");
+
+    NodeRateLimiter congested;
+    congested.debugSetBootMs(0);
+    NodeRateLimiter::testChutilOverride = 40.0f;
+    NodeRateLimiter::testNowOverride = NodeRateLimiter::WARMUP_MS;
+    for (uint32_t i = 0; i < NodeRateLimiter::YOUNG_TRIP; i++) {
+        dropText(congested, 0xA3000000 + i, i + 1);
+    }
+    TEST_ASSERT_TRUE(congested.debugYoungLimited());
+    TEST_ASSERT_FALSE_MESSAGE(congested.debugTakeAnnounce(ids, n), "suppressed while channel utilisation is high");
+
+    NodeRateLimiter::testChutilOverride = 0.0f;
+    NodeRateLimiter::testNowOverride = 0;
+    NodeRateLimiter relayBusy;
+    for (uint32_t i = 0; i < 60; i++) {
+        NodeRateLimiter::testNowOverride = i;
+        auto p = makePacket(0xA4000000 + i, NODENUM_BROADCAST, 3, 3, 0x10, meshtastic_PortNum_TELEMETRY_APP, 600 + i);
+        relayBusy.shouldDrop(&p);
+    }
+    TEST_ASSERT_TRUE(relayBusy.debugUnresolvedRelayLimited());
+    TEST_ASSERT_FALSE(relayBusy.debugYoungLimited());
+    NodeRateLimiter::testNowOverride = NodeRateLimiter::WARMUP_MS;
+    for (uint32_t i = 0; i < NodeRateLimiter::YOUNG_TRIP; i++) {
+        dropText(relayBusy, 0xA5000000 + i, 700 + i);
+    }
+    TEST_ASSERT_TRUE(relayBusy.debugYoungLimited());
+    TEST_ASSERT_FALSE_MESSAGE(relayBusy.debugTakeAnnounce(ids, n), "suppressed while the RELAY bucket is limiting");
+}
+
 } // namespace
 
 void setUp(void) {}
@@ -450,6 +641,14 @@ void setup()
     RUN_TEST(test_would_drop_without_charging);
     RUN_TEST(test_relay_recovers_below_clear);
     RUN_TEST(test_preset_airtime_scales_budget);
+    RUN_TEST(test_established_originator_is_never_charged_to_young);
+    RUN_TEST(test_forged_identities_share_one_young_bucket);
+    RUN_TEST(test_young_record_is_released_after_thirty_minutes);
+    RUN_TEST(test_no_record_fails_open_with_room_and_closed_when_full);
+    RUN_TEST(test_young_bucket_is_not_enforced_during_warmup);
+    RUN_TEST(test_young_bucket_clears_below_clear_without_a_silent_window);
+    RUN_TEST(test_undecodable_traffic_does_not_charge_young);
+    RUN_TEST(test_young_announce_respects_refractory_and_congestion);
     exit(UNITY_END());
 }
 

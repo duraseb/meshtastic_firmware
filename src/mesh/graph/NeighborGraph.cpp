@@ -1291,6 +1291,8 @@ bool NeighborGraph::admitsCoverage(NodeNum relay, NodeNum target, float poorLink
     // to it: our own link to it is already retracted, and crediting peers with reaching it hands
     // them a slot they will decline.
     if (policy && isSilentPublisher(target, *policy)) return false;
+    if (policy && policy->isDroppedCoverageTarget && policy->isDroppedCoverageTarget(policy->ctx, target))
+        return false;
     if (covers(relay, target, poorLinkEtx, policy)) return true;
     // A neighbour nobody can be shown to reach is still worth one relay, but only from its owner.
     return policy && coverageOwner(target, *policy) == relay;
@@ -1560,6 +1562,9 @@ NodeNum NeighborGraph::uniqueCoverageNeighbor(NodeNum myNode, const NodeNum *cov
         // path did not, so a queued relay was kept alive for a node the ranking had already agreed
         // nobody could carry. One rule, read the same way on both sides.
         if (policy && isSilentPublisher(neighbor, *policy)) {
+            continue;
+        }
+        if (policy && policy->isDroppedCoverageTarget && policy->isDroppedCoverageTarget(policy->ctx, neighbor)) {
             continue;
         }
 

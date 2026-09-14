@@ -9,6 +9,7 @@
 #include "NodeDB.h"
 #include "RTC.h"
 #include "Router.h"
+#include "NodeRateLimiter.h"
 #include "configuration.h"
 #include "memGet.h"
 #include "pb_decode.h"
@@ -102,6 +103,9 @@ NeighborGraph::CoveragePolicy SignalRoutingModule::coveragePolicy() const
     p.poorLinkEtx = cfgPoorLinkEtxThreshold;
     p.nowSecs = millis() / 1000;
     p.publisherSilenceSecs = PUBLISHER_SILENCE_SECS;
+    p.isDroppedCoverageTarget = [](void *, NodeNum n) {
+        return nodeRateLimiter && nodeRateLimiter->isDroppedCoverageTarget(n);
+    };
     return p;
 }
 

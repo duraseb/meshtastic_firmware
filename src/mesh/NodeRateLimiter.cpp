@@ -14,6 +14,7 @@
 #endif
 #include <Arduino.h>
 #include <algorithm>
+#include <cstring>
 
 static void getNodeDisplayName(NodeNum nodeId, char *buf, size_t bufSize)
 {
@@ -43,6 +44,7 @@ NodeNum (*NodeRateLimiter::testResolveRelayHook)(uint8_t, int16_t, float) = null
 bool (*NodeRateLimiter::testNodeInGraphHook)(NodeNum) = nullptr;
 uint8_t (*NodeRateLimiter::testGraphHopsHook)(NodeNum) = nullptr;
 float NodeRateLimiter::testChutilOverride = -1.0f;
+int64_t NodeRateLimiter::testNowOverride = -1;
 
 bool NodeRateLimiter::debugTracksOriginator(NodeNum nodeId) const
 {
@@ -84,6 +86,32 @@ bool NodeRateLimiter::debugUnresolvedRelayLimited() const
 void NodeRateLimiter::debugRelayBudgets(uint32_t airMs, uint32_t &tripMs, uint32_t &clearMs) const
 {
     relayBudgets(airMs, tripMs, clearMs);
+}
+
+bool NodeRateLimiter::debugTracksYoung(NodeNum nodeId) const
+{
+    return findYoung(nodeId) >= 0;
+}
+
+bool NodeRateLimiter::debugIsYoung(NodeNum nodeId) const
+{
+    return isYoung(nodeId, nowMs());
+}
+
+void NodeRateLimiter::debugSetBootMs(uint32_t bootMs_)
+{
+    bootMs = bootMs_;
+    bootKnown = true;
+}
+
+void NodeRateLimiter::debugSeedYoung(NodeNum nodeId, uint32_t firstSeenMs)
+{
+    noteOriginator(nodeId, firstSeenMs);
+}
+
+bool NodeRateLimiter::debugTakeAnnounce(NodeNum *ids, uint8_t &count)
+{
+    return takeYoungAnnounce(ids, count);
 }
 #endif
 
@@ -436,6 +464,167 @@ NodeRateLimiter::RelayEntry *NodeRateLimiter::getOrCreateRelay(NodeNum nodeId, u
     return slot;
 }
 
+uint32_t NodeRateLimiter::nowMs() const
+{
+#if defined(UNIT_TEST)
+    if (testNowOverride >= 0) {
+        return (uint32_t)testNowOverride;
+    }
+#endif
+    return millis();
+}
+
+void NodeRateLimiter::noteBoot(uint32_t now)
+{
+    if (!bootKnown) {
+        bootMs = now;
+        bootKnown = true;
+    }
+}
+
+bool NodeRateLimiter::warmedUp(uint32_t now) const
+{
+    return bootKnown && (now - bootMs) >= WARMUP_MS;
+}
+
+int NodeRateLimiter::findYoung(NodeNum nodeId) const
+{
+    for (uint8_t i = 0; i < youngCount; i++) {
+        if (young[i].nodeId == nodeId) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+bool NodeRateLimiter::inAlumni(NodeNum nodeId) const
+{
+    for (uint8_t i = 0; i < alumniCount; i++) {
+        if (alumni[i] == nodeId) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void NodeRateLimiter::addAlumni(NodeNum nodeId)
+{
+    if (inAlumni(nodeId)) {
+        return;
+    }
+    if (alumniCount < MAX_YOUNG_ENTRIES) {
+        alumni[alumniCount++] = nodeId;
+        return;
+    }
+    memmove(&alumni[0], &alumni[1], (MAX_YOUNG_ENTRIES - 1) * sizeof(alumni[0]));
+    alumni[MAX_YOUNG_ENTRIES - 1] = nodeId;
+}
+
+void NodeRateLimiter::removeYoungAt(uint8_t idx)
+{
+    uint8_t last = youngCount - 1;
+    if (idx < last) {
+        young[idx] = young[last];
+    }
+    young[last] = YoungSighting{};
+    youngCount--;
+}
+
+void NodeRateLimiter::expireIfOld(NodeNum nodeId, uint32_t now)
+{
+    int idx = findYoung(nodeId);
+    if (idx < 0) {
+        return;
+    }
+    uint32_t age = now - young[idx].firstSeenMs;
+    if (age >= YOUNG_AGE_MS) {
+        addAlumni(nodeId);
+        removeYoungAt((uint8_t)idx);
+    }
+}
+
+void NodeRateLimiter::noteOriginator(NodeNum nodeId, uint32_t now)
+{
+    expireIfOld(nodeId, now);
+    if (findYoung(nodeId) >= 0 || inAlumni(nodeId)) {
+        return;
+    }
+    if (youngCount < MAX_YOUNG_ENTRIES) {
+        young[youngCount].nodeId = nodeId;
+        young[youngCount].firstSeenMs = now;
+        youngCount++;
+    }
+}
+
+bool NodeRateLimiter::isYoung(NodeNum nodeId, uint32_t now) const
+{
+    int idx = findYoung(nodeId);
+    if (idx >= 0) {
+        return (now - young[idx].firstSeenMs) < YOUNG_AGE_MS;
+    }
+    if (inAlumni(nodeId)) {
+        return false;
+    }
+    return youngCount >= MAX_YOUNG_ENTRIES;
+}
+
+bool NodeRateLimiter::relayAnyLimited() const
+{
+    if (unresolvedRelay.limited) {
+        return true;
+    }
+    for (uint8_t i = 0; i < relayCount; i++) {
+        if (relays[i].relay.limited) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void NodeRateLimiter::maybeAnnounce(uint32_t now, float chutil)
+{
+    if (relayAnyLimited() || chutil > ANNOUNCE_CHUTIL_HIGH) {
+        return;
+    }
+    if (announceEver && (now - lastAnnounceMs) < ANNOUNCE_REFRACTORY_MS) {
+        return;
+    }
+    pendingAnnounceCount = 0;
+    uint8_t n = youngCount < ANNOUNCE_MAX_IDS ? youngCount : ANNOUNCE_MAX_IDS;
+    for (uint8_t i = 0; i < n; i++) {
+        pendingAnnounceIds[i] = young[i].nodeId;
+        pendingAnnounceCount++;
+    }
+    lastAnnounceMs = now;
+    announceEver = true;
+    pendingAnnounce = true;
+}
+
+bool NodeRateLimiter::takeYoungAnnounce(NodeNum *ids, uint8_t &count)
+{
+    if (!pendingAnnounce) {
+        count = 0;
+        return false;
+    }
+    count = pendingAnnounceCount;
+    if (ids) {
+        for (uint8_t i = 0; i < count; i++) {
+            ids[i] = pendingAnnounceIds[i];
+        }
+    }
+    pendingAnnounce = false;
+    pendingAnnounceCount = 0;
+    return true;
+}
+
+bool NodeRateLimiter::isDroppedCoverageTarget(NodeNum nodeId) const
+{
+    if (!nodeId || !warmedUp(nowMs()) || !youngBucket.limited) {
+        return false;
+    }
+    return isYoung(nodeId, nowMs());
+}
+
 bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
 {
     if (!cfgEnabled || !p) {
@@ -448,8 +637,14 @@ bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
         return false;
     }
 
-    uint32_t nowMs = millis();
+    uint32_t nowMs = this->nowMs();
+    noteBoot(nowMs);
+    pendingAnnounce = false;
     bool drop = false;
+    const bool decoded = p->which_payload_variant == meshtastic_MeshPacket_decoded_tag;
+    if (decoded) {
+        noteOriginator(p->from, nowMs);
+    }
 
     // --- Originator buckets (favorites bypass originator only) ---
     bool favoriteOriginator = false;
@@ -507,6 +702,24 @@ bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
         const uint32_t clear = std::max<uint32_t>(1, (trip * DEFAULT_CLEAR_RATIO_NUM) / DEFAULT_CLEAR_RATIO_DEN);
         if (checkAndUpdateBucket(*b, trip, clear, 1, nowMs, label, entry->nodeId)) {
             drop = true;
+        }
+    }
+
+    if (decoded && warmedUp(nowMs) && isYoung(p->from, nowMs)) {
+        if (checkAndUpdateBucket(youngBucket, YOUNG_TRIP, YOUNG_CLEAR, 1, nowMs, "young", 0)) {
+            drop = true;
+        }
+        if (youngBucket.limited && youngBucket.count == YOUNG_TRIP) {
+            float chutil = 0.0f;
+#if defined(UNIT_TEST)
+            if (testChutilOverride >= 0.0f) {
+                chutil = testChutilOverride;
+            } else
+#endif
+                if (airTime) {
+                chutil = airTime->channelUtilizationPercent();
+            }
+            maybeAnnounce(nowMs, chutil);
         }
     }
 
@@ -606,6 +819,11 @@ bool NodeRateLimiter::wouldDrop(const meshtastic_MeshPacket *p) const
             }
             break;
         }
+    }
+
+    if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag && youngBucket.limited &&
+        warmedUp(nowMs()) && isYoung(p->from, nowMs())) {
+        return true;
     }
 
     if (!isRebroadcastCandidate(p)) {
