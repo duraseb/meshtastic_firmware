@@ -199,3 +199,77 @@ Check that all expected branch nodes are in each other's direct neighbor lists. 
 4. `cancelSending removed=1` = successfully cancelled; `removed=0` = already on air.
 
 The `alreadyCovered` set in slot scheduling is intentionally NOT updated between iterations — each candidate's unique coverage is evaluated independently. Actual relay suppression happens via over-the-air dupe detection, not slot ordering.
+
+## Diagnosing a node that has gone quiet
+
+A node that stops carrying traffic is the hardest thing to diagnose here, because every layer
+produces the same outward symptom. Work down this list in order; each step rules out a whole class
+and costs minutes, where guessing costs hours.
+
+**First, separate "silent" from "selective".** Ask the neighbours' captures whether the node still
+originates its *own* traffic — telemetry, position, topology. A node that relays nothing but still
+originates has a decision or policy problem. A node that emits nothing at all has stopped running,
+or stopped transmitting, and no inbound policy can explain it: the rate limiter is a receive-path
+control and exempts frames from us and to us, so it can never silence a node's own broadcasts. This
+one question eliminates more wrong theories than any other.
+
+**Check whether every failure follows an action.** If the node dies shortly after each flash,
+configuration change or reconnection, suspect the action, not the code. A build comparison that
+looks like a clean before/after is worthless if the act of changing builds is itself the variable.
+Recovery that only ever happens when somebody intervenes is the same signal inverted: policies and
+timeouts lift on their own, hangs and bad images do not.
+
+**Distinguish the bootloader from the application.** A board waiting in its bootloader is silent on
+air, absent from the mesh, and recovers only when a flash completes — indistinguishable from a dead
+node unless you look at what it presents over USB. Learn the two descriptors for each board family,
+because "in DFU" and "crashed" need completely different responses. LED patterns distinguish states
+too: a slow pulse is usually idle-in-bootloader, fast blinking is activity or a fault indicator, and
+which is which is worth knowing per board before you need it.
+
+**Suspect stored configuration before firmware.** A node that hangs at a fixed, early point in boot
+— bringing up Bluetooth, the radio, or the filesystem — after a configuration change has a config
+problem. Reflashing does not clear stored settings and will not fix it; erasing the flash does, at
+the cost of every setting on the device. If a node fails identically across several firmware
+versions but ran fine before a settings change, erase before bisecting.
+
+**Measure stack, not just RAM.** A reported RAM figure covers static allocation and says nothing
+about the depth of a call chain. Where a fault appears on one MCU family and not another, compare
+the *task* stack sizes: they differ by multiples between platforms, and a chain that fits comfortably
+on one will overflow on another. Build with stack-usage reporting, list the largest frames, and add
+up the real chain from the entry point down. An overflow here does not fault cleanly — it corrupts a
+neighbouring region and wedges, so the watchdog is what you see, not the bug.
+
+Two habits make that measurement honest. The last line in a log before a restart is the moment the
+node **hung**, not the moment it reset — the gap between them is the watchdog period, and mistaking
+one for the other will send you looking in the wrong place. And large routing scratch — coverage
+sets, packing buffers, candidate lists — belongs off the stack on constrained targets, but only
+where the path is single-threaded and non-reentrant; a shared buffer must be cleared explicitly at
+entry, because unlike a local it keeps the previous call's contents.
+
+**Host simulation clears portable logic and nothing else.** Running the same firmware as host
+processes will exercise the routing, the policies and the protocol faithfully, and a long clean soak
+is strong evidence that a fault is not in any of that. It cannot clear the platform layer: stack
+limits, interrupt timing, radio drivers and USB all differ or are absent. A green soak alongside a
+failing board narrows the search to exactly those, which is a result worth having rather than a
+disappointment.
+
+## Reading logs without fooling yourself
+
+**Count per node and deduplicate.** Merging several nodes' captures and counting receptions inflates
+per-node rates several-fold, because one frame is heard by many nodes and each hears relayed copies.
+Anything compared against a per-node threshold must be counted the way that node sees it: at one
+node, with duplicate copies of the same packet collapsed.
+
+**Confirm which device a port belongs to before concluding anything about it.** Port numbering is
+not stable across replugs, resets or a board entering its bootloader, and a board in download mode
+presents a different descriptor entirely. More than one confident finding here has turned out to be
+a reading of the wrong device. Key any mapping on a stable identifier, never on the port number, and
+refuse to guess when an identifier does not match what is expected.
+
+**Read a serial stream in a way that returns partial data.** Fixed-size reads block until the byte
+count is met and discard everything on timeout, which makes a healthy, chatty node look mute.
+
+**Prefer an explanation that kills a hypothesis to one that supports it.** Several plausible stories
+will fit a partial picture; the useful evidence is whatever separates them. Hold the count of live
+theories at one, and when a new fact contradicts the standing theory, say so plainly and start
+again rather than layering a second theory on the first.
