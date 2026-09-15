@@ -1008,13 +1008,11 @@ void NeighborGraph::etxToSignal(float etx, meshtastic_Config_LoRaConfig_ModemPre
 // domain.
 void NeighborGraph::etxToSignal(float etx, uint8_t spreadingFactor, int32_t &rssi, int32_t &snr)
 {
-    // std::max does not have Rust's NaN-avoiding f32::max semantics: std::max(NaN, 1.0f) returns
-    // NaN (NaN < 1.0f is false, so std::max returns its first argument unchanged), where Rust's
-    // etx.max(1.0) returns 1.0 (the non-NaN operand). Left unguarded, a NaN etx would propagate
-    // through target/margin/snr and reach static_cast<int32_t> below, which is undefined behaviour
-    // on NaN — worse than MR's defined result for the same input. Substituting NaN with 1.0 before
-    // the max reproduces Rust's result exactly and makes this function total for every etx,
-    // including non-finite ones, matching MR.
+    // std::max propagates NaN rather than avoiding it: std::max(NaN, 1.0f) returns NaN, because
+    // NaN < 1.0f is false and std::max then returns its first argument unchanged. Left unguarded, a
+    // NaN etx would propagate through target/margin/snr and reach the static_cast<int32_t> below,
+    // which is undefined behaviour on NaN. Substituting NaN with 1.0 before the max makes this
+    // function total for every etx, including non-finite ones.
     float safeEtx = std::isnan(etx) ? 1.0f : etx;
     float targetProb = 1.0f / std::max(safeEtx, 1.0f);
 

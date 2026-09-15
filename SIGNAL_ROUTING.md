@@ -674,7 +674,14 @@ amplifiers that would rebroadcast a flood into the rest of the mesh. It is
 **SignalRouting-only** (compiled out with `MESHTASTIC_EXCLUDE_SIGNALROUTING`, same
 as ChannelQoS). It is checked in `Router::handleReceived()` after decode but before
 `MeshModule::callModules()`, so a limited packet reaches no module: it is not
-relayed, not ACKed, not delivered to the phone, and does not update the SR graph.
+relayed, not ACKed and not delivered to the phone.
+
+A dropped frame does still feed the graph, and deliberately so. A direct, non-MQTT
+frame carrying a signal reading is our own measurement of that link; discarding it
+would let a neighbour that is being limited age out of the topology and become a
+node we relay *for* instead of one we relay *behind*. `observeForGraph()` records
+that one edge and nothing else, applying the same direct/signal test the ordinary
+receive path uses.
 
 Each tracked **originator** gets four independent buckets:
 
@@ -685,8 +692,13 @@ Each tracked **originator** gets four independent buckets:
 | OTHER | every other decoded portnum | 4 |
 | UNKNOWN | undecodable packets: no key for the channel, PKI traffic for other nodes | 12 |
 
-Originator clear threshold is **0**: while limited, any further packet resets the
-quiet window (must go silent for a full window to recover). Up to 16 originators
+Originator clear threshold is **half the trip** (minimum 1): a limited originator
+recovers at the window roll once its count for that window is below half the
+threshold that tripped it. Half, not the RELAY bucket's quarter, because these
+thresholds are small — a quarter of OTHER's 4 is 1, which would demand a
+completely silent window. A clear of 0 would mean sticky-until-silent, and since
+every packet arriving while limited restarts that window, an originator that kept
+talking could never recover at all. Up to 16 originators
 are tracked; eviction prefers nodes not in our graph, then farthest by graph hops
 (never frame `hop_start`/`hop_limit`).
 
@@ -709,6 +721,14 @@ packet is not amplified without re-charging.
 Direct first-hop frames key RELAY on the originator NodeID when `relay_node` is
 absent or matches the sender; multi-hop frames use resolved last-hop identity
 (or the shared unresolved slot).
+
+A node running SR that has no established graph — not one direct neighbour
+recorded — does not charge the shared unresolved slot at all
+(`shouldChargeUnresolvedRelay`). Just after boot every `relay_node` byte is
+unresolved, so the single shared slot would trip on ordinary traffic and suppress
+exactly the relays the node needs in order to learn who its neighbours are. One
+known direct neighbour is enough to start charging it normally. A build without
+SR charges it unconditionally, having no graph to wait for.
 
 ### Young-node bucket
 
