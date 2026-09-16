@@ -4,6 +4,8 @@
 - `../logs/<node>_YYYYMMDD_HHMM.txt` — per-node logs
 - Always use the most recent file per node.
 - Logs are binary-safe only via `strings`: `strings <log> | grep ...`
+- **lorastats.pl** — what other nodes heard on air. Use the JSON API (do not scrape HTML). This fleet is region `Zachód`. Node page: `https://lorastats.pl/Node/<8-hex-id>`. Procedure, User-Agent, and endpoints: `.claude/skills/newrelic-query.md`.
+- New Relic — FCM6 (`108aef6c`) only; often empty. Same skill.
 
 ## Key log patterns
 

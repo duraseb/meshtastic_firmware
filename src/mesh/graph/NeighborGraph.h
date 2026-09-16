@@ -359,8 +359,9 @@ class NeighborGraph {
     uint8_t pruneSilentPublishers(NodeNum myNode, uint32_t currentTimeSecs, uint32_t silenceSecs,
                                   const CoveragePolicy *policy);
 
-    /// `selfNode` is the node running the ranking: its own coverage counts only Reported edges (what it
-    /// broadcasts in its topology), so peers ranking it from their mirrored view reach the same order.
+    /// Coverage is who can hear `relay`: publishers that listed it (measured reverse edge in
+    /// their broadcast graph), or — when `includeOwned` — silent neighbours it owns. Not whom
+    /// the relay hears. `selfNode` already has the packet and is not a target.
     // poorLinkEtx: coverage ceiling handed to `covers` for both the coverage sets and the cost.
     RelayCandidate findBestRelayCandidate(const NodeSet &candidates, const NodeSet &alreadyCovered,
                                           uint32_t currentTime, uint32_t packetId,
@@ -369,7 +370,8 @@ class NeighborGraph {
 
     // Is `to` known to hear `from`? Edges are one-directional evidence: `from` listing `to` only
     // says `from` hears `to`. The reverse needs hearsUs on that edge (`to` confirmed it) or `to`
-    // listing `from`.
+    // listing `from` with a measured edge. An Inferred reverse is the symmetry guess from hearing
+    // `to`, and is not delivery evidence.
     bool knownToHear(NodeNum from, NodeNum to) const;
 
     // Cost of the hop from → to, priced at the receiver when it published a measurement of the
@@ -380,9 +382,9 @@ class NeighborGraph {
     //
     // What counts as evidence depends on whether the receiver ever reports. `publishesTopology(to)`
     // true: it is held to its own lists and must be known to hear the sender (knownToHear), since
-    // its silence about the sender is itself information. False (stock, mute, unclassified): it can
-    // never confirm anything, so the sender's own edge to it is all the evidence there will ever be
-    // — demanding more made every neighbour of one silent node relay for it on every frame. Either
+    // its silence about the sender is itself information. False (stock, or not yet classified): it
+    // can never confirm anything, so the sender's own edge to it is all the evidence there will ever
+    // be — demanding more made every neighbour of one silent node relay for it on every frame. Either
     // way the delivery-direction link must not be hopeless (hearsUs is sticky, so a peer that heard
     // the sender once keeps the flag while its link decays). `poorLinkEtx` 0 drops the ceiling.
     bool covers(NodeNum from, NodeNum to, float poorLinkEtx, const CoveragePolicy *policy = nullptr) const;
@@ -423,9 +425,10 @@ class NeighborGraph {
 
     size_t getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, size_t maxNodes, const NodeNum *alreadyCovered,
                                size_t alreadyCoveredCount, NodeNum selfNode = 0,
-                               const CoveragePolicy *policy = nullptr) const;
+                               const CoveragePolicy *policy = nullptr, bool includeOwned = true) const;
 
-    /// Do we still reach a direct neighbour none of `coveredBy` reaches? A coverer counts only when
+    /// Do we still reach a neighbour none of `coveredBy` reaches? A publisher is ours when its
+    /// list names us; a silent neighbour is ours when we own it. A coverer counts only when
     /// it `covers` the neighbour, the same rule pre-coverage applies at ranking time.
     bool hasUniqueCoverage(NodeNum myNode, const NodeNum *coveredBy, size_t coveredByCount, float poorLinkEtx = 0.0f,
                            const CoveragePolicy *policy = nullptr) const
@@ -517,6 +520,20 @@ class NeighborGraph {
     // Find edge in node (returns nullptr if not found)
     Edge *findEdge(NodeEdges *node, NodeNum to);
     const Edge *findEdge(const NodeEdges *node, NodeNum to) const;
+
+    // Every node that has a slot, and every destination of those slots' edges. Coverage walks
+    // this set so a publisher that listed a candidate is counted even when the candidate never
+    // listed them (and they may exist only as someone else's edge destination).
+    template <typename Fn>
+    void forEachPossibleTarget(Fn &&fn) const
+    {
+        for (uint8_t i = 0; i < neighborCount; i++) {
+            fn(neighbors[i].nodeId);
+            for (uint8_t e = 0; e < neighbors[i].edgeCount; e++) {
+                fn(neighbors[i].edges[e].to);
+            }
+        }
+    }
 
     // Check if a node is our direct neighbor (has a slot)
     bool isOurDirectNeighbor(NodeNum nodeId) const;

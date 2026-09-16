@@ -236,6 +236,43 @@ static void test_refresh_reported_direct_neighbor_updates_cache_and_variance()
     TEST_ASSERT_TRUE(sawReverse);
 }
 
+static void test_a_single_rf_observation_survives_aging()
+{
+    constexpr NodeNum me = 0x0A0A0A0A;
+    constexpr NodeNum peer = 0x0B0B0B0B;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    DirectNeighborSignal signals[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE] = {};
+    uint8_t signalCount = 0;
+
+    TEST_ASSERT_EQUAL_INT(EDGE_NEW, refreshReportedDirectNeighborObservation(
+                                        &graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, me, peer, -22, 12.0f,
+                                        100));
+    TEST_ASSERT_TRUE(hasReportedDirectEdgeTo(&graph, me, peer));
+
+    const NodeEdges *theirs = graph.getEdgesFrom(peer);
+    TEST_ASSERT_NOT_NULL(theirs);
+    TEST_ASSERT_GREATER_THAN(0, theirs->edgeCount);
+
+    graph.ageEdges(160, 5400);
+    TEST_ASSERT_TRUE(hasReportedDirectEdgeTo(&graph, me, peer));
+    TEST_ASSERT_NOT_NULL(lookupDirectNeighborSignal(signals, signalCount, peer));
+}
+
+static void test_age_edges_keeps_a_heard_neighbour_with_no_published_list()
+{
+    constexpr NodeNum me = 0x11111111;
+    constexpr NodeNum peer = 0x22222222;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+
+    TEST_ASSERT_EQUAL_INT(EDGE_NEW, graph.updateEdge(me, peer, 1.0f, 100, Edge::Source::Reported));
+    TEST_ASSERT_TRUE(hasReportedDirectEdgeTo(&graph, me, peer));
+    graph.ageEdges(160, 5400);
+    TEST_ASSERT_TRUE(hasReportedDirectEdgeTo(&graph, me, peer));
+}
+
 static void test_an_improvement_larger_than_the_bar_is_significant()
 {
     constexpr NodeNum me = 0xAAAAAAAA;
@@ -567,7 +604,7 @@ static void test_inbound_gateway_is_the_fallback_only_without_a_confirmed_path()
     TEST_ASSERT_EQUAL_UINT16(100 + 300 + 300, route.costFixed);
 }
 
-static void test_self_coverage_counts_only_reported_edges()
+static void test_self_coverage_is_who_hears_the_relay()
 {
     constexpr NodeNum me = 0x0A0B0C0D;
     constexpr NodeNum peer = 0x11111111;
@@ -577,45 +614,89 @@ static void test_self_coverage_counts_only_reported_edges()
     initGraphTestNodeDb(me);
 
     NeighborGraph graph;
-    // Our reported neighbours: the peer and a. b is only mirrored (it relayed us once).
     graph.updateEdge(me, peer, 1.0f, 1000, Edge::Source::Reported);
     graph.updateEdge(me, a, 1.5f, 1000, Edge::Source::Reported);
+    // b relayed us once: we have a Mirrored RX edge, not a listing from b.
     graph.updateEdge(me, b, 1.5f, 1000, Edge::Source::Mirrored);
-    // The peer's topology as we mirrored it: a, b and c.
     graph.updateEdge(peer, a, 1.5f, 1000, Edge::Source::Reported);
     graph.updateEdge(peer, b, 1.5f, 1000, Edge::Source::Mirrored);
     graph.updateEdge(peer, c, 1.5f, 1000, Edge::Source::Mirrored);
-    // Coverage needs the delivery direction: each listed node confirmed hearing the lister.
-    for (NodeNum n : {peer, a, b}) {
+    for (NodeNum n : {peer, a}) {
         graph.setEdgeHearsUs(me, n, true);
     }
     for (NodeNum n : {a, b, c}) {
         graph.setEdgeHearsUs(peer, n, true);
     }
 
+    NeighborGraph::CoveragePolicy policy;
+    policy.publishesTopology = [](void *, NodeNum) { return true; };
+    policy.poorLinkEtx = 7.0f;
+
     NodeNum out[NODE_SET_MAX];
-    // Ranking ourselves: only what we report (and peers can see) counts.
-    size_t n = graph.getCoverageIfRelays(me, out, NODE_SET_MAX, nullptr, 0, me);
+    size_t n = graph.getCoverageIfRelays(me, out, NODE_SET_MAX, nullptr, 0, me, &policy);
     TEST_ASSERT_EQUAL_UINT32(2, n);
     for (size_t i = 0; i < n; i++) {
         TEST_ASSERT_NOT_EQUAL(b, out[i]);
+        TEST_ASSERT_NOT_EQUAL(c, out[i]);
     }
-    // Ranking a peer from our mirrored view: every edge we hold for it counts.
-    TEST_ASSERT_EQUAL_UINT32(3, graph.getCoverageIfRelays(peer, out, NODE_SET_MAX, nullptr, 0, me));
-    // Without a self node the legacy behaviour is unchanged.
-    TEST_ASSERT_EQUAL_UINT32(3, graph.getCoverageIfRelays(me, out, NODE_SET_MAX, nullptr, 0));
+    TEST_ASSERT_EQUAL_UINT32(3, graph.getCoverageIfRelays(peer, out, NODE_SET_MAX, nullptr, 0, me, &policy));
 
-    // Through the ranking: the peer covers three nodes, we report two. The legacy count gave us a
-    // phantom third (b) and let our cheaper edges win slot 0; the peer sees it the other way round.
     NodeSet candidates;
     candidates.insert(me);
     candidates.insert(peer);
     NodeSet covered;
-    RelayCandidate best = graph.findBestRelayCandidate(candidates, covered, 1, 0x10, false, 0, me);
+    RelayCandidate best = graph.findBestRelayCandidate(candidates, covered, 1, 0x10, false, 0, me, &policy);
     TEST_ASSERT_EQUAL_UINT32(peer, best.nodeId);
     TEST_ASSERT_EQUAL_UINT32(3, best.coverageCount);
-    RelayCandidate legacy = graph.findBestRelayCandidate(candidates, covered, 1, 0x10, false, 0);
-    TEST_ASSERT_EQUAL_UINT32(me, legacy.nodeId);
+}
+
+static void test_a_candidates_coverage_is_who_listed_it()
+{
+    // Far's topology named the peer; the peer's own list never names far. Coverage of the peer
+    // includes far because far can hear it. Coverage of us does not, and ranking follows that set.
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum peer = 0x11111111;
+    constexpr NodeNum far = 0x22222222;
+    constexpr NodeNum shared = 0x33333333;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, peer, 1.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(me, shared, 1.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(me, far, 1.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(peer, shared, 1.0f, 1000, Edge::Source::Mirrored);
+    graph.updateEdge(far, peer, 1.2f, 1000, Edge::Source::Mirrored);
+    graph.setEdgeHearsUs(me, peer, true);
+    graph.setEdgeHearsUs(me, shared, true);
+    graph.setEdgeHearsUs(peer, shared, true);
+
+    NeighborGraph::CoveragePolicy policy;
+    policy.publishesTopology = [](void *, NodeNum) { return true; };
+    policy.poorLinkEtx = 7.0f;
+
+    NodeNum out[NODE_SET_MAX];
+    size_t peerCov = graph.getCoverageIfRelays(peer, out, NODE_SET_MAX, nullptr, 0, me, &policy);
+    bool peerCoversFar = false;
+    for (size_t i = 0; i < peerCov; i++) {
+        if (out[i] == far) {
+            peerCoversFar = true;
+        }
+    }
+    TEST_ASSERT_TRUE(peerCoversFar);
+
+    size_t myCov = graph.getCoverageIfRelays(me, out, NODE_SET_MAX, nullptr, 0, me, &policy);
+    for (size_t i = 0; i < myCov; i++) {
+        TEST_ASSERT_NOT_EQUAL(far, out[i]);
+    }
+
+    NodeSet candidates;
+    candidates.insert(me);
+    candidates.insert(peer);
+    NodeSet covered;
+    covered.insert(shared);
+    covered.insert(peer);
+    RelayCandidate best = graph.findBestRelayCandidate(candidates, covered, 1, 0x10, false, 0, me, &policy);
+    TEST_ASSERT_EQUAL_UINT32(peer, best.nodeId);
 }
 
 // Coverage is evidenced delivery over a link that is not hopeless, priced at the receiver.
@@ -633,6 +714,10 @@ static void test_covers_requires_evidence_and_a_sound_link()
     // u publishes topology, so its silence about the peer counts against coverage.
     NeighborGraph::CoveragePolicy reports;
     reports.publishesTopology = [](void *, NodeNum) { return true; };
+    TEST_ASSERT_FALSE(graph.knownToHear(peer, u));
+    TEST_ASSERT_FALSE(graph.covers(peer, u, 7.0f, &reports));
+    // Hearing u mints an Inferred reverse. That is the symmetry guess, not u listing the peer.
+    graph.updateEdge(u, peer, 1.5f, 1000, Edge::Source::Inferred);
     TEST_ASSERT_FALSE(graph.knownToHear(peer, u));
     TEST_ASSERT_FALSE(graph.covers(peer, u, 7.0f, &reports));
     // A node that publishes nothing can never confirm anything, so the peer's own edge is all the
@@ -700,6 +785,52 @@ static void test_a_publisher_has_no_owner()
     TEST_ASSERT_EQUAL_UINT32(me, graph.coverageOwner(target, policy));
     targetReports = true;
     TEST_ASSERT_EQUAL_UINT32(0, graph.coverageOwner(target, policy));
+}
+
+static void test_unique_coverage_of_a_publisher_that_listed_us()
+{
+    // Delivery to a publisher is its list, not hearsUs on our RX edge. We heard the mute (so its
+    // listing can be stored) but it has not been flagged; naming us is enough.
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum mute = 0x33333333;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, mute, 1.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(mute, me, 1.0f, 1000, Edge::Source::Mirrored);
+
+    NeighborGraph::CoveragePolicy policy;
+    policy.me = me;
+    policy.meRelays = true;
+    policy.poorLinkEtx = 7.0f;
+    policy.publishesTopology = [](void *, NodeNum n) { return n == mute; };
+
+    TEST_ASSERT_TRUE(graph.knownToHear(me, mute));
+    TEST_ASSERT_EQUAL_UINT32(mute, graph.uniqueCoverageNeighbor(me, nullptr, 0, 7.0f, &policy));
+    NodeNum out[NODE_SET_MAX];
+    TEST_ASSERT_EQUAL_UINT32(1, graph.getCoverageIfRelays(me, out, NODE_SET_MAX, nullptr, 0, me, &policy));
+    TEST_ASSERT_EQUAL_UINT32(mute, out[0]);
+}
+
+static void test_unique_coverage_skips_a_publisher_that_did_not_list_us()
+{
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum mute = 0x33333333;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, mute, 1.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(mute, me, 1.0f, 1000, Edge::Source::Inferred);
+
+    NeighborGraph::CoveragePolicy policy;
+    policy.me = me;
+    policy.meRelays = true;
+    policy.poorLinkEtx = 7.0f;
+    policy.publishesTopology = [](void *, NodeNum n) { return n == mute; };
+
+    TEST_ASSERT_FALSE(graph.knownToHear(me, mute));
+    TEST_ASSERT_EQUAL_UINT32(0, graph.coverageOwner(mute, policy));
+    TEST_ASSERT_EQUAL_UINT32(0, graph.uniqueCoverageNeighbor(me, nullptr, 0, 7.0f, &policy));
 }
 
 void test_a_publisher_we_stopped_hearing_is_nobodys_target()
@@ -1156,6 +1287,8 @@ static void test_topology_version_verdict_rules()
     // ...until two silent intervals, or its version-0 boot broadcast.
     TEST_ASSERT_EQUAL(SrTopologyVerdict::SilenceResync, srTopologyVersionVerdict(2, 26, 5000, 5000 + resync, resync, false));
     TEST_ASSERT_EQUAL(SrTopologyVerdict::BootReset, srTopologyVersionVerdict(0, 26, 5000, 6000, resync, true));
+    // After a boot reset the first neighbour list is version 1, not another 0.
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::Accept, srTopologyVersionVerdict(1, 0, 5000, 6000, resync, false));
     // A header-only version-0 report without the boot flag semantics is just backwards.
     TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(0, 26, 5000, 6000, resync, false));
     // millis() wrap: an accept just before the wrap is still recent after it.
@@ -1647,6 +1780,8 @@ void setup()
     RUN_TEST(test_direct_signal_upsert_lookup_and_prune);
     RUN_TEST(test_empty_topology_reply_delay_range_and_determinism);
     RUN_TEST(test_refresh_reported_direct_neighbor_updates_cache_and_variance);
+    RUN_TEST(test_a_single_rf_observation_survives_aging);
+    RUN_TEST(test_age_edges_keeps_a_heard_neighbour_with_no_published_list);
     RUN_TEST(test_an_improvement_larger_than_the_bar_is_significant);
     RUN_TEST(test_a_degradation_larger_than_the_bar_is_significant);
     RUN_TEST(test_a_change_just_above_half_is_significant_on_a_quiet_edge);
@@ -1656,7 +1791,8 @@ void setup()
     RUN_TEST(test_relay_refresh_skips_without_reported_edge);
     RUN_TEST(test_mirrored_edge_update_does_not_upgrade_reported_edge);
     RUN_TEST(test_topology_listing_us_confirms_sender_hears_us);
-    RUN_TEST(test_self_coverage_counts_only_reported_edges);
+    RUN_TEST(test_self_coverage_is_who_hears_the_relay);
+    RUN_TEST(test_a_candidates_coverage_is_who_listed_it);
     RUN_TEST(test_route_never_uses_a_one_way_edge);
     RUN_TEST(test_route_cost_is_measured_at_the_receiver);
     RUN_TEST(test_inbound_gateway_is_the_fallback_only_without_a_confirmed_path);
@@ -1666,6 +1802,8 @@ void setup()
     RUN_TEST(test_coverage_owner_is_the_best_link_then_the_lowest_id);
     RUN_TEST(test_ownership_stops_at_the_coverage_ceiling);
     RUN_TEST(test_a_publisher_has_no_owner);
+    RUN_TEST(test_unique_coverage_of_a_publisher_that_listed_us);
+    RUN_TEST(test_unique_coverage_skips_a_publisher_that_did_not_list_us);
     RUN_TEST(test_a_publisher_we_stopped_hearing_is_nobodys_target);
     RUN_TEST(test_routing_through_us_confirms_the_sender_hears_us);
     RUN_TEST(test_a_guess_never_outranks_or_prices_a_measurement);

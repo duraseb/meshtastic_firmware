@@ -527,6 +527,11 @@ static inline int refreshReportedDirectNeighborObservation(NeighborGraph *graph,
     }
 
     float etx = NeighborGraph::calculateETX(rssi, snr, currentCostingSpreadingFactor());
+    // The measured direction is what we publish, so it alone decides whether the topology changed.
+    // Write it first: `updateEdge` refuses a `from` that is not already our direct neighbour, so
+    // an Inferred reverse attempted before this was dropped, the dest slot stayed edgeless, and
+    // `ageEdges` deleted both the slot and this Reported edge on the next 60 s pass.
+    int changeType = graph->updateEdge(myNode, nodeId, etx, nowSecs, Edge::Source::Reported);
     // We measured one direction: the frame we just received. How well the neighbour hears *us* is
     // an assumption of symmetry, so the reverse edge is `Inferred`, the same class this module
     // already gives the reverse direction synthesised while merging a topology. Recorded as
@@ -537,8 +542,6 @@ static inline int refreshReportedDirectNeighborObservation(NeighborGraph *graph,
     // it simply no longer prices one. Delivery cost is unaffected: the lookup tries the receive
     // direction first and falls back to this same observation on the forward edge.
     (void)graph->updateEdge(nodeId, myNode, etx, nowSecs, Edge::Source::Inferred);
-    // The measured direction is what we publish, so it alone decides whether the topology changed.
-    int changeType = graph->updateEdge(myNode, nodeId, etx, nowSecs, Edge::Source::Reported);
 
     int8_t clampedSnr = static_cast<int8_t>(std::max(-128.f, std::min(127.f, snr)));
     upsertDirectNeighborSignal(signals, signalCount, maxSignals, nodeId, static_cast<int8_t>(rssi), clampedSnr, nowSecs);

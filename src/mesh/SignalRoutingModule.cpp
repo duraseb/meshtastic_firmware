@@ -447,7 +447,11 @@ int32_t SignalRoutingModule::runOnce()
             needsBootBroadcast = false;
             LOG_INFO("[SR] Sending empty boot broadcast");
             uint8_t bootBuf[PACKED_NEIGHBOR_HEADER_SIZE];
-            writePackedHeader(bootBuf, 0, isActiveRoutingRole());
+            // Consume version 0 so the first neighbour list is version 1. A hardcoded 0 here
+            // left currentTopologyVersion at 0, so the first real list was also v=0 and peers
+            // that missed this empty packet treated it as stale against their pre-reboot last.
+            uint8_t bootVersion = currentTopologyVersion++;
+            writePackedHeader(bootBuf, bootVersion, isActiveRoutingRole());
             sendTopologyPacket(NODENUM_BROADCAST, bootBuf, PACKED_NEIGHBOR_HEADER_SIZE);
             commitTopologyTxTimestamp();
             sentTopologyThisPass = true;
@@ -1828,17 +1832,18 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                     routingGraph->recordNodeTransmission(mp.from, mp.id, currentTime);
                     routingGraph->recordNodeTransmission(inferredRelayer, mp.id, currentTime);
                 }
-
-                // If this node relayed a packet we originated or previously relayed,
-                // it can hear us. Mark the edge as bidirectional (hearsUs) for coverage decisions.
-                NodeNum ourNode = nodeDB ? nodeDB->getNodeNum() : 0;
-                if (ourNode != 0 && inferredRelayer != 0 && inferredRelayer != ourNode &&
-                    (mp.from == ourNode || isCommittedRelay(mp.id))) {
-                    markStockNodeRelayedOurPacket(inferredRelayer);
-                }
             }
-        }  // End of else block for topology-publishing roles' relayed packet processing
-    }
+        }
+        // Hearing them retransmit a packet we originated (or already committed to relay) is the
+        // proof they hear us. That is true of our own echo; gating it on !ownEcho left mute
+        // nodes publishing hearsUs=false on a neighbour that had just relayed them.
+        if (nodeDB && inferredRelayer != 0 && !isPlaceholderNode(inferredRelayer)) {
+            NodeNum ourNode = nodeDB->getNodeNum();
+            if (inferredRelayer != ourNode && (mp.from == ourNode || isCommittedRelay(mp.id))) {
+                markStockNodeRelayedOurPacket(inferredRelayer);
+            }
+        }
+        }
     }
 
     if (mp.which_payload_variant == meshtastic_MeshPacket_decoded_tag) {
@@ -2973,9 +2978,8 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     NeighborGraph::CoveragePolicy coveragePolicy = this->coveragePolicy();
 
     // Build coverage sets.
-    // Only mark heardFrom's neighbors as already-covered if the link is good.
-    // Poor-quality links (high ETX) should NOT be pre-covered: if our link to
-    // that node is much better, we should still relay and get an earlier slot.
+    // Pre-cover nodes that can hear heardFrom (their published lists), not nodes heardFrom
+    // hears. Poor-quality links stay uncovered so a better local copy still gets a slot.
     // Three NodeSets live here and each is 196 bytes (48 node ids plus a count), which is the
     // bulk of this function's stack frame -- and this function sits on the deepest call chain on
     // a thread with a 4 KB stack. They are static and explicitly cleared: unlike a local, a static
@@ -2983,15 +2987,17 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     // the relay decision runs only on the loop thread and never re-enters itself.
     static NodeSet alreadyCovered;
     alreadyCovered.clear();
+    // Pre-coverage: who can hear heardFrom, from their published lists — not whom heardFrom
+    // hears. A copy already on the air uses covers() only; ownership is who *would* carry a
+    // silent neighbour, not evidence this frame reached them.
     alreadyCovered.insert(sourceNode);
     alreadyCovered.insert(heardFrom);
-    const NodeEdges *heardFromEdges = routingGraph->getEdgesFrom(heardFrom);
-    if (heardFromEdges) {
-        for (uint8_t i = 0; i < heardFromEdges->edgeCount; i++) {
-            NodeNum neighbor = heardFromEdges->edges[i].to;
-            if (routingGraph->covers(heardFrom, neighbor, cfgPoorLinkEtxThreshold, &coveragePolicy)) {
-                alreadyCovered.insert(neighbor);
-            }
+    {
+        static NodeNum reached[NODE_SET_MAX];
+        size_t n = routingGraph->getCoverageIfRelays(heardFrom, reached, NODE_SET_MAX, nullptr, 0, myNode,
+                                                     &coveragePolicy, /*includeOwned=*/false);
+        for (size_t i = 0; i < n; i++) {
+            alreadyCovered.insert(reached[i]);
         }
     }
 
@@ -3000,7 +3006,8 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     candidates.clear();
     const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
 
-    // Log any of our own neighbors excluded from pre-coverage due to poor heardFrom link
+    // Log any of our own neighbors excluded from pre-coverage due to a hopeless delivery link
+    const NodeEdges *heardFromEdges = routingGraph->getEdgesFrom(heardFrom);
     if (myEdges && heardFromEdges) {
         for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
             NodeNum myNeighbor = myEdges->edges[i].to;
@@ -3155,14 +3162,11 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
             const uint32_t reservedAt = positions.takeReserved();
             if (routingGraph->hasNodeTransmitted(neighbor, p->id, currentTime)) {
                 uint16_t before = alreadyCovered.count;
-                const NodeEdges *ne = routingGraph->getEdgesFrom(neighbor);
-                if (ne) {
-                    for (uint8_t j = 0; j < ne->edgeCount; j++) {
-                        NodeNum target = ne->edges[j].to;
-                        if (routingGraph->covers(neighbor, target, cfgPoorLinkEtxThreshold, &coveragePolicy)) {
-                            alreadyCovered.insert(target);
-                        }
-                    }
+                static NodeNum stockReached[NODE_SET_MAX];
+                size_t n = routingGraph->getCoverageIfRelays(neighbor, stockReached, NODE_SET_MAX, nullptr, 0,
+                                                             myNode, &coveragePolicy, /*includeOwned=*/false);
+                for (size_t i = 0; i < n; i++) {
+                    alreadyCovered.insert(stockReached[i]);
                 }
                 alreadyCovered.insert(neighbor);
                 noteAbsorbed(neighbor, before);
@@ -3176,26 +3180,19 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
         }
     }
 
-    // The SR peers that took part in the ranking: the stock-coverage fallback coordinates
-    // ownership of uncovered mute neighbours across exactly this set.
+    // The SR peers that took part in the ranking: the insurance ladder is sized from this set.
     static NodeSet srPeers;
     srPeers = candidates;
 
 
     auto absorbRelayCoverage = [&](NodeNum relay) {
         uint16_t before = alreadyCovered.count;
-        const NodeEdges *ne = routingGraph->getEdgesFrom(relay);
-        if (ne) {
-            for (uint8_t j = 0; j < ne->edgeCount; j++) {
-                NodeNum target = ne->edges[j].to;
-                // Exactly what the ranking admitted for this relay: crediting only covers()
-                // left an owned neighbour uncovered after its owner took a slot, so a later
-                // phase relayed for it a second time. Edges we invented are in nobody's set.
-                if (!Edge::isMeasured(ne->edges[j].source)) continue;
-                if (routingGraph->admitsCoverage(relay, target, cfgPoorLinkEtxThreshold, &coveragePolicy)) {
-                    alreadyCovered.insert(target);
-                }
-            }
+        // Same set the ranking admitted: who hears this relay (their lists), plus silent
+        // neighbours it owns. A TX that already happened uses covers() alone instead.
+        static NodeNum cov[NODE_SET_MAX];
+        size_t n = routingGraph->getCoverageIfRelays(relay, cov, NODE_SET_MAX, nullptr, 0, myNode, &coveragePolicy);
+        for (size_t i = 0; i < n; i++) {
+            alreadyCovered.insert(cov[i]);
         }
         alreadyCovered.insert(relay);
         noteAbsorbed(relay, before);

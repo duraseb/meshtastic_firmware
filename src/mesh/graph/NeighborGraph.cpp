@@ -184,8 +184,14 @@ int NeighborGraph::updateEdge(NodeNum from, NodeNum to, float etx, uint32_t time
     }
 
     // If from == myNode and we're adding an edge to 'to', ensure 'to' has a neighbor slot
+    // and stamp its liveness from this observation. Leaving lastFullUpdate at 0 made the
+    // slot look infinitely stale, so the first ageEdges pass evicted a neighbour we had
+    // just heard and then deleted our Reported edge to them.
     if (isOurNode) {
-        findOrCreateNeighbor(to);
+        NodeEdges *dest = findOrCreateNeighbor(to);
+        if (dest && updateTimestamp) {
+            dest->lastFullUpdate = timestamp;
+        }
     }
 
     Edge *edge = findEdge(node, to);
@@ -358,7 +364,17 @@ void NeighborGraph::ageEdges(uint32_t currentTimeSecs, uint32_t ttlSecs)
             node->edgeCount = writeIdx;
         }
 
-        if (currentTimeSecs - node->lastFullUpdate > ttlSecs || node->edgeCount == 0) {
+        // A neighbour we still measure (Reported us→them) is not leftover junk even if they
+        // have published no outbound edges — mute nodes never fill those slots. Evicting
+        // edgeCount==0 deleted our own heard list every maintenance pass.
+        bool weHearThem = false;
+        if (const NodeEdges *self = findNeighbor(myNode)) {
+            if (const Edge *mine = findEdge(self, node->nodeId)) {
+                weHearThem = (mine->source == Edge::Source::Reported);
+            }
+        }
+
+        if (currentTimeSecs - node->lastFullUpdate > ttlSecs || (node->edgeCount == 0 && !weHearThem)) {
             // Remove downstream entries that reference this neighbor as relay
             NodeNum removedNode = node->nodeId;
             for (uint16_t i = 0; i < downstreamCount;) {
@@ -1244,8 +1260,11 @@ bool NeighborGraph::knownToHear(NodeNum from, NodeNum to) const
     const NodeEdges *fromEdges = findNeighbor(from);
     const Edge *forward = fromEdges ? findEdge(fromEdges, to) : nullptr;
     if (forward && forward->hearsUs) return true;
+    // `to` listing `from` is the delivery-direction measurement. An Inferred reverse is the
+    // symmetry guess written when we heard `to` — it says we have a link, not that `to` hears us.
     const NodeEdges *toEdges = findNeighbor(to);
-    return toEdges && findEdge(toEdges, from);
+    const Edge *reverse = toEdges ? findEdge(toEdges, from) : nullptr;
+    return reverse && Edge::isMeasured(reverse->source);
 }
 
 float NeighborGraph::hopCost(NodeNum from, NodeNum to) const
@@ -1398,47 +1417,43 @@ NodeNum NeighborGraph::coverageOwner(NodeNum target, const CoveragePolicy &polic
 
 size_t NeighborGraph::getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, size_t maxNodes,
                                            const NodeNum *alreadyCovered, size_t alreadyCoveredCount,
-                                           NodeNum selfNode, const CoveragePolicy *policy) const
+                                           NodeNum selfNode, const CoveragePolicy *policy, bool includeOwned) const
 {
     float poorLinkEtx = policy ? policy->poorLinkEtx : 0.0f;
     if (!coveredNodes || maxNodes == 0)
         return 0;
 
+    // Who hears this relay, not whom the relay hears. A publisher's broadcast list is that
+    // evidence (measured reverse edge). Ownership is only for silent neighbours, and only when
+    // ranking a transmission that has not happened yet. A copy already on the air uses covers()
+    // alone. The ranking node already has the packet, so it is never a coverage target.
     size_t coveredCount = 0;
-    const NodeEdges *relayEdges = findNeighbor(relay);
-    if (!relayEdges)
-        return 0;
-
-    for (uint8_t i = 0; i < relayEdges->edgeCount && coveredCount < maxNodes; i++) {
-        // Our own Mirrored edges (nodes we only know relayed us, or that listed us) are invisible to
-        // our peers: they rank us on what we report. Counting them here made every node see more
-        // coverage for itself than its neighbours saw for it, and colocated nodes both took slot 0.
-        // A candidate's coverage set is what it published, and for ourselves what we publish. An
-        // edge we invented from a relayed frame is invisible to everyone, the candidate it is
-        // attributed to included, so it belongs in nobody's set.
-        if (!Edge::isMeasured(relayEdges->edges[i].source)) continue;
-        if (relay == selfNode && selfNode != 0 && relayEdges->edges[i].source != Edge::Source::Reported)
-            continue;
-        NodeNum target = relayEdges->edges[i].to;
-        // Not coverage unless the relay is shown to reach it — or, when nobody can be shown to
-        // reach it at all, unless this relay is its owner. Counting it for everyone made the whole
-        // branch relay every frame for the same unconfirmed node.
-        if (!admitsCoverage(relay, target, poorLinkEtx, policy)) {
-            continue;
+    auto consider = [&](NodeNum target) {
+        if (coveredCount >= maxNodes) {
+            return;
         }
-
-        bool isAlreadyCovered = false;
+        if (target == 0 || target == relay || (selfNode != 0 && target == selfNode) ||
+            (target & 0xFF000000) == 0xFF000000) {
+            return;
+        }
+        const bool reached = includeOwned ? admitsCoverage(relay, target, poorLinkEtx, policy)
+                                          : covers(relay, target, poorLinkEtx, policy);
+        if (!reached) {
+            return;
+        }
         for (size_t j = 0; j < alreadyCoveredCount; j++) {
             if (alreadyCovered[j] == target) {
-                isAlreadyCovered = true;
-                break;
+                return;
             }
         }
-
-        if (!isAlreadyCovered) {
-            coveredNodes[coveredCount++] = target;
+        for (size_t j = 0; j < coveredCount; j++) {
+            if (coveredNodes[j] == target) {
+                return;
+            }
         }
-    }
+        coveredNodes[coveredCount++] = target;
+    };
+    forEachPossibleTarget(consider);
 
     return coveredCount;
 }
@@ -1542,17 +1557,20 @@ NodeNum NeighborGraph::uniqueCoverageNeighbor(NodeNum myNode, const NodeNum *cov
                                               float poorLinkEtx, const CoveragePolicy *policy) const
 {
     const NodeEdges *myEdges = findNeighbor(myNode);
-    if (!myEdges || myEdges->edgeCount == 0) {
-        return 0;
-    }
+    NodeNum found = 0;
 
-    for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
-        NodeNum neighbor = myEdges->edges[i].to;
+    forEachPossibleTarget([&](NodeNum neighbor) {
+        if (found != 0) {
+            return;
+        }
+        if (neighbor == 0 || neighbor == myNode) {
+            return;
+        }
 
         // Placeholder neighbors have unknown identity — they could be any of the
         // coveredBy nodes' neighbors, so don't count them as unique coverage
         if ((neighbor & 0xFF000000) == 0xFF000000) {
-            continue;
+            return;
         }
 
         // A publisher we have stopped hearing is nobody's coverage target, so it cannot be ours
@@ -1560,32 +1578,36 @@ NodeNum NeighborGraph::uniqueCoverageNeighbor(NodeNum myNode, const NodeNum *cov
         // path did not, so a queued relay was kept alive for a node the ranking had already agreed
         // nobody could carry. One rule, read the same way on both sides.
         if (policy && isSilentPublisher(neighbor, *policy)) {
-            continue;
+            return;
         }
         if (policy && policy->isDroppedCoverageTarget && policy->isDroppedCoverageTarget(policy->ctx, neighbor)) {
-            continue;
+            return;
         }
 
         // Skip nodes that are themselves in the coveredBy set
-        bool isCoverer = false;
         for (size_t c = 0; c < coveredByCount; c++) {
             if (neighbor == coveredBy[c]) {
-                isCoverer = true;
-                break;
+                return;
             }
         }
-        if (isCoverer) continue;
 
-        // Ours to cover: it proved it hears us, or nobody can prove anything about it and we are
-        // its owner. Otherwise it is another node's responsibility, or nobody's.
-        if (!myEdges->edges[i].hearsUs && policy && coverageOwner(neighbor, *policy) != myNode) {
-            continue;
-        }
-        // Confirmation or ownership says whose it is; covers() says whether a copy from us would
-        // arrive at all. hearsUs is sticky, so without this a neighbour behind a decayed link
-        // stayed "ours to cover" and kept a queued relay the ranking refuses.
-        if (!covers(myNode, neighbor, poorLinkEtx, policy)) {
-            continue;
+        const Edge *mine = myEdges ? findEdge(myEdges, neighbor) : nullptr;
+        bool hearsUs = mine && mine->hearsUs;
+        bool reports = policy && policy->reports(neighbor);
+        // A publisher's list is who can deliver to it. hearsUs on our RX edge is the same fact
+        // once they listed us; requiring the flag here dropped a mute neighbour that had named us
+        // but whose edge to us had not been flagged yet. Silent neighbours still need an owner.
+        if (reports) {
+            if (!covers(myNode, neighbor, poorLinkEtx, policy)) {
+                return;
+            }
+        } else {
+            if (!hearsUs && policy && coverageOwner(neighbor, *policy) != myNode) {
+                return;
+            }
+            if (!covers(myNode, neighbor, poorLinkEtx, policy)) {
+                return;
+            }
         }
 
         // A coverer counts only when it is shown to reach the neighbour over a link that is not
@@ -1597,11 +1619,11 @@ NodeNum NeighborGraph::uniqueCoverageNeighbor(NodeNum myNode, const NodeNum *cov
 
         if (!covered) {
             LOG_INFO("[SR] Relaying for %08x (no transmitter reaches it)", neighbor);
-            return neighbor;
+            found = neighbor;
         }
-    }
+    });
 
-    return 0;
+    return found;
 }
 
 bool NeighborGraph::isGatewayNode(NodeNum nodeId, NodeNum sourceNode) const
