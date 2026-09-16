@@ -343,7 +343,8 @@ class NeighborGraph {
         /// One step of ranking weight, above cost and below coverage. ROUTER_LATE earns none: its
         /// whole meaning is to relay after everyone else, so promoting it would invert the role its
         /// operator chose. Coverage still outranks this, so a router with nothing unique to reach
-        /// takes nothing — the zero-coverage drop happens first.
+        /// takes nothing — the zero-coverage drop happens first. Early-window *timing* is gated
+        /// separately: only ROUTER may takeSr early rungs; other SR-active roles use takeLateRung.
         uint8_t roleRank(NodeNum node) const
         {
             return (isConfiguredRouter && isConfiguredRouter(ctx, node)) ? 1 : 0;

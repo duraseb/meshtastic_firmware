@@ -1476,7 +1476,7 @@ static void test_reservations_sit_one_slot_apart()
 
 // Rungs take window positions while a half-airtime still fits; when the window is full they spill
 // past the transition. An empty window therefore places the first ranked position at 0, not at
-// the origin — that is what makes a top-ranked SR ROUTER early.
+// the origin — that is what makes a top-ranked SR ROUTER early. Non-ROUTER roles use takeLateRung.
 static void test_rungs_take_window_positions_while_a_half_airtime_fits()
 {
     // Window width 150 ms (15 × 10); half-airtime 50 so three ranked positions fit.
@@ -1484,6 +1484,18 @@ static void test_rungs_take_window_positions_while_a_half_airtime_fits()
     TEST_ASSERT_EQUAL_UINT32(0, a.takeRung());
     TEST_ASSERT_EQUAL_UINT32(50, a.takeRung());
     TEST_ASSERT_EQUAL_UINT32(100, a.takeRung());
+}
+
+// Non-ROUTER SR-active roles always sit at/after the preset origin (relay floor), never in the
+// early window — even when the window is empty.
+static void test_late_rungs_never_enter_the_early_window()
+{
+    SrPositionAllocator a(10, 50, 160, 15);
+    TEST_ASSERT_EQUAL_UINT32(160, a.takeLateRung());
+    TEST_ASSERT_EQUAL_UINT32(210, a.takeLateRung());
+    SrPositionAllocator afterEarly(10, 50, 160, 15);
+    TEST_ASSERT_EQUAL_UINT32(0, afterEarly.takeRung());
+    TEST_ASSERT_TRUE(afterEarly.takeLateRung() >= 160);
 }
 
 // One reservation then ranked positions: they share the window in order.
@@ -1685,6 +1697,7 @@ void setup()
     RUN_TEST(test_purge_for_preset_change_drops_neighbours_and_derived_state);
     RUN_TEST(test_reservations_sit_one_slot_apart);
     RUN_TEST(test_rungs_take_window_positions_while_a_half_airtime_fits);
+    RUN_TEST(test_late_rungs_never_enter_the_early_window);
     RUN_TEST(test_reservations_and_ranked_positions_interleave_in_the_window);
     RUN_TEST(test_rungs_spill_past_the_transition_when_the_window_is_full);
     RUN_TEST(test_an_empty_window_puts_the_first_rung_at_the_transition);

@@ -3262,40 +3262,61 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     uint16_t preCoveredAtRank = alreadyCovered.count;
     uint16_t candidatesAtRank = candidates.count;
 
-    // Phase 2: Iteratively pick best SR candidate, assign slots
-    while (!candidates.empty()) {
-        RelayCandidate best = routingGraph->findBestRelayCandidate(candidates, alreadyCovered,
-                                                                    currentTime, p->id, preferHighNodeId, sourceNode,
-                                                                    myNode, &coveragePolicy);
-        if (best.nodeId == 0) {
-            break;
+    // Park non-ROUTER SR candidates. Early-window rungs are ROUTER-only; everyone else waits past
+    // stock reservations and SR ROUTER early slots on the late ladder.
+    static NodeSet lateCandidates;
+    lateCandidates.clear();
+    for (uint16_t i = 0; i < candidates.count;) {
+        NodeNum id = candidates.nodes[i];
+        const bool earlyOk = coveragePolicy.isConfiguredRouter && coveragePolicy.isConfiguredRouter(coveragePolicy.ctx, id);
+        if (earlyOk) {
+            i++;
+        } else {
+            candidates.erase(id);
+            lateCandidates.insert(id);
         }
+    }
 
-        candidates.erase(best.nodeId);
+    auto placePhase = [&](NodeSet &pool, bool early) {
+        while (!pool.empty()) {
+            RelayCandidate best = routingGraph->findBestRelayCandidate(pool, alreadyCovered, currentTime, p->id,
+                                                                       preferHighNodeId, sourceNode, myNode, &coveragePolicy);
+            if (best.nodeId == 0) {
+                break;
+            }
 
-        if (routingGraph->hasNodeTransmitted(best.nodeId, p->id, currentTime)) {
+            pool.erase(best.nodeId);
+
+            if (routingGraph->hasNodeTransmitted(best.nodeId, p->id, currentTime)) {
+                absorbRelayCoverage(best.nodeId);
+                LOG_INFO("[SR] Slot --: SR %08x (already TX, coverage absorbed)", best.nodeId);
+                continue;
+            }
+
+            const uint32_t rung = early ? positions.takeRung() : positions.takeLateRung();
+            if (best.nodeId == myNode) {
+                shouldRelay = true;
+                myDelay = rung + rungJitter;
+                mySlotIndex = slotsGiven;
+                decisionReason = "SR slot assignment";
+                LOG_INFO("[SR] Slot %ums: US (%08x)%s j=%ums", myDelay, myNode, best.tier > 0 ? " (bidi)" : "",
+                         rungJitter);
+                break;
+            }
+
+            LOG_INFO("[SR] Slot %ums: SR node %08x (coverage=%u/%u, cost=%.2f%s)", rung, best.nodeId, best.coverageCount,
+                     best.totalCoverage, best.getAvgCost(), best.tier > 0 ? ", bidi" : "");
+            slotsGiven++;
+            // An earlier slot holder is assumed to relay: subtract its coverage so later candidates
+            // (and the stock-coverage fallback) only relay for nodes nobody ahead of them reaches.
             absorbRelayCoverage(best.nodeId);
-            LOG_INFO("[SR] Slot --: SR %08x (already TX, coverage absorbed)", best.nodeId);
-            continue;
         }
+    };
 
-        if (best.nodeId == myNode) {
-            shouldRelay = true;
-            myDelay = positions.takeRung() + rungJitter;
-            mySlotIndex = slotsGiven;
-            decisionReason = "SR slot assignment";
-            LOG_INFO("[SR] Slot %ums: US (%08x)%s j=%ums", myDelay, myNode, best.tier > 0 ? " (bidi)" : "",
-                     rungJitter);
-            break;
-        }
-
-        const uint32_t peerRung = positions.takeRung();
-        LOG_INFO("[SR] Slot %ums: SR node %08x (coverage=%u/%u, cost=%.2f%s)", peerRung, best.nodeId,
-                  best.coverageCount, best.totalCoverage, best.getAvgCost(), best.tier > 0 ? ", bidi" : "");
-        slotsGiven++;
-        // An earlier slot holder is assumed to relay: subtract its coverage so later candidates
-        // (and the stock-coverage fallback) only relay for nodes nobody ahead of them reaches.
-        absorbRelayCoverage(best.nodeId);
+    // Phase 2a: SR ROUTER early-window rungs; Phase 2b: every other SR-active role late.
+    placePhase(candidates, true);
+    if (!shouldRelay) {
+        placePhase(lateCandidates, false);
     }
 
     // Phase 3: Force relay if we are the recorded downstream relay for source
