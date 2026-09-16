@@ -98,6 +98,10 @@ cancelSending id=0x<id>, removed=<0|1>      ← 1=cancelled before TX, 0=already
 ### Topology propagation
 ```
 [SR] Processing topology from <name>: <N> neighbors (v<V>, <verdict>, relay=0x<byte>)
+[SR] Topology version resync from <id>: received <n>, last <n> (direct originator list)
+[SR] Topology version resync from <id>: received <n>, last <n> (counter restarted)
+[SR] Topology version resync from <id>: received <n>, last <n> (versions climbing after a lost boot broadcast)
+[SR] Ignoring stale topology from <id> (v<n>, last <n>)
 [SR] Empty broadcast from <name>: topology reply scheduled
 [SR] Topology dirty — sending early broadcast
 [SR] Network Topology: <N> nodes, <K> direct neighbors

@@ -58,9 +58,13 @@ void SignalRoutingModule::setTopologyVersion(TopologyVersionEntry *table, uint8_
 {
     // nowMs 0 keeps the stored accept time (callers pass a non-zero millis() when a report is accepted).
     if (TopologyVersionEntry *e = findTopologyEntry(table, count, nodeId)) {
+        // A repeat of the last accepted version is a continuation chunk or a delayed copy still
+        // in the air. Clearing staleValid here disarmed RestartClimb: Inno v=1 was noted stale,
+        // then a leftover v=26 was accepted as "in window" and the next v=2 had no climb state.
+        const bool sameVersion = (e->version == version);
         e->version = version;
         if (nowMs) e->lastAcceptMs = nowMs;
-        e->staleValid = false;
+        if (!sameVersion) e->staleValid = false;
         return;
     }
     TopologyVersionEntry *slot;
@@ -75,6 +79,41 @@ void SignalRoutingModule::setTopologyVersion(TopologyVersionEntry *table, uint8_
     slot->version = version;
     slot->lastAcceptMs = nowMs;
     slot->staleValid = false;
+}
+
+SrTopologyVerdict SignalRoutingModule::gateTopologyVersion(NodeNum from, uint8_t receivedVersion, bool bootBroadcast,
+                                                           bool directCompleteList, uint32_t nowMs)
+{
+    uint32_t lastAcceptMs = 0;
+    uint8_t lastProcessedVersion = getTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, from, &lastAcceptMs);
+    uint8_t staleVersion = 0;
+    bool staleValid = getTopologyStale(lastTopologyVersion, lastTopologyVersionCount, from, &staleVersion);
+    SrTopologyVerdict verdict = srTopologyVersionVerdict(receivedVersion, lastProcessedVersion, lastAcceptMs, nowMs,
+                                                         topologyResyncMs(), bootBroadcast, staleValid, staleVersion,
+                                                         directCompleteList);
+    if (verdict == SrTopologyVerdict::Stale) {
+        noteTopologyStale(lastTopologyVersion, lastTopologyVersionCount, from, receivedVersion);
+        LOG_INFO("[SR] Ignoring stale topology from %08x (v%u, last %u)", from, receivedVersion, lastProcessedVersion);
+        return verdict;
+    }
+    if (verdict == SrTopologyVerdict::BootReset || verdict == SrTopologyVerdict::SilenceResync ||
+        verdict == SrTopologyVerdict::RestartClimb || verdict == SrTopologyVerdict::DirectResync ||
+        verdict == SrTopologyVerdict::CounterReset) {
+        const char *why = "versions climbing after a lost boot broadcast";
+        if (verdict == SrTopologyVerdict::BootReset) {
+            why = "boot broadcast";
+        } else if (verdict == SrTopologyVerdict::SilenceResync) {
+            why = "silent peer";
+        } else if (verdict == SrTopologyVerdict::DirectResync) {
+            why = "direct originator list";
+        } else if (verdict == SrTopologyVerdict::CounterReset) {
+            why = "counter restarted";
+        }
+        LOG_INFO("[SR] Topology version resync from %08x: received %u, last %u (%s)", from, receivedVersion,
+                 lastProcessedVersion, why);
+    }
+    setTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, from, bootBroadcast ? 0 : receivedVersion, nowMs);
+    return verdict;
 }
 
     // The coverage rules' view of this module: who reports, who relays, and our own eligibility.
@@ -772,12 +811,10 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
         return;
     }
 
-    // Version acceptance: first contact, forward window, boot reset, or resync after two silent
-    // intervals (srTopologyVersionVerdict in the header).
+    // Version acceptance is shared with handleReceivedProtobuf via gateTopologyVersion():
+    // shouldRelay() (this path) is not the only ingest, and RestartClimb must arm on either.
     uint8_t receivedVersion = hdr.topologyVersion;
-    uint32_t lastAcceptMs = 0;
-    uint8_t lastProcessedVersion =
-        getTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, p->from, &lastAcceptMs);
+    uint8_t lastProcessedVersion = getTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, p->from);
     uint32_t nowMs = millis();
     if (nowMs == 0) nowMs = 1;
 
@@ -785,28 +822,13 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     // The notice is about the sender's counter, not the link, so a relayed copy counts: angl heard
     // Czar's restart only through a relay and called Czar stale for twenty minutes.
     bool bootBroadcast = neighborCount == 0 && receivedVersion == 0;
-    uint8_t staleVersion = 0;
-    bool staleValid = getTopologyStale(lastTopologyVersion, lastTopologyVersionCount, p->from, &staleVersion);
-    SrTopologyVerdict verdict = srTopologyVersionVerdict(receivedVersion, lastProcessedVersion, lastAcceptMs, nowMs,
-                                                         topologyResyncMs(), bootBroadcast, staleValid, staleVersion);
-    if (verdict == SrTopologyVerdict::Stale) {
-        noteTopologyStale(lastTopologyVersion, lastTopologyVersionCount, p->from, receivedVersion);
-        LOG_INFO("[SR] Ignoring stale topology from %08x (v%u, last %u)",
-                 p->from, receivedVersion, lastProcessedVersion);
+    bool directCompleteList = hdr.isCompleteList() && neighborCount > 0 && isDirectPacket(*p);
+    if (gateTopologyVersion(p->from, receivedVersion, bootBroadcast, directCompleteList, nowMs) ==
+        SrTopologyVerdict::Stale) {
         return;
-    }
-    if (verdict == SrTopologyVerdict::BootReset || verdict == SrTopologyVerdict::SilenceResync ||
-        verdict == SrTopologyVerdict::RestartClimb) {
-        LOG_INFO("[SR] Topology version resync from %08x: received %u, last %u (%s)", p->from, receivedVersion,
-                 lastProcessedVersion,
-                 verdict == SrTopologyVerdict::BootReset      ? "boot broadcast"
-                 : verdict == SrTopologyVerdict::SilenceResync ? "silent peer"
-                                                               : "versions climbing after a lost boot broadcast");
     }
 
     bool isNewVersion = (receivedVersion != lastProcessedVersion);
-    // A boot broadcast restarts the peer's counter: track 0 so its first real list (version 1) is new.
-    setTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, p->from, bootBroadcast ? 0 : receivedVersion, nowMs);
 
     // Update capability status for the sender
     CapabilityStatus newStatus = hdr.signalRoutingActive ? CapabilityStatus::SRactive : CapabilityStatus::Passive;
@@ -1021,6 +1043,18 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
         return false;
     }
 
+    // Same gate as preProcess. shouldRelay() is skipped when we stock-flood (thin topology) or
+    // hop_limit is already 0; this path used to reject without noteTopologyStale, so RestartClimb
+    // never armed and Czar kept last=26 across Inno v=1,2,3.
+    uint32_t nowMs = millis();
+    if (nowMs == 0) nowMs = 1;
+    bool bootBroadcast = neighborCount == 0 && hdr.topologyVersion == 0;
+    bool directCompleteList = hdr.isCompleteList() && neighborCount > 0 && isDirectPacket(mp);
+    if (gateTopologyVersion(mp.from, hdr.topologyVersion, bootBroadcast, directCompleteList, nowMs) ==
+        SrTopologyVerdict::Stale) {
+        return false;
+    }
+
     if (neighborCount == 0) {
         LOG_INFO("[SR] %s is online (SR v%d, %s) - no neighbors detected yet",
                  senderName, hdr.routingVersion,
@@ -1042,18 +1076,11 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
     }
 
     // Check if preProcessSignalRoutingPacket already handled edge clearing and rebuilding. It runs first
-    // for every SR broadcast an active role receives, so a version it did not record was rejected as
-    // stale there — the graph must not be rebuilt from that packet here either.
-    uint8_t preProcessedVer = getTopologyVersion(lastPreProcessedVersion, lastPreProcessedVersionCount, mp.from);
-    uint32_t acceptedAtMs = 0;
-    uint8_t acceptedVer = getTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, mp.from, &acceptedAtMs);
-    bool alreadyPreProcessed = (preProcessedVer == hdr.topologyVersion);
-    // Only a sender with accepted history can be stale; a first contact is never rejected here.
-    if (!alreadyPreProcessed && acceptedAtMs != 0 && !srTopologyVersionInWindow(hdr.topologyVersion, acceptedVer)) {
-        LOG_INFO("[SR] Stale topology from %s (v%u, last %u)", senderName,
-                 hdr.topologyVersion, acceptedVer);
-        return false;
-    }
+    // for every SR broadcast an active role receives *when shouldRelay() runs*. Missing lastPreProcessed
+    // entry used to compare version 0==0 and skip a real v=0 list.
+    const TopologyVersionEntry *preEnt =
+        findTopologyEntry(lastPreProcessedVersion, lastPreProcessedVersionCount, mp.from);
+    bool alreadyPreProcessed = preEnt && preEnt->version == hdr.topologyVersion;
 
     if (!alreadyPreProcessed) {
         // Clear inferred edges pointing TO this node that were created before we knew it was SR-capable
@@ -1080,6 +1107,7 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
             routingGraph->setEdgeHearsUs(mp.from, neighbor.nodeId, neighbor.hearsUs);
             noteTopologySenderHearsUs(mp.from, neighbor.nodeId);
         }
+        setTopologyVersion(lastPreProcessedVersion, lastPreProcessedVersionCount, mp.from, hdr.topologyVersion, nowMs);
     } else {
         LOG_INFO("[SR] Edge rebuild skipped for %s (pre-processed version %u)",
                  senderName, hdr.routingVersion);

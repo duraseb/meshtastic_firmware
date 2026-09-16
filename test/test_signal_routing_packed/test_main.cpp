@@ -1244,7 +1244,12 @@ static void test_topology_version_window_is_forward_only_and_wraps()
     TEST_ASSERT_TRUE(srTopologyVersionInWindow(132, 5));   // +127 still forward
     TEST_ASSERT_FALSE(srTopologyVersionInWindow(4, 5));    // backwards
     TEST_ASSERT_FALSE(srTopologyVersionInWindow(133, 5));  // +128 reads as backwards
-    TEST_ASSERT_FALSE(srTopologyVersionInWindow(1, 98));   // rebooted peer: needs boot reset or silence rule
+    TEST_ASSERT_FALSE(srTopologyVersionInWindow(1, 98));   // rebooted peer: large behind / boot / silence
+    TEST_ASSERT_TRUE(srTopologyVersionLargeBehind(1, 26));
+    TEST_ASSERT_FALSE(srTopologyVersionLargeBehind(25, 26));
+    TEST_ASSERT_TRUE(srTopologyVersionClimbing(2, 1));
+    TEST_ASSERT_TRUE(srTopologyVersionClimbing(3, 1));
+    TEST_ASSERT_FALSE(srTopologyVersionClimbing(1, 1));
 }
 
 static void test_topology_header_chunk_flags_round_trip()
@@ -1281,24 +1286,32 @@ static void test_topology_version_verdict_rules()
     TEST_ASSERT_EQUAL(SrTopologyVerdict::Accept, srTopologyVersionVerdict(149, 148, 5000, 6000, resync, false));
     TEST_ASSERT_EQUAL(SrTopologyVerdict::Accept, srTopologyVersionVerdict(148, 148, 5000, 6000, resync, false));
     TEST_ASSERT_EQUAL(SrTopologyVerdict::Accept, srTopologyVersionVerdict(3, 250, 5000, 6000, resync, false));
-    // Backwards is stale while the peer keeps talking...
-    TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(1, 26, 5000, 6000, resync, false));
-    TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(1, 26, 5000, 5000 + resync - 1, resync, false));
-    // ...until two silent intervals, or its version-0 boot broadcast.
-    TEST_ASSERT_EQUAL(SrTopologyVerdict::SilenceResync, srTopologyVersionVerdict(2, 26, 5000, 5000 + resync, resync, false));
+    // A few counts behind last is a delayed old list, not a reboot.
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(25, 26, 5000, 6000, resync, false));
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(25, 26, 5000, 5000 + resync - 1, resync, false));
+    // Far behind last is a restarted counter (Inno 26→1). Apply on the first list.
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::CounterReset, srTopologyVersionVerdict(1, 26, 5000, 6000, resync, false));
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::CounterReset, srTopologyVersionVerdict(2, 26, 5000, 6000, resync, false));
+    // ...until two silent intervals, or its version-0 boot broadcast (small behind still waits).
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::SilenceResync, srTopologyVersionVerdict(25, 26, 5000, 5000 + resync, resync, false));
     TEST_ASSERT_EQUAL(SrTopologyVerdict::BootReset, srTopologyVersionVerdict(0, 26, 5000, 6000, resync, true));
     // After a boot reset the first neighbour list is version 1, not another 0.
     TEST_ASSERT_EQUAL(SrTopologyVerdict::Accept, srTopologyVersionVerdict(1, 0, 5000, 6000, resync, false));
-    // A header-only version-0 report without the boot flag semantics is just backwards.
-    TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(0, 26, 5000, 6000, resync, false));
-    // millis() wrap: an accept just before the wrap is still recent after it.
-    TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(1, 26, 0xFFFFF000u, 1000, resync, false));
-    // A lost boot broadcast: the second of two rejected versions climbing by one re-bases; a repeat
-    // or a jump does not.
-    TEST_ASSERT_EQUAL(SrTopologyVerdict::RestartClimb, srTopologyVersionVerdict(2, 13, 5000, 6000, resync, false, true, 1));
-    TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(1, 13, 5000, 6000, resync, false, true, 1));
-    TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(5, 13, 5000, 6000, resync, false, true, 1));
-    TEST_ASSERT_EQUAL(SrTopologyVerdict::RestartClimb, srTopologyVersionVerdict(0, 13, 5000, 6000, resync, false, true, 255));
+    // A header-only version-0 report without the boot flag, only a few behind, is delayed-old.
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(0, 5, 5000, 6000, resync, false));
+    // millis() wrap: an accept just before the wrap is still recent after it; 26→1 is still a restart.
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::CounterReset, srTopologyVersionVerdict(1, 26, 0xFFFFF000u, 1000, resync, false));
+    // A lost boot broadcast when last is still nearby: climbing rejects re-base, including a missed list.
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::RestartClimb, srTopologyVersionVerdict(2, 5, 5000, 6000, resync, false, true, 1));
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::RestartClimb, srTopologyVersionVerdict(3, 5, 5000, 6000, resync, false, true, 1));
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(1, 5, 5000, 6000, resync, false, true, 1));
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::RestartClimb, srTopologyVersionVerdict(0, 5, 5000, 6000, resync, false, true, 255));
+    // Originator still talking: a complete list rebases on the first packet when the jump is small.
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::DirectResync,
+                      srTopologyVersionVerdict(12, 13, 5000, 6000, resync, false, false, 0, true));
+    // Relayed copies keep the stale reject so a delayed old list cannot clobber a newer one.
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale,
+                      srTopologyVersionVerdict(12, 13, 5000, 6000, resync, false, false, 0, false));
 }
 
 /// An expired rung keeps the separation the ladder gave it, rather than redrawing at random.

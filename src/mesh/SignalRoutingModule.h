@@ -240,27 +240,50 @@ static inline uint32_t computeEmptyTopologyReplyDelayMs(NodeNum senderNodeId, Pa
 }
 
 // A peer's topology version is in the accept window when it repeats the last accepted one or moves
-// forward by less than half the u8 range (wraparound-safe). Anything else is stale unless the boot-reset
-// or silence rule in preProcessSignalRoutingPacket() applies.
+// forward by less than half the u8 range (wraparound-safe). Anything else is stale unless a rebase
+// rule in gateTopologyVersion() applies.
 static inline bool srTopologyVersionInWindow(uint8_t received, uint8_t last)
 {
     return static_cast<uint8_t>(received - last) < 0x80;
 }
 
+// Delayed copies of the previous one or two broadcasts sit a few counts behind `last`. Farther
+// behind is a restarted counter (Inno flash: last=26, received=1), not an older in-flight list.
+static constexpr uint8_t SR_TOPOLOGY_DELAYED_BEHIND_MAX = 7;
+
+static inline uint8_t srTopologyVersionBehind(uint8_t received, uint8_t last)
+{
+    return static_cast<uint8_t>(last - received);
+}
+
+static inline bool srTopologyVersionLargeBehind(uint8_t received, uint8_t last)
+{
+    uint8_t behind = srTopologyVersionBehind(received, last);
+    return received != last && behind > SR_TOPOLOGY_DELAYED_BEHIND_MAX && behind < 0x80;
+}
+
+static inline bool srTopologyVersionClimbing(uint8_t received, uint8_t staleVersion)
+{
+    uint8_t step = static_cast<uint8_t>(received - staleVersion);
+    return step >= 1 && step <= SR_TOPOLOGY_DELAYED_BEHIND_MAX;
+}
+
 // Why a topology report from a peer is (or is not) processed. Pure function of the tracked state so
-// the rule is unit-testable; preProcessSignalRoutingPacket() applies it.
+// the rule is unit-testable; gateTopologyVersion() applies it from both ingest paths.
 enum class SrTopologyVerdict : uint8_t {
     Stale,         // backwards or too far ahead, and no reason to re-base
     Accept,        // repeat or forward move inside the window
     FirstContact,  // nothing accepted from this sender yet: any version is the base
     BootReset,     // header-only version-0 broadcast: the sender's counter restarted
     SilenceResync, // nothing accepted for two broadcast intervals: take this version as the new base
-    RestartClimb,  // the boot broadcast was lost: two rejected versions in a row climbing by one
+    RestartClimb,  // the boot broadcast was lost: rejected versions climbing in a new epoch
+    DirectResync,  // complete list heard from the originator: the air is newer than the tracked counter
+    CounterReset,  // received sits far behind last: the sender restarted, not a delayed old list
 };
 
 // staleValid/staleVersion: the report last rejected from this sender, if any. Late copies of old
-// reports arrive within seconds of each other, never a whole interval apart, so two rejected
-// versions climbing by one can only be a restarted counter.
+// reports sit 1–2 behind the last accepted version; a new epoch climbs from the first reject
+// (v=1 then v=2, or v=1 then v=3 if one list was missed).
 /**
  * How long a committed relay whose scheduled send time has already passed should still wait.
  *
@@ -404,14 +427,24 @@ static inline uint32_t srUnicastSlotDelayMs(uint32_t reservedBaseMs, uint8_t slo
 
 static inline SrTopologyVerdict srTopologyVersionVerdict(uint8_t received, uint8_t last, uint32_t lastAcceptMs,
                                                          uint32_t nowMs, uint32_t resyncMs, bool bootBroadcast,
-                                                         bool staleValid = false, uint8_t staleVersion = 0)
+                                                         bool staleValid = false, uint8_t staleVersion = 0,
+                                                         bool directCompleteList = false)
 {
     if (lastAcceptMs == 0) return SrTopologyVerdict::FirstContact; // entries are only created on accept, with nowMs >= 1
     if (bootBroadcast) return SrTopologyVerdict::BootReset;
     if (srTopologyVersionInWindow(received, last)) return SrTopologyVerdict::Accept;
+    // Inno 26→1 is 25 behind, not a delayed v=25. Apply on the first list, not the second climb.
+    if (srTopologyVersionLargeBehind(received, last)) return SrTopologyVerdict::CounterReset;
     uint32_t silent = nowMs - lastAcceptMs;
     if (silent >= resyncMs && silent < 0x80000000u) return SrTopologyVerdict::SilenceResync;
-    if (staleValid && received == (uint8_t)(staleVersion + 1)) return SrTopologyVerdict::RestartClimb;
+    // +1 is the usual reboot after a missed boot broadcast; allow a few missed lists so v=1 then
+    // v=3 still rebases. Delayed old reports sit 1–2 behind `last` and never climb from there.
+    if (staleValid && srTopologyVersionClimbing(received, staleVersion)) return SrTopologyVerdict::RestartClimb;
+    // The originator is on the air with a complete list whose counter looks backwards. That is a
+    // restarted neighbour, not a late copy of an old report (those arrive relayed, hop already
+    // burned). Waiting for a second climbing reject or two silent intervals left Czar ignoring
+    // Inno's post-flash lists until Czar itself rebooted.
+    if (directCompleteList) return SrTopologyVerdict::DirectResync;
     return SrTopologyVerdict::Stale;
 }
 
@@ -730,10 +763,16 @@ private:
                                uint32_t *lastAcceptMs = nullptr) const;
     void setTopologyVersion(TopologyVersionEntry *table, uint8_t &count, NodeNum nodeId, uint8_t version,
                             uint32_t nowMs = 0);
+    // Shared ingest gate: records stale rejects so RestartClimb can arm, even when shouldRelay()
+    // never called preProcess (stock flood, hop_limit 0, thin topology).
+    SrTopologyVerdict gateTopologyVersion(NodeNum from, uint8_t receivedVersion, bool bootBroadcast,
+                                          bool directCompleteList, uint32_t nowMs);
     // A peer's topology version is accepted when it moves forward by less than half the counter range
     // (or repeats). A header-only broadcast with version 0 is the peer's boot announcement and resets
-    // what we track. After two silent broadcast intervals any version is accepted again, so a peer
-    // whose counter restarted (reboot, missed boot broadcast) is not ignored until its counter catches up.
+    // what we track. After two silent broadcast intervals any version is accepted again. A complete
+    // list heard from the originator also rebases: the neighbour is transmitting now, so its counter
+    // is the one that matters, not the one we stored before it restarted. A version far behind the
+    // last accepted one is a restarted counter, not a delayed copy of the previous list.
     uint32_t topologyResyncMs() const { return 2 * cfgBroadcastSecs * 1000; }
 
     bool isSignalBasedCapable(NodeNum nodeId) const;
