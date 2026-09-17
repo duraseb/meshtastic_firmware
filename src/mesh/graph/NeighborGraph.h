@@ -61,14 +61,14 @@ struct NodeSet {
 
 #ifndef NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE
 // A city hub hears well over 24 nodes; with 24 slots it kept evicting weaker but real neighbours
-// (FCM6 dropped Czar). Lists above MAX_SIGNAL_ROUTING_NEIGHBORS go out as several chunks.
+// Lists above MAX_SIGNAL_ROUTING_NEIGHBORS go out as several chunks.
 // The graph is heap-allocated: 32x32 costs ~17 KB (24x24 was ~9.5 KB) on nodes that run with
 // ~42-46 KB of free heap, so 40x40 (+16.5 KB) is not affordable here without a heap check.
 #define NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE 32
 #endif
 
 #ifndef NEIGHBOR_GRAPH_MAX_DOWNSTREAM
-#define NEIGHBOR_GRAPH_MAX_DOWNSTREAM 1100
+#define NEIGHBOR_GRAPH_MAX_DOWNSTREAM 900
 #endif
 
 #ifndef NEIGHBOR_GRAPH_MAX_RELAY_STATES
