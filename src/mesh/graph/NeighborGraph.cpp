@@ -1524,21 +1524,21 @@ RelayCandidate NeighborGraph::findBestRelayCandidate(const NodeSet &candidates, 
             }
         }
 
-        // Role ranks above cost and below coverage: cost describes a link, the role describes the
-        // node, and two candidates reaching the same neighbours at the same price are not equally
-        // good if one of them exists for the purpose.
+        // Role ranks above coverage count and cost: a configured ROUTER with unique coverage
+        // is preferred over a non-ROUTER that reaches more neighbours. Early-window timing is
+        // gated separately (ROUTER only); this is the same split for mixed-pool ranking.
         const uint8_t candidateRoleRank = policy ? policy->roleRank(candidate) : 0;
-        bool isBetter = candidateTier > bestCandidate.tier ||
-                        (candidateTier == bestCandidate.tier && uniqueCoverageCount > bestCandidate.coverageCount) ||
-                        (candidateTier == bestCandidate.tier && uniqueCoverageCount == bestCandidate.coverageCount &&
-                         candidateRoleRank > bestCandidate.roleRank) ||
-                        (candidateTier == bestCandidate.tier && uniqueCoverageCount == bestCandidate.coverageCount &&
-                         candidateRoleRank == bestCandidate.roleRank &&
+        bool isBetter = candidateRoleRank > bestCandidate.roleRank ||
+                        (candidateRoleRank == bestCandidate.roleRank && candidateTier > bestCandidate.tier) ||
+                        (candidateRoleRank == bestCandidate.roleRank && candidateTier == bestCandidate.tier &&
+                         uniqueCoverageCount > bestCandidate.coverageCount) ||
+                        (candidateRoleRank == bestCandidate.roleRank && candidateTier == bestCandidate.tier &&
+                         uniqueCoverageCount == bestCandidate.coverageCount &&
                          avgCostFixed < bestCandidate.avgCostFixed);
-        // Deterministic tiebreak on node ID when tier, coverage, role and cost are equal
-        if (!isBetter && candidateTier == bestCandidate.tier &&
+        // Deterministic tiebreak on node ID when role, tier, coverage and cost are equal
+        if (!isBetter && candidateRoleRank == bestCandidate.roleRank &&
+            candidateTier == bestCandidate.tier &&
             uniqueCoverageCount == bestCandidate.coverageCount &&
-            candidateRoleRank == bestCandidate.roleRank &&
             avgCostFixed == bestCandidate.avgCostFixed && bestCandidate.nodeId != 0) {
             isBetter = preferHighNodeId ? (candidate > bestCandidate.nodeId)
                                         : (candidate < bestCandidate.nodeId);

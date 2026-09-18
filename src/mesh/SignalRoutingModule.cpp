@@ -3124,9 +3124,8 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     // coordinate with and whose firing time we cannot compute, the other a node we do — and one
     // merged reason string cannot say which, so removing the reservation would be invisible.
     uint8_t reservedSlots = 0;
-    // Coverage taken off the table before the ranking ran, and by whom. Absorption is why a
-    // candidate finds nothing unique; it was computed here and logged nowhere, so a suppression
-    // could not be attributed to the relay that caused it.
+    // Coverage taken off the table by copies already on the air, and by whom. Planned later
+    // slots do not absorb; a heard dupe does.
     uint16_t absorbedTotal = 0;
     NodeNum absorbedBy[4] = {0, 0, 0, 0};
     uint8_t absorbedCredit[4] = {0, 0, 0, 0};
@@ -3332,9 +3331,9 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
             LOG_INFO("[SR] Slot %ums: SR node %08x (coverage=%u/%u, cost=%.2f%s)", rung, best.nodeId, best.coverageCount,
                      best.totalCoverage, best.getAvgCost(), best.tier > 0 ? ", bidi" : "");
             slotsGiven++;
-            // An earlier slot holder is assumed to relay: subtract its coverage so later candidates
-            // (and the stock-coverage fallback) only relay for nodes nobody ahead of them reaches.
-            absorbRelayCoverage(best.nodeId);
+            // Ranked ahead of us, not yet on the air: they get a slot. Unique is vs the
+            // transmitter (and copies already heard). If they never transmit, our later rung
+            // still fires.
         }
     };
 
