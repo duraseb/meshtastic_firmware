@@ -685,7 +685,7 @@ private:
     // Bootstrap replies are rate-limited: a burst of empty broadcasts (many reboots, or a rogue) must not
     // make every node answer each one with its list. The requester is in our graph regardless and gets
     // the next periodic broadcast.
-    static constexpr uint32_t BOOTSTRAP_REPLY_MIN_INTERVAL_MS = 60000;
+    static constexpr uint32_t BOOTSTRAP_REPLY_MIN_INTERVAL_MS = 120000;
     // Channel-access model: after a frame ends a
     // receiver spends up to ~170 ms (measured here: "Packet RX" 69-172 ms) reading it out before it
     // listens again. Every "how long does a peer need" wait and the first relay slot start from this.
