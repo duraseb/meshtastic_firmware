@@ -423,6 +423,17 @@ class NeighborGraph {
     // what keeps stock destinations reachable; coverage decisions use the strict `covers` instead.
     bool canDeliver(NodeNum from, NodeNum to, const RoutePolicy &policy) const;
 
+    /// Last-hop delivery: a priced hop to the destination, or `node` is its downstream gateway.
+    /// Optimistic `canDeliver` alone is not enough — it is true for every unpublished dest.
+    bool unicastCanFinish(NodeNum node, NodeNum destination, const RoutePolicy &policy) const;
+    /// Cost of `node` as a unicast relay candidate: priced hop, dest's downstream, or shared next hop.
+    uint16_t unicastCandidateCost(NodeNum node, NodeNum destination, NodeNum myNode, NodeNum myNextHop,
+                                  const RoutePolicy &policy) const;
+    /// Heard-copy cancel: the relayer can finish, or is ranked ahead of us with a path. Keep if we
+    /// can finish and they cannot. Unresolved or placeholder identity cancels only when we cannot.
+    bool unicastDupeCancels(NodeNum myNode, NodeNum destination, uint32_t packetId, NodeNum dupeRelayer,
+                            NodeNum myNextHop, const RoutePolicy &policy) const;
+
     size_t getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, size_t maxNodes, const NodeNum *alreadyCovered,
                                size_t alreadyCoveredCount, NodeNum selfNode = 0,
                                const CoveragePolicy *policy = nullptr, bool includeOwned = true) const;

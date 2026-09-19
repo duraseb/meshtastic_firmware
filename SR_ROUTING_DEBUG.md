@@ -201,7 +201,8 @@ Check that all expected branch nodes are in each other's direct neighbor lists. 
 
 1. **Slot scheduling** (`shouldRelayBroadcast`): each node independently ranks all SR candidates by unique coverage versus the transmitter (and copies already heard). Stock routers take reserved early slots. Every SR candidate that still uniquely reaches someone the transmitter did not gets a later slot. "US" gets assigned a delay and breaks the loop.
 2. **TX**: packet queued with `tx_after = now + slotDelay`.
-3. **Dupe arrives**: `areAllNeighborsCovered` subtracts the dupe relayer's coverage (accumulated across copies). If nothing unique is left → cancel TX. If we still uniquely reach someone → keep TX.
+3. **Dupe arrives (broadcast)**: `areAllNeighborsCovered` subtracts the dupe relayer's coverage (accumulated across copies). If nothing unique is left → cancel TX. If we still uniquely reach someone → keep TX.
+3b. **Dupe arrives (unicast)**: `unicastDupeCancels` — cancel only if the transmitter can finish (priced hop or dest's downstream) or is ranked ahead with a path. Keep if we can finish and they cannot. An unresolved/placeholder relay byte cancels only when we cannot finish.
 4. `cancelSending removed=1` = successfully cancelled; `removed=0` = already on air.
 
 The `alreadyCovered` set in slot scheduling is intentionally NOT updated between iterations — each candidate's unique coverage is evaluated independently. Actual relay suppression happens via over-the-air dupe detection, not slot ordering.

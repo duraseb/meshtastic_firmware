@@ -2660,14 +2660,10 @@ void SignalRoutingModule::cancelBroadcastRetransmit(PacketId packetId)
 
 bool SignalRoutingModule::unicastCanFinish(NodeNum node, NodeNum destination) const
 {
-    if (!routingGraph || node == 0) {
+    if (!routingGraph) {
         return false;
     }
-    if (routingGraph->getDownstreamRelay(destination) == node) {
-        return true;
-    }
-    return routingGraph->canDeliver(node, destination, routePolicy()) &&
-           routingGraph->hopCost(node, destination) > 0.0f;
+    return routingGraph->unicastCanFinish(node, destination, routePolicy());
 }
 
 uint16_t SignalRoutingModule::unicastCandidateCost(NodeNum node, NodeNum destination, NodeNum myNextHop) const
@@ -2675,41 +2671,7 @@ uint16_t SignalRoutingModule::unicastCandidateCost(NodeNum node, NodeNum destina
     if (!routingGraph || !nodeDB) {
         return UINT16_MAX;
     }
-    NodeNum myNode = nodeDB->getNodeNum();
-    auto bucket = [](uint16_t etxFixed) -> uint16_t {
-        return (uint16_t)(etxFixed / SR_COST_BUCKET_FIXED * SR_COST_BUCKET_FIXED);
-    };
-    auto deliveryCostFixed = [&](NodeNum from, NodeNum to) -> uint16_t {
-        if (!routingGraph->canDeliver(from, to, routePolicy())) {
-            return UINT16_MAX;
-        }
-        float cost = routingGraph->hopCost(from, to);
-        if (cost <= 0.0f) {
-            return UINT16_MAX;
-        }
-        return (uint16_t)std::min(cost * 100.0f, 32766.0f);
-    };
-    uint16_t direct = deliveryCostFixed(node, destination);
-    if (direct != UINT16_MAX) {
-        return bucket(std::min<uint16_t>(direct, 0x7FFEu));
-    }
-    NodeNum dsRelay = routingGraph->getDownstreamRelay(destination);
-    if (dsRelay != 0 && dsRelay == node) {
-        return 0x7FFFu;
-    }
-    if (myNextHop != 0 && myNextHop != destination && myNextHop != myNode && myNextHop != node) {
-        uint16_t shared = deliveryCostFixed(node, myNextHop);
-        if (shared != UINT16_MAX) {
-            return bucket(std::min<uint16_t>(shared, 0x7FFFu)) | 0x8000u;
-        }
-    }
-    return UINT16_MAX;
-}
-
-static bool unicastRankedAhead(NodeNum a, uint16_t aCost, NodeNum b, uint16_t bCost, uint32_t packetId)
-{
-    const bool preferHighId = (packetId & 1) != 0;
-    return aCost < bCost || (aCost == bCost && (preferHighId ? a > b : a < b));
+    return routingGraph->unicastCandidateCost(node, destination, nodeDB->getNodeNum(), myNextHop, routePolicy());
 }
 
 bool SignalRoutingModule::unicastDupeCancels(const meshtastic_MeshPacket *p, NodeNum dupeRelayer)
@@ -2717,28 +2679,8 @@ bool SignalRoutingModule::unicastDupeCancels(const meshtastic_MeshPacket *p, Nod
     if (!routingGraph || !nodeDB || !p) {
         return false;
     }
-    NodeNum myNode = nodeDB->getNodeNum();
-    NodeNum destination = p->to;
-    bool weFinish = unicastCanFinish(myNode, destination);
-    if (dupeRelayer == 0 || dupeRelayer == myNode || isPlaceholderNode(dupeRelayer)) {
-        return !weFinish;
-    }
-    if (unicastCanFinish(dupeRelayer, destination)) {
-        return true;
-    }
-    if (weFinish) {
-        return false;
-    }
-    NodeNum myNextHop = getNextHop(destination, p->from, 0, false);
-    uint16_t theirCost = unicastCandidateCost(dupeRelayer, destination, myNextHop);
-    if (theirCost == UINT16_MAX) {
-        return false;
-    }
-    uint16_t myCost = unicastCandidateCost(myNode, destination, myNextHop);
-    if (myCost == UINT16_MAX) {
-        myCost = 0xFFFEu;
-    }
-    return unicastRankedAhead(dupeRelayer, theirCost, myNode, myCost, p->id);
+    NodeNum myNextHop = getNextHop(p->to, p->from, 0, false);
+    return routingGraph->unicastDupeCancels(nodeDB->getNodeNum(), p->to, p->id, dupeRelayer, myNextHop, routePolicy());
 }
 
 bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p, NodeNum *uniqueNeighbor)

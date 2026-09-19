@@ -394,7 +394,7 @@ When SR approves a unicast relay, `NextHopRouter::sendRelay()` stamps SR's route
 - An SR neighbor that covers `heardFrom` can reach destination → suppress only if they already transmitted this id
 
 **Dupe Cancellation:**
-When a dupe arrives for a committed unicast relay, `areAllNeighborsCovered()` / `unicastDupeCancels()` cancel only if the dupe relayer can finish delivery (priced hop or dest's downstream), or is ranked ahead of us with a path. If we can finish and they cannot, our relay is kept. An unresolved relay byte cancels only when we cannot finish (the designated or stock hop we were waiting for). Late unicast rungs are not clamped to 2 s — a clamp would bunch later slots onto the same instant.
+When a dupe arrives for a committed unicast relay, `areAllNeighborsCovered()` calls `NeighborGraph::unicastDupeCancels()`: cancel only if the dupe relayer can finish delivery (priced hop or dest's downstream), or is ranked ahead of us with a path. If we can finish and they cannot, our relay is kept. An unresolved relay byte (or a placeholder identity) cancels only when we cannot finish (the designated or stock hop we were waiting for). Late unicast rungs are not clamped to 2 s — a clamp would bunch later slots onto the same instant. Native tests: `test_unicast_dupe_cancel_predicate`.
 
 ## Broadcast Routing
 

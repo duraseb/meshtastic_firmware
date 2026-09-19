@@ -1292,6 +1292,80 @@ bool NeighborGraph::canDeliver(NodeNum from, NodeNum to, const RoutePolicy &poli
     return !(policy.publishes && policy.publishes(policy.ctx, to));
 }
 
+bool NeighborGraph::unicastCanFinish(NodeNum node, NodeNum destination, const RoutePolicy &policy) const
+{
+    if (node == 0) {
+        return false;
+    }
+    if (getDownstreamRelay(destination) == node) {
+        return true;
+    }
+    return canDeliver(node, destination, policy) && hopCost(node, destination) > 0.0f;
+}
+
+uint16_t NeighborGraph::unicastCandidateCost(NodeNum node, NodeNum destination, NodeNum myNode, NodeNum myNextHop,
+                                             const RoutePolicy &policy) const
+{
+    auto bucket = [](uint16_t etxFixed) -> uint16_t {
+        return (uint16_t)(etxFixed / SR_COST_BUCKET_FIXED * SR_COST_BUCKET_FIXED);
+    };
+    auto deliveryCostFixed = [&](NodeNum from, NodeNum to) -> uint16_t {
+        if (!canDeliver(from, to, policy)) {
+            return UINT16_MAX;
+        }
+        float cost = hopCost(from, to);
+        if (cost <= 0.0f) {
+            return UINT16_MAX;
+        }
+        return (uint16_t)std::min(cost * 100.0f, 32766.0f);
+    };
+    uint16_t direct = deliveryCostFixed(node, destination);
+    if (direct != UINT16_MAX) {
+        return bucket(std::min<uint16_t>(direct, 0x7FFEu));
+    }
+    NodeNum dsRelay = getDownstreamRelay(destination);
+    if (dsRelay != 0 && dsRelay == node) {
+        return 0x7FFFu;
+    }
+    if (myNextHop != 0 && myNextHop != destination && myNextHop != myNode && myNextHop != node) {
+        uint16_t shared = deliveryCostFixed(node, myNextHop);
+        if (shared != UINT16_MAX) {
+            return bucket(std::min<uint16_t>(shared, 0x7FFFu)) | 0x8000u;
+        }
+    }
+    return UINT16_MAX;
+}
+
+static bool unicastRankedAhead(NodeNum a, uint16_t aCost, NodeNum b, uint16_t bCost, uint32_t packetId)
+{
+    const bool preferHighId = (packetId & 1) != 0;
+    return aCost < bCost || (aCost == bCost && (preferHighId ? a > b : a < b));
+}
+
+bool NeighborGraph::unicastDupeCancels(NodeNum myNode, NodeNum destination, uint32_t packetId, NodeNum dupeRelayer,
+                                       NodeNum myNextHop, const RoutePolicy &policy) const
+{
+    bool weFinish = unicastCanFinish(myNode, destination, policy);
+    if (dupeRelayer == 0 || dupeRelayer == myNode || Edge::isPlaceholderId(dupeRelayer)) {
+        return !weFinish;
+    }
+    if (unicastCanFinish(dupeRelayer, destination, policy)) {
+        return true;
+    }
+    if (weFinish) {
+        return false;
+    }
+    uint16_t theirCost = unicastCandidateCost(dupeRelayer, destination, myNode, myNextHop, policy);
+    if (theirCost == UINT16_MAX) {
+        return false;
+    }
+    uint16_t myCost = unicastCandidateCost(myNode, destination, myNode, myNextHop, policy);
+    if (myCost == UINT16_MAX) {
+        myCost = 0xFFFEu;
+    }
+    return unicastRankedAhead(dupeRelayer, theirCost, myNode, myCost, packetId);
+}
+
 bool NeighborGraph::isSilentPublisher(NodeNum node, const CoveragePolicy &policy) const
 {
     if (policy.publisherSilenceSecs == 0 || !policy.reports(node)) return false;

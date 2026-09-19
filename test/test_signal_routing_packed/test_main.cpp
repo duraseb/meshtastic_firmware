@@ -1780,6 +1780,54 @@ static void test_undecoded_direct_frame_is_recorded_as_a_neighbour()
     TEST_ASSERT_EQUAL_UINT32(stranger, module.resolveRelayIdentity(mp.relay_node));
 }
 
+static NeighborGraph seedUnicastFieldGraph(NodeNum me, NodeNum peer, NodeNum gw, NodeNum dest)
+{
+    const uint32_t now = millis() / 1000;
+    NeighborGraph graph;
+    graph.updateEdge(me, gw, 1.5f, now, Edge::Source::Reported);
+    graph.setEdgeHearsUs(me, gw, true);
+    graph.updateEdge(me, peer, 1.0f, now, Edge::Source::Reported);
+    graph.setEdgeHearsUs(me, peer, true);
+    graph.updateDownstream(dest, gw, 2.0f, now);
+    return graph;
+}
+
+// Mirrors MeshRustic unicast_relay::tests for the shared cancel predicate.
+void test_unicast_dupe_cancel_predicate()
+{
+    constexpr NodeNum me = 0x046b553a;
+    constexpr NodeNum peer = 0xbdacce55;
+    constexpr NodeNum gw = 0x63dc8f8c;
+    constexpr NodeNum dest = 0x32aca541;
+    const uint32_t now = millis() / 1000;
+    const NeighborGraph::RoutePolicy policy;
+    initGraphTestNodeDb(me);
+
+    {
+        NeighborGraph graph = seedUnicastFieldGraph(me, peer, gw, dest);
+        TEST_ASSERT_TRUE(graph.unicastDupeCancels(me, dest, 0x30, gw, 0, policy));
+        TEST_ASSERT_FALSE(graph.unicastDupeCancels(me, dest, 0x30, peer, 0, policy));
+        TEST_ASSERT_TRUE(graph.unicastDupeCancels(me, dest, 0x30, 0, 0, policy));
+        TEST_ASSERT_TRUE(graph.unicastDupeCancels(me, dest, 0x30, Edge::PLACEHOLDER_NODE_BASE | 0x99, 0, policy));
+    }
+
+    {
+        NeighborGraph graph = seedUnicastFieldGraph(me, peer, gw, dest);
+        graph.updateEdge(me, dest, 1.2f, now, Edge::Source::Reported);
+        graph.setEdgeHearsUs(me, dest, true);
+        TEST_ASSERT_FALSE(graph.unicastDupeCancels(me, dest, 0x31, peer, 0, policy));
+        TEST_ASSERT_FALSE(graph.unicastDupeCancels(me, dest, 0x31, 0, 0, policy));
+    }
+
+    {
+        NeighborGraph graph = seedUnicastFieldGraph(me, peer, gw, dest);
+        graph.updateEdge(peer, gw, 1.5f, now, Edge::Source::Reported);
+        graph.setEdgeHearsUs(peer, gw, true);
+        TEST_ASSERT_FALSE(graph.unicastDupeCancels(me, dest, 0x32, peer, gw, policy));
+        TEST_ASSERT_TRUE(graph.unicastDupeCancels(me, dest, 0x33, peer, gw, policy));
+    }
+}
+
 void setup()
 {
     initializeTestEnvironment();
@@ -1857,6 +1905,7 @@ void setup()
     RUN_TEST(test_preset_change_resets_topology_version_and_relay_identity);
     RUN_TEST(test_radio_reconfigured_purges_only_when_the_preset_changes);
     RUN_TEST(test_undecoded_direct_frame_is_recorded_as_a_neighbour);
+    RUN_TEST(test_unicast_dupe_cancel_predicate);
 
     UNITY_END();
 }
