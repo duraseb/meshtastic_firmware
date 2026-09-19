@@ -17,6 +17,13 @@
  * drop matching traffic; lift at window end when count is below clear (clear==0 means
  * a quiet window with count==0). RELAY and YOUNG use a clear threshold below trip.
  *
+ * Dest drop: while any originator bucket for a node is limited, unicast frames
+ * addressed to that node on the default public channel are logged and dropped without
+ * charging the sender. WantResponse replies from other nodes would otherwise keep
+ * flooding after the originator itself is already silenced. Unicast on a non-default
+ * channel (private PSK / PKI) is not dest-dropped. RELAY and YOUNG limits do not
+ * dest-drop; only an originator ban does.
+ *
  * Young path: one shared packet-count bucket for originators first heard less than
  * 30 minutes ago, so a flood of minted identities buys one slot, not one each.
  */
@@ -28,11 +35,20 @@ class NodeRateLimiter
     /**
      * Returns true if the packet should be dropped (rate limited).
      * Packets addressed to us are never limited. Updates internal counters.
+     * Default-channel unicast to a limited originator is dest-dropped without charging
+     * the sender.
      */
     bool shouldDrop(const meshtastic_MeshPacket *p);
 
     /**
-     * True if this packet's originator/RELAY buckets are already limited.
+     * True if the last shouldDrop() returned true because the destination is a
+     * limited originator (default-channel unicast). False after any other outcome.
+     */
+    bool lastDropWasDest() const { return lastDestDrop; }
+
+    /**
+     * True if this packet's originator/RELAY buckets are already limited, or if it is
+     * default-channel unicast to a limited originator.
      * Does not update counters — for dupe/upgrade rebroadcast gates so we do not
      * amplify after a prior shouldDrop, and do not double-charge airtime.
      */
@@ -44,8 +60,10 @@ class NodeRateLimiter
     static bool (*testNodeInGraphHook)(NodeNum nodeId);
     static uint8_t (*testGraphHopsHook)(NodeNum nodeId);
     static float testChutilOverride; // < 0 => use airTime / default
+    static int8_t testOnDefaultChannelOverride; // < 0 => treat as default channel
 
     bool debugTracksOriginator(NodeNum nodeId) const;
+    bool debugOriginatorLimited(NodeNum nodeId) const;
     bool debugTracksRelay(NodeNum nodeId) const;
     bool debugRelayLimited(NodeNum nodeId) const;
     bool debugUnresolvedRelayLimited() const;
@@ -186,6 +204,7 @@ class NodeRateLimiter
     NodeNum pendingAnnounceIds[ANNOUNCE_MAX_IDS] = {};
     uint8_t pendingAnnounceCount = 0;
     bool pendingAnnounce = false;
+    bool lastDestDrop = false;
 
     static Bucket classifyBucket(meshtastic_PortNum portnum);
     static bool isRebroadcastCandidate(const meshtastic_MeshPacket *p);
@@ -220,6 +239,9 @@ class NodeRateLimiter
     bool isYoung(NodeNum nodeId, uint32_t now) const;
     bool relayAnyLimited() const;
     void maybeAnnounce(uint32_t now, float chutil);
+    bool isLimitedOriginator(NodeNum nodeId) const;
+    bool isOnDefaultChannel(const meshtastic_MeshPacket *p) const;
+    bool shouldDropToLimitedDest(const meshtastic_MeshPacket *p) const;
 };
 
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING

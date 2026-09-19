@@ -57,3 +57,6 @@ CMakeLists.txt
 
 # PYTHONPATH used by the Nix shell
 .python3
+
+# graphify knowledge-graph output (generated locally, not source)
+graphify-out/

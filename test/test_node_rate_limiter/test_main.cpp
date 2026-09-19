@@ -86,6 +86,7 @@ static void prepareEnv(uint32_t windowSecs = 1)
     NodeRateLimiter::testGraphHopsHook = nullptr;
     NodeRateLimiter::testChutilOverride = -1.0f;
     NodeRateLimiter::testNowOverride = -1;
+    NodeRateLimiter::testOnDefaultChannelOverride = -1;
 #endif
 }
 
@@ -603,6 +604,57 @@ static void test_young_announce_respects_refractory_and_congestion()
     TEST_ASSERT_FALSE_MESSAGE(relayBusy.debugTakeAnnounce(ids, n), "suppressed while the RELAY bucket is limiting");
 }
 
+static void test_default_channel_unicast_to_limited_originator_is_dropped()
+{
+    prepareEnv();
+    NodeRateLimiter limiter;
+    const NodeNum banned = 0x0BADF00D;
+    const NodeNum responder = 0x11112222;
+
+    for (uint32_t i = 0; i + 1 < NodeRateLimiter::DEFAULT_OTHER_TRIP; i++) {
+        auto p = makePacket(banned, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 2000 + i);
+        TEST_ASSERT_FALSE(limiter.shouldDrop(&p));
+    }
+    auto trip = makePacket(banned, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 2010);
+    TEST_ASSERT_TRUE(limiter.shouldDrop(&trip));
+    TEST_ASSERT_TRUE(limiter.debugOriginatorLimited(banned));
+
+    auto reply = makePacket(responder, banned, 3, 3, 0, meshtastic_PortNum_NODEINFO_APP, 2020);
+    TEST_ASSERT_TRUE_MESSAGE(limiter.shouldDrop(&reply), "default-channel unicast to a limited originator must drop");
+    TEST_ASSERT_TRUE(limiter.lastDropWasDest());
+    TEST_ASSERT_FALSE_MESSAGE(limiter.debugTracksOriginator(responder), "dest-drop must not charge the responder");
+    TEST_ASSERT_TRUE_MESSAGE(limiter.wouldDrop(&reply), "wouldDrop must dest-drop too");
+
+    NodeRateLimiter::testOnDefaultChannelOverride = 0;
+    auto privateReply = makePacket(responder, banned, 3, 3, 0, meshtastic_PortNum_NODEINFO_APP, 2021);
+    TEST_ASSERT_FALSE_MESSAGE(limiter.shouldDrop(&privateReply), "non-default unicast must not dest-drop");
+    TEST_ASSERT_FALSE(limiter.lastDropWasDest());
+    NodeRateLimiter::testOnDefaultChannelOverride = -1;
+
+    auto pkiReply = makePacket(responder, banned, 3, 3, 0, meshtastic_PortNum_NODEINFO_APP, 2022);
+    pkiReply.pki_encrypted = true;
+    TEST_ASSERT_FALSE_MESSAGE(limiter.shouldDrop(&pkiReply), "PKI DM is not dest-dropped");
+}
+
+static void test_dest_drop_does_not_apply_to_relay_only_limit()
+{
+    prepareEnv();
+    NodeRateLimiter::testResolveRelayHook = resolveHookOnly11;
+    testNodeDB->setFavorite(kRemote);
+    NodeRateLimiter limiter;
+
+    for (uint32_t i = 0; i < 60; i++) {
+        auto p = makePacket(kRemote, NODENUM_BROADCAST, 3, 3, 0x11, meshtastic_PortNum_TELEMETRY_APP, 2100 + i);
+        limiter.shouldDrop(&p);
+    }
+    TEST_ASSERT_TRUE(limiter.debugRelayLimited(0x0A000011u));
+    TEST_ASSERT_FALSE(limiter.debugOriginatorLimited(0x0A000011u));
+
+    auto toRelay = makePacket(0x11112222, 0x0A000011u, 3, 3, 0, meshtastic_PortNum_NODEINFO_APP, 2200);
+    TEST_ASSERT_FALSE_MESSAGE(limiter.shouldDrop(&toRelay), "RELAY-limited last hop is not an originator ban");
+    TEST_ASSERT_FALSE(limiter.lastDropWasDest());
+}
+
 } // namespace
 
 void setUp(void) {}
@@ -649,6 +701,8 @@ void setup()
     RUN_TEST(test_young_bucket_clears_below_clear_without_a_silent_window);
     RUN_TEST(test_undecodable_traffic_does_not_charge_young);
     RUN_TEST(test_young_announce_respects_refractory_and_congestion);
+    RUN_TEST(test_default_channel_unicast_to_limited_originator_is_dropped);
+    RUN_TEST(test_dest_drop_does_not_apply_to_relay_only_limit);
     exit(UNITY_END());
 }
 

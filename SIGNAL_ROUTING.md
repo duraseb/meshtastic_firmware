@@ -702,6 +702,13 @@ talking could never recover at all. Up to 16 originators
 are tracked; eviction prefers nodes not in our graph, then farthest by graph hops
 (never frame `hop_start`/`hop_limit`).
 
+While any originator bucket for a node is limited, **unicast frames addressed to
+that node on the default public channel** are logged and dropped without charging
+the sender. A limited originator with `want_response` would otherwise keep the
+mesh flooded by replies from nodes that have not yet limited it. Unicast on a
+non-default channel (private PSK) and PKI DMs are not dest-dropped. RELAY and
+YOUNG limits do not dest-drop; only an originator ban does.
+
 ### RELAY bucket
 
 Packets this node would consider for **rebroadcast** also charge a **RELAY**

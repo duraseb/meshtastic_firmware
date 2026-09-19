@@ -8,6 +8,9 @@
 #include "SignalRoutingModule.h"
 #include "airtime.h"
 #include "configuration.h"
+#if !defined(UNIT_TEST)
+#include "Channels.h"
+#endif
 #include "mesh/graph/NeighborGraph.h"
 #if HAS_TRAFFIC_MANAGEMENT
 #include "modules/TrafficManagementModule.h"
@@ -44,6 +47,7 @@ NodeNum (*NodeRateLimiter::testResolveRelayHook)(uint8_t, int16_t, float) = null
 bool (*NodeRateLimiter::testNodeInGraphHook)(NodeNum) = nullptr;
 uint8_t (*NodeRateLimiter::testGraphHopsHook)(NodeNum) = nullptr;
 float NodeRateLimiter::testChutilOverride = -1.0f;
+int8_t NodeRateLimiter::testOnDefaultChannelOverride = -1;
 int64_t NodeRateLimiter::testNowOverride = -1;
 
 bool NodeRateLimiter::debugTracksOriginator(NodeNum nodeId) const
@@ -54,6 +58,11 @@ bool NodeRateLimiter::debugTracksOriginator(NodeNum nodeId) const
         }
     }
     return false;
+}
+
+bool NodeRateLimiter::debugOriginatorLimited(NodeNum nodeId) const
+{
+    return isLimitedOriginator(nodeId);
 }
 
 bool NodeRateLimiter::debugTracksRelay(NodeNum nodeId) const
@@ -625,8 +634,50 @@ bool NodeRateLimiter::isDroppedCoverageTarget(NodeNum nodeId) const
     return isYoung(nodeId, nowMs());
 }
 
+bool NodeRateLimiter::isLimitedOriginator(NodeNum nodeId) const
+{
+    if (!nodeId) {
+        return false;
+    }
+    for (uint8_t i = 0; i < originatorCount; i++) {
+        if (originators[i].nodeId != nodeId) {
+            continue;
+        }
+        return originators[i].text.limited || originators[i].routing.limited || originators[i].other.limited ||
+               originators[i].unknown.limited;
+    }
+    return false;
+}
+
+bool NodeRateLimiter::isOnDefaultChannel(const meshtastic_MeshPacket *p) const
+{
+    if (!p || p->pki_encrypted) {
+        return false;
+    }
+#if defined(UNIT_TEST)
+    if (testOnDefaultChannelOverride >= 0) {
+        return testOnDefaultChannelOverride != 0;
+    }
+    return true;
+#else
+    return channels.isDefaultChannel(p->channel);
+#endif
+}
+
+bool NodeRateLimiter::shouldDropToLimitedDest(const meshtastic_MeshPacket *p) const
+{
+    if (!p || isBroadcast(p->to) || p->to == 0) {
+        return false;
+    }
+    if (!isOnDefaultChannel(p)) {
+        return false;
+    }
+    return isLimitedOriginator(p->to);
+}
+
 bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
 {
+    lastDestDrop = false;
     if (!cfgEnabled || !p) {
         return false;
     }
@@ -635,6 +686,10 @@ bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
     }
     if (isToUs(p)) {
         return false;
+    }
+    if (shouldDropToLimitedDest(p)) {
+        lastDestDrop = true;
+        return true;
     }
 
     uint32_t nowMs = this->nowMs();
@@ -780,6 +835,9 @@ bool NodeRateLimiter::wouldDrop(const meshtastic_MeshPacket *p) const
     }
     if (isToUs(p)) {
         return false;
+    }
+    if (shouldDropToLimitedDest(p)) {
+        return true;
     }
 
     bool favoriteOriginator = false;

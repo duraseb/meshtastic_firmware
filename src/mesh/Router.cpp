@@ -833,13 +833,20 @@ void Router::handleReceived(meshtastic_MeshPacket *p, RxSource src)
             signalRoutingModule->observeForGraph(*p);
         }
         if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag) {
-            LOG_WARN("[RateLimit] Dropping packet 0x%08x from 0x%08x portnum=%d hops=%d",
-                     p->id, p->from, p->decoded.portnum,
-                     p->hop_start > p->hop_limit ? p->hop_start - p->hop_limit : 0);
+            if (nodeRateLimiter->lastDropWasDest()) {
+                LOG_WARN("[RateLimit] Dropping packet 0x%08x to 0x%08x from 0x%08x (dest limited)", p->id, p->to, p->from);
+            } else {
+                LOG_WARN("[RateLimit] Dropping packet 0x%08x from 0x%08x portnum=%d hops=%d", p->id, p->from, p->decoded.portnum,
+                         p->hop_start > p->hop_limit ? p->hop_start - p->hop_limit : 0);
+            }
         } else {
-            LOG_WARN("[RateLimit] Dropping undecoded packet 0x%08x from 0x%08x hops=%d",
-                     p->id, p->from,
-                     p->hop_start > p->hop_limit ? p->hop_start - p->hop_limit : 0);
+            if (nodeRateLimiter->lastDropWasDest()) {
+                LOG_WARN("[RateLimit] Dropping undecoded packet 0x%08x to 0x%08x from 0x%08x (dest limited)", p->id, p->to,
+                         p->from);
+            } else {
+                LOG_WARN("[RateLimit] Dropping undecoded packet 0x%08x from 0x%08x hops=%d", p->id, p->from,
+                         p->hop_start > p->hop_limit ? p->hop_start - p->hop_limit : 0);
+            }
         }
         NodeNum youngIds[NodeRateLimiter::ANNOUNCE_MAX_IDS];
         uint8_t youngN = 0;

@@ -168,7 +168,7 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                     // Do not amplify after an inbound rate-limit (dupe/upgrade paths skip handleReceived).
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
                     if (nodeRateLimiter && nodeRateLimiter->wouldDrop(p)) {
-                        LOG_WARN("[RateLimit] Skip rebroadcast of 0x%08x from 0x%08x (limited)", p->id, p->from);
+                        LOG_WARN("[RateLimit] Skip rebroadcast of 0x%08x from 0x%08x to 0x%08x (limited)", p->id, p->from, p->to);
                         return false;
                     }
 #endif
