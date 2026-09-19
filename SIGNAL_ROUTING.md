@@ -707,7 +707,18 @@ that node on the default public channel** are logged and dropped without chargin
 the sender. A limited originator with `want_response` would otherwise keep the
 mesh flooded by replies from nodes that have not yet limited it. Unicast on a
 non-default channel (private PSK) and PKI DMs are not dest-dropped. RELAY and
-YOUNG limits do not dest-drop; only an originator ban does.
+YOUNG limits do not dest-drop.
+
+Default-channel **POSITION / NODEINFO / TELEMETRY** unicast this node would
+rebroadcast also charges a per-destination **dest-volume** bucket (8 slots;
+trip **20** / clear **5** / same 90 s window, RELAY-style hysteresis). Trip
+requires at least **3 distinct senders** in the window, so one node chatting
+at a dest does not dest-ban the inbox. Once dest-volume limited, dest-drop
+applies the same way as an originator ban (including TEXT) until a window
+rolls under the clear — a WantResponse storm is cut even when we never saw
+the originator, and even from a single request that never trips OTHER.
+Dest-volume is never favorite-bypassed. A full table of dest-volume-limited
+sinks refuses a new slot rather than evicting a dest-ban.
 
 ### RELAY bucket
 

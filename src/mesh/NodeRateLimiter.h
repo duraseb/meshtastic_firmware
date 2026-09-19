@@ -24,6 +24,15 @@
  * channel (private PSK / PKI) is not dest-dropped. RELAY and YOUNG limits do not
  * dest-drop; only an originator ban does.
  *
+ * Dest volume: default-channel POSITION / NODEINFO / TELEMETRY unicast this node
+ * would rebroadcast also charges a per-destination count (MAX_DEST_ENTRIES slots).
+ * Trip DEST_TRIP / clear DEST_CLEAR / same window, RELAY-style hysteresis, but
+ * only once DEST_MIN_SENDERS distinct senders have contributed in the window.
+ * Once dest-volume limited, dest-drop applies the same way as an originator ban
+ * (including TEXT) until a window rolls under the clear. Never favorite-bypassed.
+ * A full table of dest-volume-limited sinks refuses a new slot rather than
+ * lifting a dest-ban.
+ *
  * Young path: one shared packet-count bucket for originators first heard less than
  * 30 minutes ago, so a flood of minted identities buys one slot, not one each.
  */
@@ -35,20 +44,21 @@ class NodeRateLimiter
     /**
      * Returns true if the packet should be dropped (rate limited).
      * Packets addressed to us are never limited. Updates internal counters.
-     * Default-channel unicast to a limited originator is dest-dropped without charging
-     * the sender.
+     * Default-channel unicast to a limited originator or dest-volume sink is dest-dropped
+     * without charging the sender.
      */
     bool shouldDrop(const meshtastic_MeshPacket *p);
 
     /**
      * True if the last shouldDrop() returned true because the destination is a
-     * limited originator (default-channel unicast). False after any other outcome.
+     * limited originator or dest-volume sink (default-channel unicast). False after
+     * any other outcome.
      */
     bool lastDropWasDest() const { return lastDestDrop; }
 
     /**
      * True if this packet's originator/RELAY buckets are already limited, or if it is
-     * default-channel unicast to a limited originator.
+     * default-channel unicast to a limited originator or dest-volume sink.
      * Does not update counters — for dupe/upgrade rebroadcast gates so we do not
      * amplify after a prior shouldDrop, and do not double-charge airtime.
      */
@@ -75,6 +85,11 @@ class NodeRateLimiter
     bool debugIsYoung(NodeNum nodeId) const;
     bool debugYoungLimited() const { return youngBucket.limited; }
     uint32_t debugYoungCharge() const { return youngBucket.count; }
+    bool debugTracksDest(NodeNum nodeId) const;
+    bool debugDestLimited(NodeNum nodeId) const;
+    uint32_t debugDestCharge(NodeNum nodeId) const;
+    uint8_t debugDestSenders(NodeNum nodeId) const;
+    uint8_t debugDestCount() const { return destCount; }
     void debugSetBootMs(uint32_t bootMs);
     void debugSeedYoung(NodeNum nodeId, uint32_t firstSeenMs);
     bool debugTakeAnnounce(NodeNum *ids, uint8_t &count);
@@ -136,6 +151,12 @@ class NodeRateLimiter
     static constexpr float ANNOUNCE_CHUTIL_HIGH = 25.0f;
     static constexpr uint8_t ANNOUNCE_MAX_IDS = 4;
 
+    static constexpr uint8_t MAX_DEST_ENTRIES = 8;
+    static constexpr uint8_t DEST_TRIP = 20;
+    static constexpr uint8_t DEST_CLEAR = 5;
+    static constexpr uint8_t DEST_MIN_SENDERS = 3;
+    static constexpr uint8_t DEST_SENDER_SLOTS = 8;
+
 
   private:
     static constexpr uint8_t MAX_ORIGINATOR_ENTRIES = 16;
@@ -180,6 +201,13 @@ class NodeRateLimiter
         BucketState relay;
     };
 
+    struct DestEntry {
+        NodeNum nodeId = 0;
+        BucketState dest;
+        NodeNum senders[DEST_SENDER_SLOTS] = {};
+        uint8_t senderCount = 0;
+    };
+
     OriginatorEntry originators[MAX_ORIGINATOR_ENTRIES];
     uint8_t originatorCount = 0;
 
@@ -196,6 +224,8 @@ class NodeRateLimiter
     NodeNum alumni[MAX_YOUNG_ENTRIES] = {};
     uint8_t alumniCount = 0;
     BucketState youngBucket;
+    DestEntry dests[MAX_DEST_ENTRIES];
+    uint8_t destCount = 0;
     uint32_t bootMs = 0;
     bool bootKnown = false;
     bool cfgAnnounceBroadcast = false;
@@ -222,6 +252,18 @@ class NodeRateLimiter
     RelayEntry *findRelay(NodeNum nodeId);
     RelayEntry *getOrCreateRelay(NodeNum nodeId, uint32_t nowMs);
     int findRelayEvictionCandidate() const;
+
+    DestEntry *findDest(NodeNum nodeId);
+    const DestEntry *findDest(NodeNum nodeId) const;
+    DestEntry *getOrCreateDest(NodeNum nodeId, uint32_t nowMs);
+    int findDestEvictionCandidate() const;
+    static bool destWindowWillRoll(const BucketState &b, uint32_t nowMs, uint32_t windowMs);
+    static void rollDestSenders(DestEntry &entry, uint32_t nowMs, uint32_t windowMs);
+    static void noteDestSender(DestEntry &entry, NodeNum from);
+    static bool isDestVolumePort(meshtastic_PortNum portnum);
+    bool chargesDestVolume(const meshtastic_MeshPacket *p) const;
+    bool isLimitedDest(NodeNum nodeId) const;
+    bool chargeDestVolume(const meshtastic_MeshPacket *p);
 
     // Eviction helpers (observed graph proximity; never frame hop fields)
     static bool nodeInGraph(NodeNum nodeId);

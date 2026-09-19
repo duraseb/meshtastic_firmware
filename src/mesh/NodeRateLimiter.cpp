@@ -122,9 +122,31 @@ bool NodeRateLimiter::debugTakeAnnounce(NodeNum *ids, uint8_t &count)
 {
     return takeYoungAnnounce(ids, count);
 }
+
+bool NodeRateLimiter::debugTracksDest(NodeNum nodeId) const
+{
+    return findDest(nodeId) != nullptr;
+}
+
+bool NodeRateLimiter::debugDestLimited(NodeNum nodeId) const
+{
+    return isLimitedDest(nodeId);
+}
+
+uint32_t NodeRateLimiter::debugDestCharge(NodeNum nodeId) const
+{
+    const DestEntry *e = findDest(nodeId);
+    return e ? e->dest.count : 0;
+}
+
+uint8_t NodeRateLimiter::debugDestSenders(NodeNum nodeId) const
+{
+    const DestEntry *e = findDest(nodeId);
+    return e ? e->senderCount : 0;
+}
 #endif
 
-NodeRateLimiter::NodeRateLimiter() : originatorCount(0), relayCount(0)
+NodeRateLimiter::NodeRateLimiter() : originatorCount(0), relayCount(0), destCount(0)
 {
     if (moduleConfig.has_node_rate_limiter) {
         const auto &cfg = moduleConfig.node_rate_limiter;
@@ -473,6 +495,82 @@ NodeRateLimiter::RelayEntry *NodeRateLimiter::getOrCreateRelay(NodeNum nodeId, u
     return slot;
 }
 
+NodeRateLimiter::DestEntry *NodeRateLimiter::findDest(NodeNum nodeId)
+{
+    for (uint8_t i = 0; i < destCount; i++) {
+        if (dests[i].nodeId == nodeId) {
+            return &dests[i];
+        }
+    }
+    return nullptr;
+}
+
+const NodeRateLimiter::DestEntry *NodeRateLimiter::findDest(NodeNum nodeId) const
+{
+    for (uint8_t i = 0; i < destCount; i++) {
+        if (dests[i].nodeId == nodeId) {
+            return &dests[i];
+        }
+    }
+    return nullptr;
+}
+
+int NodeRateLimiter::findDestEvictionCandidate() const
+{
+    auto oldestWindow = [](const DestEntry &e) { return e.dest.windowStart; };
+
+    int candidate = -1;
+    for (int i = 0; i < destCount; i++) {
+        if (dests[i].dest.limited) {
+            continue;
+        }
+        bool inGraph = nodeInGraph(dests[i].nodeId);
+        if (candidate == -1) {
+            candidate = i;
+            continue;
+        }
+        bool candInGraph = nodeInGraph(dests[candidate].nodeId);
+        if (!inGraph && candInGraph) {
+            candidate = i;
+            continue;
+        }
+        if (inGraph == candInGraph) {
+            uint8_t hops = graphHopsAway(dests[i].nodeId);
+            uint8_t candHops = graphHopsAway(dests[candidate].nodeId);
+            if (hops > candHops) {
+                candidate = i;
+            } else if (hops == candHops && oldestWindow(dests[i]) < oldestWindow(dests[candidate])) {
+                candidate = i;
+            }
+        }
+    }
+    return candidate;
+}
+
+NodeRateLimiter::DestEntry *NodeRateLimiter::getOrCreateDest(NodeNum nodeId, uint32_t nowMs)
+{
+    DestEntry *existing = findDest(nodeId);
+    if (existing) {
+        return existing;
+    }
+
+    DestEntry *slot;
+    if (destCount < MAX_DEST_ENTRIES) {
+        slot = &dests[destCount++];
+    } else {
+        int evict = findDestEvictionCandidate();
+        if (evict < 0) {
+            return nullptr;
+        }
+        slot = &dests[evict];
+    }
+
+    *slot = DestEntry{};
+    slot->nodeId = nodeId;
+    slot->dest.windowStart = nowMs;
+    return slot;
+}
+
 uint32_t NodeRateLimiter::nowMs() const
 {
 #if defined(UNIT_TEST)
@@ -672,7 +770,90 @@ bool NodeRateLimiter::shouldDropToLimitedDest(const meshtastic_MeshPacket *p) co
     if (!isOnDefaultChannel(p)) {
         return false;
     }
-    return isLimitedOriginator(p->to);
+    return isLimitedOriginator(p->to) || isLimitedDest(p->to);
+}
+
+bool NodeRateLimiter::isLimitedDest(NodeNum nodeId) const
+{
+    const DestEntry *e = findDest(nodeId);
+    return e && e->dest.limited;
+}
+
+bool NodeRateLimiter::isDestVolumePort(meshtastic_PortNum portnum)
+{
+    return portnum == meshtastic_PortNum_POSITION_APP || portnum == meshtastic_PortNum_NODEINFO_APP ||
+           portnum == meshtastic_PortNum_TELEMETRY_APP;
+}
+
+bool NodeRateLimiter::chargesDestVolume(const meshtastic_MeshPacket *p) const
+{
+    if (!p || isBroadcast(p->to) || p->to == 0) {
+        return false;
+    }
+    if (!isOnDefaultChannel(p)) {
+        return false;
+    }
+    if (!isRebroadcastCandidate(p)) {
+        return false;
+    }
+    if (p->which_payload_variant != meshtastic_MeshPacket_decoded_tag) {
+        return false;
+    }
+    return isDestVolumePort(p->decoded.portnum);
+}
+
+bool NodeRateLimiter::destWindowWillRoll(const BucketState &b, uint32_t nowMs, uint32_t windowMs)
+{
+    return b.windowStart != 0 && (nowMs - b.windowStart) >= windowMs;
+}
+
+void NodeRateLimiter::rollDestSenders(DestEntry &entry, uint32_t nowMs, uint32_t windowMs)
+{
+    if (destWindowWillRoll(entry.dest, nowMs, windowMs)) {
+        memset(entry.senders, 0, sizeof(entry.senders));
+        entry.senderCount = 0;
+    }
+}
+
+void NodeRateLimiter::noteDestSender(DestEntry &entry, NodeNum from)
+{
+    if (!from) {
+        return;
+    }
+    for (uint8_t i = 0; i < entry.senderCount; i++) {
+        if (entry.senders[i] == from) {
+            return;
+        }
+    }
+    if (entry.senderCount < DEST_SENDER_SLOTS) {
+        entry.senders[entry.senderCount++] = from;
+    }
+}
+
+bool NodeRateLimiter::chargeDestVolume(const meshtastic_MeshPacket *p)
+{
+    if (!p || isBroadcast(p->to) || p->to == 0 || !isOnDefaultChannel(p)) {
+        return false;
+    }
+
+    const uint32_t now = nowMs();
+    if (chargesDestVolume(p)) {
+        DestEntry *entry = getOrCreateDest(p->to, now);
+        if (!entry) {
+            return isLimitedDest(p->to);
+        }
+        rollDestSenders(*entry, now, cfgWindowMs);
+        noteDestSender(*entry, p->from);
+        const uint32_t trip = (entry->dest.limited || entry->senderCount >= DEST_MIN_SENDERS) ? DEST_TRIP : UINT32_MAX;
+        return checkAndUpdateBucket(entry->dest, trip, DEST_CLEAR, 1, now, "dest", entry->nodeId);
+    }
+
+    DestEntry *entry = findDest(p->to);
+    if (entry) {
+        rollDestSenders(*entry, now, cfgWindowMs);
+        checkAndUpdateBucket(entry->dest, DEST_TRIP, DEST_CLEAR, 0, now, "dest", entry->nodeId);
+    }
+    return isLimitedDest(p->to);
 }
 
 bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
@@ -687,13 +868,15 @@ bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
     if (isToUs(p)) {
         return false;
     }
-    if (shouldDropToLimitedDest(p)) {
-        lastDestDrop = true;
-        return true;
-    }
 
     uint32_t nowMs = this->nowMs();
     noteBoot(nowMs);
+
+    const bool destVolumeDrop = chargeDestVolume(p);
+    if (destVolumeDrop || shouldDropToLimitedDest(p)) {
+        lastDestDrop = true;
+        return true;
+    }
     pendingAnnounce = false;
     bool drop = false;
     const bool decoded = p->which_payload_variant == meshtastic_MeshPacket_decoded_tag;

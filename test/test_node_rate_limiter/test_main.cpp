@@ -655,6 +655,184 @@ static void test_dest_drop_does_not_apply_to_relay_only_limit()
     TEST_ASSERT_FALSE(limiter.lastDropWasDest());
 }
 
+static NodeNum destSender(uint32_t i)
+{
+    return 0x31110001u + i;
+}
+
+static bool chargeDestStormFrom(NodeRateLimiter &limiter, NodeNum dest, uint32_t n, uint32_t startMs, uint32_t senderBase)
+{
+    bool last = false;
+    for (uint32_t i = 0; i < n; i++) {
+        NodeRateLimiter::testNowOverride = startMs + i;
+        auto p = makePacket(destSender(senderBase + i), dest, 3, 3, 0, meshtastic_PortNum_NODEINFO_APP, 8000 + senderBase + i);
+        last = limiter.shouldDrop(&p);
+    }
+    return last;
+}
+
+static bool chargeDestStorm(NodeRateLimiter &limiter, NodeNum dest, uint32_t n, uint32_t startMs)
+{
+    return chargeDestStormFrom(limiter, dest, n, startMs, 0);
+}
+
+static void test_dest_volume_trips_at_20_with_sender_diversity()
+{
+    prepareEnv();
+    NodeRateLimiter limiter;
+    const NodeNum dest = 0x0D057001;
+    for (uint32_t i = 0; i < 19; i++) {
+        NodeRateLimiter::testNowOverride = i;
+        auto p = makePacket(destSender(i), dest, 3, 3, 0, meshtastic_PortNum_NODEINFO_APP, 8100 + i);
+        TEST_ASSERT_FALSE_MESSAGE(limiter.shouldDrop(&p), "dest charge must not trip before 20");
+    }
+    TEST_ASSERT_FALSE(limiter.debugDestLimited(dest));
+    TEST_ASSERT_TRUE(limiter.debugDestSenders(dest) >= NodeRateLimiter::DEST_MIN_SENDERS);
+
+    NodeRateLimiter::testNowOverride = 19;
+    const NodeNum lastFrom = destSender(19);
+    auto trip = makePacket(lastFrom, dest, 3, 3, 0, meshtastic_PortNum_NODEINFO_APP, 8119);
+    TEST_ASSERT_TRUE(limiter.shouldDrop(&trip));
+    TEST_ASSERT_TRUE(limiter.debugDestLimited(dest));
+    TEST_ASSERT_TRUE(limiter.lastDropWasDest());
+    TEST_ASSERT_FALSE_MESSAGE(limiter.debugTracksOriginator(lastFrom), "dest-volume drop must not charge the responder");
+}
+
+static void test_dest_volume_trips_with_exactly_three_senders()
+{
+    prepareEnv();
+    NodeRateLimiter limiter;
+    const NodeNum dest = 0x0D057008;
+    const NodeNum senders[3] = {destSender(0), destSender(1), destSender(2)};
+    for (uint32_t i = 0; i < 20; i++) {
+        NodeRateLimiter::testNowOverride = i;
+        auto p = makePacket(senders[i % 3], dest, 3, 3, 0, meshtastic_PortNum_NODEINFO_APP, 8200 + i);
+        limiter.shouldDrop(&p);
+    }
+    TEST_ASSERT_TRUE(limiter.debugDestLimited(dest));
+    TEST_ASSERT_EQUAL(3, limiter.debugDestSenders(dest));
+}
+
+static void test_dest_volume_does_not_trip_from_two_senders()
+{
+    prepareEnv();
+    NodeRateLimiter limiter;
+    const NodeNum dest = 0x0D057002;
+    const NodeNum senders[2] = {destSender(0), destSender(1)};
+    for (uint32_t i = 0; i < 24; i++) {
+        NodeRateLimiter::testNowOverride = i;
+        auto p = makePacket(senders[i % 2], dest, 3, 3, 0, meshtastic_PortNum_NODEINFO_APP, 8300 + i);
+        limiter.shouldDrop(&p);
+        TEST_ASSERT_FALSE_MESSAGE(limiter.debugDestLimited(dest), "two senders must not dest-volume trip");
+    }
+    TEST_ASSERT_EQUAL(2, limiter.debugDestSenders(dest));
+    TEST_ASSERT_EQUAL(24, limiter.debugDestCharge(dest));
+}
+
+static void test_dest_volume_does_not_charge_text_or_routing()
+{
+    prepareEnv();
+    NodeRateLimiter limiter;
+    const NodeNum dest = 0x0D057003;
+    for (uint32_t i = 0; i < 20; i++) {
+        NodeRateLimiter::testNowOverride = i;
+        auto text = makePacket(destSender(i), dest, 3, 3, 0, meshtastic_PortNum_TEXT_MESSAGE_APP, 8400 + i);
+        TEST_ASSERT_FALSE(limiter.shouldDrop(&text));
+        auto routing = makePacket(destSender(100 + i), dest, 3, 3, 0, meshtastic_PortNum_ROUTING_APP, 8500 + i);
+        TEST_ASSERT_FALSE(limiter.shouldDrop(&routing));
+    }
+    TEST_ASSERT_FALSE(limiter.debugTracksDest(dest));
+    TEST_ASSERT_FALSE(limiter.debugDestLimited(dest));
+}
+
+static void test_dest_volume_ignores_non_rebroadcast_and_non_default()
+{
+    prepareEnv();
+    NodeRateLimiter limiter;
+    const NodeNum dest = 0x0D057004;
+    for (uint32_t i = 0; i < 20; i++) {
+        NodeRateLimiter::testNowOverride = i;
+        auto noRelay = makePacket(destSender(i), dest, 0, 0, 0, meshtastic_PortNum_NODEINFO_APP, 8600 + i);
+        TEST_ASSERT_FALSE(limiter.shouldDrop(&noRelay));
+        NodeRateLimiter::testOnDefaultChannelOverride = 0;
+        auto privateReply = makePacket(destSender(50 + i), dest, 3, 3, 0, meshtastic_PortNum_NODEINFO_APP, 8700 + i);
+        TEST_ASSERT_FALSE(limiter.shouldDrop(&privateReply));
+        NodeRateLimiter::testOnDefaultChannelOverride = -1;
+    }
+    TEST_ASSERT_FALSE(limiter.debugDestLimited(dest));
+}
+
+static void test_dest_volume_dest_drops_text_after_trip()
+{
+    prepareEnv();
+    NodeRateLimiter limiter;
+    const NodeNum dest = 0x0D057005;
+    TEST_ASSERT_TRUE(chargeDestStorm(limiter, dest, 20, 0));
+    auto text = makePacket(0xAAAA0001, dest, 3, 3, 0, meshtastic_PortNum_TEXT_MESSAGE_APP, 8800);
+    TEST_ASSERT_TRUE(limiter.shouldDrop(&text));
+    TEST_ASSERT_TRUE(limiter.lastDropWasDest());
+    TEST_ASSERT_FALSE_MESSAGE(limiter.debugTracksOriginator(0xAAAA0001), "dest-drop must not charge the TEXT sender");
+    TEST_ASSERT_TRUE_MESSAGE(limiter.wouldDrop(&text), "wouldDrop must dest-drop a dest-volume sink");
+}
+
+static void test_dest_volume_clears_after_quiet_window()
+{
+    prepareEnv();
+    NodeRateLimiter limiter;
+    const NodeNum dest = 0x0D057006;
+    TEST_ASSERT_TRUE(chargeDestStorm(limiter, dest, 20, 0));
+    TEST_ASSERT_TRUE(limiter.debugDestLimited(dest));
+
+    NodeRateLimiter::testNowOverride = 1000 + 20;
+    auto firstRoll = makePacket(destSender(40), dest, 3, 3, 0, meshtastic_PortNum_NODEINFO_APP, 8900);
+    TEST_ASSERT_TRUE(limiter.shouldDrop(&firstRoll));
+    TEST_ASSERT_TRUE(limiter.debugDestLimited(dest));
+
+    NodeRateLimiter::testNowOverride = 2000 + 21;
+    auto secondRoll = makePacket(destSender(41), dest, 3, 3, 0, meshtastic_PortNum_NODEINFO_APP, 8901);
+    TEST_ASSERT_FALSE(limiter.shouldDrop(&secondRoll));
+    TEST_ASSERT_FALSE(limiter.debugDestLimited(dest));
+}
+
+static void test_dest_volume_eviction_keeps_a_limited_dest()
+{
+    prepareEnv();
+    NodeRateLimiter limiter;
+    const NodeNum keep = 0x0D0500AA;
+    TEST_ASSERT_TRUE(chargeDestStorm(limiter, keep, 20, 0));
+    TEST_ASSERT_TRUE(limiter.debugDestLimited(keep));
+
+    for (uint32_t i = 0; i < NodeRateLimiter::MAX_DEST_ENTRIES; i++) {
+        NodeRateLimiter::testNowOverride = 100 + i;
+        const NodeNum dest = 0x0D051000 + i;
+        auto p = makePacket(destSender(80 + i), dest, 3, 3, 0, meshtastic_PortNum_NODEINFO_APP, 9000 + i);
+        TEST_ASSERT_FALSE(limiter.shouldDrop(&p));
+    }
+    TEST_ASSERT_TRUE_MESSAGE(limiter.debugDestLimited(keep), "a dest-volume limited sink must not be evicted");
+    TEST_ASSERT_TRUE(limiter.debugTracksDest(keep));
+}
+
+static void test_dest_volume_full_limited_table_does_not_evict()
+{
+    prepareEnv();
+    NodeRateLimiter limiter;
+    NodeNum kept[NodeRateLimiter::MAX_DEST_ENTRIES] = {};
+    for (uint32_t i = 0; i < NodeRateLimiter::MAX_DEST_ENTRIES; i++) {
+        const NodeNum dest = 0x0D052000 + i;
+        kept[i] = dest;
+        TEST_ASSERT_TRUE(chargeDestStormFrom(limiter, dest, 20, i * 20, i * 20));
+        TEST_ASSERT_TRUE(limiter.debugDestLimited(dest));
+    }
+
+    const NodeNum extra = 0x0D052FFF;
+    chargeDestStormFrom(limiter, extra, 20, 200, 200);
+    TEST_ASSERT_FALSE_MESSAGE(limiter.debugDestLimited(extra), "a full table of dest-volume bans must not open a ninth slot");
+    TEST_ASSERT_FALSE(limiter.debugTracksDest(extra));
+    for (uint32_t i = 0; i < NodeRateLimiter::MAX_DEST_ENTRIES; i++) {
+        TEST_ASSERT_TRUE_MESSAGE(limiter.debugDestLimited(kept[i]), "limited dest must survive a full table");
+    }
+}
+
 } // namespace
 
 void setUp(void) {}
@@ -703,6 +881,15 @@ void setup()
     RUN_TEST(test_young_announce_respects_refractory_and_congestion);
     RUN_TEST(test_default_channel_unicast_to_limited_originator_is_dropped);
     RUN_TEST(test_dest_drop_does_not_apply_to_relay_only_limit);
+    RUN_TEST(test_dest_volume_trips_at_20_with_sender_diversity);
+    RUN_TEST(test_dest_volume_trips_with_exactly_three_senders);
+    RUN_TEST(test_dest_volume_does_not_trip_from_two_senders);
+    RUN_TEST(test_dest_volume_does_not_charge_text_or_routing);
+    RUN_TEST(test_dest_volume_ignores_non_rebroadcast_and_non_default);
+    RUN_TEST(test_dest_volume_dest_drops_text_after_trip);
+    RUN_TEST(test_dest_volume_clears_after_quiet_window);
+    RUN_TEST(test_dest_volume_eviction_keeps_a_limited_dest);
+    RUN_TEST(test_dest_volume_full_limited_table_does_not_evict);
     exit(UNITY_END());
 }
 
