@@ -896,7 +896,10 @@ private:
     NodeNum getPlaceholderForRelay(uint8_t relayId) const;
     void replaceGatewayNode(NodeNum oldNode, NodeNum newNode);
     bool isPlaceholderConnectedToUs(NodeNum placeholderId) const;
-    bool hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum heardFrom, NodeNum destination = 0);
+    bool hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum heardFrom, NodeNum destination, uint32_t packetId);
+    bool unicastCanFinish(NodeNum node, NodeNum destination) const;
+    uint16_t unicastCandidateCost(NodeNum node, NodeNum destination, NodeNum myNextHop) const;
+    bool unicastDupeCancels(const meshtastic_MeshPacket *p, NodeNum dupeRelayer);
     bool isNodeRoutable(NodeNum nodeId) const;
     void logNetworkTopology();
 

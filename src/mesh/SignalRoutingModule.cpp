@@ -1282,7 +1282,7 @@ bool SignalRoutingModule::isPlaceholderConnectedToUs(NodeNum placeholderId) cons
     return false;
 }
 
-bool SignalRoutingModule::hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum heardFrom, NodeNum destination)
+bool SignalRoutingModule::hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum heardFrom, NodeNum destination, uint32_t packetId)
 {
     if (!routingGraph || heardFrom == 0 || heardFrom == myNode)
         return false;
@@ -1299,6 +1299,12 @@ bool SignalRoutingModule::hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum 
         // Only consider SR-active neighbors
         CapabilityStatus status = getCapabilityStatus(neighbor);
         if (status != CapabilityStatus::SRactive)
+            continue;
+
+        // Unicast: a neighbour that *could* hear the transmitter is not enough — they must
+        // already hold this copy, otherwise we may be the sole hearer.
+        if (destination != 0 &&
+            !routingGraph->hasNodeTransmitted(neighbor, packetId, millis() / 1000))
             continue;
 
         const NodeEdges *neighborEdges = routingGraph->getEdgesFrom(neighbor);
@@ -1952,10 +1958,12 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
                               p->next_hop == nodeDB->getLastByteOfNodeNum(myNode);
     const char *suppressReason = nullptr;
 
-    // If src and dst are both downstream of the same relay, that relay handles delivery.
+    // If src and dst are both downstream of the same relay, that relay handles delivery —
+    // only once it is known to hold this copy. Otherwise we may be the sole hearer.
     NodeNum sourceRelay = routingGraph->getDownstreamRelay(sourceNode);
     NodeNum destRelay = routingGraph->getDownstreamRelay(destination);
-    if (!weAreDesignatedHop && sourceRelay != 0 && sourceRelay == destRelay && sourceRelay != myNode) {
+    if (!weAreDesignatedHop && sourceRelay != 0 && sourceRelay == destRelay && sourceRelay != myNode &&
+        (sourceRelay == heardFrom || routingGraph->hasNodeTransmitted(sourceRelay, p->id, currentTime))) {
         char relayName[64];
         getNodeDisplayName(sourceRelay, relayName, sizeof(relayName));
         LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: src and dst downstream of %s", p->id, srcName, destName, relayName);
@@ -1978,7 +1986,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
                 return false;
             }
             suppressReason = "heardFrom can finish";
-        } else if (hasBetterPositionedSRNeighbor(myNode, heardFrom, destination)) {
+        } else if (hasBetterPositionedSRNeighbor(myNode, heardFrom, destination, p->id)) {
             LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: neighbor covering %s reaches dst", p->id, srcName, destName, heardFromName);
             if (!relayerNamed) {
                 return false;
@@ -2009,7 +2017,8 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     //   - No usable path                        → skip
     //
     // Each node independently picks the same ordering; the one assigned our slot sets
-    // pendingRelayDelayMs and returns true.  Any dupe cancels our queued relay.
+    // pendingRelayDelayMs and returns true. A heard copy cancels that backup only when the
+    // transmitter can finish or is ranked ahead with a path.
 
     uint32_t halfAirtime = SR_FALLBACK_HALF_AIRTIME_MS;
     uint32_t airtimeMs = 300;
@@ -2083,46 +2092,13 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         }
     }
 
-    // Returns the candidate's cost to reach destination, in three tiers that never overlap:
-    //   direct edge to destination      -> etxFixed (clamped below 0x7FFF)
-    //   known downstream relay of dest  -> 0x7FFF (the downstream table is often the only knowledge
-    //                                      we have of a gateway's branch before its topology arrives)
-    //   edge to the shared next hop     -> etxFixed | 0x8000
     // Costs are compared in half-ETX buckets. Each node prices its own link from its own
     // measurements and a peer's link from the peer's packed report, so near-equal costs differ by a
     // few hundredths in a direction that varies per node; exact comparison ranked two colocated
     // nodes in opposite orders and both took the same slot. Within a bucket the node-id tie-break
     // below decides identically everywhere.
-    auto bucket = [](uint16_t etxFixed) -> uint16_t { return (uint16_t)(etxFixed / SR_COST_BUCKET_FIXED * SR_COST_BUCKET_FIXED); };
-    // A listing is not a path and the lister's own ETX measures the other direction, so every
-    // tier asks canDeliver and prices the hop at its receiver.
-    auto deliveryCostFixed = [&](NodeNum from, NodeNum to) -> uint16_t {
-        if (!routingGraph->canDeliver(from, to, routePolicy())) {
-            return UINT16_MAX;
-        }
-        float cost = routingGraph->hopCost(from, to);
-        if (cost <= 0.0f) {
-            return UINT16_MAX;
-        }
-        return (uint16_t)std::min(cost * 100.0f, 32766.0f);
-    };
     auto getCandidateCost = [&](NodeNum node) -> uint16_t {
-        uint16_t direct = deliveryCostFixed(node, destination);
-        if (direct != UINT16_MAX) {
-            return bucket(std::min<uint16_t>(direct, 0x7FFEu));
-        }
-        NodeNum dsRelay = routingGraph->getDownstreamRelay(destination);
-        if (dsRelay != 0 && dsRelay == node) {
-            return 0x7FFFu;
-        }
-        // A neighbour reaching "us" is not a path when the route picker fell back to us.
-        if (myNextHop != 0 && myNextHop != destination && myNextHop != myNode && myNextHop != node) {
-            uint16_t shared = deliveryCostFixed(node, myNextHop);
-            if (shared != UINT16_MAX) {
-                return bucket(std::min<uint16_t>(shared, 0x7FFFu)) | 0x8000u;
-            }
-        }
-        return UINT16_MAX;
+        return unicastCandidateCost(node, destination, myNextHop);
     };
 
     const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
@@ -2297,7 +2273,6 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     // separated by this and nothing else, and at zero neither copy cancels the other.
     const uint32_t jitterRange = std::max(halfAirtime / 2, SR_MIN_TIE_BREAK_RANGE_MS);
     const uint32_t jitter = (((uint32_t)(myNode ^ p->id)) % jitterRange) + 1;
-    const uint32_t MAX_UNICAST_RELAY_HOLD_MS = 2000;
 
     LOG_INFO("[SR] Uni slots 0x%08x to %s: half=%ums %u cands leader=%ums j=%dms",
              p->id, destName, halfAirtime, srCount, leaderWait, (int)jitter);
@@ -2322,7 +2297,6 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
             totalDelay = (int64_t)srUnicastSlotDelayMs(slotDelay, slotIndex, earliestMs, leaderWait, halfAirtime);
             totalDelay += (int64_t)jitter;
             if (totalDelay < 0) totalDelay = 0;
-            if ((uint64_t)totalDelay > MAX_UNICAST_RELAY_HOLD_MS) totalDelay = MAX_UNICAST_RELAY_HOLD_MS;
             shouldRelay = true;
             myDelay = (uint32_t)totalDelay;
             LOG_INFO("[SR] Unicast slot %ums: US (%08x) — rank %u, cost=%.2f", myDelay, myNode, slotIndex,
@@ -2684,6 +2658,89 @@ void SignalRoutingModule::cancelBroadcastRetransmit(PacketId packetId)
     }
 }
 
+bool SignalRoutingModule::unicastCanFinish(NodeNum node, NodeNum destination) const
+{
+    if (!routingGraph || node == 0) {
+        return false;
+    }
+    if (routingGraph->getDownstreamRelay(destination) == node) {
+        return true;
+    }
+    return routingGraph->canDeliver(node, destination, routePolicy()) &&
+           routingGraph->hopCost(node, destination) > 0.0f;
+}
+
+uint16_t SignalRoutingModule::unicastCandidateCost(NodeNum node, NodeNum destination, NodeNum myNextHop) const
+{
+    if (!routingGraph || !nodeDB) {
+        return UINT16_MAX;
+    }
+    NodeNum myNode = nodeDB->getNodeNum();
+    auto bucket = [](uint16_t etxFixed) -> uint16_t {
+        return (uint16_t)(etxFixed / SR_COST_BUCKET_FIXED * SR_COST_BUCKET_FIXED);
+    };
+    auto deliveryCostFixed = [&](NodeNum from, NodeNum to) -> uint16_t {
+        if (!routingGraph->canDeliver(from, to, routePolicy())) {
+            return UINT16_MAX;
+        }
+        float cost = routingGraph->hopCost(from, to);
+        if (cost <= 0.0f) {
+            return UINT16_MAX;
+        }
+        return (uint16_t)std::min(cost * 100.0f, 32766.0f);
+    };
+    uint16_t direct = deliveryCostFixed(node, destination);
+    if (direct != UINT16_MAX) {
+        return bucket(std::min<uint16_t>(direct, 0x7FFEu));
+    }
+    NodeNum dsRelay = routingGraph->getDownstreamRelay(destination);
+    if (dsRelay != 0 && dsRelay == node) {
+        return 0x7FFFu;
+    }
+    if (myNextHop != 0 && myNextHop != destination && myNextHop != myNode && myNextHop != node) {
+        uint16_t shared = deliveryCostFixed(node, myNextHop);
+        if (shared != UINT16_MAX) {
+            return bucket(std::min<uint16_t>(shared, 0x7FFFu)) | 0x8000u;
+        }
+    }
+    return UINT16_MAX;
+}
+
+static bool unicastRankedAhead(NodeNum a, uint16_t aCost, NodeNum b, uint16_t bCost, uint32_t packetId)
+{
+    const bool preferHighId = (packetId & 1) != 0;
+    return aCost < bCost || (aCost == bCost && (preferHighId ? a > b : a < b));
+}
+
+bool SignalRoutingModule::unicastDupeCancels(const meshtastic_MeshPacket *p, NodeNum dupeRelayer)
+{
+    if (!routingGraph || !nodeDB || !p) {
+        return false;
+    }
+    NodeNum myNode = nodeDB->getNodeNum();
+    NodeNum destination = p->to;
+    bool weFinish = unicastCanFinish(myNode, destination);
+    if (dupeRelayer == 0 || dupeRelayer == myNode || isPlaceholderNode(dupeRelayer)) {
+        return !weFinish;
+    }
+    if (unicastCanFinish(dupeRelayer, destination)) {
+        return true;
+    }
+    if (weFinish) {
+        return false;
+    }
+    NodeNum myNextHop = getNextHop(destination, p->from, 0, false);
+    uint16_t theirCost = unicastCandidateCost(dupeRelayer, destination, myNextHop);
+    if (theirCost == UINT16_MAX) {
+        return false;
+    }
+    uint16_t myCost = unicastCandidateCost(myNode, destination, myNextHop);
+    if (myCost == UINT16_MAX) {
+        myCost = 0xFFFEu;
+    }
+    return unicastRankedAhead(dupeRelayer, theirCost, myNode, myCost, p->id);
+}
+
 bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p, NodeNum *uniqueNeighbor)
 {
     if (uniqueNeighbor) {
@@ -2714,6 +2771,22 @@ bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p,
 
     NodeNum myNode = nodeDB->getNodeNum();
 
+    if (!isBroadcast(p->to)) {
+        bool cancel = unicastDupeCancels(p, dupeRelayer);
+        char destName[64];
+        getNodeDisplayName(p->to, destName, sizeof(destName));
+        if (dupeRelayer == 0 || dupeRelayer == myNode) {
+            LOG_INFO("[SR] Uni dupe 0x%08x to %s: relay 0x%02x %s → %s", p->id, destName, p->relay_node,
+                     dupeRelayer == myNode ? "is us" : "unresolved", cancel ? "cancel" : "keep");
+        } else {
+            char relayerName[64];
+            getNodeDisplayName(dupeRelayer, relayerName, sizeof(relayerName));
+            LOG_INFO("[SR] Uni dupe 0x%08x to %s from %s: %s", p->id, destName, relayerName,
+                     cancel ? "canceling relay" : "keeping relay");
+        }
+        return cancel;
+    }
+
     if (dupeRelayer == 0) {
         LOG_INFO("[SR] Coverage 0x%08x: relay 0x%02x unresolved", p->id, p->relay_node);
         return false;
@@ -2725,28 +2798,6 @@ bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p,
 
     char relayerName[64];
     getNodeDisplayName(dupeRelayer, relayerName, sizeof(relayerName));
-
-    // Unicast: cancel only if the dupe relayer can actually reach the destination.
-    // If it cannot but we can (direct edge or destination is our downstream), keep our relay
-    // to ensure delivery — otherwise the message is lost even though we hold the best path.
-    if (!isBroadcast(p->to)) {
-        char destName[64];
-        getNodeDisplayName(p->to, destName, sizeof(destName));
-
-        bool dupeCanReachDest = hasDirectConnectivity(dupeRelayer, p->to) ||
-                                 routingGraph->getDownstreamRelay(p->to) == dupeRelayer;
-        bool weCanReachDest   = hasDirectConnectivity(myNode, p->to) ||
-                                 routingGraph->getDownstreamRelay(p->to) == myNode;
-
-        if (!dupeCanReachDest && weCanReachDest) {
-            LOG_INFO("[SR] Uni dupe 0x%08x to %s from %s: cannot reach dest",
-                     p->id, destName, relayerName);
-            return false;
-        }
-
-        LOG_INFO("[SR] Unicast dupe pkt=0x%08x to %s from %s: canceling relay", p->id, destName, relayerName);
-        return true;
-    }
 
     // Broadcast: accumulate all transmitters heard for this packet and check whether
     // they collectively cover all our neighbors.

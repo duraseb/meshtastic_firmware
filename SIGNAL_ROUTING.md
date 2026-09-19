@@ -346,7 +346,7 @@ Unicast relay failures are detected end-to-end: the original sender retransmits 
 
 ### Unicast Relay Coordination
 
-SignalRouting uses the same slot-based scheduling algorithm for unicasts as for broadcasts. Nodes that overhear a unicast packet independently compute a relay candidate ranking and schedule their TX at the assigned slot delay. If any node transmits before our slot fires, we cancel our queued relay unconditionally.
+SignalRouting uses the same slot-based scheduling algorithm for unicasts as for broadcasts. Nodes that overhear a unicast packet independently compute a relay candidate ranking and schedule their TX at the assigned slot delay. A heard copy cancels a later slot only when that transmitter can finish delivery (priced hop to dest, or dest's downstream) or is ranked ahead of us with a path; we keep the slot if we can finish and they cannot. An unresolved relay byte cancels only when we cannot finish ourselves.
 
 **Coordination Through Overhearing:**
 When a unicast packet is transmitted, nodes that overhear it can participate in relay coordination:
@@ -389,12 +389,12 @@ When the unicast was heard straight from its source and the source's topology li
 When SR approves a unicast relay, `NextHopRouter::sendRelay()` stamps SR's route pick as `next_hop` instead of the NodeDB-learned value, or clears the field when the route picker fell back to "relay it ourselves" (our own byte never goes on the wire). The incoming byte is never forwarded: it named us or a node that stayed silent, and legacy nodes relay a unicast only when the byte is clear or their own. A stamped next hop arms the usual relayer-side retransmissions, whose last retry clears the field and falls back to flooding.
 
 **Quick Suppression Checks (before slot scheduling):**
-- Source and destination both downstream of the same relay → suppress
-- `heardFrom` already has a direct edge or downstream relay path to destination → suppress
-- An SR neighbor that covers `heardFrom` can reach destination → suppress
+- Source and destination both downstream of the same relay → suppress only if that relay holds this copy (`heardFrom` or already transmitted this id)
+- `heardFrom` already can finish delivery (`canDeliver` or is dest's downstream) → suppress
+- An SR neighbor that covers `heardFrom` can reach destination → suppress only if they already transmitted this id
 
 **Dupe Cancellation:**
-When a dupe arrives for a committed unicast relay, `areAllNeighborsCovered()` evaluates whether the dupe relayer can reach the destination. If the dupe relayer has a direct edge or downstream path to the destination, our queued TX is canceled — the slot-based ordering guarantees earlier transmitters are better positioned. However, if the dupe relayer cannot reach the destination but we can (direct edge or downstream relay), our relay is kept to ensure delivery.
+When a dupe arrives for a committed unicast relay, `areAllNeighborsCovered()` / `unicastDupeCancels()` cancel only if the dupe relayer can finish delivery (priced hop or dest's downstream), or is ranked ahead of us with a path. If we can finish and they cannot, our relay is kept. An unresolved relay byte cancels only when we cannot finish (the designated or stock hop we were waiting for). Late unicast rungs are not clamped to 2 s — a clamp would bunch later slots onto the same instant.
 
 ## Broadcast Routing
 
@@ -1097,12 +1097,12 @@ Slot spacing is half the packet airtime, ensuring the next-slot node detects ong
 
 `shouldRelayUnicastForCoordination` mirrors the broadcast slot scheduler:
 
-1. **Quick suppression**: src+dst same downstream relay, heardFrom can reach dst, SR neighbor covering heardFrom can reach dst
+1. **Quick suppression**: src+dst same downstream relay that already holds this copy; heardFrom can finish; SR neighbor covering heardFrom already transmitted this id and can finish
 2. **No route → suppress**: `getNextHop(destination)` returns 0
 3. **Phase 1 — designated next_hop**: if `p->next_hop` is set, slot 0 belongs to it; if we ARE that node, relay at slot 0 immediately; otherwise advance slotDelay to slot 1
 4. **Phase 2 — SR candidates**: self + SR-active neighbors sorted ascending by cost-to-destination; first unassigned candidate gets the next slot
-5. **Slot assignment**: if it's our slot, `pendingRelayDelayMs` is set and we return true; otherwise suppress
-6. **Dupe cancellation**: if any dupe arrives before our TX fires, `isDupeRelayRedundant` unconditionally cancels our queued relay
+5. **Slot assignment**: if it's our slot, `pendingRelayDelayMs` is set and we return true; otherwise suppress. No 2 s delay clamp.
+6. **Dupe cancellation**: a heard copy cancels only when the transmitter can finish or is ranked ahead with a path; keep if we can finish and they cannot
 
 ```
 Slot timing example (150ms half-airtime, next_hop set, 2 SR nodes with direct edge to FCM6):
@@ -1111,7 +1111,7 @@ Slot timing example (150ms half-airtime, next_hop set, 2 SR nodes with direct ed
   Slot 1 (150ms):  SR node with lower ETX to destination (e.g. MBe4, ETX=1.2)
   Slot 2 (300ms):  SR node with higher ETX to destination (e.g. MBf1, ETX=1.8)
 
-MB9c transmits at slot 0. MBe4 hears it → isDupeRelayRedundant: any dupe → redundant → cancelSending. MBf1 also cancels.
+MB9c transmits at slot 0. MBe4 hears it → unicastDupeCancels: MB9c can finish or is ranked ahead → cancelSending. MBf1 also cancels.
 
 Slot timing example (150ms half-airtime, next_hop NOT set):
 
@@ -1133,7 +1133,7 @@ MB9c transmits at slot 0. MBe4 hears it → cancels.
 **Unicast Coordination:**
 - Uses the same slot-based scheduling as broadcasts, with ETX-to-destination as the ranking metric
 - Designated next_hop (from `p->next_hop`) gets slot 0; SR candidates sorted by cost start from slot 1 (or slot 0 if no next_hop)
-- Any dupe unconditionally cancels queued unicast relays — the slot ordering guarantees earlier transmitters are better positioned
+- Any dupe that can finish, or is ranked ahead with a path, cancels queued unicast relays; a worse-placed copy that cannot finish does not kill a last hop we can deliver
 - Falls back to broadcast-style relay for all destinations not reachable via SR topology
 
 **Network Adaptation:**
