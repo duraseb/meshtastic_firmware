@@ -278,7 +278,10 @@ class NeighborGraph {
 
     // Like updateDownstream, but ensures each destination has exactly one relay entry.
     // If the destination already exists with a different relay, the relay is replaced.
-    void updateDownstreamExclusive(NodeNum destination, NodeNum relay, float totalCost, uint32_t timestamp);
+    // `evenIfRelayHasEdge`: a former direct neighbour heard only via this relay must still
+    // become its downstream, even when the relay already published an edge to it.
+    void updateDownstreamExclusive(NodeNum destination, NodeNum relay, float totalCost, uint32_t timestamp,
+                                   bool evenIfRelayHasEdge = false);
 
     NodeNum getDownstreamRelay(NodeNum destination) const;
 
@@ -486,6 +489,11 @@ class NeighborGraph {
 
     /// Remove one directed edge, leaving both endpoints in the graph.
     bool removeEdge(NodeNum from, NodeNum to);
+
+    /// Drop our measured link to `neighbor` and their edge back to us. Used when we hear them
+    /// only through a relayer, so Dijkstra stops treating them as a last hop. Returns true if
+    /// our edge to them existed.
+    bool retractDirectLink(NodeNum myNode, NodeNum neighbor);
 
     void clearInferredEdgesToNode(NodeNum nodeId);
 

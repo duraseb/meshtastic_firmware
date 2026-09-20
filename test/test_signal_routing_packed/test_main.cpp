@@ -1003,6 +1003,59 @@ void test_a_silent_publisher_loses_our_direct_link()
     TEST_ASSERT_TRUE(hasEdge(gw, pub));
 }
 
+// A neighbour we used to hear, now heard only through a relay, must leave our direct set
+// immediately and sit behind that relay — otherwise unicasts keep aiming at a dead last hop.
+static void test_a_relayed_former_neighbour_becomes_downstream()
+{
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum traveller = 0x11111111;
+    constexpr NodeNum relay = 0x22222222;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, traveller, 1.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(traveller, me, 1.0f, 1000, Edge::Source::Mirrored);
+    graph.setEdgeHearsUs(me, traveller, true);
+    graph.updateEdge(me, relay, 1.0f, 1000, Edge::Source::Reported);
+    graph.setEdgeHearsUs(me, relay, true);
+    graph.updateEdge(relay, traveller, 1.2f, 1000, Edge::Source::Mirrored);
+    graph.updateEdge(traveller, relay, 1.2f, 1000, Edge::Source::Mirrored);
+    graph.setEdgeHearsUs(relay, traveller, true);
+
+    NeighborGraph::RoutePolicy publishes;
+    publishes.publishes = [](void *, NodeNum) { return true; };
+    graph.clearCache();
+    TEST_ASSERT_EQUAL_UINT32(traveller, graph.calculateRoute(traveller, 1000, publishes).nextHop);
+
+    TEST_ASSERT_TRUE(graph.retractDirectLink(me, traveller));
+    const uint32_t now = millis() / 1000;
+    graph.updateDownstreamExclusive(traveller, relay, 1.5f, now, true);
+
+    const NodeEdges *self = graph.getEdgesFrom(me);
+    TEST_ASSERT_NOT_NULL(self);
+    bool stillDirect = false;
+    for (uint8_t i = 0; i < self->edgeCount; i++) {
+        if (self->edges[i].to == traveller) {
+            stillDirect = true;
+            break;
+        }
+    }
+    TEST_ASSERT_FALSE(stillDirect);
+    TEST_ASSERT_TRUE(graph.isDownstream(traveller));
+    TEST_ASSERT_EQUAL_UINT32(relay, graph.getDownstreamRelay(traveller));
+
+    graph.clearCache();
+    Route viaRelay = graph.calculateRoute(traveller, 2000, publishes);
+    TEST_ASSERT_EQUAL_UINT32(relay, viaRelay.nextHop);
+
+    graph.updateEdge(me, traveller, 1.0f, 3000, Edge::Source::Reported);
+    graph.setEdgeHearsUs(me, traveller, true);
+    graph.clearDownstreamForDestination(traveller);
+    TEST_ASSERT_FALSE(graph.isDownstream(traveller));
+    graph.clearCache();
+    TEST_ASSERT_EQUAL_UINT32(traveller, graph.calculateRoute(traveller, 3000, publishes).nextHop);
+}
+
 void test_admits_coverage_credits_an_owned_neighbour()
 {
     // Admission and absorb must credit the same set: a relay that owns a silent neighbour
@@ -1869,6 +1922,7 @@ void setup()
     RUN_TEST(test_routing_through_us_confirms_the_sender_hears_us);
     RUN_TEST(test_a_guess_never_outranks_or_prices_a_measurement);
     RUN_TEST(test_a_silent_publisher_loses_our_direct_link);
+    RUN_TEST(test_a_relayed_former_neighbour_becomes_downstream);
     RUN_TEST(test_admits_coverage_credits_an_owned_neighbour);
     RUN_TEST(test_a_dropped_young_node_is_not_a_coverage_target);
     RUN_TEST(test_a_sticky_confirmation_behind_a_decayed_link_is_not_ours);

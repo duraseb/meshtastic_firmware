@@ -736,7 +736,8 @@ void NeighborGraph::updateDownstream(NodeNum destination, NodeNum relay, float t
     }
 }
 
-void NeighborGraph::updateDownstreamExclusive(NodeNum destination, NodeNum relay, float totalCost, uint32_t timestamp)
+void NeighborGraph::updateDownstreamExclusive(NodeNum destination, NodeNum relay, float totalCost, uint32_t timestamp,
+                                             bool evenIfRelayHasEdge)
 {
     if (destination == 0 || relay == 0 || destination == relay)
         return;
@@ -745,9 +746,11 @@ void NeighborGraph::updateDownstreamExclusive(NodeNum destination, NodeNum relay
     if (destination == myNode)
         return;
 
-    // Skip if the relay already has this destination as a direct edge — it's a neighbor, not downstream
+    // Skip if the relay already has this destination as a direct edge — it's a neighbor, not downstream.
+    // A travelling node we just stopped hearing still has to sit behind the relayer we heard, even
+    // when that relayer already published the edge.
     const NodeEdges *relayNode = findNeighbor(relay);
-    if (relayNode && findEdge(relayNode, destination))
+    if (!evenIfRelayHasEdge && relayNode && findEdge(relayNode, destination))
         return;
 
     uint16_t costFixed = static_cast<uint16_t>(std::min(totalCost * 100.0f, 65535.0f));
@@ -1187,6 +1190,19 @@ bool NeighborGraph::removeEdge(NodeNum from, NodeNum to)
     return false;
 }
 
+bool NeighborGraph::retractDirectLink(NodeNum myNode, NodeNum neighbor)
+{
+    if (myNode == 0 || neighbor == 0 || myNode == neighbor) {
+        return false;
+    }
+    bool removed = removeEdge(myNode, neighbor);
+    removeEdge(neighbor, myNode);
+    if (removed) {
+        routeCacheCount = 0;
+    }
+    return removed;
+}
+
 uint8_t NeighborGraph::pruneSilentPublishers(NodeNum myNode, uint32_t currentTimeSecs, uint32_t silenceSecs,
                                              const CoveragePolicy *policy)
 {
@@ -1208,8 +1224,7 @@ uint8_t NeighborGraph::pruneSilentPublishers(NodeNum myNode, uint32_t currentTim
     }
 
     for (uint8_t i = 0; i < count; i++) {
-        removeEdge(myNode, gone[i]);
-        removeEdge(gone[i], myNode);
+        retractDirectLink(myNode, gone[i]);
         LOG_INFO("[SR] %08x silent for %us — direct link retracted", gone[i], silenceSecs);
     }
     return count;

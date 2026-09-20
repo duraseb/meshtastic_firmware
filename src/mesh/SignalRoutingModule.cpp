@@ -858,6 +858,7 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     // Mirrored edges are not cleared on new topology versions — they age out naturally.
 
     // Process each neighbor from the decoded packed data
+    const bool senderIsDirect = hasReportedDirectEdge(p->from);
     for (uint8_t i = 0; i < neighborCount; i++) {
         const PackedNeighborEntry &neighbor = neighbors[i];
 
@@ -867,12 +868,14 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
             continue;
         }
 
-        // Process this neighbor directly - capability status was already handled for the main sender
-        updateGraphWithNeighbor(p->from, neighbor.nodeId, neighbor.rssi, neighbor.snr, neighbor.hearsUs);
+        // A sender we do not hear must not reinstall sender→us: Dijkstra would treat us as a
+        // last hop to them from a stale list after they moved behind a relay.
+        if (neighbor.nodeId != ourNode || senderIsDirect) {
+            updateGraphWithNeighbor(p->from, neighbor.nodeId, neighbor.rssi, neighbor.snr, neighbor.hearsUs);
+        }
 
         // Create gateway relationship ONLY for nodes we cannot hear directly
         bool hasDirectConnection = false;
-        NodeNum ourNode = nodeDB ? nodeDB->getNodeNum() : 0;
 
         // Never mark ourselves as downstream of anyone
         if (neighbor.nodeId == ourNode) {
@@ -1095,6 +1098,11 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
             }
 
             float etx = NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr, currentCostingSpreadingFactor());
+
+            NodeNum ourNode = nodeDB ? nodeDB->getNodeNum() : 0;
+            if (neighbor.nodeId == ourNode && !hasReportedDirectEdge(mp.from)) {
+                continue;
+            }
 
             // The sender published only that it hears this neighbour. The reverse direction is
             // our assumption of symmetry, so it must not outrank — and permanently block — the
@@ -1785,35 +1793,47 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
             // Relay node is actively participating, tracked via SR capability system
 
             // Record gateway relationship: inferredRelayer is gateway for mp.from
-            // But only if:
-            // 1. We have a direct connection to inferredRelayer (can hear them directly)
-            // 2. We don't have a direct connection to mp.from ourselves
-            // 3. We haven't already seen this source recently via a different relay
-            //    (prevents inflated downstream counts when SR cluster nodes re-relay the same traffic)
+            // when we have a Reported edge to the relayer. A former direct neighbour heard
+            // only through that relayer is retracted immediately — waiting for publisher
+            // silence left travelling unicasts aimed at a dead last hop.
             bool hasDirectConnectionToRelay = hasReportedDirectEdge(inferredRelayer);
+            bool wasDirectNeighbor = hasReportedDirectEdge(mp.from);
+            if (wasDirectNeighbor && nodeDB) {
+                if (routingGraph->retractDirectLink(nodeDB->getNodeNum(), mp.from)) {
+                    removeDirectSignal(mp.from);
+                    markTopologyDirty();
+                    LOG_INFO("[SR] %08x heard only via %08x: direct link retracted",
+                             mp.from, inferredRelayer);
+                }
+            }
 
             // Infer downstream relationship based on hop count and source capability:
+            // - Former direct neighbour heard only via this relay: always infer — they moved.
             // - Single-hop (hop_start - hop_limit == 1): always infer — sender went directly through
             //   inferredRelayer to reach us, so sender is definitively downstream of that relay.
             // - Multi-hop, non-SR-aware source (Unknown/Legacy): also infer — stock nodes never
             //   advertise their own topology, so relay observation is the only signal we have.
             //   Even if inferredRelayer doesn't hear the sender directly (some intermediate relay
             //   exists), from piko's routing perspective the path still goes through inferredRelayer.
-            // - Multi-hop, SR-aware source: skip — the source broadcasts its own topology, which
-            //   captures relationships more accurately than hop-count inference.
+            // - Multi-hop, SR-aware source that was never our neighbour: skip — the source
+            //   broadcasts its own topology, which captures relationships more accurately.
             bool singleHopRelay = (mp.hop_start - mp.hop_limit) == 1;
             CapabilityStatus sourceStatus = getCapabilityStatus(mp.from);
             bool sourceIsSRAware = (sourceStatus == CapabilityStatus::SRactive ||
                                     sourceStatus == CapabilityStatus::Passive);
-            if (activeRouting && hasDirectConnectionToRelay && (singleHopRelay || !sourceIsSRAware)) {
+            if (activeRouting && hasDirectConnectionToRelay &&
+                (wasDirectNeighbor || singleHopRelay || !sourceIsSRAware)) {
                 // Nominal link per hop travelled: the relay's link to the source is not what we measured,
                 // and a multi-hop path must not price like a single good link.
                 uint8_t hopsUsed = mp.hop_start > mp.hop_limit ? mp.hop_start - mp.hop_limit : 1;
                 float inferredEtx = NeighborGraph::calculateETX(-70, 5.0f, currentCostingSpreadingFactor()) * hopsUsed;
-                routingGraph->updateDownstreamExclusive(mp.from, inferredRelayer, inferredEtx, millis() / 1000);
-                if (!singleHopRelay) {
+                routingGraph->updateDownstreamExclusive(mp.from, inferredRelayer, inferredEtx, millis() / 1000,
+                                                        wasDirectNeighbor);
+                if (!singleHopRelay && !wasDirectNeighbor) {
                     LOG_INFO("[SR] Downstream: %08x via %08x (%d hops, stock)",
                              mp.from, inferredRelayer, mp.hop_start - mp.hop_limit);
+                } else {
+                    LOG_INFO("[SR] Downstream: %08x via %08x", mp.from, inferredRelayer);
                 }
             } else if (activeRouting && hasDirectConnectionToRelay && !singleHopRelay) {
                 LOG_INFO("[SR] No downstream %08x via %08x: %d hops, SR",
