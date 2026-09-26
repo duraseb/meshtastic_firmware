@@ -2075,14 +2075,19 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
                  p->id, heardFromName);
         pendingUnicastNextHop = 0;
     }
-    // A backup that cannot name a next hop which hears us would clear the byte. Stock nodes
-    // that hear that copy then all relay, from a place the designated hop — the node that
-    // actually heard the previous transmitter — cannot. Leave the designated copy in place.
-    // If that node stays silent, the transmitter's own retry clears next_hop and floods.
-    if (relayerNamed && !weAreDesignatedHop && pendingUnicastNextHop == 0) {
-        LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: backup has no next hop that hears us "
-                 "(designated 0x%02x)",
+    // A backup transmits only when it will stamp a different hop from the one already on the
+    // packet and from the node it heard the packet from. Naming the designated hop again, or
+    // clearing the byte, is not another path: stock nodes flood from the wrong side of the
+    // mesh, and the originator treats any rebroadcast as an implicit ack and stops retrying.
+    // Leave the designated copy in place. If that node stays silent, its own retries repeat
+    // the stamp and then flood.
+    uint8_t stampByte = pendingUnicastNextHop != 0 ? nodeDB->getLastByteOfNodeNum(pendingUnicastNextHop) : 0;
+    bool stampIsDesignated = stampByte != 0 && stampByte == p->next_hop;
+    bool stampIsTransmitter = pendingUnicastNextHop != 0 && heardFrom != 0 && pendingUnicastNextHop == heardFrom;
+    if (relayerNamed && !weAreDesignatedHop && (pendingUnicastNextHop == 0 || stampIsDesignated || stampIsTransmitter)) {
+        LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: backup has no next hop past 0x%02x",
                  p->id, srcName, destName, p->next_hop);
+        pendingUnicastNextHop = 0;
         return false;
     }
 

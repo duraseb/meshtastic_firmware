@@ -673,6 +673,14 @@ static void test_a_backup_does_not_relay_when_its_next_hop_cannot_hear_it()
     verified = false;
     TEST_ASSERT_EQUAL_UINT32(hop, module.getNextHop(dest, previous, previous, false, &verified));
     TEST_ASSERT_TRUE(verified);
+    // The packet already names that hop. Stamping it again is not another path.
+    uni.hop_limit = 3;
+    uni.hop_start = 3;
+    TEST_ASSERT_FALSE(module.shouldRelayUnicastForCoordination(&uni));
+    // A different designated hop, and our route names someone else: take the later slot.
+    uni.next_hop = static_cast<uint8_t>(previous & 0xFF);
+    uni.id = 0x839bbed1;
+    TEST_ASSERT_TRUE(module.shouldRelayUnicastForCoordination(&uni));
 }
 
 // A confirmed path wins whenever one exists, however long; without one the node that hears the

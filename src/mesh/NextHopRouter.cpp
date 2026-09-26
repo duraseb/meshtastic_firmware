@@ -74,10 +74,10 @@ bool NextHopRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
 
         if (p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA) {
             rxDupe++;
-            // The one intermediate retry's last try clears next_hop and floods. Cancelling it on
-            // every duplicate meant a backup that cannot finish delivery also deleted that flood,
-            // so a designated hop that missed the frame had no second chance. Unicast uses the
-            // same predicate as the committed-relay cancel: keep the retry unless the duplicate's
+            // A relay replays its stamped header twice, then floods. Cancelling that series on
+            // every duplicate meant a backup that cannot finish delivery also deleted it, so a
+            // designated hop that missed the frame had no second chance. Unicast uses the same
+            // predicate as the committed-relay cancel: keep the retry unless the duplicate's
             // transmitter can finish, or is ranked ahead of us.
             bool stopRetry = true;
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
@@ -451,6 +451,11 @@ int32_t NextHopRouter::doRetransmissions()
                             LOG_INFO("Resetting next hop for packet with dest 0x%x\n", p.packet->to);
                             sentTo->next_hop = NO_NEXT_HOP_PREFERENCE;
                         }
+                        FloodingRouter::send(packetPool.allocCopy(*p.packet));
+                    } else if (!isFromUs(p.packet)) {
+                        // Replay the header sendRelay already stamped. NextHopRouter::send
+                        // would recompute next_hop and startRetransmission() would replace
+                        // this record, so the two directed tries never happened.
                         FloodingRouter::send(packetPool.allocCopy(*p.packet));
                     } else {
                         NextHopRouter::send(packetPool.allocCopy(*p.packet));
