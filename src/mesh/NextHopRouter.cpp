@@ -31,7 +31,21 @@ ErrorCode NextHopRouter::send(meshtastic_MeshPacket *p)
     p->relay_node = nodeDB->getLastByteOfNodeNum(getNodeNum()); // First set the relayer to us
     wasSeenRecently(p);                                         // FIXME, move this to a sniffSent method
 
-    p->next_hop = getNextHop(p->to, p->relay_node).value_or(NO_NEXT_HOP_PREFERENCE); // set the next hop
+    // NodeDB's learned byte is the stock fallback. An originated unicast from an SR node
+    // names the graph's next hop instead, so the first transmission already tells stock
+    // relays to stand down. A relayed copy is stamped later by sendRelay(); this path is
+    // the one ReliableRouter uses for packets we originate (and for our own retries).
+    uint8_t nextHopByte = getNextHop(p->to, p->relay_node).value_or(NO_NEXT_HOP_PREFERENCE);
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+    if (!isBroadcast(p->to) && isFromUs(p) && signalRoutingModule) {
+        bool verified = false;
+        NodeNum hop = signalRoutingModule->getNextHop(p->to, getNodeNum(), getNodeNum(), false, &verified);
+        if (verified && hop != 0 && hop != getNodeNum()) {
+            nextHopByte = nodeDB->getLastByteOfNodeNum(hop);
+        }
+    }
+#endif
+    p->next_hop = nextHopByte;
     LOG_DEBUG("Setting next hop for packet with dest %x to %x", p->to, p->next_hop);
 
     // If it's from us, ReliableRouter already handles retransmissions if want_ack is set. If a next hop is set and hop limit is
@@ -60,7 +74,20 @@ bool NextHopRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
 
         if (p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA) {
             rxDupe++;
-            stopRetransmission(p->from, p->id);
+            // The one intermediate retry's last try clears next_hop and floods. Cancelling it on
+            // every duplicate meant a backup that cannot finish delivery also deleted that flood,
+            // so a designated hop that missed the frame had no second chance. Unicast uses the
+            // same predicate as the committed-relay cancel: keep the retry unless the duplicate's
+            // transmitter can finish, or is ranked ahead of us.
+            bool stopRetry = true;
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+            if (!isBroadcast(p->to) && signalRoutingModule) {
+                stopRetry = signalRoutingModule->areAllNeighborsCovered(p);
+            }
+#endif
+            if (stopRetry) {
+                stopRetransmission(p->from, p->id);
+            }
         }
 
         // If it was a fallback to flooding, try to relay again

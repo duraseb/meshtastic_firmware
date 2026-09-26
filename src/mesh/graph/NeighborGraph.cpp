@@ -554,9 +554,15 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, c
 
             // The nodes N hears, at the cost N measured on their signal: the true cost of M -> N.
             const NodeEdges *nEdges = findNeighbor(n);
+            // Variance is EWMA(|ΔETX|)×20. Route cost is ETX×100, so one variance unit is
+            // 5 cost units. A link that keeps moving is a worse place to pin an exclusive
+            // next hop than a stable link with the same mean.
+            auto priced = [](const Edge &e) -> uint32_t {
+                return (uint32_t)e.etxFixed + (uint32_t)e.etxVariance * 5u;
+            };
             if (nEdges) {
                 for (uint8_t e = 0; e < nEdges->edgeCount; e++) {
-                    relax(nEdges->edges[e].to, n, uCost, nEdges->edges[e].etxFixed);
+                    relax(nEdges->edges[e].to, n, uCost, priced(nEdges->edges[e]));
                 }
             }
             // Nodes N confirmed hearing (hearsUs on their edge to N) and, for a node without lists,
@@ -570,9 +576,9 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, c
                 const Edge *toN = findEdge(&neighbors[i], n);
                 if (!toN) continue;
                 if (toN->hearsUs || !nPublishes) {
-                    relax(m, n, uCost, toN->etxFixed);
+                    relax(m, n, uCost, priced(*toN));
                 } else if (allowUnverified) {
-                    relax(m, n, uCost, (uint32_t)toN->etxFixed * UNVERIFIED_HOP_COST_FACTOR);
+                    relax(m, n, uCost, (uint32_t)toN->etxFixed * UNVERIFIED_HOP_COST_FACTOR + (uint32_t)toN->etxVariance * 5u);
                 }
             }
         }

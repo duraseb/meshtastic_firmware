@@ -4,6 +4,7 @@
 #include "mesh/SignalRoutingModule.h"
 #include <cmath>
 #include <cstring>
+#include <pb_encode.h>
 #include <unity.h>
 
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
@@ -558,6 +559,120 @@ static void test_route_cost_is_measured_at_the_receiver()
     TEST_ASSERT_EQUAL_UINT32(relay, route.nextHop);
     TEST_ASSERT_EQUAL_UINT16(500, route.costFixed);
     TEST_ASSERT_EQUAL_UINT8(2, route.hops);
+}
+
+// Variance is EWMA(|ΔETX|)×20 and one unit adds 5 to the ETX×100 route cost. The noisy hop has
+// the better mean, so it wins while both edges are quiet; once it swings, the stable hop is the
+// one a stamped next hop should name.
+static void test_variance_outranks_a_slightly_better_mean()
+{
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum stable = 0x11111111;
+    constexpr NodeNum noisy = 0x33333333;
+    constexpr NodeNum dest = 0x22222222;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    // Our own links first: a remote list is stored only once that node is already reachable.
+    graph.updateEdge(me, noisy, 1.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(me, stable, 1.0f, 1000, Edge::Source::Reported);
+    graph.updateEdge(noisy, dest, 1.0f, 1000, Edge::Source::Mirrored);
+    graph.updateEdge(stable, dest, 1.0f, 1000, Edge::Source::Mirrored);
+    graph.updateEdge(dest, noisy, 1.0f, 1000, Edge::Source::Mirrored);
+    graph.updateEdge(dest, stable, 1.5f, 1000, Edge::Source::Mirrored);
+    graph.updateEdge(noisy, me, 1.0f, 1000, Edge::Source::Mirrored);
+    graph.updateEdge(stable, me, 1.0f, 1000, Edge::Source::Mirrored);
+
+    NeighborGraph::RoutePolicy publishes;
+    publishes.publishes = [](void *, NodeNum) { return true; };
+    graph.clearCache();
+    Route quiet = graph.calculateRoute(dest, 1000, publishes);
+    TEST_ASSERT_EQUAL_UINT32(noisy, quiet.nextHop);
+    TEST_ASSERT_EQUAL_UINT16(200, quiet.costFixed);
+
+    const NodeEdges *destEdges = graph.getEdgesFrom(dest);
+    TEST_ASSERT_NOT_NULL(destEdges);
+    bool stamped = false;
+    for (uint8_t i = 0; i < destEdges->edgeCount; i++) {
+        if (destEdges->edges[i].to == noisy) {
+            const_cast<Edge &>(destEdges->edges[i]).etxVariance = 20;
+            stamped = true;
+        }
+    }
+    TEST_ASSERT_TRUE(stamped);
+    graph.clearCache();
+    Route swinging = graph.calculateRoute(dest, 1000, publishes);
+    TEST_ASSERT_EQUAL_UINT32(stable, swinging.nextHop);
+    TEST_ASSERT_EQUAL_UINT16(250, swinging.costFixed);
+}
+
+// Feed one neighbour list so the sender is recorded as an SR publisher and the edge exists.
+static void ingestOneNeighbor(SignalRoutingModule &module, NodeNum from, NodeNum neighbor, bool hearsUs, uint32_t packetId)
+{
+    uint8_t packed[32] = {};
+    size_t packedLen = buildPackedBuffer(packed, sizeof(packed), neighbor, -90, 5, false, hearsUs, 0);
+    meshtastic_SignalRoutingInfo info = meshtastic_SignalRoutingInfo_init_zero;
+    info.packed_neighbors.size = packedLen;
+    memcpy(info.packed_neighbors.bytes, packed, packedLen);
+
+    uint8_t payload[96];
+    pb_ostream_t stream = pb_ostream_from_buffer(payload, sizeof(payload));
+    TEST_ASSERT_TRUE(pb_encode(&stream, &meshtastic_SignalRoutingInfo_msg, &info));
+
+    meshtastic_MeshPacket mp = meshtastic_MeshPacket_init_zero;
+    mp.from = from;
+    mp.to = NODENUM_BROADCAST;
+    mp.id = packetId;
+    mp.hop_start = 0;
+    mp.hop_limit = 0;
+    mp.relay_node = static_cast<uint8_t>(from & 0xFF);
+    mp.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    mp.decoded.portnum = meshtastic_PortNum_SIGNAL_ROUTING_APP;
+    mp.decoded.payload.size = stream.bytes_written;
+    memcpy(mp.decoded.payload.bytes, payload, stream.bytes_written);
+    module.preProcessSignalRoutingPacket(&mp);
+}
+
+// The confirmed route runs through a hop that hears the previous transmitter. That hop is only
+// stampable once it also hears us; a backup with nothing else to name must stay silent.
+static void test_a_backup_does_not_relay_when_its_next_hop_cannot_hear_it()
+{
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum previous = 0x63dc8f8c;
+    constexpr NodeNum hop = 0x32aca541;
+    constexpr NodeNum dest = 0xee594922;
+    initGraphTestNodeDb(me);
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+
+    class GraphWriter : public SignalRoutingModule {
+    public:
+        void note(NodeNum from, NodeNum to, bool hearsUs) { updateGraphWithNeighbor(from, to, -90, 5, hearsUs); }
+    };
+    GraphWriter module;
+    // Reachability before the published lists, or those lists are dropped.
+    module.note(me, hop, false);
+    module.note(hop, dest, true);
+    module.note(me, previous, true);
+    ingestOneNeighbor(module, dest, hop, true, 1);
+    ingestOneNeighbor(module, previous, hop, true, 2);
+
+    bool verified = true;
+    NodeNum refused = module.getNextHop(dest, previous, previous, false, &verified);
+    TEST_ASSERT_EQUAL_UINT32(me, refused);
+    TEST_ASSERT_FALSE(verified);
+
+    meshtastic_MeshPacket uni = meshtastic_MeshPacket_init_zero;
+    uni.from = previous;
+    uni.to = dest;
+    uni.id = 0x839bbed0;
+    uni.next_hop = static_cast<uint8_t>(hop & 0xFF);
+    uni.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    TEST_ASSERT_FALSE(module.shouldRelayUnicastForCoordination(&uni));
+
+    module.note(me, hop, true);
+    verified = false;
+    TEST_ASSERT_EQUAL_UINT32(hop, module.getNextHop(dest, previous, previous, false, &verified));
+    TEST_ASSERT_TRUE(verified);
 }
 
 // A confirmed path wins whenever one exists, however long; without one the node that hears the
@@ -1909,6 +2024,8 @@ void setup()
     RUN_TEST(test_a_candidates_coverage_is_who_listed_it);
     RUN_TEST(test_route_never_uses_a_one_way_edge);
     RUN_TEST(test_route_cost_is_measured_at_the_receiver);
+    RUN_TEST(test_variance_outranks_a_slightly_better_mean);
+    RUN_TEST(test_a_backup_does_not_relay_when_its_next_hop_cannot_hear_it);
     RUN_TEST(test_inbound_gateway_is_the_fallback_only_without_a_confirmed_path);
     RUN_TEST(test_topology_listing_peer_confirms_peer_hears_sender);
     RUN_TEST(test_covers_requires_evidence_and_a_sound_link);

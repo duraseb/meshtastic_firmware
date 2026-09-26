@@ -2075,6 +2075,16 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
                  p->id, heardFromName);
         pendingUnicastNextHop = 0;
     }
+    // A backup that cannot name a next hop which hears us would clear the byte. Stock nodes
+    // that hear that copy then all relay, from a place the designated hop — the node that
+    // actually heard the previous transmitter — cannot. Leave the designated copy in place.
+    // If that node stays silent, the transmitter's own retry clears next_hop and floods.
+    if (relayerNamed && !weAreDesignatedHop && pendingUnicastNextHop == 0) {
+        LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: backup has no next hop that hears us "
+                 "(designated 0x%02x)",
+                 p->id, srcName, destName, p->next_hop);
+        return false;
+    }
 
     // Heard straight from the source, and the source's own topology says the destination hears it:
     // the destination most likely has the packet already. A routing ACK on that link is never
@@ -3561,6 +3571,27 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
             }
         }
 
+        // The copy we are about to send is transmitted by us, not by heardFrom. A next hop that
+        // hears the previous relay but not us will never see this frame, and stamping them makes
+        // every stock node stand down waiting for a relay that cannot happen from here.
+        NodeNum myNodeForStamp = nodeDB ? nodeDB->getNodeNum() : 0;
+        bool nextHopHearsUs = (route.nextHop == destination || route.nextHop == myNodeForStamp);
+        if (!nextHopHearsUs && myNodeForStamp != 0) {
+            const NodeEdges *stampEdges = routingGraph->getEdgesFrom(myNodeForStamp);
+            if (stampEdges) {
+                for (uint8_t i = 0; i < stampEdges->edgeCount; i++) {
+                    if (stampEdges->edges[i].to == route.nextHop && stampEdges->edges[i].hearsUs) {
+                        nextHopHearsUs = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (nextHopCanHearTransmitter && !nextHopHearsUs && route.nextHop != destination) {
+            LOG_INFO("[SR] Route via %s rejected: does not hear us", nextHopName);
+            nextHopCanHearTransmitter = false;
+        }
+
         if (nextHopCanHearTransmitter) {
             // Even if we have a route, check if any neighbor has a significantly better route
             // This ensures unicasts are forwarded to better-positioned nodes
@@ -3624,17 +3655,28 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
         }
 
         // Only use relay if we can verify connectivity (be conservative with stock nodes)
+        // and that relay hears the copy we would transmit. Connectivity to the previous
+        // transmitter is not enough: this frame leaves our radio.
+        bool relayHearsUs = false;
         if (relayCanHearTransmitter && !connectivityUnknown) {
             const NodeEdges* myEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
             if (myEdges) {
                 for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
-                    if (myEdges->edges[i].to == relayForDest) {
+                    if (myEdges->edges[i].to == relayForDest && myEdges->edges[i].hearsUs) {
+                        relayHearsUs = true;
+                    }
+                    if (myEdges->edges[i].to == relayForDest && relayHearsUs) {
                         char gwName[64];
                         getNodeDisplayName(relayForDest, gwName, sizeof(gwName));
                         LOG_INFO("[SR] No direct route to %s, but forwarding to relay %s", destName, gwName);
                         return relayForDest;
                     }
                 }
+            }
+            if (!relayHearsUs) {
+                char gwName[64];
+                getNodeDisplayName(relayForDest, gwName, sizeof(gwName));
+                LOG_INFO("[SR] Relay %s skipped: does not hear us", gwName);
             }
         } else {
             char gwName[64], heardFromName[64];
