@@ -160,9 +160,9 @@ struct Route {
     uint16_t costFixed; // Cost * 100 (fixed-point)
     uint32_t timestamp;
     uint8_t hops; // Path length, 1 for a direct neighbour; 0 from the downstream table or none
-    // Every hop confirmed by its receiver. False for the inbound-gateway fallback (a hop into a
-    // topology-publishing node that never confirmed the sender, at UNVERIFIED_HOP_COST_FACTOR times
-    // its cost) and for downstream-table routes.
+    // Every hop priced from the receiver's own measurement. False for the inbound-gateway fallback
+    // (a hop into a publisher that has not published a measurement of the sender, at
+    // UNVERIFIED_HOP_COST_FACTOR times the sender's reverse cost) and for downstream-table routes.
     bool verified;
 
     Route() : destination(0), nextHop(0), costFixed(0), timestamp(0), hops(0), verified(true) {}
@@ -235,13 +235,15 @@ class NeighborGraph {
 
     // Route to `destination`: a Dijkstra search run backwards from the destination over "who hears
     // whom". A settled node N is reached by the nodes that can deliver to it: the nodes N lists (N
-    // hears them, priced at the cost N measured on their signal), the nodes whose edge to N carries
-    // hearsUs (N confirmed it hears them), and, when N publishes no topology (publishesTopology(N)
-    // false), anyone who hears N. An edge is never used against its direction and every hop is
-    // priced at its receiver. nodeFilter gates intermediate hops only. When no confirmed path
-    // exists (nor a downstream-table one), the search runs again allowing unconfirmed hops at
-    // UNVERIFIED_HOP_COST_FACTOR times their cost, so the node that hears the far side still
-    // carries the frame out; that route is marked unverified.
+    // hears them, priced at the cost N measured on their signal) and, when N publishes no topology
+    // (publishesTopology(N) false), anyone who hears N. hearsUs on a sender's edge says N once
+    // heard that sender; it is not N's price. Into a publisher that has not listed the sender,
+    // that reverse measurement is only the fallback pass, at UNVERIFIED_HOP_COST_FACTOR times the
+    // sender's cost. An edge is never used against its direction, and a confirmed hop is priced at
+    // its receiver. nodeFilter gates intermediate hops only. When no path priced from receiver
+    // measurements exists (nor a downstream-table one), the search runs again allowing those
+    // reverse-only hops, so the node that hears the far side still carries the frame out; that
+    // route is marked unverified.
     // Predicates the route search asks the caller: may `node` relay (intermediate hops only), and
     // does `node` publish topology. Plain function pointers with a context, not std::function: the
     // image sits at the BLE OTA size limit and every std::function instantiation costs flash.
@@ -378,8 +380,16 @@ class NeighborGraph {
     bool knownToHear(NodeNum from, NodeNum to) const;
 
     // Cost of the hop from → to, priced at the receiver when it published a measurement of the
-    // sender, else at the sender's own. 0 when neither has an edge.
+    // sender, else at the sender's own. 0 when neither has a measured edge. This is the raw number.
+    // covers() uses it against the ceiling. The hop into a destination goes through
+    // deliveryHopCost(), which penalises a publisher that has not measured the arrival.
     float hopCost(NodeNum from, NodeNum to) const;
+
+    // Price of delivering from → to. The receiver's measurement when it published one. When the
+    // only measurement is the sender's and `receiverPublishes`, that reverse SNR is taken at
+    // UNVERIFIED_HOP_COST_FACTOR. A receiver that publishes nothing has no better number, so the
+    // sender's measurement stands. 0 when neither has a measured edge.
+    float deliveryHopCost(NodeNum from, NodeNum to, bool receiverPublishes) const;
 
     // Does a transmission by `from` reach `to` well enough to relieve a bystander of relaying?
     //

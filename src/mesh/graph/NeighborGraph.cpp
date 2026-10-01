@@ -565,9 +565,11 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, c
                     relax(nEdges->edges[e].to, n, uCost, priced(nEdges->edges[e]));
                 }
             }
-            // Nodes N confirmed hearing (hearsUs on their edge to N) and, for a node without lists,
-            // anyone hearing N. Priced at the sender's measurement of N, the best available. In the
-            // fallback pass an unconfirmed hop into a publishing node counts too, penalised.
+            // Nodes that hear N but that N has not listed. The edge stores their measurement of N,
+            // the reverse of M → N. hearsUs says N once confirmed hearing M; it is not N's price.
+            // A publisher that has not published that price is taken only in the fallback pass, at
+            // a penalty. A node that publishes nothing has no list coming, so the sender's
+            // measurement stands at face value.
             bool nPublishes = policy.publishes && policy.publishes(policy.ctx, n);
             for (uint8_t i = 0; i < neighborCount; i++) {
                 NodeNum m = neighbors[i].nodeId;
@@ -575,7 +577,7 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, c
                 if (nEdges && findEdge(nEdges, m)) continue; // already priced from N's own list
                 const Edge *toN = findEdge(&neighbors[i], n);
                 if (!toN) continue;
-                if (toN->hearsUs || !nPublishes) {
+                if (!nPublishes) {
                     relax(m, n, uCost, priced(*toN));
                 } else if (allowUnverified) {
                     relax(m, n, uCost, (uint32_t)toN->etxFixed * UNVERIFIED_HOP_COST_FACTOR + (uint32_t)toN->etxVariance * 5u);
@@ -1292,11 +1294,10 @@ bool NeighborGraph::knownToHear(NodeNum from, NodeNum to) const
 float NeighborGraph::hopCost(NodeNum from, NodeNum to) const
 {
     // An Inferred edge is skipped: it was minted at a nominal price because a frame once
-    // crossed the link, which says a path exists and nothing about what it costs. Everything
-    // that decides whether a transmission may be skipped reads this price — covers(),
-    // coverageOwner(), acknowledgementPrice() and the slot rankings — so a guess must not produce one.
-    // The route search prices its own hops from the edges directly and keeps using inferred
-    // edges for reachability, which is what they exist for.
+    // crossed the link, which says a path exists and nothing about what it costs. A guess must
+    // not produce a price. The route search prices its own hops from the edges directly and keeps
+    // using inferred edges for reachability, which is what they exist for.
+    // This is the raw number. covers() and the slot rankings use deliveryHopCost().
     const NodeEdges *toEdges = findNeighbor(to);
     if (const Edge *received = toEdges ? findEdge(toEdges, from) : nullptr) {
         if (Edge::isMeasured(received->source)) return received->getEtx();
@@ -1304,6 +1305,23 @@ float NeighborGraph::hopCost(NodeNum from, NodeNum to) const
     const NodeEdges *fromEdges = findNeighbor(from);
     if (const Edge *sent = fromEdges ? findEdge(fromEdges, to) : nullptr) {
         if (Edge::isMeasured(sent->source)) return sent->getEtx();
+    }
+    return 0.0f;
+}
+
+float NeighborGraph::deliveryHopCost(NodeNum from, NodeNum to, bool receiverPublishes) const
+{
+    const NodeEdges *toEdges = findNeighbor(to);
+    if (const Edge *received = toEdges ? findEdge(toEdges, from) : nullptr) {
+        if (Edge::isMeasured(received->source)) return received->getEtx();
+    }
+    const NodeEdges *fromEdges = findNeighbor(from);
+    if (const Edge *sent = fromEdges ? findEdge(fromEdges, to) : nullptr) {
+        if (Edge::isMeasured(sent->source)) {
+            float cost = sent->getEtx();
+            if (receiverPublishes) return cost * UNVERIFIED_HOP_COST_FACTOR;
+            return cost;
+        }
     }
     return 0.0f;
 }
@@ -1322,7 +1340,8 @@ bool NeighborGraph::unicastCanFinish(NodeNum node, NodeNum destination, const Ro
     if (getDownstreamRelay(destination) == node) {
         return true;
     }
-    return canDeliver(node, destination, policy) && hopCost(node, destination) > 0.0f;
+    bool publishes = policy.publishes && policy.publishes(policy.ctx, destination);
+    return canDeliver(node, destination, policy) && deliveryHopCost(node, destination, publishes) > 0.0f;
 }
 
 uint16_t NeighborGraph::unicastCandidateCost(NodeNum node, NodeNum destination, NodeNum myNode, NodeNum myNextHop,
@@ -1332,6 +1351,21 @@ uint16_t NeighborGraph::unicastCandidateCost(NodeNum node, NodeNum destination, 
         return (uint16_t)(etxFixed / SR_COST_BUCKET_FIXED * SR_COST_BUCKET_FIXED);
     };
     auto deliveryCostFixed = [&](NodeNum from, NodeNum to) -> uint16_t {
+        if (!canDeliver(from, to, policy)) {
+            return UINT16_MAX;
+        }
+        // The hop into the destination. A publisher that has not measured it is priced at the
+        // reverse SNR times the unverified factor, so a measured arrival ranks ahead of a
+        // cheaper reverse number. The shared-next-hop arm below stays on the raw price: two
+        // neighbours a few hundredths apart have to remain one bucket.
+        bool publishes = policy.publishes && policy.publishes(policy.ctx, to);
+        float cost = deliveryHopCost(from, to, publishes);
+        if (cost <= 0.0f) {
+            return UINT16_MAX;
+        }
+        return (uint16_t)std::min(cost * 100.0f, 32766.0f);
+    };
+    auto rawCostFixed = [&](NodeNum from, NodeNum to) -> uint16_t {
         if (!canDeliver(from, to, policy)) {
             return UINT16_MAX;
         }
@@ -1350,7 +1384,7 @@ uint16_t NeighborGraph::unicastCandidateCost(NodeNum node, NodeNum destination, 
         return 0x7FFFu;
     }
     if (myNextHop != 0 && myNextHop != destination && myNextHop != myNode && myNextHop != node) {
-        uint16_t shared = deliveryCostFixed(node, myNextHop);
+        uint16_t shared = rawCostFixed(node, myNextHop);
         if (shared != UINT16_MAX) {
             return bucket(std::min<uint16_t>(shared, 0x7FFFu)) | 0x8000u;
         }
@@ -1425,6 +1459,8 @@ bool NeighborGraph::covers(NodeNum from, NodeNum to, float poorLinkEtx, const Co
     // reach it: the policy carries the configured ceiling and a non-positive configuration is
     // rejected, so only direct graph-level callers see this.
     if (poorLinkEtx <= 0.0f) return true;
+    // Raw measurement against the ceiling. The reverse-only penalty is for route selection;
+    // applying it here dropped neighbours whose ETX is fine and whose hearsUs is real.
     float cost = hopCost(from, to);
     return cost > 0.0f && cost <= poorLinkEtx;
 }

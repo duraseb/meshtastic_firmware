@@ -1807,21 +1807,45 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                 }
             }
 
-            // Infer downstream relationship based on hop count and source capability:
-            // - Former direct neighbour heard only via this relay: always infer — they moved.
-            // - Single-hop (hop_start - hop_limit == 1): always infer — sender went directly through
-            //   inferredRelayer to reach us, so sender is definitively downstream of that relay.
-            // - Multi-hop, non-SR-aware source (Unknown/Legacy): also infer — stock nodes never
-            //   advertise their own topology, so relay observation is the only signal we have.
-            //   Even if inferredRelayer doesn't hear the sender directly (some intermediate relay
-            //   exists), from piko's routing perspective the path still goes through inferredRelayer.
+            // Infer downstream only when the relay hears us and the originator lists that relay.
+            // Hop count and source capability then decide which of those usable paths we keep:
+            // - Former direct neighbour heard only via this relay: they moved.
+            // - Single-hop (hop_start - hop_limit == 1): sender went through inferredRelayer.
+            // - Multi-hop, non-SR-aware source (Unknown/Legacy): stock nodes never advertise
+            //   their own topology, so relay observation is the only signal we have.
             // - Multi-hop, SR-aware source that was never our neighbour: skip — the source
             //   broadcasts its own topology, which captures relationships more accurately.
+            // Without the two facts above, the frame only says we heard the originator along the
+            // way, which is not a path we can send.
             bool singleHopRelay = (mp.hop_start - mp.hop_limit) == 1;
             CapabilityStatus sourceStatus = getCapabilityStatus(mp.from);
             bool sourceIsSRAware = (sourceStatus == CapabilityStatus::SRactive ||
                                     sourceStatus == CapabilityStatus::Passive);
-            if (activeRouting && hasDirectConnectionToRelay &&
+            // Hearing the originator via a relay is the other direction from delivering to them.
+            // Keep the row only when we can send to the relay and the originator lists it.
+            bool relayHearsUs = false;
+            if (nodeDB) {
+                const NodeEdges *mine = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
+                if (mine) {
+                    for (uint8_t i = 0; i < mine->edgeCount; i++) {
+                        if (mine->edges[i].to == inferredRelayer && mine->edges[i].hearsUs) {
+                            relayHearsUs = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            bool destinationListsRelay = false;
+            const NodeEdges *originEdges = routingGraph->getEdgesFrom(mp.from);
+            if (originEdges) {
+                for (uint8_t i = 0; i < originEdges->edgeCount; i++) {
+                    if (originEdges->edges[i].to == inferredRelayer) {
+                        destinationListsRelay = true;
+                        break;
+                    }
+                }
+            }
+            if (activeRouting && hasDirectConnectionToRelay && relayHearsUs && destinationListsRelay &&
                 (wasDirectNeighbor || singleHopRelay || !sourceIsSRAware)) {
                 // Nominal link per hop travelled: the relay's link to the source is not what we measured,
                 // and a multi-hop path must not price like a single good link.
@@ -1835,6 +1859,11 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                 } else {
                     LOG_INFO("[SR] Downstream: %08x via %08x", mp.from, inferredRelayer);
                 }
+            } else if (activeRouting && hasDirectConnectionToRelay &&
+                       (wasDirectNeighbor || singleHopRelay || !sourceIsSRAware) &&
+                       (!relayHearsUs || !destinationListsRelay)) {
+                LOG_INFO("[SR] No downstream %08x via %08x: relay hears us %d, originator lists relay %d",
+                         mp.from, inferredRelayer, relayHearsUs, destinationListsRelay);
             } else if (activeRouting && hasDirectConnectionToRelay && !singleHopRelay) {
                 LOG_INFO("[SR] No downstream %08x via %08x: %d hops, SR",
                          mp.from, inferredRelayer, mp.hop_start - mp.hop_limit);
