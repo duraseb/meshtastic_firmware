@@ -920,12 +920,13 @@ static constexpr float SF7_SNR_THRESHOLD_DB = -7.5f;
 static constexpr float SNR_THRESHOLD_STEP_DB_PER_SF = -2.5f;
 
 // Decode-margin breakpoints (dB above the preset's demodulator threshold) and the delivery
-// probability at each: steep across a narrow band around zero margin, because a LoRa demodulator is
-// close to a step function at its threshold, not a gradual slope over tens of dB the way path loss
-// is over distance. Flat below the first point and above the last.
-static constexpr float marginBreakDb[] = {-10.0f, -5.0f, -2.0f, 0.0f, 3.0f, 8.0f};
-static constexpr float marginProb[] = {0.025f, 0.05f, 0.10f, 0.15f, 0.50f, 0.95f};
-static constexpr int MARGIN_N = 6;
+// probability at each. Flat below the first point and above the last. The last point is +17 dB,
+// not +8: on ShortSlow that is SNR +7, and a link still climbing at SNR +2 (margin +12) costs half
+// an ETX more. The rise is already underway at +6 dB, so a 1 dB gap near the floor lands in a
+// later ranking bucket too. Below zero margin the curve is unchanged.
+static constexpr float marginBreakDb[] = {-10.0f, -5.0f, -2.0f, 0.0f, 6.0f, 12.0f, 17.0f};
+static constexpr float marginProb[] = {0.025f, 0.05f, 0.10f, 0.15f, 0.50f, 0.62f, 0.95f};
+static constexpr int MARGIN_N = 7;
 
 // RSSI quality factor breakpoints (dBm) and the multiplier at each: a mild, monotonic secondary
 // term — capture effect, interference margin, estimate confidence — never large enough to be a veto

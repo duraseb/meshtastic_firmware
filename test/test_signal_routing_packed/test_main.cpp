@@ -1594,15 +1594,15 @@ void test_both_links_are_usable_at_long_slow()
     TEST_ASSERT_TRUE(above <= 7.0f);
 }
 
-// +8 dB of margin or more is the saturation point; going further must not lower the ETX any more,
+// +17 dB of margin or more is the saturation point; going further must not lower the ETX any more,
 // at a fast preset (SF7, threshold -7.5) or a slow one (SF12, threshold -20).
 void test_margin_saturates_at_the_top_regardless_of_preset()
 {
-    float atCap = NeighborGraph::calculateETX(-60, -7.5f + 8.0f, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_FAST);
+    float atCap = NeighborGraph::calculateETX(-60, -7.5f + 17.0f, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_FAST);
     float pastCap = NeighborGraph::calculateETX(-60, 20.0f, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_FAST);
     TEST_ASSERT_EQUAL_FLOAT(atCap, pastCap);
 
-    float atCapSlow = NeighborGraph::calculateETX(-60, -20.0f + 8.0f, meshtastic_Config_LoRaConfig_ModemPreset_LONG_SLOW);
+    float atCapSlow = NeighborGraph::calculateETX(-60, -20.0f + 17.0f, meshtastic_Config_LoRaConfig_ModemPreset_LONG_SLOW);
     float pastCapSlow = NeighborGraph::calculateETX(-60, 20.0f, meshtastic_Config_LoRaConfig_ModemPreset_LONG_SLOW);
     TEST_ASSERT_EQUAL_FLOAT(atCapSlow, pastCapSlow);
 }
@@ -1739,8 +1739,8 @@ void test_margin_five_db_below_threshold_pins_the_low_breakpoint_probability()
     TEST_ASSERT_FLOAT_WITHIN(0.001f, 20.0f, etx);
 }
 
-// Margin pinned at the saturation point (SNR -2.0 at SHORT_SLOW is margin +8.0, so delivery
-// probability is flat at marginProb[5] = 0.95) isolates the RSSI term. At RSSI -110 dBm, strictly
+// Margin pinned at the saturation point (SNR +7.0 at SHORT_SLOW is margin +17.0, so delivery
+// probability is flat at 0.95) isolates the RSSI term. At RSSI -110 dBm, strictly
 // between rssiFactorBreakDbm's -120 and -60: t = (-110 - (-120)) / 60 = 1/6,
 // rssiFactor = 0.90 + (1/6)*0.10 = 0.91667, prob = 0.95 * 0.91667 = 0.87083,
 // ETX = 1/0.87083 = 1.14833. Moving rssiFactorBreakDbm[0] from -120 to -100 puts -110
@@ -1748,7 +1748,7 @@ void test_margin_five_db_below_threshold_pins_the_low_breakpoint_probability()
 // 1.16959 instead.
 void test_weak_rssi_at_saturated_margin_pins_the_rssi_floor_breakpoint()
 {
-    float etx = NeighborGraph::calculateETX(-110, -2.0f, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW);
+    float etx = NeighborGraph::calculateETX(-110, 7.0f, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW);
     TEST_ASSERT_FLOAT_WITHIN(0.0005f, 1.14833f, etx);
 }
 
