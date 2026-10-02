@@ -612,6 +612,17 @@ public:
         pendingUnicastNextHop = 0;
         return n;
     }
+    UnicastSlotFlags takePendingUnicastFlags()
+    {
+        UnicastSlotFlags f = pendingUnicastFlags;
+        pendingUnicastFlags = {};
+        return f;
+    }
+    UnicastSlotFlags unicastCommitFlags(PacketId packetId) const;
+    bool hasPricedDeliveryHop(NodeNum dest) const;
+    bool isSignalRoutingNode(NodeNum nodeId) const { return publishesTopology(nodeId); }
+    bool deliveringRelayerIsSR(const meshtastic_MeshPacket *p) const;
+    uint32_t nextHopCarryWaitMs(NodeNum nextHop, uint32_t airtimeMs, float rxSnr) const;
     void updateNodeActivityForPacket(NodeNum nodeId);
     void updateNodeActivityForPacketAndRelay(const meshtastic_MeshPacket *p);
     bool shouldRelay(const meshtastic_MeshPacket *p);
@@ -919,7 +930,8 @@ private:
         uint32_t txDelayMs = 0;
         NodeNum heardTransmitters[MAX_HEARD_TRANSMITTERS];
         uint8_t heardTransmitterCount = 0;
-        CommittedRelay() : packetId(0), originalHeardFrom(0), txDelayMs(0), heardTransmitterCount(0) {
+        UnicastSlotFlags unicastFlags;
+        CommittedRelay() : packetId(0), originalHeardFrom(0), txDelayMs(0), heardTransmitterCount(0), unicastFlags() {
             memset(heardTransmitters, 0, sizeof(heardTransmitters));
         }
     };
@@ -976,6 +988,7 @@ public:
     uint32_t pendingRelayDelayMs = 0; // Set by shouldRelayBroadcast, consumed by commitRelay
     // Set by shouldRelayUnicastForCoordination: the next hop to stamp on our relayed copy (0 = none).
     NodeNum pendingUnicastNextHop = 0;
+    UnicastSlotFlags pendingUnicastFlags;
 
     void commitRelay(PacketId packetId, NodeNum originalHeardFrom, uint32_t txDelayMs = 0);
     bool isCommittedRelay(PacketId packetId) const;

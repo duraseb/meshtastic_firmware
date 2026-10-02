@@ -341,6 +341,7 @@ void SignalRoutingModule::purgeGraphForPresetChange()
     committedRelayCount = 0;
     pendingRelayDelayMs = 0;
     pendingUnicastNextHop = 0;
+    pendingUnicastFlags = {};
     for (uint8_t i = 0; i < MAX_COMMITTED_RELAYS; i++) {
         committedRelays[i] = CommittedRelay();
     }
@@ -2080,6 +2081,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     // picker fell back to "relay it ourselves" (our own byte must never go on the wire: legacy nodes
     // would refuse the packet and SR peers would wait for a second copy from us).
     pendingUnicastNextHop = (myNextHop == myNode) ? 0 : myNextHop;
+    pendingUnicastFlags = {};
     // Containment. A route the search could only complete by admitting an unconfirmed hop is a
     // guess: the node it names never proved it hears the destination, and a stamped designation
     // makes every other candidate stand down and wait for a copy that node may have no way to
@@ -2109,16 +2111,8 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     // clearing the byte, is not another path: stock nodes flood from the wrong side of the
     // mesh, and the originator treats any rebroadcast as an implicit ack and stops retrying.
     // Leave the designated copy in place. If that node stays silent, its own retries repeat
-    // the stamp and then flood.
-    uint8_t stampByte = pendingUnicastNextHop != 0 ? nodeDB->getLastByteOfNodeNum(pendingUnicastNextHop) : 0;
-    bool stampIsDesignated = stampByte != 0 && stampByte == p->next_hop;
-    bool stampIsTransmitter = pendingUnicastNextHop != 0 && heardFrom != 0 && pendingUnicastNextHop == heardFrom;
-    if (relayerNamed && !weAreDesignatedHop && (pendingUnicastNextHop == 0 || stampIsDesignated || stampIsTransmitter)) {
-        LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: backup has no next hop past 0x%02x",
-                 p->id, srcName, destName, p->next_hop);
-        pendingUnicastNextHop = 0;
-        return false;
-    }
+    // the stamp and then flood. A flood salvage slot is the exception: it deliberately
+    // clears next_hop after named hops have had their chance. Applied after ranking.
 
     // Heard straight from the source, and the source's own topology says the destination hears it:
     // the destination most likely has the packet already. A routing ACK on that link is never
@@ -2127,6 +2121,14 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     // cancelSending(request_id) path; only silence lets the relay go. Colocated receivers lose about
     // half the frames of a very strong neighbour, so the relay must stay available, just not be first.
     uint32_t destAckWaitMs = 0;
+    uint32_t destAckDurationMs = 0;
+    {
+        uint32_t contention = 2 * halfAirtime;
+        if (router && router->getRadioInterface()) {
+            contention = router->getRadioInterface()->getTxDelayMsecMaxAtUtil();
+        }
+        destAckDurationMs = SR_PEER_TURNAROUND_MS + 2 * contention + airtimeMs;
+    }
     if (heardFrom == sourceNode) {
         const NodeEdges *srcEdges = routingGraph->getEdgesFrom(sourceNode);
         const Edge *srcToDest = nullptr;
@@ -2145,11 +2147,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
                 return false;
             }
             if (srcToDest->hearsUs) {
-                uint32_t contention = 2 * halfAirtime;
-                if (router && router->getRadioInterface()) {
-                    contention = router->getRadioInterface()->getTxDelayMsecMaxAtUtil();
-                }
-                destAckWaitMs = SR_PEER_TURNAROUND_MS + 2 * contention + airtimeMs;
+                destAckWaitMs = destAckDurationMs;
                 LOG_INFO("[SR] Unicast 0x%08x: %s hears %s directly, waiting %ums for ACK",
                          p->id, destName, srcName, destAckWaitMs);
             }
@@ -2196,6 +2194,10 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         if (ourLastByte == p->next_hop) {
             LOG_INFO("[SR-DEC] UNICAST RELAY 0x%08x %s->%s: designated next_hop (slot 0, %ums)",
                      p->id, srcName, destName, earliestMs);
+            if (getCandidateCost(myNode) < UNICAST_DOWNSTREAM_TIER) {
+                pendingUnicastNextHop = destination;
+            }
+            pendingUnicastFlags = {};
             pendingRelayDelayMs = earliestMs;
             routingGraph->recordNodeTransmission(myNode, p->id, currentTime);
             return true;
@@ -2257,7 +2259,6 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     }
 
     // Phase 2: SR candidates (including self) sorted by cost to destination.
-    struct UnicastCandidate { NodeNum nodeId; uint16_t cost; };
     UnicastCandidate srCandidates[8];
     uint8_t srCount = 0;
 
@@ -2316,6 +2317,14 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         srCandidates[j + 1] = key;
     }
 
+    const bool destSr = publishesTopology(destination);
+    if (!unicastKeepLastHopSlots(srCandidates, srCount, myNode, destSr)) {
+        LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: last hop reserved", p->id, srcName, destName);
+        pendingUnicastNextHop = 0;
+        pendingUnicastFlags = {};
+        return false;
+    }
+
     // Ordinal slot delay.
     //
     // Candidates hold slots in ranked order. Slot 0 keys up at the earliest floor that applies to
@@ -2323,53 +2332,96 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     // (its contention delay at the current channel utilization plus one airtime), then slots space
     // out by half an airtime. When Phase 1 reserved slot 0 for a designated next hop, the ranked
     // candidates follow that reservation instead.
-    // The earlier ETX-gap formula masked the tier bit off the costs, so with a downstream-tier
-    // leader every gap clamped to zero and a node ranked last fired at 0 ms.
+    // Last-hop backup waits for dest's ACK of the early last hop. A non-final flood slot waits
+    // for the named hop ahead of it, then airtime plus the nominated hop's carry wait.
     uint32_t leaderWait = 2 * halfAirtime;
     if (router && router->getRadioInterface()) {
         leaderWait = airtimeMs + router->getRadioInterface()->getTxDelayMsecMaxAtUtil();
     }
     leaderWait += SR_PEER_TURNAROUND_MS;
-    // Deterministic per-packet tie-break, strictly positive and no larger than the range, so a
-    // rung can be pushed later than its position but never earlier. Centring it on zero let a rung
-    // fire ahead of its own slot, which on the broadcast ladder is what let rung 0 fall inside the
-    // window it is meant to sit behind. Not zero either: two nodes that computed the same rung are
-    // separated by this and nothing else, and at zero neither copy cancels the other.
     const uint32_t jitterRange = std::max(halfAirtime / 2, SR_MIN_TIE_BREAK_RANGE_MS);
     const uint32_t jitter = (((uint32_t)(myNode ^ p->id)) % jitterRange) + 1;
 
     LOG_INFO("[SR] Uni slots 0x%08x to %s: half=%ums %u cands leader=%ums j=%dms",
              p->id, destName, halfAirtime, srCount, leaderWait, (int)jitter);
 
-    uint8_t slotIndex = 0; // among candidates that have not transmitted yet
+    uint8_t slotIndex = 0;
+    int16_t mySlot = -1;
+    bool myDirect = false;
+    uint8_t lastNonDirectSlot = 0;
+    uint8_t nonDirectSlots = 0;
+    bool canReachDestDirectly = hasDirectConnectivity(myNode, destination);
     for (uint8_t i = 0; i < srCount; i++) {
         NodeNum candidate = srCandidates[i].nodeId;
         if (routingGraph->hasNodeTransmitted(candidate, p->id, currentTime)) {
             LOG_INFO("[SR] Unicast slot --: SR node %08x (already transmitted)", candidate);
             continue;
         }
-        if (candidate == myNode) {
-            // Hop-budget gate: if hop_limit==1 and we have no direct edge to dest, we can't
-            // actually deliver — let some other candidate win the slot if possible.
-            bool canReachDestDirectly = hasDirectConnectivity(myNode, destination);
-            if (p->hop_limit <= 1 && !canReachDestDirectly) {
-                LOG_INFO("[SR] Uni slot --: US (%08x) hl=%u no direct edge to dest",
-                         myNode, p->hop_limit);
-                continue;
-            }
-            int64_t totalDelay;
-            totalDelay = (int64_t)srUnicastSlotDelayMs(slotDelay, slotIndex, earliestMs, leaderWait, halfAirtime);
-            totalDelay += (int64_t)jitter;
-            if (totalDelay < 0) totalDelay = 0;
-            shouldRelay = true;
-            myDelay = (uint32_t)totalDelay;
-            LOG_INFO("[SR] Unicast slot %ums: US (%08x) — rank %u, cost=%.2f", myDelay, myNode, slotIndex,
-                     (srCandidates[i].cost & 0x7FFFu) / 100.0f);
-            break;
+        if (candidate == myNode && p->hop_limit <= 1 && !canReachDestDirectly) {
+            LOG_INFO("[SR] Uni slot --: US (%08x) hl=%u no direct edge to dest", myNode, p->hop_limit);
+            continue;
         }
-        LOG_INFO("[SR] Unicast slot %u: SR node %08x ahead of us (cost=%.2f%s)", slotIndex, candidate,
-                 (srCandidates[i].cost & 0x7FFFu) / 100.0f, (srCandidates[i].cost & 0x8000u) ? ", indirect" : "");
+        const bool direct = srCandidates[i].cost < UNICAST_DOWNSTREAM_TIER;
+        if (!direct) {
+            lastNonDirectSlot = slotIndex;
+            nonDirectSlots++;
+        }
+        if (candidate == myNode) {
+            mySlot = slotIndex;
+            myDirect = direct;
+        } else {
+            LOG_INFO("[SR] Unicast slot %u: SR node %08x ahead of us (cost=%.2f%s)", slotIndex, candidate,
+                     (srCandidates[i].cost & 0x7FFFu) / 100.0f, (srCandidates[i].cost & 0x8000u) ? ", indirect" : "");
+        }
         slotIndex++;
+    }
+
+    if (mySlot >= 0) {
+        const bool lastHopBackup = myDirect && destSr && mySlot == 1;
+        const bool nonfinalFlood = !myDirect && nonDirectSlots >= 2 && lastNonDirectSlot == (uint8_t)mySlot;
+        pendingUnicastFlags.lastHopBackup = lastHopBackup;
+        pendingUnicastFlags.nonfinalFlood = nonfinalFlood;
+        pendingUnicastFlags.nominatedNextHop = pendingUnicastNextHop;
+
+        int64_t totalDelay;
+        if (lastHopBackup) {
+            totalDelay = (int64_t)earliestMs + (int64_t)airtimeMs + (int64_t)destAckDurationMs;
+        } else if (nonfinalFlood) {
+            uint8_t namedSlot = mySlot > 0 ? (uint8_t)(mySlot - 1) : 0;
+            totalDelay = (int64_t)srUnicastSlotDelayMs(slotDelay, namedSlot, earliestMs, leaderWait, halfAirtime);
+            totalDelay += (int64_t)airtimeMs;
+            totalDelay += (int64_t)nextHopCarryWaitMs(pendingUnicastNextHop, airtimeMs, p->rx_snr);
+        } else {
+            totalDelay = (int64_t)srUnicastSlotDelayMs(slotDelay, (uint8_t)mySlot, earliestMs, leaderWait, halfAirtime);
+        }
+        totalDelay += (int64_t)jitter;
+        if (totalDelay < 0) {
+            totalDelay = 0;
+        }
+        shouldRelay = true;
+        myDelay = (uint32_t)totalDelay;
+        LOG_INFO("[SR] Unicast slot %ums: US (%08x) — rank %u, cost=%.2f%s%s", myDelay, myNode, (unsigned)mySlot,
+                 (getCandidateCost(myNode) & 0x7FFFu) / 100.0f, lastHopBackup ? ", dest-ACK backup" : "",
+                 nonfinalFlood ? ", flood salvage" : "");
+
+        if (nonfinalFlood) {
+            pendingUnicastNextHop = 0;
+        } else if (getCandidateCost(myNode) < UNICAST_DOWNSTREAM_TIER) {
+            pendingUnicastNextHop = destination;
+        }
+    }
+
+    if (shouldRelay && relayerNamed && !weAreDesignatedHop && !pendingUnicastFlags.nonfinalFlood) {
+        uint8_t stampByte = pendingUnicastNextHop != 0 ? nodeDB->getLastByteOfNodeNum(pendingUnicastNextHop) : 0;
+        bool stampIsDesignated = stampByte != 0 && stampByte == p->next_hop;
+        bool stampIsTransmitter = pendingUnicastNextHop != 0 && heardFrom != 0 && pendingUnicastNextHop == heardFrom;
+        if (pendingUnicastNextHop == 0 || stampIsDesignated || stampIsTransmitter) {
+            LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: backup has no next hop past 0x%02x",
+                     p->id, srcName, destName, p->next_hop);
+            pendingUnicastNextHop = 0;
+            pendingUnicastFlags = {};
+            return false;
+        }
     }
 
     LOG_INFO("[SR-DEC] UNICAST %s 0x%08x %s->%s via %s (delay=%ums)",
@@ -2476,6 +2528,7 @@ void SignalRoutingModule::commitRelay(PacketId packetId, NodeNum originalHeardFr
     entry.packetId = packetId;
     entry.originalHeardFrom = originalHeardFrom;
     entry.txDelayMs = txDelayMs;
+    entry.unicastFlags = pendingUnicastFlags;
     if (committedRelayCount < MAX_COMMITTED_RELAYS) {
         committedRelays[committedRelayCount++] = entry;
     } else {
@@ -2744,7 +2797,58 @@ bool SignalRoutingModule::unicastDupeCancels(const meshtastic_MeshPacket *p, Nod
         return false;
     }
     NodeNum myNextHop = getNextHop(p->to, p->from, 0, false);
-    return routingGraph->unicastDupeCancels(nodeDB->getNodeNum(), p->to, p->id, dupeRelayer, myNextHop, routePolicy());
+    UnicastSlotFlags flags = unicastCommitFlags(p->id);
+    return routingGraph->unicastDupeCancels(nodeDB->getNodeNum(), p->to, p->id, dupeRelayer, myNextHop, routePolicy(), flags,
+                                            p->next_hop);
+}
+
+UnicastSlotFlags SignalRoutingModule::unicastCommitFlags(PacketId packetId) const
+{
+    for (uint8_t i = 0; i < committedRelayCount; i++) {
+        if (committedRelays[i].packetId == packetId) {
+            return committedRelays[i].unicastFlags;
+        }
+    }
+    return {};
+}
+
+bool SignalRoutingModule::hasPricedDeliveryHop(NodeNum dest) const
+{
+    if (!routingGraph || !nodeDB) {
+        return false;
+    }
+    return unicastCandidateCost(nodeDB->getNodeNum(), dest, 0) < UNICAST_DOWNSTREAM_TIER;
+}
+
+bool SignalRoutingModule::deliveringRelayerIsSR(const meshtastic_MeshPacket *p) const
+{
+    if (!p) {
+        return false;
+    }
+    NodeNum node = 0;
+    if (getHopsAway(*p) == 0) {
+        node = p->from;
+    } else if (p->relay_node == 0) {
+        return false;
+    } else {
+        node = resolveRelayIdentity(p->relay_node);
+    }
+    if (node == 0) {
+        return false;
+    }
+    return publishesTopology(node);
+}
+
+uint32_t SignalRoutingModule::nextHopCarryWaitMs(NodeNum nextHop, uint32_t airtimeMs, float rxSnr) const
+{
+    if (nextHop != 0 && publishesTopology(nextHop)) {
+        return ladderTransitionMs() + airtimeMs;
+    }
+    uint32_t worst = 2 * std::max(airtimeMs / 2, SR_MIN_RUNG_SPACING_MS);
+    if (router && router->getRadioInterface()) {
+        worst = router->getRadioInterface()->getTxDelayMsecWeightedWorst(rxSnr);
+    }
+    return worst + airtimeMs;
 }
 
 bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p, NodeNum *uniqueNeighbor)

@@ -324,24 +324,28 @@ Destinations that are known through any mechanism are still relayed:
 
 ### Last-Hop Unicasts
 
-`capsLastHop()` decides whether a unicast is a last hop: the destination is a direct neighbour with
-`hearsUs = true`, and at least one other direct neighbour is not SR-active (stock firmware). A
-last-hop frame carries `hop_limit = SR_LAST_HOP_BUDGET` (one hop) and the destination's own byte as
-`next_hop`, whatever the link quality. Stock's `NextHopRouter` relays a unicast only when
-`next_hop` is unset or its own byte, so stock neighbours leave the frame alone; the destination
-reads `hop_start == hop_limit` (or one hop used on a relayed frame) and acknowledges it; and
-`hop_start` stays populated, which the Meshtastic Android app requires before it shows a traceroute
-reply (a zero `hop_start` with a zero bitfield reads as a legacy frame there). When all other
-direct neighbours are SR-active the budget is left untouched: SR nodes suppress relays themselves
-through the slot algorithm.
+`capsLastHop()` still frames an **originated** unicast (or a reply to a direct neighbour that hears
+us) when the destination is a direct `hearsUs` neighbour and at least one other direct neighbour is
+stock: `hop_limit = SR_LAST_HOP_BUDGET` and the destination's byte as `next_hop`
+(`Router::send()`). Stock relays a unicast only when `next_hop` is unset or its own byte, so they
+leave the frame alone; the destination reads zero hops used; `hop_start` stays populated.
 
-`hop_start` is adjusted to preserve `hopsAway` (`hop_start - hop_limit`) for receivers:
-- **Originated packets**: `hop_start = hop_limit` (standard convention)
-- **Relayed packets**: `hop_start = original_hops_taken + SR_LAST_HOP_BUDGET + 1`
+A **relayed** last hop is a priced hop to the destination (`deliveryHopCost`), not `capsLastHop`.
+That relay names the destination as next hop and decrements `hop_limit` like any other hop; it does
+not rewrite the remaining budget. If the incoming hop fields are inverted (`hop_start < hop_limit`),
+`hop_start` is raised to the outgoing hop limit so `getHopsAway` stays readable (`0`: only this hop
+is known).
 
-The rule is applied in two places:
-- **`NextHopRouter::perhapsRebroadcast()`** — when relaying a unicast we received from another node
-- **`Router::send()`** — when originating a unicast ourselves
+Among SR overhearers, at most two priced last hops get slots if the destination is SR-active or
+passive (early + dest-ACK backup); otherwise one. Extra directs stay silent (`LastHopReserved`).
+The backup waits for dest's ACK of the early last hop (early slot + that copy's airtime + dest-ACK
+wait) and cancels only on dest's own copy. Last hops do not flood. A last-hop `want_ack` toward a
+non-SR dest keeps `NUM_RELIABLE_RETX` without clearing `next_hop`, including after hop_limit
+reaches 0.
+
+Unsolicited dest ACK (no `want_ack`) is hop-0 only when the delivering transmitter is SR: hops away
+0 means the originator, otherwise the resolved relay byte. Stock last hops are not waiting. Dest
+ACK / reply still cancels a queued backup via `cancelSending(request_id)`.
 
 ### Speculative Retransmission
 
@@ -394,7 +398,12 @@ Two of those branches were unreachable until 2026-09-11: the reservation base wa
 When the unicast was heard straight from its source and the source's topology lists the destination with `hearsUs`, the destination most likely has it. A routing ACK on that link is never relayed (a lost ACK is covered by the sender's own retransmission). Any other unicast has every slot, including a designated next hop's slot 0, pushed behind a wait of one airtime plus twice the maximum contention delay at the current utilization, so the destination's ACK or reply, which cancels the queued relay via `cancelSending(request_id)`, arrives first; only silence lets a relay go. Colocated receivers were seen to lose about half the frames of a very strong neighbour, so the relay stays available rather than being suppressed outright.
 
 **Next hop on the relayed copy:**
-When SR approves a unicast relay, `NextHopRouter::sendRelay()` stamps SR's route pick as `next_hop` instead of the NodeDB-learned value, or clears the field when the route picker fell back to "relay it ourselves" (our own byte never goes on the wire). The incoming byte is never forwarded: it named us or a node that stayed silent, and legacy nodes relay a unicast only when the byte is clear or their own. A stamped next hop arms the usual relayer-side retransmissions, whose last retry clears the field and falls back to flooding.
+When SR approves a unicast relay, `NextHopRouter::sendRelay()` stamps SR's route pick as `next_hop`,
+or the destination when this hop is a priced last hop, or clears the field for a flood-salvage slot
+(the last of two or more non-direct candidates) and when the route picker fell back to "relay it
+ourselves". Named forwards arm one flood-insurance retry (`numReTx = 1`, `floodOnLast`); a later
+flood slot in the ranking is not proof that neighbour overheard this copy. Last-hop backups and
+flood slots do not arm a follow-up. Last hops do not flood.
 
 **Quick Suppression Checks (before slot scheduling):**
 - Source and destination both downstream of the same relay → suppress only if that relay holds this copy (`heardFrom` or already transmitted this id)
@@ -402,7 +411,7 @@ When SR approves a unicast relay, `NextHopRouter::sendRelay()` stamps SR's route
 - An SR neighbor that covers `heardFrom` can reach destination → suppress only if they already transmitted this id
 
 **Dupe Cancellation:**
-When a dupe arrives for a committed unicast relay, `areAllNeighborsCovered()` calls `NeighborGraph::unicastDupeCancels()`: cancel only if the dupe relayer can finish delivery (priced hop or dest's downstream), or is ranked ahead of us with a path. If we can finish and they cannot, our relay is kept. An unresolved relay byte (or a placeholder identity) cancels only when we cannot finish (the designated or stock hop we were waiting for). Late unicast rungs are not clamped to 2 s — a clamp would bunch later slots onto the same instant. Native tests: `test_unicast_dupe_cancel_predicate`.
+When a dupe arrives for a committed unicast relay, `areAllNeighborsCovered()` calls `NeighborGraph::unicastDupeCancels()`: cancel only if the dupe relayer can finish delivery (priced hop or dest's downstream), or is ranked ahead of us with a path. If we can finish and they cannot, our relay is kept. An unresolved relay byte (or a placeholder identity) cancels only when we cannot finish (the designated or stock hop we were waiting for). Last-hop backup cancels only on dest's own copy. A flood salvage slot stays for a same-hop named SR that cannot finish, and cancels on dest, a finisher, the nominated hop, or another flood copy. Late unicast rungs are not clamped to 2 s — a clamp would bunch later slots onto the same instant. Native tests: `test_unicast_dupe_cancel_predicate`, `test_unicast_last_hop_slots_and_dupe_flags`.
 
 ## Broadcast Routing
 

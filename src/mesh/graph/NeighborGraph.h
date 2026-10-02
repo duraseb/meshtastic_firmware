@@ -22,6 +22,60 @@ static constexpr size_t NODE_SET_MAX = 48;
 /// ETX costs are compared in buckets this wide (ETX × 100): half an ETX. Own links and peer-reported
 /// links price a few hundredths apart, and exact comparison made colocated nodes disagree on order.
 static constexpr uint16_t SR_COST_BUCKET_FIXED = 50;
+/// Cost of a unicast candidate that is the destination's downstream relay without a priced hop.
+static constexpr uint16_t UNICAST_DOWNSTREAM_TIER = 0x7FFF;
+
+/// How a committed unicast slot should treat a heard copy and whether it floods.
+struct UnicastSlotFlags {
+    bool lastHopBackup = false;
+    bool nonfinalFlood = false;
+    NodeNum nominatedNextHop = 0;
+};
+
+/// One ranked unicast relay candidate (ourselves or an SR neighbour).
+struct UnicastCandidate {
+    NodeNum nodeId = 0;
+    uint16_t cost = 0;
+};
+
+/// Last hop: at most two priced links if dest is SR (early + dest-ACK backup), otherwise one.
+/// Extra directs are dropped. Returns false if `me` was a dropped direct (LastHopReserved).
+inline bool unicastKeepLastHopSlots(UnicastCandidate *cands, uint8_t &count, NodeNum me, bool destSr)
+{
+    bool iAmDirect = false;
+    for (uint8_t i = 0; i < count; i++) {
+        if (cands[i].nodeId == me && cands[i].cost < UNICAST_DOWNSTREAM_TIER) {
+            iAmDirect = true;
+            break;
+        }
+    }
+    if (count == 0 || cands[0].cost >= UNICAST_DOWNSTREAM_TIER) {
+        return true;
+    }
+    const uint8_t maxDirects = destSr ? 2 : 1;
+    uint8_t kept = 0;
+    uint8_t keptDirects = 0;
+    for (uint8_t i = 0; i < count; i++) {
+        const bool direct = cands[i].cost < UNICAST_DOWNSTREAM_TIER;
+        if (direct) {
+            if (keptDirects >= maxDirects) {
+                continue;
+            }
+            keptDirects++;
+        }
+        cands[kept++] = cands[i];
+    }
+    count = kept;
+    if (!iAmDirect) {
+        return true;
+    }
+    for (uint8_t i = 0; i < count; i++) {
+        if (cands[i].nodeId == me) {
+            return true;
+        }
+    }
+    return false;
+}
 
 struct NodeSet {
     NodeNum nodes[NODE_SET_MAX];
@@ -444,8 +498,11 @@ class NeighborGraph {
                                   const RoutePolicy &policy) const;
     /// Heard-copy cancel: the relayer can finish, or is ranked ahead of us with a path. Keep if we
     /// can finish and they cannot. Unresolved or placeholder identity cancels only when we cannot.
+    /// Last-hop backup: only dest's own copy cancels. A flood slot stays for a same-hop named SR
+    /// that cannot finish, and cancels on dest, a finisher, the nominated hop, or another flood.
     bool unicastDupeCancels(NodeNum myNode, NodeNum destination, uint32_t packetId, NodeNum dupeRelayer,
-                            NodeNum myNextHop, const RoutePolicy &policy) const;
+                            NodeNum myNextHop, const RoutePolicy &policy, UnicastSlotFlags flags = {},
+                            uint8_t dupeNextHop = 0) const;
 
     size_t getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, size_t maxNodes, const NodeNum *alreadyCovered,
                                size_t alreadyCoveredCount, NodeNum selfNode = 0,

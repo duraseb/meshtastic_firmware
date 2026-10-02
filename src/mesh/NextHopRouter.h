@@ -39,8 +39,11 @@ struct PendingPacket {
     /** Starts at NUM_RETRANSMISSIONS -1 and counts down.  Once zero it will be removed from the list */
     uint8_t numRetransmissions = 0;
 
+    /** Last remaining attempt of a named forward: clear next_hop so stock may pick up. */
+    bool floodOnLast = true;
+
     PendingPacket() {}
-    explicit PendingPacket(meshtastic_MeshPacket *p, uint8_t numRetransmissions);
+    explicit PendingPacket(meshtastic_MeshPacket *p, uint8_t numRetransmissions, bool floodOnLast = true);
 };
 
 class GlobalPacketIdHashFunction
@@ -76,8 +79,9 @@ class NextHopRouter : public FloodingRouter
 
     /**
      * Send a relayed copy whose next hop was decided by SignalRouting: `nextHop` (a relay byte, or
-     * NO_NEXT_HOP_PREFERENCE) replaces the NodeDB-learned value send() would stamp. Relayer-side
-     * retransmissions are armed exactly as for a NodeDB next hop.
+     * NO_NEXT_HOP_PREFERENCE) replaces the NodeDB-learned value send() would stamp. Named forwards
+     * arm one flood-insurance retry; last-hop want_ack toward a non-SR dest keeps reliable retries
+     * without flooding; last-hop backups and flood slots do not arm a follow-up.
      */
     ErrorCode sendRelay(meshtastic_MeshPacket *p, uint8_t nextHop);
 
@@ -94,10 +98,8 @@ class NextHopRouter : public FloodingRouter
         return min(d, r);
     }
 
-    // Relayed unicast attempts, including the send that just happened. The pending record
-    // stores one less, so 4 leaves three tries: two replay the stamped header and the last
-    // clears next_hop. One less than this never reached the replay branch, so a relay's only
-    // retry was already the flood.
+    // Default for a NodeDB-stamped next hop (stock path). SR named forwards arm one insurance
+    // copy instead; last-hop want_ack toward a non-SR dest uses NUM_RELIABLE_RETX and does not flood.
     constexpr static uint8_t NUM_INTERMEDIATE_RETX = 4;
     // The number of retransmissions the original sender will do
     constexpr static uint8_t NUM_RELIABLE_RETX = 3;
@@ -130,7 +132,8 @@ class NextHopRouter : public FloodingRouter
     /**
      * Add p to the list of packets to retransmit occasionally.  We will free it once we stop retransmitting.
      */
-    PendingPacket *startRetransmission(meshtastic_MeshPacket *p, uint8_t numReTx = NUM_INTERMEDIATE_RETX);
+    PendingPacket *startRetransmission(meshtastic_MeshPacket *p, uint8_t numReTx = NUM_INTERMEDIATE_RETX,
+                                       bool floodOnLast = true);
 
     // Return true if we're allowed to cancel a packet in the txQueue (so we may never transmit it even once)
     bool roleAllowsCancelingFromTxQueue(const meshtastic_MeshPacket *p);

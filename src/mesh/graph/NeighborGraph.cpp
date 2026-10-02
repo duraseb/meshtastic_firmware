@@ -1399,11 +1399,31 @@ static bool unicastRankedAhead(NodeNum a, uint16_t aCost, NodeNum b, uint16_t bC
 }
 
 bool NeighborGraph::unicastDupeCancels(NodeNum myNode, NodeNum destination, uint32_t packetId, NodeNum dupeRelayer,
-                                       NodeNum myNextHop, const RoutePolicy &policy) const
+                                       NodeNum myNextHop, const RoutePolicy &policy, UnicastSlotFlags flags,
+                                       uint8_t dupeNextHop) const
 {
     bool weFinish = unicastCanFinish(myNode, destination, policy);
     if (dupeRelayer == 0 || dupeRelayer == myNode || Edge::isPlaceholderId(dupeRelayer)) {
         return !weFinish;
+    }
+    if (flags.lastHopBackup) {
+        return dupeRelayer == destination;
+    }
+    if (flags.nonfinalFlood) {
+        if (dupeRelayer == destination) {
+            return true;
+        }
+        if (unicastCanFinish(dupeRelayer, destination, policy)) {
+            return true;
+        }
+        NodeNum nominated = flags.nominatedNextHop;
+        if (nominated != 0 && (dupeRelayer == nominated || (nominated & 0xFF) == (dupeRelayer & 0xFF))) {
+            return true;
+        }
+        if (dupeNextHop == 0) {
+            return true;
+        }
+        return false;
     }
     if (unicastCanFinish(dupeRelayer, destination, policy)) {
         return true;

@@ -2021,6 +2021,64 @@ void test_unicast_dupe_cancel_predicate()
     }
 }
 
+void test_unicast_last_hop_slots_and_dupe_flags()
+{
+    constexpr NodeNum me = 0x046b553a;
+    constexpr NodeNum peer = 0xbdacce55;
+    constexpr NodeNum gw = 0x63dc8f8c;
+    constexpr NodeNum dest = 0x32aca541;
+    constexpr NodeNum extra = 0x11111111;
+    const uint32_t now = millis() / 1000;
+    const NeighborGraph::RoutePolicy policy;
+    initGraphTestNodeDb(me);
+
+    {
+        UnicastCandidate cands[3] = {{me, 100}, {peer, 100}, {gw, UNICAST_DOWNSTREAM_TIER}};
+        uint8_t count = 3;
+        TEST_ASSERT_TRUE(unicastKeepLastHopSlots(cands, count, me, false));
+        TEST_ASSERT_EQUAL_UINT8(2, count);
+        TEST_ASSERT_EQUAL_UINT32(me, cands[0].nodeId);
+        TEST_ASSERT_EQUAL_UINT32(gw, cands[1].nodeId);
+    }
+    {
+        UnicastCandidate cands[2] = {{peer, 100}, {me, 100}};
+        uint8_t count = 2;
+        TEST_ASSERT_FALSE(unicastKeepLastHopSlots(cands, count, me, false));
+    }
+    {
+        UnicastCandidate cands[3] = {{peer, 100}, {me, 100}, {extra, 120}};
+        uint8_t count = 3;
+        TEST_ASSERT_TRUE(unicastKeepLastHopSlots(cands, count, me, true));
+        TEST_ASSERT_EQUAL_UINT8(2, count);
+        TEST_ASSERT_EQUAL_UINT32(peer, cands[0].nodeId);
+        TEST_ASSERT_EQUAL_UINT32(me, cands[1].nodeId);
+    }
+
+    {
+        NeighborGraph graph = seedUnicastFieldGraph(me, peer, gw, dest);
+        graph.updateEdge(me, dest, 1.2f, now, Edge::Source::Reported);
+        graph.setEdgeHearsUs(me, dest, true);
+        UnicastSlotFlags flags;
+        flags.lastHopBackup = true;
+        TEST_ASSERT_FALSE_MESSAGE(graph.unicastDupeCancels(me, dest, 0x40, peer, dest, policy, flags, 0),
+                                  "another last hop is not dest's ACK");
+        TEST_ASSERT_TRUE(graph.unicastDupeCancels(me, dest, 0x40, dest, dest, policy, flags, 0));
+    }
+
+    {
+        NeighborGraph graph = seedUnicastFieldGraph(me, peer, gw, dest);
+        UnicastSlotFlags flags;
+        flags.nonfinalFlood = true;
+        flags.nominatedNextHop = gw;
+        TEST_ASSERT_FALSE_MESSAGE(graph.unicastDupeCancels(me, dest, 0x40, peer, gw, policy, flags, (uint8_t)(peer & 0xFF)),
+                                  "a named same-hop SR that cannot finish is not dest's ACK");
+        TEST_ASSERT_TRUE(graph.unicastDupeCancels(me, dest, 0x40, gw, gw, policy, flags, 0));
+        TEST_ASSERT_TRUE(graph.unicastDupeCancels(me, dest, 0x40, dest, gw, policy, flags, 0));
+        TEST_ASSERT_TRUE_MESSAGE(graph.unicastDupeCancels(me, dest, 0x40, peer, gw, policy, flags, 0),
+                                 "another flood copy cancels");
+    }
+}
+
 void setup()
 {
     initializeTestEnvironment();
@@ -2102,6 +2160,7 @@ void setup()
     RUN_TEST(test_radio_reconfigured_purges_only_when_the_preset_changes);
     RUN_TEST(test_undecoded_direct_frame_is_recorded_as_a_neighbour);
     RUN_TEST(test_unicast_dupe_cancel_predicate);
+    RUN_TEST(test_unicast_last_hop_slots_and_dupe_flags);
 
     UNITY_END();
 }

@@ -16,10 +16,11 @@
 
 NextHopRouter::NextHopRouter() {}
 
-PendingPacket::PendingPacket(meshtastic_MeshPacket *p, uint8_t numRetransmissions)
+PendingPacket::PendingPacket(meshtastic_MeshPacket *p, uint8_t numRetransmissions, bool floodOnLast)
 {
     packet = p;
     this->numRetransmissions = numRetransmissions - 1; // We subtract one, because we assume the user just did the first send
+    this->floodOnLast = floodOnLast;
 }
 
 /**
@@ -239,29 +240,30 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                     }
 #endif
                     LOG_INFO("Rebroadcast received message coming from %x", p->relay_node);
-                    bool srLastHop = false;
+                    bool srPricedLastHop = false;
+                    bool srNonfinalFlood = false;
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+                    if (signalRoutingModule) {
+                        UnicastSlotFlags flags = signalRoutingModule->unicastCommitFlags(p->id);
+                        srNonfinalFlood = flags.nonfinalFlood;
+                        srPricedLastHop = signalRoutingModule->hasPricedDeliveryHop(p->to) && !srNonfinalFlood;
+                    }
+#endif
 
                     // If exhausting hops, force hop_limit = 0 regardless of other logic
 		    if (exhaustHops) {
                         tosend->hop_limit = 0;
                         LOG_INFO("Traffic management: exhausting hops for 0x%08x, setting hop_limit=0", getFrom(p));
-#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
-                    } else if (signalRoutingModule && signalRoutingModule->capsLastHop(p)) {
-                        srLastHop = true;
-                        // Last hop: the destination is a direct neighbour that hears us and stock
-                        // neighbours listen. One hop, the destination named as next hop, and hop_start
-                        // rewritten so hopsAway (hop_start - hop_limit) stays correct for receivers.
-                        tosend->hop_start = tosend->hop_start - tosend->hop_limit + SR_LAST_HOP_BUDGET + 1;
-                        tosend->hop_limit = SR_LAST_HOP_BUDGET;
-                        tosend->next_hop = nodeDB->getLastByteOfNodeNum(p->to);
-                        LOG_INFO("[SR] Last hop for unicast relay 0x%08x: hop_limit=%d, next_hop=0x%02x", p->id,
-                                 tosend->hop_limit, tosend->next_hop);
-#endif
                     } else if (shouldDecrementHopLimit(p)) {
                         // Use shared logic to determine if hop_limit should be decremented
                         tosend->hop_limit--; // bump down the hop count
                     } else {
                         LOG_INFO("favorite-ROUTER/CLIENT_BASE-to-ROUTER/CLIENT_BASE rebroadcast: preserving hop_limit");
+                    }
+                    // Inverted hop_start < hop_limit is unreadable (stock getHopsAway returns
+                    // unknown). Treat travelled as zero without rewriting the remaining budget.
+                    if (tosend->hop_start != 0 && tosend->hop_start < tosend->hop_limit) {
+                        tosend->hop_start = tosend->hop_limit;
                     }
 #if USERPREFS_EVENT_MODE
                     if (tosend->hop_limit > 2) {
@@ -277,11 +279,10 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                         // value, and never forward the incoming byte: it named us or a node that stayed
                         // silent, and legacy nodes relay a unicast only when the byte is clear or theirs.
                         uint8_t nextHopByte = srNextHop ? nodeDB->getLastByteOfNodeNum(srNextHop) : NO_NEXT_HOP_PREFERENCE;
-                        // A last hop already carries the destination as its next hop, and that is
-                        // what makes stock relays leave the frame alone. SR clearing its own
-                        // designation must not erase it.
-                        if (srLastHop) {
-                            nextHopByte = tosend->next_hop;
+                        if (srNonfinalFlood) {
+                            nextHopByte = NO_NEXT_HOP_PREFERENCE;
+                        } else if (srPricedLastHop) {
+                            nextHopByte = nodeDB->getLastByteOfNodeNum(p->to);
                         }
                         NextHopRouter::sendRelay(tosend, nextHopByte);
                         return true;
@@ -312,8 +313,39 @@ ErrorCode NextHopRouter::sendRelay(meshtastic_MeshPacket *p, uint8_t nextHop)
     wasSeenRecently(p);
     p->next_hop = nextHop;
     LOG_DEBUG("Setting SR next hop for relayed packet with dest %x to %x", p->to, p->next_hop);
+
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+    UnicastSlotFlags flags{};
+    bool destSr = false;
+    bool lastHop = false;
+    if (signalRoutingModule) {
+        flags = signalRoutingModule->unicastCommitFlags(p->id);
+        destSr = signalRoutingModule->isSignalRoutingNode(p->to);
+        lastHop = signalRoutingModule->hasPricedDeliveryHop(p->to);
+    }
+    if (p->hop_limit == 0 && !lastHop) {
+        return Router::send(p);
+    }
+    if (lastHop) {
+        if (!p->want_ack || destSr || flags.lastHopBackup) {
+            return Router::send(p);
+        }
+        startRetransmission(packetPool.allocCopy(*p), NUM_RELIABLE_RETX, false);
+        return Router::send(p);
+    }
+    if (flags.nonfinalFlood || p->next_hop == NO_NEXT_HOP_PREFERENCE) {
+        return Router::send(p);
+    }
+    PendingPacket *rec = startRetransmission(packetPool.allocCopy(*p), 2, true);
+    if (rec && signalRoutingModule && iface) {
+        uint32_t airtime = iface->getPacketTime(p);
+        rec->nextTxMsec = millis() + signalRoutingModule->nextHopCarryWaitMs(flags.nominatedNextHop, airtime, p->rx_snr);
+        setReceivedMessage();
+    }
+#else
     if (p->next_hop != NO_NEXT_HOP_PREFERENCE && (p->hop_limit > 0 || p->want_ack))
         startRetransmission(packetPool.allocCopy(*p));
+#endif
     return Router::send(p);
 }
 
@@ -397,10 +429,10 @@ bool NextHopRouter::stopRetransmission(GlobalPacketId key)
 /**
  * Add p to the list of packets to retransmit occasionally.  We will free it once we stop retransmitting.
  */
-PendingPacket *NextHopRouter::startRetransmission(meshtastic_MeshPacket *p, uint8_t numReTx)
+PendingPacket *NextHopRouter::startRetransmission(meshtastic_MeshPacket *p, uint8_t numReTx, bool floodOnLast)
 {
     auto id = GlobalPacketId(p);
-    auto rec = PendingPacket(p, numReTx);
+    auto rec = PendingPacket(p, numReTx, floodOnLast);
 
     stopRetransmission(getFrom(p), p->id);
 
@@ -442,20 +474,21 @@ int32_t NextHopRouter::doRetransmissions()
                           p.packet->id, p.numRetransmissions);
 
                 if (!isBroadcast(p.packet->to)) {
-                    if (p.numRetransmissions == 1) {
-                        // Last retransmission, reset next_hop (fallback to FloodingRouter)
+                    if (p.numRetransmissions == 1 && p.floodOnLast) {
+                        // Last retransmission of a named forward: release to flooding.
                         p.packet->next_hop = NO_NEXT_HOP_PREFERENCE;
-                        // Also reset it in the nodeDB
-                        meshtastic_NodeInfoLite *sentTo = nodeDB->getMeshNode(p.packet->to);
-                        if (sentTo) {
-                            LOG_INFO("Resetting next hop for packet with dest 0x%x\n", p.packet->to);
-                            sentTo->next_hop = NO_NEXT_HOP_PREFERENCE;
+                        if (isFromUs(p.packet)) {
+                            meshtastic_NodeInfoLite *sentTo = nodeDB->getMeshNode(p.packet->to);
+                            if (sentTo) {
+                                LOG_INFO("Resetting next hop for packet with dest 0x%x\n", p.packet->to);
+                                sentTo->next_hop = NO_NEXT_HOP_PREFERENCE;
+                            }
                         }
                         FloodingRouter::send(packetPool.allocCopy(*p.packet));
                     } else if (!isFromUs(p.packet)) {
                         // Replay the header sendRelay already stamped. NextHopRouter::send
                         // would recompute next_hop and startRetransmission() would replace
-                        // this record, so the two directed tries never happened.
+                        // this record, so the directed tries never happened.
                         FloodingRouter::send(packetPool.allocCopy(*p.packet));
                     } else {
                         NextHopRouter::send(packetPool.allocCopy(*p.packet));
