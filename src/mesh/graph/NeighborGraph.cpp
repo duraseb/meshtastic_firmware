@@ -9,6 +9,76 @@
 
 NeighborGraph::NeighborGraph() : neighborCount(0), downstreamCount(0), relayStateCount(0), routeCacheCount(0) {}
 
+uint16_t Edge::silenceEtxFixedFromAge(uint32_t ageSecs, uint32_t periodSecs)
+{
+    const uint32_t half = periodSecs / 2;
+    if (ageSecs < half) {
+        return 0;
+    }
+    if (ageSecs < periodSecs) {
+        return static_cast<uint16_t>((uint64_t)(ageSecs - half) * 50 / half);
+    }
+    const uint32_t two = periodSecs * 2;
+    if (ageSecs < two) {
+        return static_cast<uint16_t>(50 + (uint64_t)(ageSecs - periodSecs) * 550 / periodSecs);
+    }
+    return 1275;
+}
+
+uint8_t Edge::silenceVarianceByteFromAge(uint32_t ageSecs, uint32_t periodSecs)
+{
+    const uint32_t fixed = silenceEtxFixedFromAge(ageSecs, periodSecs);
+    const uint32_t scaled = (fixed * 20 + 50) / 100;
+    return scaled > 255 ? 255 : static_cast<uint8_t>(scaled);
+}
+
+uint8_t Edge::effectiveVarianceByte(uint32_t nowSecs, uint32_t periodSecs, bool ourRx) const
+{
+    if (!ourRx || lastHeardSecs == 0) {
+        return etxVariance;
+    }
+    const uint32_t age = nowSecs - lastHeardSecs;
+    const uint8_t silence = silenceVarianceByteFromAge(age, periodSecs);
+    const uint16_t sum = static_cast<uint16_t>(etxVariance) + silence;
+    return sum > 255 ? 255 : static_cast<uint8_t>(sum);
+}
+
+uint16_t NeighborGraph::pricedHopCostFixed(const Edge &edge, NodeNum listOwner, NodeNum myNode, uint32_t nowSecs,
+                                           bool unverified) const
+{
+    uint32_t etx = edge.etxFixed;
+    if (unverified) {
+        etx = std::min(uint32_t{0xFFFF}, uint32_t{edge.etxFixed} * UNVERIFIED_HOP_COST_FACTOR);
+    }
+    const bool ourRx = (listOwner == myNode) && (edge.source == Edge::Source::Reported);
+    const uint8_t varByte = edge.effectiveVarianceByte(nowSecs, TOPOLOGY_BROADCAST_SECS, ourRx);
+    const uint16_t weight = ourRx ? 10u : 5u;
+    uint32_t cost = etx + uint32_t{varByte} * weight;
+    return cost > 0xFFFE ? 0xFFFE : static_cast<uint16_t>(cost);
+}
+
+void NeighborGraph::foldSilenceBeforeReportedHear(NodeNum myNode, NodeNum peer, uint32_t nowSecs)
+{
+    NodeEdges *mine = findNeighbor(myNode);
+    Edge *edge = mine ? findEdge(mine, peer) : nullptr;
+    if (!edge || edge->source != Edge::Source::Reported || edge->lastHeardSecs == 0) {
+        return;
+    }
+    const uint32_t gap = nowSecs - edge->lastHeardSecs;
+    if (gap >= TOPOLOGY_BROADCAST_SECS / 2) {
+        edge->updateEtxVariance(Edge::silenceEtxFixedFromAge(gap, TOPOLOGY_BROADCAST_SECS) / 100.0f);
+    }
+}
+
+void NeighborGraph::stampReportedLastHeard(NodeNum myNode, NodeNum peer, uint32_t nowSecs)
+{
+    NodeEdges *mine = findNeighbor(myNode);
+    Edge *edge = mine ? findEdge(mine, peer) : nullptr;
+    if (edge && edge->source == Edge::Source::Reported) {
+        edge->lastHeardSecs = nowSecs;
+    }
+}
+
 void NeighborGraph::purgeForPresetChange()
 {
     neighborCount = 0;
@@ -232,6 +302,7 @@ int NeighborGraph::updateEdge(NodeNum from, NodeNum to, float etx, uint32_t time
         edge->lastUpdate = timestamp;
         edge->etxVariance = 0;
         edge->source = source;
+        edge->lastHeardSecs = 0;
 
         // Remove redundant downstream entry now that we have a proper edge
         for (uint16_t i = 0; i < downstreamCount; i++) {
@@ -274,6 +345,7 @@ int NeighborGraph::updateEdge(NodeNum from, NodeNum to, float etx, uint32_t time
         edge->etxVariance = 0;
         edge->source = source;
         edge->hearsUs = false; // Reset on edge replacement — must be re-confirmed
+        edge->lastHeardSecs = 0;
         return EDGE_SIGNIFICANT_CHANGE;
     }
 
@@ -557,12 +629,24 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, c
             // Variance is EWMA(|ΔETX|)×20. Route cost is ETX×100, so one variance unit is
             // 5 cost units. A link that keeps moving is a worse place to pin an exclusive
             // next hop than a stable link with the same mean.
-            auto priced = [](const Edge &e) -> uint32_t {
-                return (uint32_t)e.etxFixed + (uint32_t)e.etxVariance * 5u;
+            auto pricedFrom = [&](NodeNum listOwner, const Edge &e, bool unverified) -> uint32_t {
+                return pricedHopCostFixed(e, listOwner, myNode, currentTime, unverified);
+            };
+            auto relaxPriced = [&](NodeNum m, NodeNum via, uint16_t cost, NodeNum listOwner, const Edge &edge,
+                                   bool unverified) {
+                uint32_t edgeCost = pricedFrom(listOwner, edge, unverified);
+                if (m == myNode) {
+                    const NodeEdges *myEdges = findNeighbor(myNode);
+                    const Edge *rx = myEdges ? findEdge(myEdges, via) : nullptr;
+                    if (rx && rx->source == Edge::Source::Reported && rx->lastHeardSecs != 0) {
+                        edgeCost = std::max(edgeCost, (uint32_t)pricedFrom(myNode, *rx, false));
+                    }
+                }
+                relax(m, via, cost, edgeCost);
             };
             if (nEdges) {
                 for (uint8_t e = 0; e < nEdges->edgeCount; e++) {
-                    relax(nEdges->edges[e].to, n, uCost, priced(nEdges->edges[e]));
+                    relaxPriced(nEdges->edges[e].to, n, uCost, n, nEdges->edges[e], false);
                 }
             }
             // Nodes that hear N but that N has not listed. The edge stores their measurement of N,
@@ -578,9 +662,9 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, c
                 const Edge *toN = findEdge(&neighbors[i], n);
                 if (!toN) continue;
                 if (!nPublishes) {
-                    relax(m, n, uCost, priced(*toN));
+                    relaxPriced(m, n, uCost, m, *toN, false);
                 } else if (allowUnverified) {
-                    relax(m, n, uCost, (uint32_t)toN->etxFixed * UNVERIFIED_HOP_COST_FACTOR + (uint32_t)toN->etxVariance * 5u);
+                    relaxPriced(m, n, uCost, m, *toN, true);
                 }
             }
         }
@@ -1355,18 +1439,19 @@ float NeighborGraph::hopCost(NodeNum from, NodeNum to) const
     return 0.0f;
 }
 
-float NeighborGraph::deliveryHopCost(NodeNum from, NodeNum to, bool receiverPublishes) const
+float NeighborGraph::deliveryHopCost(NodeNum from, NodeNum to, bool receiverPublishes, uint32_t currentTimeSecs) const
 {
+    const NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
     const NodeEdges *toEdges = findNeighbor(to);
     if (const Edge *received = toEdges ? findEdge(toEdges, from) : nullptr) {
-        if (Edge::isMeasured(received->source)) return received->getEtx();
+        if (Edge::isMeasured(received->source)) {
+            return pricedHopCostFixed(*received, to, myNode, currentTimeSecs, false) / 100.0f;
+        }
     }
     const NodeEdges *fromEdges = findNeighbor(from);
     if (const Edge *sent = fromEdges ? findEdge(fromEdges, to) : nullptr) {
         if (Edge::isMeasured(sent->source)) {
-            float cost = sent->getEtx();
-            if (receiverPublishes) return cost * UNVERIFIED_HOP_COST_FACTOR;
-            return cost;
+            return pricedHopCostFixed(*sent, from, myNode, currentTimeSecs, receiverPublishes) / 100.0f;
         }
     }
     return 0.0f;
@@ -1387,7 +1472,8 @@ bool NeighborGraph::unicastCanFinish(NodeNum node, NodeNum destination, const Ro
         return true;
     }
     bool publishes = policy.publishes && policy.publishes(policy.ctx, destination);
-    return canDeliver(node, destination, policy) && deliveryHopCost(node, destination, publishes) > 0.0f;
+    const uint32_t nowSecs = millis() / 1000;
+    return canDeliver(node, destination, policy) && deliveryHopCost(node, destination, publishes, nowSecs) > 0.0f;
 }
 
 uint16_t NeighborGraph::unicastCandidateCost(NodeNum node, NodeNum destination, NodeNum myNode, NodeNum myNextHop,
@@ -1405,7 +1491,8 @@ uint16_t NeighborGraph::unicastCandidateCost(NodeNum node, NodeNum destination, 
         // cheaper reverse number. The shared-next-hop arm below stays on the raw price: two
         // neighbours a few hundredths apart have to remain one bucket.
         bool publishes = policy.publishes && policy.publishes(policy.ctx, to);
-        float cost = deliveryHopCost(from, to, publishes);
+        const uint32_t nowSecs = millis() / 1000;
+        float cost = deliveryHopCost(from, to, publishes, nowSecs);
         if (cost <= 0.0f) {
             return UINT16_MAX;
         }

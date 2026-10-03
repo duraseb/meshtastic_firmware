@@ -560,11 +560,13 @@ static inline int refreshReportedDirectNeighborObservation(NeighborGraph *graph,
     }
 
     float etx = NeighborGraph::calculateETX(rssi, snr, currentCostingSpreadingFactor());
+    graph->foldSilenceBeforeReportedHear(myNode, nodeId, nowSecs);
     // The measured direction is what we publish, so it alone decides whether the topology changed.
     // Write it first: `updateEdge` refuses a `from` that is not already our direct neighbour, so
     // an Inferred reverse attempted before this was dropped, the dest slot stayed edgeless, and
     // `ageEdges` deleted both the slot and this Reported edge on the next 60 s pass.
     int changeType = graph->updateEdge(myNode, nodeId, etx, nowSecs, Edge::Source::Reported);
+    graph->stampReportedLastHeard(myNode, nodeId, nowSecs);
     // We measured one direction: the frame we just received. How well the neighbour hears *us* is
     // an assumption of symmetry, so the reverse edge is `Inferred`, the same class this module
     // already gives the reverse direction synthesised while merging a topology. Recorded as

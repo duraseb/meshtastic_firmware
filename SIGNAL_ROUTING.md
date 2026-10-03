@@ -149,12 +149,14 @@ Every healthy link now prices into one cost bucket, and that is accepted, not a 
 
 The second consequence is assessed separately: `etxChangeThreshold` is an absolute ETX delta (default 0.5, "half a retransmission"), and an edge update is significant when `|new - old| > threshold + variance`, with variance the per-edge EWMA of absolute ETX changes — all three terms in ETX units. The comparison is symmetric, so an improvement past the bar marks topology dirty the same way a degradation does. Variance raises the bar on a link that swings repeatedly, which is what keeps a single unstable neighbour from driving early broadcasts; a stable link keeps reporting at the 0.5 floor. Field traffic under the margin curve is almost entirely either no change at all or a jump well above any bar between 0.2 and 1.0, so the saturated healthy band — not the threshold — is what keeps the graph quiet, and the dirty broadcast floor caps how often an early send can fire.
 
+**Silence-aware variance is local scoring; the wire is unchanged.** Each node keeps `lastHeardSecs` on its own `Reported` RX edges (direct originator or on-air relay gateway only; zero means never heard: no live surcharge). Age since that stamp adds a silence component with `T` = `NeighborGraph::TOPOLOGY_BROADCAST_SECS` = `SIGNAL_ROUTING_BROADCAST_SECS` = 600 s: `< T/2` none, `T/2…T` slight, `T…2T` much more, `≥ 2T` saturate. Dijkstra and `deliveryHopCost` add `stored_variance×5` on peers' lists and `effective_variance×10` on our RX edges. An unverified reverse hop saturates `etx×UNVERIFIED_HOP_COST_FACTOR` first, then adds that variance term. The egress hop `me → N` takes the dearer of N's list of us and our RX of N only when we have RF-heard N (`lastHeardSecs != 0`). After `≥T/2` quiet, the next RF hear folds the gap into the stored EWMA before `lastHeardSecs` resets, so cost does not snap back to the fresh-link price. Packed `etxVariance`, `covers` / `hopCost` / acknowledgements, and the dirty-topology bar still use stored EWMA / raw mean ETX. Native tests: `test_silence_variance_follows_age_bands`, `test_delivery_cost_rises_with_silence_on_our_rx_edge`, `test_variance_outranks_a_slightly_better_mean_when_a_neighbour_is_silent`, `test_silence_fold_keeps_scar_after_a_long_gap_packet`, `test_last_heard_follows_the_on_air_transmitter`, `test_in_window_hear_does_not_fold_silence_but_etx_jump_still_raises`, `test_packed_variance_stays_stored_while_silence_is_live`, `test_egress_silence_applies_only_after_we_have_heard_them`, `test_unverified_priced_hop_saturates_instead_of_wrapping`.
+
 ### Topology Graph
 
 SignalRouting maintains a network topology graph where:
 - **Nodes** = Mesh devices
 - **Edges** = Wireless links with ETX weights
-- **Sources** = Reported (measured by peer) vs Mirrored (estimated from our perspective)
+- **Sources** = Reported (we measured), Mirrored (peer published), Inferred (guess from a relayed frame)
 
 #### Topology Discovery Mechanisms
 
@@ -225,8 +227,9 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, ...) {
         if (neighbor == destination) return destination; // Direct route
 
     // 2. Find multi-hop routes with Dijkstra run backwards from the destination
-    //    over "who hears whom" (see Edge Direction in Route Calculation below)
-    //    Falls back to downstream table only for nodes not in edge graph
+    //    over "who hears whom" (see Edge Direction in Route Calculation below),
+    //    with silence-aware variance on each hop. A downstream chain onto a
+    //    neighbour we hear is stampable even when Dijkstra did not verify the path.
     Route route = routingGraph->calculateRoute(destination, currentTime);
     if (route.nextHop != 0) {
         return route.nextHop; // Multi-hop route found
@@ -260,23 +263,29 @@ to it, namely the nodes N lists (priced at the cost N measured on their signal, 
 the hop into N), the nodes whose edge to N carries `hearsUs` (N confirmed it hears them), and,
 when N publishes no topology (`publishesTopology`: neither SR active nor passive), anyone who
 hears N, since nothing better is known. An edge is never used against its direction and every hop
-is priced at its receiver. `nodeFilter` still gates intermediate hops only. The resulting `Route`
-carries `hops`, logged as `Route to X via Y (cost: C, hops: H)`.
+is priced at its receiver, then that list's silence-aware variance (stored×5 on a peer list,
+effective×10 on our Reported RX). The egress hop out of us takes the dearer of their list of us
+and our RX of them only when `lastHeardSecs != 0`. `nodeFilter` still gates intermediate hops only.
+The resulting `Route` carries `hops`, logged as `Route to X via Y (cost: C, hops: H)`.
 
 Field case: a node hearing the city hub at -108 dBm listed it without `hearsUs`, the hub's own
 list did not contain that node, and every peer still routed to the hub through it.
 
 **Inbound-gateway fallback.** When no confirmed path exists (and the downstream table offers
 none), the search runs again allowing hops into a topology-publishing node that never confirmed
-the sender, at `UNVERIFIED_HOP_COST_FACTOR` (4) times their cost, so the node that hears the far
+the sender, at `UNVERIFIED_HOP_COST_FACTOR` (4) times their ETX (saturating) plus the same
+variance term as a verified hop, so the node that hears the far
 side still carries the frame out: a one-way edge is usually a marginal link or a truncated list,
 not silence. The route is marked `verified = false` and logged with `unverified`; a confirmed path
 of any length wins over it, and `nodeFilter` still keeps passive nodes from being the gateway.
 
 **A guessed route is never stamped, and never carried backwards.** `getNextHop()` reports the
-verdict through a `verified` out-parameter — every path other than the confirmed search
-(opportunistic neighbour, downstream relay, best-effort self relay, direct delivery) is a guess
-and reports false. A relayed unicast on a guessed route therefore goes out with no next hop: the
+verdict through a `verified` out-parameter. The confirmed Dijkstra search reports true. A
+downstream chain that egresses onto a neighbour we hear is also stampable (`verified` false, but
+the next hop is designated): dest need not be an RF neighbour of its parent; walk dest → via
+until the current node is a neighbour we can name. Opportunistic neighbour, inbound-gateway
+fallback, best-effort self relay and direct delivery remain guesses and report false. A relayed
+unicast on a guessed route therefore goes out with no next hop: the
 node it names never proved it hears the destination, and a designation makes every other
 candidate stand down and wait for a copy that node may have no way to send. If the guess points
 back at the node that handed us the packet, the relay is dropped instead — carrying it moves the
@@ -284,7 +293,7 @@ frame away from its destination, onto our own side of the mesh where the only pa
 is the one it arrived on — unless the frame named us as its next hop, in which case the sender is
 waiting on us specifically and its retries would designate us again, so one copy from us costs
 less than three from it. A last hop keeps its destination designation through the clear: that
-byte is what makes stock relays leave the frame alone.
+byte is what makes stock relays leave the frame alone. Native tests: `test_chain_walks_to_the_first_hearable_hop`, `test_downstream_chain_appoints_the_neighbour_we_hear`.
 
 **Backups survive suppression.** The checks that suppress a unicast relay — source and destination
 downstream of the same relay, the node we heard it from can finish delivery, a better placed SR
@@ -614,7 +623,7 @@ Edges come in three classes, and only two of them are evidence. `Reported` is a 
 
 `hopCost()` prices only measured edges and returns nothing when a link is known only as a guess, so `covers()`, `coverageOwner()`, `acknowledgementPrice()` and the slot rankings all refuse to let a guess excuse a transmission — no price means no coverage, which means relay. The route search prices its hops straight from the edges and still travels over an inferred edge, which is what inferring one is for. A candidate's coverage set is who can hear it: publishers that listed it with a measured edge, or silent neighbours it owns. An Inferred reverse from hearing a publisher is not that listing, so it is in nobody's set.
 
-Three writes that used to claim more than they knew now say what they are. An edge `gateway → source` is invented only when the gateway is a stock (`Legacy`) node or an unresolved placeholder, because the gateway is the only node that can publish that edge; reachability learned from relayed frames lives in the downstream table, gated separately on the source and the hop count, since no publisher supplies it. And the reverse direction synthesised while merging a topology — the sender's neighbour hearing the sender — is `Inferred`, because the sender published only its own direction; recorded as `Reported` it outranked and permanently blocked that neighbour's own measurement of the sender, and priced the delivery from our assumption of symmetry. The same holds for a direct RF observation: the frame we received measures `us -> neighbour` and that direction alone is `Reported`, while `neighbour -> us` is `Inferred`, since how well the neighbour hears us is an assumption until it says so itself. Because the direction we publish is the one we measured, it alone decides whether the observation marks the topology dirty; delivery cost is unchanged, the lookup falling back to the forward edge carrying the same figure.
+Three writes that used to claim more than they knew now say what they are. An edge `gateway → source` is invented only when the gateway is a stock (`Legacy`) node or an unresolved placeholder, because the gateway is the only node that can publish that edge; reachability learned from relayed frames lives in the downstream table, gated separately on the source and the hop count, since no publisher supplies it. And the reverse direction synthesised while merging a topology — the sender's neighbour hearing the sender — is `Inferred`, because the sender published only its own direction; recorded as `Reported` it outranked and permanently blocked that neighbour's own measurement of the sender, and priced the delivery from our assumption of symmetry. The same holds for a direct RF observation: the frame we received measures `us -> neighbour` and that direction alone is `Reported`, while `neighbour -> us` is `Inferred`, since how well the neighbour hears us is an assumption until it says so itself. Because the direction we publish is the one we measured, it alone decides whether the observation marks the topology dirty. Live silence scoring is local and does not dirty the list. Delivery still prefers the receiver's published measurement of the sender when one exists; our reverse `Inferred` edge is only a fallback.
 
 A measurement taken off a relayed frame is `Reported` for the `us → relayer` link, and it establishes
 that link rather than only refreshing one. The frame is a direct RF transmission from its relayer
@@ -871,7 +880,7 @@ The `NeighborGraph` class uses fixed-size arrays (~24 KB heap) and runs on all p
 ```cpp
 class NeighborGraph {
     NodeEdges neighbors[32];              // Graph node slots (32 nodes × 32 edges each, ~17 KB)
-    DownstreamEntry downstream[1100];     // Remote node routing table
+    DownstreamEntry downstream[900];      // Remote node routing table
     RelayState relayStates[32];           // Transmission tracking for contention
     Route routeCache[32];                 // Cached Dijkstra results
     // Total: ~24 KB fixed allocation
@@ -882,7 +891,7 @@ class NeighborGraph {
 
 | Struct | Purpose |
 |--------|---------|
-| `Edge` | Link to a neighbor with ETX (fixed-point ×100), variance, source (Reported/Mirrored), timestamp |
+| `Edge` | Link to a neighbor with ETX (fixed-point ×100), stored EWMA variance, `lastHeardSecs` (our Reported RX only), source (Reported/Mirrored/Inferred), timestamp |
 | `NodeEdges` | A neighbor slot: nodeId + up to 32 edges + last full update time |
 | `DownstreamEntry` | Remote node routing: (destination, relay, cost, lastUpdate) |
 | `Route` | Cached route result: (destination, nextHop, cost, timestamp) |
@@ -895,7 +904,7 @@ class NeighborGraph {
 |-----------|---------|---------|
 | `NEIGHBOR_GRAPH_MAX_NEIGHBORS` | 32 | Graph node slots (heap; nodes run with ~42-46 KB free) |
 | `NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE` | 32 | Max edges per node (a city hub hears well over 24; at 24 real neighbours were evicted) |
-| `NEIGHBOR_GRAPH_MAX_DOWNSTREAM` | 1100 | Remote node routing entries |
+| `NEIGHBOR_GRAPH_MAX_DOWNSTREAM` | 900 | Remote node routing entries |
 | `NEIGHBOR_GRAPH_MAX_RELAY_STATES` | 32 | Transmission tracking slots |
 | `NEIGHBOR_GRAPH_MAX_CACHED_ROUTES` | 32 | Dijkstra result cache |
 
@@ -921,7 +930,11 @@ struct DownstreamEntry {
 
 - Updated when SR topology broadcasts report neighbor lists from relay nodes
 - Supports multiple relays per destination (entries with different relay fields)
-- Used as **fallback only** when Dijkstra over the edge graph cannot reach the destination (e.g., non-SR nodes without topology edges). Dijkstra routes always take priority over downstream estimates.
+- Dijkstra over the edge graph takes priority when it can price a path. When it cannot, a
+  downstream *chain* still stamps: walk dest → via until the current node is a neighbour we
+  hear (`downstreamChainEgress`, at most `MAX_DOWNSTREAM_CHAIN` hops). That hop is designated,
+  not the inbound-gateway guess. Native tests: `test_chain_walks_to_the_first_hearable_hop`,
+  `test_downstream_chain_appoints_the_neighbour_we_hear`.
 - During placeholder resolution, entries are transferred to the real node via `transferDownstream()`
 
 ### Placeholder System
@@ -991,7 +1004,7 @@ The default values for the configurable parameters above are defined in `SignalR
 
 ```cpp
 // SignalRoutingModule.h
-#define SIGNAL_ROUTING_BROADCAST_SECS        360   // periodic topology broadcast interval
+#define SIGNAL_ROUTING_BROADCAST_SECS        600   // periodic topology broadcast interval (10 min)
 #define SIGNAL_ROUTING_DIRTY_BROADCAST_SECS  300   // minimum gap before early dirty broadcast (5 min)
 #define SR_BROADCAST_MAX_HOPS                  5   // hop_limit cap for topology packets
 #define MAX_SIGNAL_ROUTING_NEIGHBORS          28   // neighbors per broadcast payload (packed binary, fits 233-byte limit)
@@ -1005,7 +1018,9 @@ static constexpr uint32_t PUBLISHER_SILENCE_SECS = SIGNAL_ROUTING_BROADCAST_SECS
 
 // NeighborGraph.h (private instance variable)
 float etxChangeThreshold = 0.5f;   // absolute ETX delta for a significant edge change (base; per-edge etxVariance added)
-uint8_t etxVariance;               // EWMA of |ETX change| × 20 on each edge — locally computed, broadcast to all
+uint8_t etxVariance;               // EWMA of |ETX change| × 20 on each edge — stored on the wire; live silence is local
+uint32_t lastHeardSecs;            // last RF hear as on-air TX on our Reported RX edge; 0 = no silence surcharge
+static constexpr uint32_t TOPOLOGY_BROADCAST_SECS = 600;  // same T as SIGNAL_ROUTING_BROADCAST_SECS
 ```
 
 ### Prompt Dirty-Topology Rebroadcast (`markTopologyDirty()`)

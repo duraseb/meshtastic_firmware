@@ -177,8 +177,13 @@ struct Edge {
     uint8_t etxVariance; // EWMA of |ETX change| × 20 (range 0.00–12.75 ETX units)
     Source source;
     bool hearsUs;        // True if this node proved it hears us: relayed our packets or listed us in its topology
+    uint32_t lastHeardSecs; // Last RF hear as on-air TX on our Reported RX edge; 0 = no silence surcharge
 
-    Edge() : to(0), etxFixed(100), lastUpdate(0), etxVariance(0), source(Source::Mirrored), hearsUs(false) {}
+    Edge()
+        : to(0), etxFixed(100), lastUpdate(0), etxVariance(0), source(Source::Mirrored), hearsUs(false),
+          lastHeardSecs(0)
+    {
+    }
 
     float getEtx() const { return etxFixed / 100.0f; }
     void setEtx(float etx) { etxFixed = static_cast<uint16_t>(etx * 100.0f); }
@@ -191,6 +196,10 @@ struct Edge {
         uint16_t scaled = static_cast<uint16_t>(updated * 20.0f + 0.5f);
         etxVariance = (scaled > 255) ? 255 : static_cast<uint8_t>(scaled);
     }
+
+    static uint16_t silenceEtxFixedFromAge(uint32_t ageSecs, uint32_t periodSecs);
+    static uint8_t silenceVarianceByteFromAge(uint32_t ageSecs, uint32_t periodSecs);
+    uint8_t effectiveVarianceByte(uint32_t nowSecs, uint32_t periodSecs, bool ourRx) const;
 };
 
 struct NodeEdges {
@@ -286,6 +295,9 @@ class NeighborGraph {
 
     int updateEdge(NodeNum from, NodeNum to, float etx, uint32_t timestamp,
                    Edge::Source source = Edge::Source::Mirrored, bool updateTimestamp = true);
+
+    void foldSilenceBeforeReportedHear(NodeNum myNode, NodeNum peer, uint32_t nowSecs);
+    void stampReportedLastHeard(NodeNum myNode, NodeNum peer, uint32_t nowSecs);
 
     const NodeEdges *getEdgesFrom(NodeNum node) const;
 
@@ -457,7 +469,7 @@ class NeighborGraph {
     // only measurement is the sender's and `receiverPublishes`, that reverse SNR is taken at
     // UNVERIFIED_HOP_COST_FACTOR. A receiver that publishes nothing has no better number, so the
     // sender's measurement stands. 0 when neither has a measured edge.
-    float deliveryHopCost(NodeNum from, NodeNum to, bool receiverPublishes) const;
+    float deliveryHopCost(NodeNum from, NodeNum to, bool receiverPublishes, uint32_t currentTimeSecs) const;
 
     // Does a transmission by `from` reach `to` well enough to relieve a bystander of relaying?
     //
@@ -592,6 +604,11 @@ class NeighborGraph {
 
     void setEtxChangeThreshold(float v) { etxChangeThreshold = v; }
     float getEtxChangeThreshold() const { return etxChangeThreshold; }
+
+    uint16_t pricedHopCostFixed(const Edge &edge, NodeNum listOwner, NodeNum myNode, uint32_t nowSecs,
+                                bool unverified) const;
+
+    static constexpr uint32_t TOPOLOGY_BROADCAST_SECS = 600;
 
   private:
     float etxChangeThreshold = 0.5f; // Absolute ETX delta to register an edge change as significant

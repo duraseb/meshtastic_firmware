@@ -27,6 +27,20 @@ static void initGraphTestNodeDb(NodeNum localNode)
     myNodeInfo.my_node_num = localNode;
 }
 
+static const Edge *edgeBetween(const NeighborGraph &graph, NodeNum from, NodeNum to)
+{
+    const NodeEdges *n = graph.getEdgesFrom(from);
+    if (!n) {
+        return nullptr;
+    }
+    for (uint8_t i = 0; i < n->edgeCount; i++) {
+        if (n->edges[i].to == to) {
+            return &n->edges[i];
+        }
+    }
+    return nullptr;
+}
+
 static uint8_t buildPackedBuffer(uint8_t *buf, size_t bufSize, NodeNum nodeId, int8_t rssi, int8_t snr, bool srActive,
                                  bool hearsUs, uint8_t etxVariance)
 {
@@ -618,6 +632,185 @@ static void test_variance_outranks_a_slightly_better_mean()
     Route swinging = graph.calculateRoute(dest, 1000, publishes);
     TEST_ASSERT_EQUAL_UINT32(stable, swinging.nextHop);
     TEST_ASSERT_EQUAL_UINT16(250, swinging.costFixed);
+}
+
+static void test_silence_variance_follows_age_bands()
+{
+    constexpr uint32_t T = NeighborGraph::TOPOLOGY_BROADCAST_SECS;
+    TEST_ASSERT_EQUAL_UINT16(0, Edge::silenceEtxFixedFromAge(T / 2 - 1, T));
+    TEST_ASSERT_EQUAL_UINT16(0, Edge::silenceEtxFixedFromAge(T / 2, T));
+    const uint16_t slight = Edge::silenceEtxFixedFromAge(T / 2 + T / 8, T);
+    TEST_ASSERT_TRUE(slight > 0 && slight < 50);
+    const uint16_t mid = Edge::silenceEtxFixedFromAge(T + T / 2, T);
+    TEST_ASSERT_EQUAL_UINT16(325, mid);
+    TEST_ASSERT_TRUE(mid > slight);
+    TEST_ASSERT_EQUAL_UINT16(1275, Edge::silenceEtxFixedFromAge(2 * T, T));
+    TEST_ASSERT_EQUAL_UINT8(255, Edge::silenceVarianceByteFromAge(2 * T, T));
+}
+
+static void test_delivery_cost_rises_with_silence_on_our_rx_edge()
+{
+    constexpr NodeNum ME = 0xAA0000AA;
+    constexpr NodeNum PEER = 0xBB0000BB;
+    constexpr uint32_t T = NeighborGraph::TOPOLOGY_BROADCAST_SECS;
+    initGraphTestNodeDb(ME);
+    NeighborGraph graph;
+    const uint32_t t0 = 5'000'000;
+    graph.updateEdge(ME, PEER, 2.0f, t0, Edge::Source::Reported);
+    Edge *rx = const_cast<Edge *>(edgeBetween(graph, ME, PEER));
+    TEST_ASSERT_NOT_NULL(rx);
+    rx->lastHeardSecs = t0;
+    const float inside = graph.deliveryHopCost(PEER, ME, false, t0 + T / 4);
+    const float loud = graph.deliveryHopCost(PEER, ME, false, t0 + T + 1);
+    const float saturated = graph.deliveryHopCost(PEER, ME, false, t0 + 2 * T);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 2.0f, inside);
+    TEST_ASSERT_TRUE(loud > inside);
+    TEST_ASSERT_TRUE(saturated > loud);
+}
+
+static void test_last_heard_follows_the_on_air_transmitter()
+{
+    constexpr NodeNum ME = 0xAA0000AA;
+    constexpr NodeNum PEER = 0xBB0000BB;
+    constexpr NodeNum HUB = 0xCC0000CC;
+    initGraphTestNodeDb(ME);
+    NeighborGraph graph;
+    DirectNeighborSignal signals[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE] = {};
+    uint8_t signalCount = 0;
+    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, PEER,
+                                             -70, 8.0f, 1000);
+    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, HUB, -72,
+                                             7.0f, 2000);
+    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, HUB, -65,
+                                             9.0f, 3000);
+    const Edge *peer = edgeBetween(graph, ME, PEER);
+    const Edge *hub = edgeBetween(graph, ME, HUB);
+    TEST_ASSERT_NOT_NULL(peer);
+    TEST_ASSERT_NOT_NULL(hub);
+    TEST_ASSERT_EQUAL_UINT32(1000, peer->lastHeardSecs);
+    TEST_ASSERT_EQUAL_UINT32(3000, hub->lastHeardSecs);
+    TEST_ASSERT_NULL(edgeBetween(graph, ME, 0xDD0000DD));
+}
+
+static void test_in_window_hear_does_not_fold_silence_but_etx_jump_still_raises()
+{
+    constexpr NodeNum ME = 0xAA0000AA;
+    constexpr NodeNum PEER = 0xBB0000BB;
+    constexpr uint32_t T = NeighborGraph::TOPOLOGY_BROADCAST_SECS;
+    initGraphTestNodeDb(ME);
+    NeighborGraph graph;
+    DirectNeighborSignal signals[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE] = {};
+    uint8_t signalCount = 0;
+    const uint32_t t0 = 4'000'000;
+    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, PEER,
+                                             -70, 8.0f, t0);
+    const uint8_t quiet = edgeBetween(graph, ME, PEER)->etxVariance;
+    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, PEER,
+                                             -70, 8.0f, t0 + T / 4);
+    TEST_ASSERT_EQUAL_UINT8(quiet, edgeBetween(graph, ME, PEER)->etxVariance);
+    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, PEER,
+                                             -90, -15.0f, t0 + T / 4 + 1);
+    TEST_ASSERT_GREATER_THAN(quiet, edgeBetween(graph, ME, PEER)->etxVariance);
+}
+
+static void test_silence_fold_keeps_scar_after_a_long_gap_packet()
+{
+    constexpr NodeNum ME = 0xAA0000AA;
+    constexpr NodeNum PEER = 0xBB0000BB;
+    constexpr uint32_t T = NeighborGraph::TOPOLOGY_BROADCAST_SECS;
+    initGraphTestNodeDb(ME);
+    NeighborGraph graph;
+    DirectNeighborSignal signals[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE] = {};
+    uint8_t signalCount = 0;
+    const uint32_t t0 = 1'000'000;
+    TEST_ASSERT_EQUAL_INT(EDGE_NEW, refreshReportedDirectNeighborObservation(
+                                        &graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, PEER, -70,
+                                        8.0f, t0));
+    const float fresh = graph.deliveryHopCost(PEER, ME, false, t0);
+    TEST_ASSERT_EQUAL_INT(EDGE_NO_CHANGE, refreshReportedDirectNeighborObservation(
+                                              &graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, PEER,
+                                              -70, 8.0f, t0 + 2 * T + 1));
+    const float after = graph.deliveryHopCost(PEER, ME, false, t0 + 2 * T + 1);
+    TEST_ASSERT_TRUE(after > fresh);
+}
+
+static void test_packed_variance_stays_stored_while_silence_is_live()
+{
+    constexpr NodeNum ME = 0xAA0000AA;
+    constexpr NodeNum PEER = 0xBB0000BB;
+    constexpr uint32_t T = NeighborGraph::TOPOLOGY_BROADCAST_SECS;
+    initGraphTestNodeDb(ME);
+    NeighborGraph graph;
+    graph.updateEdge(ME, PEER, 2.0f, 1000, Edge::Source::Reported);
+    Edge *rx = const_cast<Edge *>(edgeBetween(graph, ME, PEER));
+    TEST_ASSERT_NOT_NULL(rx);
+    rx->lastHeardSecs = 1000;
+    const uint32_t silentAt = 1000 + 2 * T;
+    TEST_ASSERT_EQUAL_UINT8(0, rx->etxVariance);
+    TEST_ASSERT_GREATER_THAN(0, rx->effectiveVarianceByte(silentAt, T, true));
+    uint8_t entry[PACKED_NEIGHBOR_ENTRY_SIZE] = {};
+    encodePackedNeighborEntry(entry, PEER, -70, 8, false, false, rx->etxVariance);
+    TEST_ASSERT_EQUAL_UINT8(rx->etxVariance, entry[7]);
+    TEST_ASSERT_NOT_EQUAL(rx->effectiveVarianceByte(silentAt, T, true), entry[7]);
+}
+
+static void test_variance_outranks_a_slightly_better_mean_when_a_neighbour_is_silent()
+{
+    constexpr NodeNum ME = 0xAA0000AA;
+    constexpr NodeNum QUIET = 0xBB0000BB;
+    constexpr NodeNum NOISY = 0xCC0000CC;
+    constexpr NodeNum DEST = 0xDD0000DD;
+    constexpr uint32_t T = NeighborGraph::TOPOLOGY_BROADCAST_SECS;
+    const uint32_t t0 = 10'000'000;
+    initGraphTestNodeDb(ME);
+    NeighborGraph graph;
+    graph.updateEdge(ME, QUIET, 1.8f, t0, Edge::Source::Reported);
+    graph.updateEdge(ME, NOISY, 2.0f, t0, Edge::Source::Reported);
+    const_cast<Edge *>(edgeBetween(graph, ME, QUIET))->lastHeardSecs = t0;
+    const_cast<Edge *>(edgeBetween(graph, ME, NOISY))->lastHeardSecs = t0 + T;
+    graph.updateEdge(QUIET, DEST, 1.0f, t0, Edge::Source::Mirrored);
+    graph.updateEdge(NOISY, DEST, 1.2f, t0, Edge::Source::Mirrored);
+    graph.updateEdge(DEST, QUIET, 1.0f, t0, Edge::Source::Mirrored);
+    graph.updateEdge(DEST, NOISY, 1.2f, t0, Edge::Source::Mirrored);
+    graph.clearCache();
+    Route route = graph.calculateRoute(DEST, t0 + 2 * T + 1);
+    TEST_ASSERT_EQUAL_UINT32(NOISY, route.nextHop);
+}
+
+static void test_egress_silence_applies_only_after_we_have_heard_them()
+{
+    constexpr NodeNum ME = 0xAA0000AA;
+    constexpr NodeNum HUB = 0xBB0000BB;
+    constexpr NodeNum DEST = 0xCC0000CC;
+    initGraphTestNodeDb(ME);
+    NeighborGraph graph;
+    graph.updateEdge(ME, HUB, 5.0f, 0, Edge::Source::Reported);
+    graph.updateEdge(HUB, ME, 1.0f, 0, Edge::Source::Mirrored);
+    graph.updateEdge(HUB, DEST, 1.0f, 0, Edge::Source::Mirrored);
+    graph.updateEdge(DEST, HUB, 1.0f, 0, Edge::Source::Mirrored);
+    NeighborGraph::RoutePolicy publishes;
+    publishes.publishes = [](void *, NodeNum) { return true; };
+    graph.clearCache();
+    Route unheard = graph.calculateRoute(DEST, 0, publishes);
+    TEST_ASSERT_EQUAL_UINT32(HUB, unheard.nextHop);
+    TEST_ASSERT_EQUAL_UINT16(200, unheard.costFixed);
+    const_cast<Edge *>(edgeBetween(graph, ME, HUB))->lastHeardSecs = 1;
+    graph.clearCache();
+    Route heard = graph.calculateRoute(DEST, 1, publishes);
+    TEST_ASSERT_EQUAL_UINT32(HUB, heard.nextHop);
+    TEST_ASSERT_TRUE(heard.costFixed > unheard.costFixed);
+}
+
+static void test_unverified_priced_hop_saturates_instead_of_wrapping()
+{
+    constexpr NodeNum ME = 0xAA0000AA;
+    initGraphTestNodeDb(ME);
+    NeighborGraph graph;
+    Edge edge;
+    edge.to = 0xBB0000BB;
+    edge.etxFixed = 20000;
+    edge.source = Edge::Source::Mirrored;
+    TEST_ASSERT_EQUAL_UINT16(0xFFFE, graph.pricedHopCostFixed(edge, edge.to, ME, 0, true));
 }
 
 // Feed one neighbour list so the sender is recorded as an SR publisher and the edge exists.
@@ -2191,6 +2384,15 @@ void setup()
     RUN_TEST(test_route_never_uses_a_one_way_edge);
     RUN_TEST(test_route_cost_is_measured_at_the_receiver);
     RUN_TEST(test_variance_outranks_a_slightly_better_mean);
+    RUN_TEST(test_silence_variance_follows_age_bands);
+    RUN_TEST(test_delivery_cost_rises_with_silence_on_our_rx_edge);
+    RUN_TEST(test_last_heard_follows_the_on_air_transmitter);
+    RUN_TEST(test_in_window_hear_does_not_fold_silence_but_etx_jump_still_raises);
+    RUN_TEST(test_silence_fold_keeps_scar_after_a_long_gap_packet);
+    RUN_TEST(test_packed_variance_stays_stored_while_silence_is_live);
+    RUN_TEST(test_variance_outranks_a_slightly_better_mean_when_a_neighbour_is_silent);
+    RUN_TEST(test_egress_silence_applies_only_after_we_have_heard_them);
+    RUN_TEST(test_unverified_priced_hop_saturates_instead_of_wrapping);
     RUN_TEST(test_a_backup_does_not_relay_when_its_next_hop_cannot_hear_it);
     RUN_TEST(test_inbound_gateway_is_the_fallback_only_without_a_confirmed_path);
     RUN_TEST(test_topology_listing_peer_confirms_peer_hears_sender);
