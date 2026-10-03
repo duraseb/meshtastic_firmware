@@ -2355,6 +2355,50 @@ void test_unicast_last_hop_slots_and_dupe_flags()
     }
 }
 
+static void test_neighbour_that_does_not_hear_the_transmitter_gets_no_slot()
+{
+    constexpr NodeNum me = 0xAA0000AA;
+    constexpr NodeNum hub = 0xBB0000BB;
+    constexpr NodeNum tx = 0x11000011;
+    constexpr NodeNum dest = 0x22000022;
+    initGraphTestNodeDb(me);
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+
+    {
+        NeighborGraph graph;
+        graph.updateEdge(me, hub, 1.5f, 0, Edge::Source::Reported);
+        graph.setEdgeHearsUs(me, hub, true);
+        graph.updateEdge(me, tx, 1.5f, 0, Edge::Source::Reported);
+        TEST_ASSERT_TRUE(graph.unicastHeardTransmitter(tx, me, me));
+        TEST_ASSERT_FALSE(graph.unicastHeardTransmitter(tx, hub, me));
+        graph.updateEdge(hub, tx, 1.2f, 0, Edge::Source::Mirrored);
+        TEST_ASSERT_TRUE(graph.unicastHeardTransmitter(tx, hub, me));
+    }
+
+    class GraphWriter : public SignalRoutingModule {
+    public:
+        void note(NodeNum from, NodeNum to, bool hearsUs) { updateGraphWithNeighbor(from, to, -90, 5, hearsUs); }
+    };
+    GraphWriter module;
+    module.note(me, hub, true);
+    module.note(me, tx, false);
+    ingestOneNeighbor(module, hub, dest, true, 1);
+    TEST_ASSERT_TRUE(module.isSignalRoutingNode(hub));
+
+    meshtastic_MeshPacket uni = meshtastic_MeshPacket_init_zero;
+    uni.from = tx;
+    uni.to = dest;
+    uni.id = 0x40;
+    uni.hop_start = 3;
+    uni.hop_limit = 3;
+    uni.relay_node = static_cast<uint8_t>(tx & 0xFF);
+    uni.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    TEST_ASSERT_TRUE(module.shouldRelayUnicastForCoordination(&uni));
+    const uint32_t floorMs = module.ladderTransitionMs();
+    TEST_ASSERT_TRUE(module.pendingRelayDelayMs >= floorMs);
+    TEST_ASSERT_TRUE(module.pendingRelayDelayMs < floorMs + 200);
+}
+
 void setup()
 {
     initializeTestEnvironment();
@@ -2449,6 +2493,7 @@ void setup()
     RUN_TEST(test_undecoded_direct_frame_is_recorded_as_a_neighbour);
     RUN_TEST(test_unicast_dupe_cancel_predicate);
     RUN_TEST(test_unicast_last_hop_slots_and_dupe_flags);
+    RUN_TEST(test_neighbour_that_does_not_hear_the_transmitter_gets_no_slot);
 
     UNITY_END();
 }

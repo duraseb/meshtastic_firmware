@@ -383,13 +383,14 @@ If the packet carries a `next_hop` field, slot 0 is reserved for that designated
 `NextHopRouter::perhapsRebroadcast` lets SR-coordinated unicasts past the stock gate (which otherwise admits a unicast only when it names nobody or names us), so this path is reachable; nodes without SR keep the stock rule.
 
 **Candidate Cost Metric (SR candidates, slot 1+):**
-For each candidate (self + SR-active direct neighbors), three tiers that never overlap:
+For each candidate (self, plus SR-active direct neighbors that are known to hear this copy's
+transmitter), three tiers that never overlap:
 - Direct edge to destination → `etxFixed` (clamped below 0x7FFF)
 - Known downstream relay of the destination → `0x7FFF` — the downstream table is often the only knowledge we have of a gateway's branch before its topology report arrives
 - Edge to the shared next hop (indirect) → `etxFixed | 0x8000` — always sorts after the two tiers above
 - No usable path → excluded
 
-This ensures last-hop delivery nodes are always scheduled before intermediate relays, and within each tier the lower ETX wins. Costs are compared in half-ETX buckets (`SR_COST_BUCKET_FIXED`), for unicast candidates and for the broadcast ranking's average cost alike: a node prices its own link from its own measurements and a peer's link from the peer's packed report, so near-equal costs differ by a few hundredths in a direction that varies per node, and exact comparison let two colocated nodes rank each other in opposite orders and take the same slot. Within a bucket the packet-id-parity node-id tie-break decides identically everywhere.
+This ensures last-hop delivery nodes are always scheduled before intermediate relays, and within each tier the lower ETX wins. A neighbour that does not hear the transmitter (`knownToHear`) is not a candidate even if it has a path to the destination: ranking it made every overhearer wait for a slot that never fired. We ourselves always count — we overheard the frame. Native test: `test_neighbour_that_does_not_hear_the_transmitter_gets_no_slot`. Costs are compared in half-ETX buckets (`SR_COST_BUCKET_FIXED`), for unicast candidates and for the broadcast ranking's average cost alike: a node prices its own link from its own measurements and a peer's link from the peer's packed report, so near-equal costs differ by a few hundredths in a direction that varies per node, and exact comparison let two colocated nodes rank each other in opposite orders and take the same slot. Within a bucket the packet-id-parity node-id tie-break decides identically everywhere.
 
 **Channel-access model:** waits are built from stock's own contention geometry (the preset's CAD slot time and its contention window), the frame airtime, and a fixed guard after somebody else's frame — the turnaround, `SR_PEER_TURNAROUND_MS` = 250 ms. The ACK gate is turnaround + twice the maximum contention delay + the reply airtime; the wait behind a designated SR next hop is turnaround + maximum contention + one airtime; the coordinated broadcast ladder and undesignated unicast slot 0 both start at stock's contention floor, `getRelayFloorMsec()` = 2 × CWmax × slot time (rung k at floor + k × half airtime). The turnaround remains the peer re-arm used by dest-ACK and peer-relay waits, not the ladder origin.
 
@@ -1143,7 +1144,7 @@ Slot spacing is half the packet airtime, ensuring the next-slot node detects ong
 1. **Quick suppression**: src+dst same downstream relay that already holds this copy; heardFrom can finish; SR neighbor covering heardFrom already transmitted this id and can finish
 2. **No route → suppress**: `getNextHop(destination)` returns 0
 3. **Phase 1 — designated next_hop**: if `p->next_hop` is set, slot 0 belongs to it; if we ARE that node, relay at slot 0 immediately; otherwise advance slotDelay to slot 1
-4. **Phase 2 — SR candidates**: self + SR-active neighbors sorted ascending by cost-to-destination; first unassigned candidate gets the next slot
+4. **Phase 2 — SR candidates**: self + SR-active neighbors that heard this copy, sorted ascending by cost-to-destination; first unassigned candidate gets the next slot
 5. **Slot assignment**: if it's our slot, `pendingRelayDelayMs` is set and we return true; otherwise suppress. No 2 s delay clamp.
 6. **Dupe cancellation**: a heard copy cancels only when the transmitter can finish or is ranked ahead with a path; keep if we can finish and they cannot
 

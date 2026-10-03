@@ -2061,7 +2061,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     // --- Slot-based relay coordination ---
     //
     // If p->next_hop is set, slot 0 is reserved for the designated next_hop node.
-    // SR candidates (self + SR-active direct neighbors that can reach destination)
+    // SR candidates (self + SR-active direct neighbors that heard this copy and can reach destination)
     // are sorted ascending by cost-to-destination and assigned subsequent slots:
     //   - Direct edge to destination            → etxFixed (range ~100–32767)
     //   - Edge to the shared next hop (proxy)   → etxFixed | 0x8000 (always after direct)
@@ -2245,6 +2245,9 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
                 if (getCapabilityStatus(nb) != CapabilityStatus::SRactive) {
                     continue;
                 }
+                if (!routingGraph->unicastHeardTransmitter(heardFrom, nb, myNode)) {
+                    continue;
+                }
                 if (((p->id & 1) != 0) ? (nb > myNode) : (nb < myNode)) {
                     rank++;
                 }
@@ -2289,6 +2292,10 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
             }
             if (getCapabilityStatus(nb) != CapabilityStatus::SRactive) {
                 LOG_INFO("[SR] Unicast candidate %08x skipped (not SR-active)", nb);
+                continue;
+            }
+            if (!routingGraph->unicastHeardTransmitter(heardFrom, nb, myNode)) {
+                LOG_INFO("[SR] Unicast candidate %08x skipped (does not hear transmitter)", nb);
                 continue;
             }
             uint16_t cost = getCandidateCost(nb);

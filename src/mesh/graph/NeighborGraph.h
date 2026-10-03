@@ -522,6 +522,15 @@ class NeighborGraph {
     /// Cost of `node` as a unicast relay candidate: priced hop, dest's downstream, or shared next hop.
     uint16_t unicastCandidateCost(NodeNum node, NodeNum destination, NodeNum myNode, NodeNum myNextHop,
                                   const RoutePolicy &policy) const;
+    /// A neighbour only gets a unicast relay slot if it is known to hear this copy's transmitter.
+    /// We ourselves always count: we are ranking because we received the frame.
+    bool unicastHeardTransmitter(NodeNum heardFrom, NodeNum candidate, NodeNum myNode) const
+    {
+        if (heardFrom == 0 || candidate == myNode) {
+            return true;
+        }
+        return knownToHear(heardFrom, candidate);
+    }
     /// Heard-copy cancel: the relayer can finish, or is ranked ahead of us with a path. Keep if we
     /// can finish and they cannot. Unresolved or placeholder identity cancels only when we cannot.
     /// Last-hop backup: only dest's own copy cancels. A flood slot stays for a same-hop named SR
