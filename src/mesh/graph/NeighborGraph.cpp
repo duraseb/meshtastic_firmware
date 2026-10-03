@@ -620,33 +620,25 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, c
         }
     }
 
-    // Fallback: downstream table only when Dijkstra found no route at all.
-    // Never let the downstream estimate compete with a Dijkstra-computed cost,
-    // since the edge graph gives us verified per-link costs.
+    // Fallback: walk dest along downstream until a neighbour we hear.
     if (result.nextHop == 0) {
-        const NodeEdges *myEdges = findNeighbor(myNode);
-        for (uint16_t i = 0; i < downstreamCount; i++) {
-            if (downstream[i].destination == destination) {
-                if (policy.routable && !policy.routable(policy.ctx, downstream[i].relay)) continue;
-                if (!findNeighbor(downstream[i].relay)) continue;
-
-                uint16_t costToRelay = 0xFFFF;
-                if (myEdges) {
-                    for (uint8_t j = 0; j < myEdges->edgeCount; j++) {
-                        if (myEdges->edges[j].to == downstream[i].relay) {
-                            costToRelay = myEdges->edges[j].etxFixed;
-                            break;
-                        }
+        ChainEgress chain = downstreamChainEgress(destination, myNode);
+        if (chain.node != 0 && (!policy.routable || policy.routable(policy.ctx, chain.node))) {
+            const NodeEdges *myEdges = findNeighbor(myNode);
+            uint16_t costToEgress = 0xFFFF;
+            if (myEdges) {
+                for (uint8_t j = 0; j < myEdges->edgeCount; j++) {
+                    if (myEdges->edges[j].to == chain.node) {
+                        costToEgress = myEdges->edges[j].etxFixed;
+                        break;
                     }
                 }
-                uint16_t totalCost = (costToRelay < 0xFFF0 && downstream[i].costFixed < 0xFFF0)
-                                         ? costToRelay + downstream[i].costFixed
-                                         : 0xFFFF;
-                if (totalCost < result.costFixed) {
-                    result.nextHop = downstream[i].relay;
-                    result.costFixed = totalCost;
-                    result.verified = false;
-                }
+            }
+            if (costToEgress < 0xFFF0 && chain.costFixed < 0xFFF0) {
+                uint32_t total = (uint32_t)costToEgress + chain.costFixed;
+                result.nextHop = chain.node;
+                result.costFixed = total > 0xFFFF ? 0xFFFF : (uint16_t)total;
+                result.verified = false;
             }
         }
     }
@@ -799,6 +791,13 @@ void NeighborGraph::updateDownstreamExclusive(NodeNum destination, NodeNum relay
 
 NodeNum NeighborGraph::getDownstreamRelay(NodeNum destination) const
 {
+    NodeNum relay = 0;
+    uint16_t cost = 0;
+    return downstreamRelayAndCost(destination, relay, cost) ? relay : 0;
+}
+
+bool NeighborGraph::downstreamRelayAndCost(NodeNum destination, NodeNum &relayOut, uint16_t &costOut) const
+{
     uint32_t now = millis() / 1000;
     NodeNum bestRelay = 0;
     uint16_t bestCost = UINT16_MAX;
@@ -810,7 +809,54 @@ NodeNum NeighborGraph::getDownstreamRelay(NodeNum destination) const
             }
         }
     }
-    return bestRelay;
+    if (bestRelay == 0) {
+        return false;
+    }
+    relayOut = bestRelay;
+    costOut = bestCost;
+    return true;
+}
+
+ChainEgress NeighborGraph::downstreamChainEgress(NodeNum destination, NodeNum myNode) const
+{
+    ChainEgress out;
+    if (destination == 0 || myNode == 0) {
+        return out;
+    }
+    auto hears = [&](NodeNum n) -> bool {
+        if (n == 0 || n == myNode) {
+            return false;
+        }
+        const NodeEdges *mine = findNeighbor(myNode);
+        return mine && findEdge(mine, n);
+    };
+    NodeNum cur = destination;
+    NodeNum seen[MAX_DOWNSTREAM_CHAIN];
+    uint8_t hops = 0;
+    uint16_t costFixed = 0;
+    while (hops < MAX_DOWNSTREAM_CHAIN) {
+        NodeNum relay = 0;
+        uint16_t hopCost = 0;
+        if (!downstreamRelayAndCost(cur, relay, hopCost) || relay == 0 || relay == cur) {
+            return ChainEgress{};
+        }
+        for (uint8_t i = 0; i < hops; i++) {
+            if (seen[i] == relay) {
+                return ChainEgress{};
+            }
+        }
+        seen[hops++] = relay;
+        uint32_t nextCost = (uint32_t)costFixed + hopCost;
+        costFixed = nextCost > 0xFFFF ? 0xFFFF : (uint16_t)nextCost;
+        if (hears(relay)) {
+            out.node = relay;
+            out.hops = hops;
+            out.costFixed = costFixed;
+            return out;
+        }
+        cur = relay;
+    }
+    return ChainEgress{};
 }
 
 bool NeighborGraph::isDownstream(NodeNum destination) const
@@ -1381,6 +1427,10 @@ uint16_t NeighborGraph::unicastCandidateCost(NodeNum node, NodeNum destination, 
     }
     NodeNum dsRelay = getDownstreamRelay(destination);
     if (dsRelay != 0 && dsRelay == node) {
+        return 0x7FFFu;
+    }
+    NodeNum egress = downstreamChainEgress(destination, myNode).node;
+    if (egress != 0 && egress == node) {
         return 0x7FFFu;
     }
     if (myNextHop != 0 && myNextHop != destination && myNextHop != myNode && myNextHop != node) {

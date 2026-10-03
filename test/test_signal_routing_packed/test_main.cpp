@@ -1196,6 +1196,89 @@ static void test_a_relayed_former_neighbour_becomes_downstream()
     TEST_ASSERT_EQUAL_UINT32(traveller, graph.calculateRoute(traveller, 3000, publishes).nextHop);
 }
 
+static void test_chain_walks_to_the_first_hearable_hop()
+{
+    constexpr NodeNum me = 0xAA0000AA;
+    constexpr NodeNum hub = 0xF60000F6;
+    constexpr NodeNum parent = 0x11000011;
+    constexpr NodeNum mid = 0x33000033;
+    constexpr NodeNum dest = 0x22000022;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    const uint32_t now = millis() / 1000;
+    graph.updateEdge(me, hub, 1.2f, now, Edge::Source::Reported);
+    graph.updateDownstream(dest, mid, 1.5f, now);
+    graph.updateDownstream(mid, parent, 1.5f, now);
+    graph.updateDownstream(parent, hub, 2.0f, now);
+
+    ChainEgress chain = graph.downstreamChainEgress(dest, me);
+    TEST_ASSERT_EQUAL_UINT32(hub, chain.node);
+    TEST_ASSERT_EQUAL_UINT8(3, chain.hops);
+    TEST_ASSERT_EQUAL_UINT16(150 + 150 + 200, chain.costFixed);
+
+    ChainEgress toParent = graph.downstreamChainEgress(parent, me);
+    TEST_ASSERT_EQUAL_UINT32(hub, toParent.node);
+    TEST_ASSERT_EQUAL_UINT8(1, toParent.hops);
+    TEST_ASSERT_EQUAL_UINT16(200, toParent.costFixed);
+
+    NeighborGraph atHub;
+    initGraphTestNodeDb(hub);
+    atHub.updateEdge(hub, parent, 1.4f, now, Edge::Source::Reported);
+    atHub.updateDownstream(dest, mid, 1.5f, now);
+    atHub.updateDownstream(mid, parent, 1.5f, now);
+    ChainEgress hubAppoints = atHub.downstreamChainEgress(dest, hub);
+    TEST_ASSERT_EQUAL_UINT32(parent, hubAppoints.node);
+    TEST_ASSERT_EQUAL_UINT8(2, hubAppoints.hops);
+    TEST_ASSERT_EQUAL_UINT16(150 + 150, hubAppoints.costFixed);
+}
+
+static void test_chain_returns_none_on_a_cycle_or_a_broken_path()
+{
+    constexpr NodeNum me = 0xAA0000AA;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph cycle;
+    const uint32_t now = millis() / 1000;
+    cycle.updateDownstream(0x22000022, 0x11000011, 1.0f, now);
+    cycle.updateDownstream(0x11000011, 0x22000022, 1.0f, now);
+    TEST_ASSERT_EQUAL_UINT32(0, cycle.downstreamChainEgress(0x22000022, me).node);
+
+    NeighborGraph broken;
+    broken.updateDownstream(0x22000022, 0x11000011, 1.0f, now);
+    TEST_ASSERT_EQUAL_UINT32(0, broken.downstreamChainEgress(0x22000022, me).node);
+}
+
+static void test_downstream_chain_appoints_the_neighbour_we_hear()
+{
+    constexpr NodeNum me = 0xAA0000AA;
+    constexpr NodeNum hub = 0xF60000F6;
+    constexpr NodeNum parent = 0x11000011;
+    constexpr NodeNum dest = 0x22000022;
+    const uint32_t now = millis() / 1000;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, hub, 1.2f, now, Edge::Source::Reported);
+    graph.updateDownstream(dest, parent, 2.0f, now);
+    graph.updateDownstream(parent, hub, 2.0f, now);
+    graph.clearCache();
+    Route route = graph.calculateRoute(dest, now);
+    TEST_ASSERT_EQUAL_UINT32(hub, route.nextHop);
+    TEST_ASSERT_FALSE(route.verified);
+    TEST_ASSERT_EQUAL_UINT16(120 + 200 + 200, route.costFixed);
+
+    initGraphTestNodeDb(hub);
+    NeighborGraph atHub;
+    atHub.updateEdge(hub, parent, 1.4f, now, Edge::Source::Reported);
+    atHub.updateDownstream(dest, parent, 2.0f, now);
+    atHub.clearCache();
+    Route hubRoute = atHub.calculateRoute(dest, now);
+    TEST_ASSERT_EQUAL_UINT32(parent, hubRoute.nextHop);
+    TEST_ASSERT_FALSE(hubRoute.verified);
+    TEST_ASSERT_EQUAL_UINT16(140 + 200, hubRoute.costFixed);
+}
+
 void test_admits_coverage_credits_an_owned_neighbour()
 {
     // Admission and absorb must credit the same set: a relay that owns a silent neighbour
@@ -2123,6 +2206,9 @@ void setup()
     RUN_TEST(test_a_guess_never_outranks_or_prices_a_measurement);
     RUN_TEST(test_a_silent_publisher_loses_our_direct_link);
     RUN_TEST(test_a_relayed_former_neighbour_becomes_downstream);
+    RUN_TEST(test_chain_walks_to_the_first_hearable_hop);
+    RUN_TEST(test_chain_returns_none_on_a_cycle_or_a_broken_path);
+    RUN_TEST(test_downstream_chain_appoints_the_neighbour_we_hear);
     RUN_TEST(test_admits_coverage_credits_an_owned_neighbour);
     RUN_TEST(test_a_dropped_young_node_is_not_a_coverage_target);
     RUN_TEST(test_a_sticky_confirmation_behind_a_decayed_link_is_not_ours);

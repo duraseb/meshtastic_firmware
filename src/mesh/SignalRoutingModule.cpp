@@ -1808,7 +1808,8 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                 }
             }
 
-            // Infer downstream only when the relay hears us and the originator lists that relay.
+            // Infer downstream when the relay hears us. An SR-aware originator must also list
+            // that relay; a stock originator never lists anyone, so the observation is the path.
             // Hop count and source capability then decide which of those usable paths we keep:
             // - Former direct neighbour heard only via this relay: they moved.
             // - Single-hop (hop_start - hop_limit == 1): sender went through inferredRelayer.
@@ -1823,7 +1824,8 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
             bool sourceIsSRAware = (sourceStatus == CapabilityStatus::SRactive ||
                                     sourceStatus == CapabilityStatus::Passive);
             // Hearing the originator via a relay is the other direction from delivering to them.
-            // Keep the row only when we can send to the relay and the originator lists it.
+            // Keep the row when we can send to the relay. An SR-aware originator must also list
+            // it; a stock originator never lists anyone.
             bool relayHearsUs = false;
             if (nodeDB) {
                 const NodeEdges *mine = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
@@ -1846,7 +1848,8 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                     }
                 }
             }
-            if (activeRouting && hasDirectConnectionToRelay && relayHearsUs && destinationListsRelay &&
+            if (activeRouting && hasDirectConnectionToRelay && relayHearsUs &&
+                (destinationListsRelay || !sourceIsSRAware) &&
                 (wasDirectNeighbor || singleHopRelay || !sourceIsSRAware)) {
                 // Nominal link per hop travelled: the relay's link to the source is not what we measured,
                 // and a multi-hop path must not price like a single good link.
@@ -1862,7 +1865,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                 }
             } else if (activeRouting && hasDirectConnectionToRelay &&
                        (wasDirectNeighbor || singleHopRelay || !sourceIsSRAware) &&
-                       (!relayHearsUs || !destinationListsRelay)) {
+                       (!relayHearsUs || (sourceIsSRAware && !destinationListsRelay))) {
                 LOG_INFO("[SR] No downstream %08x via %08x: relay hears us %d, originator lists relay %d",
                          mp.from, inferredRelayer, relayHearsUs, destinationListsRelay);
             } else if (activeRouting && hasDirectConnectionToRelay && !singleHopRelay) {
@@ -2027,9 +2030,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     // An edge to the destination is not enough: it only says heardFrom hears the destination.
     if (heardFrom != 0 && heardFrom != myNode && heardFrom != sourceNode && !suppressReason &&
         !weAreDesignatedHop) {
-        bool heardFromCanReachDest = routingGraph->canDeliver(heardFrom, destination, routePolicy()) ||
-                                     (routingGraph->isDownstream(destination) &&
-                                      routingGraph->getDownstreamRelay(destination) == heardFrom);
+        bool heardFromCanReachDest = routingGraph->unicastCanFinish(heardFrom, destination, routePolicy());
         if (heardFromCanReachDest) {
             LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: heardFrom %s reaches dst", p->id, srcName, destName, heardFromName);
             if (!relayerNamed) {
@@ -3675,6 +3676,13 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
     float routeCost = route.getCost();
 
     if (route.nextHop != 0) {
+        auto stampable = [&]() -> bool {
+            if (route.verified) {
+                return true;
+            }
+            NodeNum me = nodeDB ? nodeDB->getNodeNum() : 0;
+            return me != 0 && routingGraph->downstreamChainEgress(destination, me).node == route.nextHop;
+        };
         char nextHopName[64];
         getNodeDisplayName(route.nextHop, nextHopName, sizeof(nextHopName));
 
@@ -3740,7 +3748,7 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
                 }
             }
 
-            if (verified) *verified = route.verified;
+            if (verified) *verified = stampable();
             return route.nextHop;
         }
         
@@ -3755,7 +3763,7 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
                     if (myEdges->edges[i].to == route.nextHop && myEdges->edges[i].hearsUs) {
                         LOG_INFO("[SR] Route via %s kept: unverified but hearsUs",
                                  nextHopName);
-            if (verified) *verified = route.verified;
+            if (verified) *verified = stampable();
             return route.nextHop;
                     }
                 }
@@ -3781,9 +3789,8 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
         }
     }
 
-    // Fallback 1: if we know a relay for this destination, and we have a direct link to it, forward there
-    // But only if the relay can hear the transmitter (heardFrom)
-    NodeNum relayForDest = routingGraph->getDownstreamRelay(destination);
+    // Fallback 1: walk dest along downstream until a neighbour we hear.
+    NodeNum relayForDest = routingGraph->downstreamChainEgress(destination, nodeDB ? nodeDB->getNodeNum() : 0).node;
     if (relayForDest != 0 && nodeDB) {
         // Verify relay can hear transmitter before using it
         bool relayCanHearTransmitter = true;
@@ -3807,6 +3814,7 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
                         char gwName[64];
                         getNodeDisplayName(relayForDest, gwName, sizeof(gwName));
                         LOG_INFO("[SR] No direct route to %s, but forwarding to relay %s", destName, gwName);
+                        if (verified) *verified = true;
                         return relayForDest;
                     }
                 }

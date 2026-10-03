@@ -125,6 +125,9 @@ struct NodeSet {
 #define NEIGHBOR_GRAPH_MAX_DOWNSTREAM 900
 #endif
 
+/// Walk dest → relay → … at most this many hops before treating the chain as a cycle.
+static constexpr uint8_t MAX_DOWNSTREAM_CHAIN = 16;
+
 #ifndef NEIGHBOR_GRAPH_MAX_RELAY_STATES
 #define NEIGHBOR_GRAPH_MAX_RELAY_STATES 32
 #endif
@@ -265,6 +268,13 @@ struct DownstreamEntry {
     DownstreamEntry() : destination(0), relay(0), costFixed(0), lastUpdate(0) {}
 };
 
+/// First neighbour we can hear on a downstream walk from a destination.
+struct ChainEgress {
+    NodeNum node = 0;
+    uint8_t hops = 0;
+    uint16_t costFixed = 0;
+};
+
 class NeighborGraph {
   public:
     static uint32_t getContentionWindowMs();
@@ -340,6 +350,10 @@ class NeighborGraph {
                                    bool evenIfRelayHasEdge = false);
 
     NodeNum getDownstreamRelay(NodeNum destination) const;
+
+    /// First neighbour `myNode` can hear on the downstream walk from `destination`.
+    /// `costFixed` is the sum of the downstream rows along that walk, not the hop to the neighbour.
+    ChainEgress downstreamChainEgress(NodeNum destination, NodeNum myNode) const;
 
     bool isDownstream(NodeNum destination) const;
 
@@ -606,6 +620,8 @@ class NeighborGraph {
     // Find edge in node (returns nullptr if not found)
     Edge *findEdge(NodeEdges *node, NodeNum to);
     const Edge *findEdge(const NodeEdges *node, NodeNum to) const;
+
+    bool downstreamRelayAndCost(NodeNum destination, NodeNum &relayOut, uint16_t &costOut) const;
 
     // Every node that has a slot, and every destination of those slots' edges. Coverage walks
     // this set so a publisher that listed a candidate is counted even when the candidate never
