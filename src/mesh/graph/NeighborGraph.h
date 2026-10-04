@@ -327,7 +327,22 @@ class NeighborGraph {
         void *ctx;
         bool (*routable)(void *ctx, NodeNum node);
         bool (*publishes)(void *ctx, NodeNum node);
-        RoutePolicy() : ctx(nullptr), routable(nullptr), publishes(nullptr) {}
+        /// Intermediate hops to skip (directed alternate search). Empty for ordinary lookups.
+        const NodeNum *excluded;
+        uint8_t excludedCount;
+        RoutePolicy() : ctx(nullptr), routable(nullptr), publishes(nullptr), excluded(nullptr), excludedCount(0) {}
+        bool isExcluded(NodeNum node) const
+        {
+            if (!excluded || node == 0) {
+                return false;
+            }
+            for (uint8_t i = 0; i < excludedCount; i++) {
+                if (excluded[i] == node) {
+                    return true;
+                }
+            }
+            return false;
+        }
     };
     Route calculateRoute(NodeNum destination, uint32_t currentTime, const RoutePolicy &policy = RoutePolicy());
 

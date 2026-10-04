@@ -545,10 +545,13 @@ uint8_t NeighborGraph::countDirectNeighbors() const
 
 Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, const RoutePolicy &policy)
 {
-    // Check cache first
-    Route cached = getCachedRoute(destination, currentTime);
-    if (cached.nextHop != 0) {
-        return cached;
+    // Excluded searches must not read or write the route cache.
+    const bool useCache = policy.excludedCount == 0;
+    if (useCache) {
+        Route cached = getCachedRoute(destination, currentTime);
+        if (cached.nextHop != 0) {
+            return cached;
+        }
     }
 
     Route result;
@@ -622,7 +625,10 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, c
             if (n == myNode) break;
 
             // Every settled node other than the destination would relay on this path.
-            if (n != destination && policy.routable && !policy.routable(policy.ctx, n)) continue;
+            if (n != destination) {
+                if (policy.isExcluded(n)) continue;
+                if (policy.routable && !policy.routable(policy.ctx, n)) continue;
+            }
 
             // The nodes N hears, at the cost N measured on their signal: the true cost of M -> N.
             const NodeEdges *nEdges = findNeighbor(n);
@@ -707,7 +713,8 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, c
     // Fallback: walk dest along downstream until a neighbour we hear.
     if (result.nextHop == 0) {
         ChainEgress chain = downstreamChainEgress(destination, myNode);
-        if (chain.node != 0 && (!policy.routable || policy.routable(policy.ctx, chain.node))) {
+        if (chain.node != 0 && !policy.isExcluded(chain.node) &&
+            (!policy.routable || policy.routable(policy.ctx, chain.node))) {
             const NodeEdges *myEdges = findNeighbor(myNode);
             uint16_t costToEgress = 0xFFFF;
             if (myEdges) {
@@ -742,7 +749,7 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, c
         }
     }
 
-    if (result.nextHop != 0) {
+    if (result.nextHop != 0 && useCache) {
         if (routeCacheCount < NEIGHBOR_GRAPH_MAX_CACHED_ROUTES) {
             routeCache[routeCacheCount++] = result;
         } else {

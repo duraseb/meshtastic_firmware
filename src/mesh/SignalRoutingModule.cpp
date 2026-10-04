@@ -158,6 +158,105 @@ NeighborGraph::RoutePolicy SignalRoutingModule::routePolicy() const
     return p;
 }
 
+bool SignalRoutingModule::isHandOffDuplicate(const meshtastic_MeshPacket *p)
+{
+    if (!p || !nodeDB || !routingGraph) {
+        return false;
+    }
+    if (isBroadcast(p->to) || isToUs(p) || isFromUs(p)) {
+        return false;
+    }
+    if (p->hop_limit == 0) {
+        return false;
+    }
+    uint8_t ourByte = nodeDB->getLastByteOfNodeNum(nodeDB->getNodeNum());
+    if (p->next_hop != ourByte) {
+        return false;
+    }
+    if (!isActiveRoutingRole() || !shouldUseSignalBasedRouting(p)) {
+        return false;
+    }
+    if (routingGraph->hasNodeTransmitted(nodeDB->getNodeNum(), p->id, millis() / 1000)) {
+        return false;
+    }
+    return true;
+}
+
+bool SignalRoutingModule::isOriginatorRetryReplan(const meshtastic_MeshPacket *p)
+{
+    if (!p || !nodeDB || !routingGraph) {
+        return false;
+    }
+    if (isBroadcast(p->to) || isToUs(p) || isFromUs(p)) {
+        return false;
+    }
+    if (p->hop_limit == 0 || !isDirectPacket(*p)) {
+        return false;
+    }
+    uint8_t ourByte = nodeDB->getLastByteOfNodeNum(nodeDB->getNodeNum());
+    if (p->next_hop != NO_NEXT_HOP_PREFERENCE && p->next_hop != ourByte) {
+        return false;
+    }
+    if (routingGraph->hasNodeTransmitted(nodeDB->getNodeNum(), p->id, millis() / 1000)) {
+        return false;
+    }
+    if (isCommittedRelay(p->id)) {
+        return false;
+    }
+    return true;
+}
+
+NodeNum SignalRoutingModule::alternateNextHop(NodeNum dest, const NodeNum *excluded, uint8_t n, uint8_t nominatedByte)
+{
+    if (!routingGraph || !nodeDB || dest == 0) {
+        return 0;
+    }
+    NeighborGraph::RoutePolicy policy = routePolicy();
+    policy.excluded = excluded;
+    policy.excludedCount = n;
+    uint32_t currentTime = millis() / 1000;
+    Route route = routingGraph->calculateRoute(dest, currentTime, policy);
+    if (route.nextHop == 0) {
+        return 0;
+    }
+    // An alternate sharing the nominated byte would be read as the silent hop again. A stock
+    // neighbour judges a duplicate by the first next_hop it recorded, so having heard our first
+    // copy it drops one that newly names it: only an SR alternate can take it.
+    if (nodeDB->getLastByteOfNodeNum(route.nextHop) == nominatedByte ||
+        getCapabilityStatus(route.nextHop) != CapabilityStatus::SRactive) {
+        return 0;
+    }
+    bool stampable = route.verified;
+    if (!stampable) {
+        NodeNum me = nodeDB->getNodeNum();
+        stampable = me != 0 && routingGraph->downstreamChainEgress(dest, me).node == route.nextHop;
+    }
+    return stampable ? route.nextHop : 0;
+}
+
+NodeNum SignalRoutingModule::nominatedHopFor(NodeNum flagged, uint8_t nextHopByte) const
+{
+    if (flagged != 0 && nodeDB && nodeDB->getLastByteOfNodeNum(flagged) == nextHopByte) {
+        return flagged;
+    }
+    return resolveRelayIdentity(nextHopByte);
+}
+
+void SignalRoutingModule::recordHopMiss(NodeNum destination, NodeNum nextHop)
+{
+    if (hopHealth.recordMiss(destination, nextHop, millis())) {
+        LOG_INFO("[SR] Next hop !%08x suspect for !%08x (misses=%u)", nextHop, destination,
+                 hopHealth.missCount(destination, nextHop));
+    }
+}
+
+void SignalRoutingModule::recordHopSuccess(NodeNum destination, NodeNum nextHop)
+{
+    if (hopHealth.recordSuccess(destination, nextHop)) {
+        LOG_INFO("[SR] Next hop !%08x healthy for !%08x", nextHop, destination);
+    }
+}
+
 // Helper to get node display name for logging
 static void getNodeDisplayName(NodeNum nodeId, char *buf, size_t bufSize) {
 #ifdef DEBUG_MUTE
@@ -2859,6 +2958,25 @@ uint32_t SignalRoutingModule::nextHopCarryWaitMs(NodeNum nextHop, uint32_t airti
     return worst + airtimeMs;
 }
 
+uint32_t SignalRoutingModule::namedForwardFollowupDelayMs(NodeNum nextHop, uint32_t airtimeMs, float rxSnr) const
+{
+    uint32_t carry = nextHopCarryWaitMs(nextHop, airtimeMs, rxSnr);
+    uint32_t halfAirtime = std::max(airtimeMs / 2, SR_MIN_RUNG_SPACING_MS);
+    // Same leader wait as the unicast ranking; our own frame leaves the air within it too.
+    uint32_t leaderWait = 2 * halfAirtime;
+    if (router && router->getRadioInterface()) {
+        leaderWait = airtimeMs + router->getRadioInterface()->getTxDelayMsecMaxAtUtil();
+    }
+    leaderWait += SR_PEER_TURNAROUND_MS;
+    const uint32_t ownTx = leaderWait;
+    uint32_t earliestMs = ladderTransitionMs();
+    // A backup downstream of us has no destination-ACK floor: that floor applies only to the
+    // source's own frame.
+    uint32_t slot1 = srUnicastSlotDelayMs(0, 1, earliestMs, leaderWait, halfAirtime);
+    uint32_t slot1End = slot1 + std::max(halfAirtime / 2, SR_MIN_TIE_BREAK_RANGE_MS) + airtimeMs;
+    return ownTx + std::max(carry, slot1End);
+}
+
 bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p, NodeNum *uniqueNeighbor)
 {
     if (uniqueNeighbor) {
@@ -3690,6 +3808,21 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
             NodeNum me = nodeDB ? nodeDB->getNodeNum() : 0;
             return me != 0 && routingGraph->downstreamChainEgress(destination, me).node == route.nextHop;
         };
+        // Suspect first hop: prefer a stampable alternate; never lose the only path.
+        if (hopHealth.isSuspect(destination, route.nextHop, millis())) {
+            NodeNum excluded[1] = {route.nextHop};
+            NeighborGraph::RoutePolicy exclPolicy = routePolicy();
+            exclPolicy.excluded = excluded;
+            exclPolicy.excludedCount = 1;
+            Route alt = routingGraph->calculateRoute(destination, currentTime, exclPolicy);
+            bool altStampable = alt.nextHop != 0 && (alt.verified || (nodeDB && nodeDB->getNodeNum() != 0 &&
+                                                                     routingGraph->downstreamChainEgress(destination, nodeDB->getNodeNum()).node ==
+                                                                         alt.nextHop));
+            if (altStampable) {
+                route = alt;
+                routeCost = route.getCost();
+            }
+        }
         char nextHopName[64];
         getNodeDisplayName(route.nextHop, nextHopName, sizeof(nextHopName));
 

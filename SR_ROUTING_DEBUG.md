@@ -68,6 +68,20 @@ Started Tx (id=0x<id> ... relay=0x<byte> ...)
 Completed sending (id=0x<id> ...)
 ```
 
+### Unicast recovery (hand-off, originator retry, hop health, named follow-up)
+```
+[SR] Hand-off 0x<id>: named as next hop
+[SR] Originator retry 0x<id> re-planned
+[SR] Relay retx armed for 0x<id> via next hop 0x<byte>
+[SR] Relay retx for 0x<id> (next hop silent, repeat)
+[SR] Relay retx for 0x<id> (next hop silent, redirect to 0x<byte>)
+[SR] Relay retx for 0x<id> (next hop silent, no alternate - dropped)
+[SR] Next hop !<id> suspect for !<dest> (misses=<n>)
+[SR] Next hop !<id> healthy for !<dest>
+```
+Removed for relayed named forwards: `(last try, next hop cleared - flooding)`. Originator
+`floodOnLast` still clears next_hop on its own final retry.
+
 ### T1 retransmit insurance
 ```
 [SR] T1 for 0x<id> (<portnum>) in <N>ms (win <W>ms + air <A>ms + stag <S>ms)

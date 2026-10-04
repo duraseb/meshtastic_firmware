@@ -411,9 +411,45 @@ When the unicast was heard straight from its source and the source's topology li
 When SR approves a unicast relay, `NextHopRouter::sendRelay()` stamps SR's route pick as `next_hop`,
 or the destination when this hop is a priced last hop, or clears the field for a flood-salvage slot
 (the last of two or more non-direct candidates) and when the route picker fell back to "relay it
-ourselves". Named forwards arm one flood-insurance retry (`numReTx = 1`, `floodOnLast`); a later
-flood slot in the ranking is not proof that neighbour overheard this copy. Last-hop backups and
-flood slots do not arm a follow-up. Last hops do not flood.
+ourselves". Named forwards arm the named follow-up (`redirectOnLast`, below); a later flood slot
+in the ranking is not proof that neighbour overheard this copy. Last-hop backups and flood slots
+do not arm a follow-up. Last hops do not flood. Originator want_ack retries still use
+`floodOnLast` so stock neighbours can honour the originator's final flood.
+
+**Hand-off duplicates:** A duplicate whose incoming `next_hop` names us is a hand-off
+(`SignalRoutingModule::isHandOffDuplicate`): cancel any later-slot relay, clear its commit and
+stop its retry, then `reprocessPacket` / `perhapsRebroadcast`. The predicate needs the router and
+has no native test; `test_is_direct_packet_originator_rule` covers the shared direct-packet rule.
+
+**Originator retries:** Under signal routing, `NextHopRouter::shouldFilterReceived` re-plans only
+a true originator retry (`isDirectPacket`, `next_hop` 0 or us, hop_limit > 0, and we hold no
+pending/committed relay and have not transmitted the id). The broadcast-path override in
+`FloodingRouter::shouldFilterReceived` is unchanged (broadcasts out of scope).
+
+**Next-hop health:** `HopHealth` remembers silent nominated hops keyed by `(destination, next hop)`.
+A named follow-up that reaches its redirect records one miss. Two misses less than ten minutes
+apart make a hop suspect until ten minutes after the last one; a success clears it. When
+stamping, `getNextHop` prefers a stampable alternate from an excluded search but never loses the
+only path. Tests: `test_hop_health_*`.
+
+**Named follow-up:** Our relay is the originator's implicit ACK, so once we forward, the
+originator's retries stop and recovery is ours. A named non-final forward arms
+`NAMED_FOLLOWUP_TRIES` (two) tries, each `namedForwardFollowupDelayMs` apart: our own contention
+and airtime, then the later of the nominated hop's carry wait and the end of ranked slot 1 with
+its tie-break spread (a backup downstream of us has no destination-ACK floor). The first try
+repeats our copy unchanged, for a nominated hop that simply missed the frame. The second records a
+miss and calls `SignalRoutingModule::alternateNextHop` with the nominated hop, upstream, originator
+and ourselves excluded (never the destination; cache bypassed). An alternate that is stampable,
+SR-active and does not share the nominated byte is retransmitted with the same hop fields;
+otherwise nothing is sent. A stock alternate is refused: stock judges a duplicate by the first
+`next_hop` it recorded, so having heard our first copy it drops one that newly names it. That is
+also why an intermediate relay cannot recruit stock nodes and the originator keeps its flood. The
+record is then dropped without touching the TX queue, so the redirected copy still goes out on
+roles that may cancel queued frames. If the nominated hop did relay on an asymmetric link we could
+not hear, the redirect may deliver a second copy; accepted, because a duplicate costs less than a
+lost unicast. Tests: `test_route_exclusion_yields_alternate`,
+`test_named_forward_followup_waits_for_our_airtime_and_slot_one`,
+`test_alternate_next_hop_requires_a_distinct_byte`.
 
 **Quick Suppression Checks (before slot scheduling):**
 - Source and destination both downstream of the same relay → suppress only if that relay holds this copy (`heardFrom` or already transmitted this id)
@@ -421,7 +457,7 @@ flood slots do not arm a follow-up. Last hops do not flood.
 - An SR neighbor that covers `heardFrom` can reach destination → suppress only if they already transmitted this id
 
 **Dupe Cancellation:**
-When a dupe arrives for a committed unicast relay, `areAllNeighborsCovered()` calls `NeighborGraph::unicastDupeCancels()`: cancel only if the dupe relayer can finish delivery (priced hop or dest's downstream), or is ranked ahead of us with a path. If we can finish and they cannot, our relay is kept. An unresolved relay byte (or a placeholder identity) cancels only when we cannot finish (the designated or stock hop we were waiting for). Last-hop backup cancels only on dest's own copy. A flood salvage slot stays for a same-hop named SR that cannot finish, and cancels on dest, a finisher, the nominated hop, or another flood copy. Late unicast rungs are not clamped to 2 s — a clamp would bunch later slots onto the same instant. Native tests: `test_unicast_dupe_cancel_predicate`, `test_unicast_last_hop_slots_and_dupe_flags`.
+When a dupe arrives for a committed unicast relay, `areAllNeighborsCovered()` calls `NeighborGraph::unicastDupeCancels()`: cancel only if the dupe relayer can finish delivery (priced hop or dest's downstream), or is ranked ahead of us with a path. If we can finish and they cannot, our relay is kept. An unresolved relay byte (or a placeholder identity) cancels only when we cannot finish (the designated or stock hop we were waiting for). Last-hop backup cancels only on dest's own copy. A flood salvage slot stays for a same-hop named SR that cannot finish, and cancels on dest, a finisher, the nominated hop, or another flood copy. A hand-off duplicate (incoming `next_hop` names us) is re-planned rather than cancelled. A named follow-up stops on the nominated hop's copy (a hop-health success) or the destination's reply/ACK (also a success); a copy from the upstream node or the originator leaves it armed, because neither has carried the packet past us; any other copy goes through `areAllNeighborsCovered()` and is neutral for hop health. Late unicast rungs are not clamped to 2 s — a clamp would bunch later slots onto the same instant. Native tests: `test_unicast_dupe_cancel_predicate`, `test_unicast_last_hop_slots_and_dupe_flags`.
 
 ## Broadcast Routing
 

@@ -39,8 +39,23 @@ struct PendingPacket {
     /** Starts at NUM_RETRANSMISSIONS -1 and counts down.  Once zero it will be removed from the list */
     uint8_t numRetransmissions = 0;
 
-    /** Last remaining attempt of a named forward: clear next_hop so stock may pick up. */
+    /** Last remaining attempt of an originated want_ack: clear next_hop so stock may pick up. */
     bool floodOnLast = true;
+
+    /** Named relayed forward: repeat to the nominated hop, then search for an alternate. */
+    bool redirectOnLast = false;
+
+    /** Nominated next hop (full node id) when redirectOnLast is set; 0 when it did not resolve. */
+    NodeNum nominatedHop = 0;
+
+    /** The next_hop byte we stamped. A copy relayed under it is the nominated hop's. */
+    uint8_t nominatedByte = 0;
+
+    /** Upstream node we heard the packet from when arming the follow-up. */
+    NodeNum upstream = 0;
+
+    /** Wait after each named follow-up try before the next one is due. */
+    uint32_t followupDelayMs = 0;
 
     PendingPacket() {}
     explicit PendingPacket(meshtastic_MeshPacket *p, uint8_t numRetransmissions, bool floodOnLast = true);
@@ -80,8 +95,9 @@ class NextHopRouter : public FloodingRouter
     /**
      * Send a relayed copy whose next hop was decided by SignalRouting: `nextHop` (a relay byte, or
      * NO_NEXT_HOP_PREFERENCE) replaces the NodeDB-learned value send() would stamp. Named forwards
-     * arm one flood-insurance retry; last-hop want_ack toward a non-SR dest keeps reliable retries
-     * without flooding; last-hop backups and flood slots do not arm a follow-up.
+     * arm a repeat to the nominated hop, then one directed alternate retry; last-hop want_ack
+     * toward a non-SR dest keeps reliable retries without flooding; last-hop backups and flood
+     * slots do not arm a follow-up.
      */
     ErrorCode sendRelay(meshtastic_MeshPacket *p, uint8_t nextHop);
 
@@ -98,11 +114,14 @@ class NextHopRouter : public FloodingRouter
         return min(d, r);
     }
 
-    // Default for a NodeDB-stamped next hop (stock path). SR named forwards arm one insurance
-    // copy instead; last-hop want_ack toward a non-SR dest uses NUM_RELIABLE_RETX and does not flood.
+    // Default for a NodeDB-stamped next hop (stock path). SR named forwards arm
+    // NAMED_FOLLOWUP_TRIES instead; last-hop want_ack toward a non-SR dest uses NUM_RELIABLE_RETX
+    // and does not flood.
     constexpr static uint8_t NUM_INTERMEDIATE_RETX = 4;
     // The number of retransmissions the original sender will do
     constexpr static uint8_t NUM_RELIABLE_RETX = 3;
+    // Follow-up tries of a named forward: the repeat to the nominated hop, then the redirect.
+    constexpr static uint8_t NAMED_FOLLOWUP_TRIES = 2;
 
   protected:
     /**
@@ -161,6 +180,10 @@ class NextHopRouter : public FloodingRouter
      * @return the node number of the next hop, 0 if no preference (fallback to FloodingRouter)
      */
     std::optional<uint8_t> getNextHop(NodeNum to, uint8_t relay_node);
+
+    /** Forget a retransmission record without touching the TX queue: a copy we just queued from
+     *  it must still go out, which stopRetransmission() would cancel for non-router roles. */
+    void dropRetransmission(GlobalPacketId key);
 
     /** Check if we should be rebroadcasting this packet if so, do so.
      *  @return true if we did rebroadcast */

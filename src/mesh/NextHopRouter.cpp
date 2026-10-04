@@ -73,9 +73,22 @@ bool NextHopRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
     if (seenRecently) {
         printPacket("Ignore dupe incoming msg", p);
 
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+        // Hand-off: a duplicate that newly names our byte is processed like a fresh reception.
+        if (signalRoutingModule && signalRoutingModule->isHandOffDuplicate(p)) {
+            LOG_INFO("[SR] Hand-off 0x%08x: named as next hop", p->id);
+            cancelSending(p->from, p->id);
+            signalRoutingModule->clearCommittedRelay(p->id);
+            stopRetransmission(p->from, p->id);
+            reprocessPacket(p);
+            perhapsRebroadcast(p);
+            return true;
+        }
+#endif
+
         if (p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA) {
             rxDupe++;
-            // A relay replays its stamped header twice, then floods. Cancelling that series on
+            // A relay repeats its stamped header once, then redirects. Cancelling that series on
             // every duplicate meant a backup that cannot finish delivery also deleted it, so a
             // designated hop that missed the frame had no second chance. Unicast uses the same
             // predicate as the committed-relay cancel: keep the retry unless the duplicate's
@@ -83,7 +96,24 @@ bool NextHopRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
             bool stopRetry = true;
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
             if (!isBroadcast(p->to) && signalRoutingModule) {
-                stopRetry = signalRoutingModule->areAllNeighborsCovered(p);
+                // A named follow-up ends when the nominated hop carries the packet (a hop-health
+                // success). The node we got it from, or the originator retrying, has not carried
+                // it past us, so their copy leaves the follow-up armed.
+                PendingPacket *named = findPendingPacket(p->from, p->id);
+                if (named && !named->redirectOnLast) {
+                    named = nullptr;
+                }
+                NodeNum tx = named ? signalRoutingModule->resolveHeardFrom(p, p->from) : 0;
+                if (named && (p->relay_node == named->nominatedByte || (named->nominatedHop != 0 && tx == named->nominatedHop))) {
+                    signalRoutingModule->recordHopSuccess(p->to, named->nominatedHop);
+                } else if (named && p->relay_node != 0 &&
+                           (p->relay_node == nodeDB->getLastByteOfNodeNum(p->from) ||
+                            (named->upstream != 0 &&
+                             (tx == named->upstream || p->relay_node == nodeDB->getLastByteOfNodeNum(named->upstream))))) {
+                    stopRetry = false;
+                } else {
+                    stopRetry = signalRoutingModule->areAllNeighborsCovered(p);
+                }
             }
 #endif
             if (stopRetry) {
@@ -101,10 +131,19 @@ bool NextHopRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
             }
         } else {
             bool isRepeated = getHopsAway(*p) == 0;
-            // Don't treat signal-routed packets as "repeated" - they preserve hop_limit by design
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
-            if (isRepeated && signalRoutingModule && signalRoutingModule->shouldUseSignalBasedRouting(p)) {
-                isRepeated = false;
+            // Under signal routing, only a true originator retry (isDirectPacket + next_hop
+            // 0/us, and we hold no relay for it) is re-planned. Broader stock isRepeated stays
+            // off so preserved hop_limit on relayed copies is not mistaken for a retry.
+            if (signalRoutingModule && signalRoutingModule->shouldUseSignalBasedRouting(p)) {
+                bool replan = signalRoutingModule->isOriginatorRetryReplan(p) && !findPendingPacket(p->from, p->id) &&
+                              !findInTxQueue(p->from, p->id) && !signalRoutingModule->isCommittedRelay(p->id);
+                if (replan) {
+                    LOG_INFO("[SR] Originator retry 0x%08x re-planned", p->id);
+                    isRepeated = true;
+                } else {
+                    isRepeated = false;
+                }
             }
 #endif
             // If repeated and not in Tx queue anymore, try relaying again, or if we are the destination, send the ACK again
@@ -153,9 +192,18 @@ void NextHopRouter::sniffReceived(const meshtastic_MeshPacket *p, const meshtast
             }
         }
         if (!isToUs(p)) {
-            Router::cancelSending(p->to, p->decoded.request_id); // cancel rebroadcast for this DM
+            PacketId origId = p->decoded.request_id != 0 ? p->decoded.request_id : p->decoded.reply_id;
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+            if (signalRoutingModule && origId != 0) {
+                PendingPacket *pending = findPendingPacket(p->to, origId);
+                if (pending && pending->nominatedHop != 0) {
+                    signalRoutingModule->recordHopSuccess(pending->packet->to, pending->nominatedHop);
+                }
+            }
+#endif
+            Router::cancelSending(p->to, origId); // cancel rebroadcast for this DM
             // stop retransmission for the original packet
-            stopRetransmission(p->to, p->decoded.request_id); // for original packet, from = to and id = request_id
+            stopRetransmission(p->to, origId); // for original packet, from = to and id = request_id
         }
     }
 
@@ -309,6 +357,10 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
 
 ErrorCode NextHopRouter::sendRelay(meshtastic_MeshPacket *p, uint8_t nextHop)
 {
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+    // Resolved before relay_node becomes our own byte.
+    NodeNum upstream = signalRoutingModule ? signalRoutingModule->resolveHeardFrom(p, p->from) : 0;
+#endif
     p->relay_node = nodeDB->getLastByteOfNodeNum(getNodeNum());
     wasSeenRecently(p);
     p->next_hop = nextHop;
@@ -336,11 +388,23 @@ ErrorCode NextHopRouter::sendRelay(meshtastic_MeshPacket *p, uint8_t nextHop)
     if (flags.nonfinalFlood || p->next_hop == NO_NEXT_HOP_PREFERENCE) {
         return Router::send(p);
     }
-    PendingPacket *rec = startRetransmission(packetPool.allocCopy(*p), 2, true);
+    // Named non-final forward: repeat to the nominated hop, then one directed alternate (no flood).
+    PendingPacket *rec = startRetransmission(packetPool.allocCopy(*p), 1 + NAMED_FOLLOWUP_TRIES, false);
     if (rec && signalRoutingModule && iface) {
         uint32_t airtime = iface->getPacketTime(p);
-        rec->nextTxMsec = millis() + signalRoutingModule->nextHopCarryWaitMs(flags.nominatedNextHop, airtime, p->rx_snr);
+        NodeNum nominated = signalRoutingModule->nominatedHopFor(flags.nominatedNextHop, p->next_hop);
+        uint32_t delay = signalRoutingModule->namedForwardFollowupDelayMs(nominated, airtime, p->rx_snr);
+        rec->redirectOnLast = true;
+        rec->nominatedHop = nominated;
+        rec->nominatedByte = p->next_hop;
+        rec->upstream = upstream;
+        rec->followupDelayMs = delay;
+        // Counted from the frame leaving the queue: a ranked slot holds it until tx_after.
+        uint32_t now = millis();
+        uint32_t release = (int32_t)(p->tx_after - now) > 0 ? p->tx_after : now;
+        rec->nextTxMsec = release + delay;
         setReceivedMessage();
+        LOG_INFO("[SR] Relay retx armed for 0x%08x via next hop 0x%02x", p->id, p->next_hop);
     }
 #else
     if (p->next_hop != NO_NEXT_HOP_PREFERENCE && (p->hop_limit > 0 || p->want_ack))
@@ -426,6 +490,16 @@ bool NextHopRouter::stopRetransmission(GlobalPacketId key)
         return false;
 }
 
+void NextHopRouter::dropRetransmission(GlobalPacketId key)
+{
+    auto it = pending.find(key);
+    if (it == pending.end()) {
+        return;
+    }
+    packetPool.release(it->second.packet);
+    pending.erase(it);
+}
+
 /**
  * Add p to the list of packets to retransmit occasionally.  We will free it once we stop retransmitting.
  */
@@ -474,8 +548,50 @@ int32_t NextHopRouter::doRetransmissions()
                           p.packet->id, p.numRetransmissions);
 
                 if (!isBroadcast(p.packet->to)) {
-                    if (p.numRetransmissions == 1 && p.floodOnLast) {
-                        // Last retransmission of a named forward: release to flooding.
+                    if (p.numRetransmissions == 1 && p.redirectOnLast && !isFromUs(p.packet)) {
+                        // Named hop silent after the repeat: one directed alternate, or drop.
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+                        if (signalRoutingModule) {
+                            signalRoutingModule->recordHopMiss(p.packet->to, p.nominatedHop);
+                            NodeNum excluded[4];
+                            uint8_t nEx = 0;
+                            NodeNum cand[4] = {p.nominatedHop, p.upstream, p.packet->from, getNodeNum()};
+                            for (uint8_t i = 0; i < 4; i++) {
+                                if (cand[i] == 0 || cand[i] == p.packet->to) {
+                                    continue;
+                                }
+                                bool dup = false;
+                                for (uint8_t j = 0; j < nEx; j++) {
+                                    if (excluded[j] == cand[i]) {
+                                        dup = true;
+                                        break;
+                                    }
+                                }
+                                if (!dup) {
+                                    excluded[nEx++] = cand[i];
+                                }
+                            }
+                            NodeNum alt = signalRoutingModule->alternateNextHop(p.packet->to, excluded, nEx, p.nominatedByte);
+                            if (alt != 0) {
+                                p.packet->next_hop = nodeDB->getLastByteOfNodeNum(alt);
+                                LOG_INFO("[SR] Relay retx for 0x%08x (next hop silent, redirect to 0x%02x)", p.packet->id,
+                                         p.packet->next_hop);
+                                FloodingRouter::send(packetPool.allocCopy(*p.packet));
+                            } else {
+                                LOG_INFO("[SR] Relay retx for 0x%08x (next hop silent, no alternate - dropped)", p.packet->id);
+                            }
+                        }
+#endif
+                        // Not stopRetransmission(): it would cancel the redirect just queued.
+                        dropRetransmission(it->first);
+                        stillValid = false;
+                        continue;
+                    } else if (p.redirectOnLast && !isFromUs(p.packet)) {
+                        // The nominated hop may simply have missed our frame: give it the same copy again.
+                        LOG_INFO("[SR] Relay retx for 0x%08x (next hop silent, repeat)", p.packet->id);
+                        FloodingRouter::send(packetPool.allocCopy(*p.packet));
+                    } else if (p.numRetransmissions == 1 && p.floodOnLast) {
+                        // Originator (or other floodOnLast) path: release to flooding.
                         p.packet->next_hop = NO_NEXT_HOP_PREFERENCE;
                         if (isFromUs(p.packet)) {
                             meshtastic_NodeInfoLite *sentTo = nodeDB->getMeshNode(p.packet->to);
@@ -502,6 +618,9 @@ int32_t NextHopRouter::doRetransmissions()
                 // Queue again
                 --p.numRetransmissions;
                 setNextTx(&p);
+                if (p.redirectOnLast) {
+                    p.nextTxMsec = millis() + p.followupDelayMs;
+                }
             }
         }
 

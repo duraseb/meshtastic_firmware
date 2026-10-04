@@ -1,5 +1,6 @@
 #include "TestUtil.h"
 #include "mesh/NodeDB.h"
+#include "mesh/graph/HopHealth.h"
 #include "mesh/graph/NeighborGraph.h"
 #include "mesh/SignalRoutingModule.h"
 #include <cmath>
@@ -2261,6 +2262,170 @@ static NeighborGraph seedUnicastFieldGraph(NodeNum me, NodeNum peer, NodeNum gw,
     return graph;
 }
 
+void test_hop_health_two_misses_make_suspect()
+{
+    HopHealth h;
+    const NodeNum dest = 0xEE0000EE;
+    const NodeNum hop = 0xBB0000BB;
+    TEST_ASSERT_FALSE(h.isSuspect(dest, hop, 1000));
+    TEST_ASSERT_FALSE(h.recordMiss(dest, hop, 1000));
+    TEST_ASSERT_FALSE(h.isSuspect(dest, hop, 1100));
+    TEST_ASSERT_TRUE(h.recordMiss(dest, hop, 2000));
+    TEST_ASSERT_TRUE(h.isSuspect(dest, hop, 2100));
+}
+
+void test_hop_health_success_resets_and_ttl_expires()
+{
+    HopHealth h;
+    const NodeNum dest = 1;
+    const NodeNum hop = 2;
+    h.recordMiss(dest, hop, 10);
+    h.recordMiss(dest, hop, 20);
+    TEST_ASSERT_TRUE(h.isSuspect(dest, hop, 30));
+    TEST_ASSERT_TRUE(h.recordSuccess(dest, hop));
+    TEST_ASSERT_FALSE(h.isSuspect(dest, hop, 60));
+
+    const uint32_t nearWrap = 0xFFFFFFFFu - 1000;
+    h.recordMiss(dest, hop, nearWrap);
+    const uint32_t lastMiss = nearWrap + 1;
+    h.recordMiss(dest, hop, lastMiss);
+    TEST_ASSERT_TRUE(h.isSuspect(dest, hop, lastMiss + 2));
+    TEST_ASSERT_FALSE(h.isSuspect(dest, hop, lastMiss + HOP_HEALTH_SUSPECT_TTL_MS));
+}
+
+void test_hop_health_misses_older_than_ttl_do_not_count()
+{
+    HopHealth h;
+    const NodeNum dest = 1;
+    const NodeNum hop = 2;
+    h.recordMiss(dest, hop, 0);
+    // A single miss from one TTL ago is not consecutive with this one.
+    TEST_ASSERT_FALSE(h.recordMiss(dest, hop, HOP_HEALTH_SUSPECT_TTL_MS));
+    TEST_ASSERT_FALSE(h.isSuspect(dest, hop, HOP_HEALTH_SUSPECT_TTL_MS + 1));
+    const uint32_t t = HOP_HEALTH_SUSPECT_TTL_MS + 10;
+    TEST_ASSERT_TRUE(h.recordMiss(dest, hop, t));
+    // After expiry a suspect pair starts over and reports when it becomes suspect again.
+    const uint32_t later = t + HOP_HEALTH_SUSPECT_TTL_MS;
+    TEST_ASSERT_FALSE(h.isSuspect(dest, hop, later));
+    TEST_ASSERT_FALSE(h.recordMiss(dest, hop, later));
+    TEST_ASSERT_TRUE(h.recordMiss(dest, hop, later + 1));
+}
+
+void test_hop_health_evicts_oldest()
+{
+    HopHealth h;
+    for (uint8_t i = 0; i < HOP_HEALTH_MAX_ENTRIES; i++) {
+        h.recordMiss(0x1000 + i, 0x2000 + i, 1000 + i);
+    }
+    TEST_ASSERT_FALSE(h.isSuspect(0x1000, 0x2000, 2000)); // one miss only, but entry exists
+    h.recordMiss(0xDEAD, 0xBEEF, 50000);
+    // Oldest (0x1000) evicted: two misses cannot make it suspect anymore without a fresh entry.
+    h.recordMiss(0x1000, 0x2000, 50001);
+    TEST_ASSERT_FALSE(h.isSuspect(0x1000, 0x2000, 50002));
+}
+
+void test_route_exclusion_yields_alternate()
+{
+    constexpr NodeNum me = 0xAA0000AA;
+    constexpr NodeNum hopA = 0xBB0000BB;
+    constexpr NodeNum hopB = 0xCC0000CC;
+    constexpr NodeNum dest = 0xDD0000DD;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+    const uint32_t now = millis() / 1000;
+    graph.updateEdge(me, hopA, 1.0f, now, Edge::Source::Reported);
+    graph.setEdgeHearsUs(me, hopA, true);
+    graph.updateEdge(me, hopB, 1.5f, now, Edge::Source::Reported);
+    graph.setEdgeHearsUs(me, hopB, true);
+    graph.updateEdge(hopA, dest, 1.0f, now, Edge::Source::Mirrored);
+    graph.updateEdge(hopB, dest, 1.0f, now, Edge::Source::Mirrored);
+    graph.updateEdge(dest, hopA, 1.0f, now, Edge::Source::Mirrored);
+    graph.updateEdge(dest, hopB, 1.0f, now, Edge::Source::Mirrored);
+
+    NeighborGraph::RoutePolicy policy;
+    Route primary = graph.calculateRoute(dest, now, policy);
+    TEST_ASSERT_EQUAL_UINT32(hopA, primary.nextHop);
+
+    NodeNum excluded[1] = {hopA};
+    policy.excluded = excluded;
+    policy.excludedCount = 1;
+    Route alt = graph.calculateRoute(dest, now, policy);
+    TEST_ASSERT_EQUAL_UINT32(hopB, alt.nextHop);
+
+    NodeNum both[2] = {hopA, hopB};
+    policy.excluded = both;
+    policy.excludedCount = 2;
+    Route none = graph.calculateRoute(dest, now, policy);
+    TEST_ASSERT_EQUAL_UINT32(0, none.nextHop);
+
+    // Destination itself is never an intermediate hop filter target in Dijkstra.
+    NodeNum exclDest[1] = {dest};
+    policy.excluded = exclDest;
+    policy.excludedCount = 1;
+    Route still = graph.calculateRoute(dest, now, policy);
+    TEST_ASSERT_EQUAL_UINT32(hopA, still.nextHop);
+}
+
+void test_is_direct_packet_originator_rule()
+{
+    meshtastic_MeshPacket mp = {};
+    mp.from = 0x12345678;
+    mp.hop_start = 3;
+    mp.hop_limit = 3;
+    mp.relay_node = 0;
+    TEST_ASSERT_TRUE(SignalRoutingModule::isDirectPacket(mp));
+    mp.relay_node = 0x78;
+    TEST_ASSERT_TRUE(SignalRoutingModule::isDirectPacket(mp));
+    mp.relay_node = 0xAB;
+    TEST_ASSERT_FALSE(SignalRoutingModule::isDirectPacket(mp));
+    mp.relay_node = 0;
+    mp.hop_limit = 2;
+    TEST_ASSERT_FALSE(SignalRoutingModule::isDirectPacket(mp));
+}
+
+void test_named_forward_followup_waits_for_our_airtime_and_slot_one()
+{
+    initGraphTestNodeDb(0xAAAAAAAA);
+    SignalRoutingModule module;
+    const uint32_t airtime = 400;
+    const uint32_t delay = module.namedForwardFollowupDelayMs(0, airtime, 0);
+    // Counted from handing our frame to the radio: our own airtime comes before the hop's wait.
+    TEST_ASSERT_TRUE(delay >= airtime + module.nextHopCarryWaitMs(0, airtime, 0));
+    // Our airtime, then slot 1 opens no earlier than one more leader airtime, then its own airtime.
+    TEST_ASSERT_TRUE(delay >= 3 * airtime);
+}
+
+// The redirect names only an SR-active alternate whose byte differs from the silent hop's.
+static void test_alternate_next_hop_requires_a_distinct_byte()
+{
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum silent = 0xBB0000BB;
+    constexpr NodeNum alt = 0xCC0000CC;
+    constexpr NodeNum dest = 0xEE0000EE;
+    initGraphTestNodeDb(me);
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+
+    class GraphWriter : public SignalRoutingModule {
+    public:
+        void note(NodeNum from, NodeNum to, bool hearsUs) { updateGraphWithNeighbor(from, to, -90, 5, hearsUs); }
+    };
+    GraphWriter module;
+    module.note(me, silent, true);
+    module.note(me, alt, false);
+    // alt's own list makes it an SR-active publisher; its links are noted after it, because a
+    // list replaces the publisher's edges.
+    ingestOneNeighbor(module, alt, dest, true, 1);
+    module.note(alt, me, true);
+    module.note(alt, dest, true);
+    ingestOneNeighbor(module, dest, alt, true, 2);
+    module.note(me, alt, true);
+
+    const NodeNum excluded[1] = {silent};
+    TEST_ASSERT_EQUAL_UINT32(alt, module.alternateNextHop(dest, excluded, 1, static_cast<uint8_t>(silent & 0xFF)));
+    // Same byte as the silent hop: a frame naming it would read as that hop again.
+    TEST_ASSERT_EQUAL_UINT32(0, module.alternateNextHop(dest, excluded, 1, static_cast<uint8_t>(alt & 0xFF)));
+}
+
 // Mirrors MeshRustic unicast_relay::tests for the shared cancel predicate.
 void test_unicast_dupe_cancel_predicate()
 {
@@ -2494,6 +2659,14 @@ void setup()
     RUN_TEST(test_unicast_dupe_cancel_predicate);
     RUN_TEST(test_unicast_last_hop_slots_and_dupe_flags);
     RUN_TEST(test_neighbour_that_does_not_hear_the_transmitter_gets_no_slot);
+    RUN_TEST(test_hop_health_two_misses_make_suspect);
+    RUN_TEST(test_hop_health_success_resets_and_ttl_expires);
+    RUN_TEST(test_hop_health_misses_older_than_ttl_do_not_count);
+    RUN_TEST(test_hop_health_evicts_oldest);
+    RUN_TEST(test_route_exclusion_yields_alternate);
+    RUN_TEST(test_is_direct_packet_originator_rule);
+    RUN_TEST(test_named_forward_followup_waits_for_our_airtime_and_slot_one);
+    RUN_TEST(test_alternate_next_hop_requires_a_distinct_byte);
 
     UNITY_END();
 }

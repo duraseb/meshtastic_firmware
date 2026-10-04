@@ -5,6 +5,7 @@
 #include "mesh/generated/meshtastic/telemetry.pb.h"
 
 #include "MeshRadio.h"
+#include "graph/HopHealth.h"
 #include "graph/NeighborGraph.h"
 
 // Routing protocol version for compatibility checking
@@ -607,6 +608,23 @@ public:
 
     bool shouldUseSignalBasedRouting(const meshtastic_MeshPacket *p);
 
+    /// Duplicate whose incoming next_hop names us: hand-off from the previous relay.
+    bool isHandOffDuplicate(const meshtastic_MeshPacket *p);
+
+    /// Originator retry that should be re-planned like a fresh reception under signal routing.
+    bool isOriginatorRetryReplan(const meshtastic_MeshPacket *p);
+
+    /// Stampable, SR-active next hop to destination with intermediate hops excluded (cache
+    /// bypassed), never one whose byte is `nominatedByte`.
+    NodeNum alternateNextHop(NodeNum dest, const NodeNum *excluded, uint8_t n, uint8_t nominatedByte);
+
+    /// Full id of the hop a stamped `next_hop` byte names: `flagged` when its byte matches, else
+    /// the resolved relay identity (0 when unknown).
+    NodeNum nominatedHopFor(NodeNum flagged, uint8_t nextHopByte) const;
+
+    void recordHopMiss(NodeNum destination, NodeNum nextHop);
+    void recordHopSuccess(NodeNum destination, NodeNum nextHop);
+
     /** The next hop SR chose for the unicast it just approved in shouldRelay() (0 = none); cleared on read. */
     NodeNum takePendingUnicastNextHop()
     {
@@ -625,6 +643,9 @@ public:
     bool isSignalRoutingNode(NodeNum nodeId) const { return publishesTopology(nodeId); }
     bool deliveringRelayerIsSR(const meshtastic_MeshPacket *p) const;
     uint32_t nextHopCarryWaitMs(NodeNum nextHop, uint32_t airtimeMs, float rxSnr) const;
+    /// Wait between named follow-up tries, from handing our frame to the radio: our own
+    /// contention and airtime, then max(carry wait, end of ranked slot 1 with its tie-break).
+    uint32_t namedForwardFollowupDelayMs(NodeNum nextHop, uint32_t airtimeMs, float rxSnr) const;
     void updateNodeActivityForPacket(NodeNum nodeId);
     void updateNodeActivityForPacketAndRelay(const meshtastic_MeshPacket *p);
     bool shouldRelay(const meshtastic_MeshPacket *p);
@@ -665,6 +686,7 @@ protected:
 
 private:
     NeighborGraph *routingGraph = nullptr;
+    HopHealth hopHealth;
     uint32_t lastGraphUpdate = 0;
     static constexpr uint32_t GRAPH_MAINTENANCE_INTERVAL_SECS = 60;
     static constexpr uint32_t NODE_TTL_SECS = 7200;    // 2 hours for all nodes in the graph
