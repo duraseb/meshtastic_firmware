@@ -2520,6 +2520,36 @@ void test_unicast_last_hop_slots_and_dupe_flags()
     }
 }
 
+// Named-backup cancel must not depend on proving the designated hop can finish — a boot graph
+// cannot answer that, and keeping the backup after hearing Czar is the field failure mode.
+void test_unicast_named_backup_cancels_on_designated_hop_without_finish_proof()
+{
+    constexpr NodeNum me = 0x5879fa8f;   // angl
+    constexpr NodeNum peer = 0x979ed146; // Dura
+    constexpr NodeNum gw = 0x63dc8f8c;   // Czar (designated)
+    constexpr NodeNum dest = 0xee594922; // MR22 (unknown to our empty graph)
+    const NeighborGraph::RoutePolicy policy;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph; // empty: no edges, cannot unicastCanFinish anyone toward dest
+    UnicastSlotFlags flags;
+    flags.designatedNextHop = (uint8_t)(gw & 0xFF);
+    flags.armedHopLimit = 7;
+
+    TEST_ASSERT_FALSE(graph.unicastCanFinish(gw, dest, policy));
+    TEST_ASSERT_TRUE_MESSAGE(
+        graph.unicastDupeCancels(me, dest, 0x50, 0, 0, policy, flags, 0, (uint8_t)(gw & 0xFF), 6),
+        "relay byte matching designated next_hop cancels even when identity is unresolved");
+    TEST_ASSERT_TRUE_MESSAGE(graph.unicastDupeCancels(me, dest, 0x51, gw, 0, policy, flags, 0, 0, 6),
+                             "resolved designated hop cancels without finish proof");
+    TEST_ASSERT_TRUE_MESSAGE(
+        graph.unicastDupeCancels(me, dest, 0x52, peer, 0, policy, flags, (uint8_t)(gw & 0xFF), (uint8_t)(peer & 0xFF), 5),
+        "lower hop_limit still naming the designation means that hop progressed");
+    TEST_ASSERT_FALSE_MESSAGE(
+        graph.unicastDupeCancels(me, dest, 0x53, peer, 0, policy, flags, 0, (uint8_t)(peer & 0xFF), 6),
+        "an unrelated peer copy does not cancel on designation alone when finish/rank are unknown");
+}
+
 static void test_neighbour_that_does_not_hear_the_transmitter_gets_no_slot()
 {
     constexpr NodeNum me = 0xAA0000AA;
@@ -2658,6 +2688,7 @@ void setup()
     RUN_TEST(test_undecoded_direct_frame_is_recorded_as_a_neighbour);
     RUN_TEST(test_unicast_dupe_cancel_predicate);
     RUN_TEST(test_unicast_last_hop_slots_and_dupe_flags);
+    RUN_TEST(test_unicast_named_backup_cancels_on_designated_hop_without_finish_proof);
     RUN_TEST(test_neighbour_that_does_not_hear_the_transmitter_gets_no_slot);
     RUN_TEST(test_hop_health_two_misses_make_suspect);
     RUN_TEST(test_hop_health_success_resets_and_ttl_expires);

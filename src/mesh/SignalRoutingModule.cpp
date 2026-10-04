@@ -2079,6 +2079,28 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
     return ProcessMessage::CONTINUE;
 }
 
+// A named-backup relay must stamp a hop that is neither empty, nor the designation already on
+// the packet, nor the node that handed us the frame. Clearing the byte is not another path:
+// stock floods from the wrong side, and the originator treats the rebroadcast as an implicit ACK.
+static bool namedBackupStampOk(NodeNum pendingStamp, NodeNum heardFrom, uint8_t designatedByte, NodeNum destination,
+                               NodeDB *nodeDB)
+{
+    if (!nodeDB || designatedByte == NO_NEXT_HOP_PREFERENCE) {
+        return true;
+    }
+    if (designatedByte == nodeDB->getLastByteOfNodeNum(destination)) {
+        return true;
+    }
+    uint8_t stampByte = pendingStamp != 0 ? nodeDB->getLastByteOfNodeNum(pendingStamp) : NO_NEXT_HOP_PREFERENCE;
+    if (stampByte == NO_NEXT_HOP_PREFERENCE || stampByte == designatedByte) {
+        return false;
+    }
+    if (heardFrom != 0 && pendingStamp == heardFrom) {
+        return false;
+    }
+    return true;
+}
+
 bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_MeshPacket *p)
 {
     if (!routingGraph || !nodeDB) {
@@ -2145,8 +2167,8 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         }
     }
 
-    // No route of our own. As a named backup that is still useful: the designated hop is the route
-    // and we relay with no next hop of our own if it stays silent.
+    // No route of our own. As a named backup that is only useful when we can stamp a *different*
+    // hop past the designation; a zero stamp is suppressed at the backup gate below.
     bool routeVerified = false;
     NodeNum myNextHop = getNextHop(destination, sourceNode, heardFrom, false, &routeVerified);
     if (myNextHop == 0 && !weAreDesignatedHop) {
@@ -2332,8 +2354,17 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
 
     // A suppressed backup does not rank: the reasons above already said peers are better placed.
     // It waits behind the designated reserve at its own rung of the node-id ladder, so several
-    // backups do not answer a silent designated hop together.
+    // backups do not answer a silent designated hop together — and only when it can stamp a
+    // different next hop (same gate as the ranked path below).
     if (suppressReason) {
+        if (relayerNamed && !weAreDesignatedHop &&
+            !namedBackupStampOk(pendingUnicastNextHop, heardFrom, p->next_hop, destination, nodeDB)) {
+            LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: backup has no next hop past 0x%02x (%s)",
+                     p->id, srcName, destName, p->next_hop, suppressReason);
+            pendingUnicastNextHop = 0;
+            pendingUnicastFlags = {};
+            return false;
+        }
         uint8_t rank = 0;
         if (myEdges) {
             for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
@@ -2356,6 +2387,8 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         LOG_INFO("[SR-DEC] UNICAST RELAY 0x%08x %s->%s: backup for next_hop 0x%02x "
                  "(%s, delay=%ums)",
                  p->id, srcName, destName, p->next_hop, suppressReason, backupDelay);
+        pendingUnicastFlags.designatedNextHop = p->next_hop;
+        pendingUnicastFlags.armedHopLimit = p->hop_limit;
         pendingRelayDelayMs = backupDelay;
         routingGraph->recordNodeTransmission(myNode, p->id, currentTime);
         return true;
@@ -2519,16 +2552,15 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     }
 
     if (shouldRelay && relayerNamed && !weAreDesignatedHop && !pendingUnicastFlags.nonfinalFlood) {
-        uint8_t stampByte = pendingUnicastNextHop != 0 ? nodeDB->getLastByteOfNodeNum(pendingUnicastNextHop) : 0;
-        bool stampIsDesignated = stampByte != 0 && stampByte == p->next_hop;
-        bool stampIsTransmitter = pendingUnicastNextHop != 0 && heardFrom != 0 && pendingUnicastNextHop == heardFrom;
-        if (pendingUnicastNextHop == 0 || stampIsDesignated || stampIsTransmitter) {
+        if (!namedBackupStampOk(pendingUnicastNextHop, heardFrom, p->next_hop, destination, nodeDB)) {
             LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: backup has no next hop past 0x%02x",
                      p->id, srcName, destName, p->next_hop);
             pendingUnicastNextHop = 0;
             pendingUnicastFlags = {};
             return false;
         }
+        pendingUnicastFlags.designatedNextHop = p->next_hop;
+        pendingUnicastFlags.armedHopLimit = p->hop_limit;
     }
 
     LOG_INFO("[SR-DEC] UNICAST %s 0x%08x %s->%s via %s (delay=%ums)",
@@ -2906,7 +2938,7 @@ bool SignalRoutingModule::unicastDupeCancels(const meshtastic_MeshPacket *p, Nod
     NodeNum myNextHop = getNextHop(p->to, p->from, 0, false);
     UnicastSlotFlags flags = unicastCommitFlags(p->id);
     return routingGraph->unicastDupeCancels(nodeDB->getNodeNum(), p->to, p->id, dupeRelayer, myNextHop, routePolicy(), flags,
-                                            p->next_hop);
+                                            p->next_hop, p->relay_node, p->hop_limit);
 }
 
 UnicastSlotFlags SignalRoutingModule::unicastCommitFlags(PacketId packetId) const
@@ -3124,22 +3156,32 @@ bool SignalRoutingModule::shouldRelay(const meshtastic_MeshPacket *p)
 
     // Check if destination is reachable through SR topology
     if (!topologyHealthyForUnicast(p->to)) {
-        // If the node exists in NodeDB, fall back to broadcast-style relay
-        // This handles legacy/stock nodes not in the SR graph
-        if (nodeDB->getMeshNode(p->to)) {
+        const uint8_t ourByte = nodeDB->getLastByteOfNodeNum(nodeDB->getNodeNum());
+        const uint8_t destByte = nodeDB->getLastByteOfNodeNum(p->to);
+        const bool namedForeignNextHop =
+            p->next_hop != NO_NEXT_HOP_PREFERENCE && p->next_hop != destByte && p->next_hop != ourByte;
+        const bool knownInNodeDb = nodeDB->getMeshNode(p->to) != nullptr;
+        const bool knownDownstream = routingGraph->isDownstream(p->to);
+
+        // A foreign next_hop already owns slot 0. The NodeDB/downstream short-circuits used to
+        // return true with stamp 0 and delay 0, which bypassed designation and stamped a flood
+        // the originator treats as an implicit ACK. Hand those frames to coordination instead
+        // (which suppresses unless we can stamp a different hop and wait behind slot 0).
+        if (namedForeignNextHop && (knownInNodeDb || knownDownstream)) {
+            LOG_INFO("[SR-DEC] UNICAST DEFER 0x%08x %s->%s: named next_hop 0x%02x, no SR route yet",
+                     p->id, senderName, destName, p->next_hop);
+            // Fall through to shouldRelayUnicastForCoordination.
+        } else if (knownInNodeDb) {
+            // Undesignated / names us: broadcast-style fallback for legacy/stock destinations.
             LOG_INFO("[SR-DEC] UNICAST RELAY 0x%08x: %s to %s, known in NodeDB only", p->id, senderName, destName);
             return true;
-        }
-        // If the destination is known as a downstream node in the topology (e.g. reachable via a
-        // neighbour's neighbour), fall back to SR relay rather than suppressing. This covers cases
-        // where the direct relay chain is missing a Dijkstra edge (destination only appears in
-        // downstream table entries whose relay is not our direct neighbour).
-        if (routingGraph->isDownstream(p->to)) {
+        } else if (knownDownstream) {
             LOG_INFO("[SR-DEC] UNICAST RELAY 0x%08x %s->%s: downstream only", p->id, senderName, destName);
             return true;
+        } else {
+            LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: unknown destination", p->id, senderName, destName);
+            return false;
         }
-        LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: unknown destination", p->id, senderName, destName);
-        return false;
     }
 
     NodeNum sourceNode = p->from;

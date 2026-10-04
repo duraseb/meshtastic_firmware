@@ -30,6 +30,12 @@ struct UnicastSlotFlags {
     bool lastHopBackup = false;
     bool nonfinalFlood = false;
     NodeNum nominatedNextHop = 0;
+    /// Incoming `next_hop` byte when we armed as a named backup (0 = undesignated / not a backup).
+    /// Hearing that hop's copy cancels us even when the graph cannot yet prove it finishes.
+    uint8_t designatedNextHop = 0;
+    /// `hop_limit` on the copy we armed from; a later copy that still names `designatedNextHop`
+    /// with a strictly lower hop_limit means that hop progressed the frame.
+    uint8_t armedHopLimit = 0;
 };
 
 /// One ranked unicast relay candidate (ourselves or an SR neighbour).
@@ -550,9 +556,11 @@ class NeighborGraph {
     /// can finish and they cannot. Unresolved or placeholder identity cancels only when we cannot.
     /// Last-hop backup: only dest's own copy cancels. A flood slot stays for a same-hop named SR
     /// that cannot finish, and cancels on dest, a finisher, the nominated hop, or another flood.
+    /// Named backup: hearing the designated next_hop byte (or a lower hop_limit still naming it)
+    /// cancels even when `unicastCanFinish` is unknown — boot graphs must not keep the backup.
     bool unicastDupeCancels(NodeNum myNode, NodeNum destination, uint32_t packetId, NodeNum dupeRelayer,
                             NodeNum myNextHop, const RoutePolicy &policy, UnicastSlotFlags flags = {},
-                            uint8_t dupeNextHop = 0) const;
+                            uint8_t dupeNextHop = 0, uint8_t dupeRelayByte = 0, uint8_t dupeHopLimit = 0) const;
 
     size_t getCoverageIfRelays(NodeNum relay, NodeNum *coveredNodes, size_t maxNodes, const NodeNum *alreadyCovered,
                                size_t alreadyCoveredCount, NodeNum selfNode = 0,

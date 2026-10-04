@@ -1544,8 +1544,23 @@ static bool unicastRankedAhead(NodeNum a, uint16_t aCost, NodeNum b, uint16_t bC
 
 bool NeighborGraph::unicastDupeCancels(NodeNum myNode, NodeNum destination, uint32_t packetId, NodeNum dupeRelayer,
                                        NodeNum myNextHop, const RoutePolicy &policy, UnicastSlotFlags flags,
-                                       uint8_t dupeNextHop) const
+                                       uint8_t dupeNextHop, uint8_t dupeRelayByte, uint8_t dupeHopLimit) const
 {
+    // Named-backup cancel that does not need a complete graph: the byte on the wire is enough.
+    if (flags.designatedNextHop != 0) {
+        if (dupeRelayByte == flags.designatedNextHop) {
+            return true;
+        }
+        if (dupeRelayer != 0 && !Edge::isPlaceholderId(dupeRelayer) &&
+            (uint8_t)(dupeRelayer & 0xFF) == flags.designatedNextHop) {
+            return true;
+        }
+        // Designation progressed: same next_hop byte, strictly fewer hops remaining.
+        if (dupeNextHop == flags.designatedNextHop && flags.armedHopLimit != 0 && dupeHopLimit < flags.armedHopLimit) {
+            return true;
+        }
+    }
+
     bool weFinish = unicastCanFinish(myNode, destination, policy);
     if (dupeRelayer == 0 || dupeRelayer == myNode || Edge::isPlaceholderId(dupeRelayer)) {
         return !weFinish;

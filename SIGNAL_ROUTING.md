@@ -295,14 +295,18 @@ waiting on us specifically and its retries would designate us again, so one copy
 less than three from it. A last hop keeps its destination designation through the clear: that
 byte is what makes stock relays leave the frame alone. Native tests: `test_chain_walks_to_the_first_hearable_hop`, `test_downstream_chain_appoints_the_neighbour_we_hear`.
 
-**Backups survive suppression.** The checks that suppress a unicast relay — source and destination
-downstream of the same relay, the node we heard it from can finish delivery, a better placed SR
-neighbour covers it, no route of our own — all say somebody else is better placed, not that the
-designated hop will succeed. When `next_hop` names a relayer other than the destination, we
-therefore stay in as a backup instead of going silent: no ranking, one slot behind the designated
-reserve at our own rung of the node-id ladder, so several backups do not answer a silent designated
-hop together. "heardFrom can finish delivery" asks `canDeliver`, not merely whether it lists the
-destination, and every candidate cost is the delivery-direction ETX priced at its receiver.
+**Backups survive suppression — only with a different stamp.** The checks that suppress a unicast
+relay — source and destination downstream of the same relay, the node we heard it from can finish
+delivery, a better placed SR neighbour covers it, no route of our own — all say somebody else is
+better placed, not that the designated hop will succeed. When `next_hop` names a relayer other than
+the destination (and not us), we therefore stay in as a backup instead of going silent: no ranking,
+one slot behind the designated reserve at our own rung of the node-id ladder, so several backups do
+not answer a silent designated hop together — **and only when we can stamp a next hop that is
+neither empty, nor that designation, nor the transmitter we heard** (`namedBackupStampOk`). Clearing
+the byte is not another path: stock floods from the wrong side, and the originator treats the
+rebroadcast as an implicit ACK. The same gate applies on the ranked path. "heardFrom can finish
+delivery" asks `canDeliver`, not merely whether it lists the destination, and every candidate cost
+is the delivery-direction ETX priced at its receiver.
 
 A unicast whose `next_hop` byte equals the destination's own byte names no relayer: stock's
 `NextHopRouter` learns the destination itself as next hop from a direct reply. Such a packet is
@@ -324,7 +328,11 @@ When deciding whether to use SR coordination for unicast packets:
 
 When a unicast packet arrives for a destination that is not in the SR graph (neither as a direct edge, downstream entry, nor Dijkstra-routable) **and** not in NodeDB, SR suppresses the relay entirely rather than falling back to broadcast-style delivery. Blindly relaying packets for completely unknown nodes wastes airtime with no reasonable chance of delivery.
 
-Destinations that are known through any mechanism are still relayed:
+When the destination *is* known in NodeDB or the downstream table but SR topology is not yet healthy, the short-circuit depends on the wire `next_hop`:
+- **Undesignated / names us** → broadcast-style fallback (`known in NodeDB only` / `downstream only`) as before.
+- **Foreign designated hop** → do **not** early-return with stamp 0 and delay 0. Log `UNICAST DEFER` and fall through into `shouldRelayUnicastForCoordination`, which reserves slot 0 for that hop and applies the backup stamp gate (typically suppresses when we have no different next hop).
+
+Destinations that are known through any mechanism may still be relayed when undesignated:
 - Present in NodeDB (legacy/stock nodes not in SR graph)
 - Present in the downstream table (reachable via a relay's topology report)
 - Routable via Dijkstra (direct or multi-hop SR path)
@@ -457,7 +465,7 @@ lost unicast. Tests: `test_route_exclusion_yields_alternate`,
 - An SR neighbor that covers `heardFrom` can reach destination → suppress only if they already transmitted this id
 
 **Dupe Cancellation:**
-When a dupe arrives for a committed unicast relay, `areAllNeighborsCovered()` calls `NeighborGraph::unicastDupeCancels()`: cancel only if the dupe relayer can finish delivery (priced hop or dest's downstream), or is ranked ahead of us with a path. If we can finish and they cannot, our relay is kept. An unresolved relay byte (or a placeholder identity) cancels only when we cannot finish (the designated or stock hop we were waiting for). Last-hop backup cancels only on dest's own copy. A flood salvage slot stays for a same-hop named SR that cannot finish, and cancels on dest, a finisher, the nominated hop, or another flood copy. A hand-off duplicate (incoming `next_hop` names us) is re-planned rather than cancelled. A named follow-up stops on the nominated hop's copy (a hop-health success) or the destination's reply/ACK (also a success); a copy from the upstream node or the originator leaves it armed, because neither has carried the packet past us; any other copy goes through `areAllNeighborsCovered()` and is neutral for hop health. Late unicast rungs are not clamped to 2 s — a clamp would bunch later slots onto the same instant. Native tests: `test_unicast_dupe_cancel_predicate`, `test_unicast_last_hop_slots_and_dupe_flags`.
+When a dupe arrives for a committed unicast relay, `areAllNeighborsCovered()` calls `NeighborGraph::unicastDupeCancels()`: cancel if the dupe relayer can finish delivery (priced hop or dest's downstream), or is ranked ahead of us with a path. If we can finish and they cannot, our relay is kept. An unresolved relay byte (or a placeholder identity) cancels only when we cannot finish (the designated or stock hop we were waiting for). A **named backup** also cancels when the heard copy's `relay_node` (or resolved identity) matches the designation byte we armed from, or when a later copy still names that designation with a strictly lower `hop_limit` — even if the graph cannot prove that hop finishes (`UnicastSlotFlags::{designatedNextHop,armedHopLimit}`). Last-hop backup cancels only on dest's own copy. A flood salvage slot stays for a same-hop named SR that cannot finish, and cancels on dest, a finisher, the nominated hop, or another flood copy. A hand-off duplicate (incoming `next_hop` names us) is re-planned rather than cancelled. A named follow-up stops on the nominated hop's copy (a hop-health success) or the destination's reply/ACK (also a success); a copy from the upstream node or the originator leaves it armed, because neither has carried the packet past us; any other copy goes through `areAllNeighborsCovered()` and is neutral for hop health. Late unicast rungs are not clamped to 2 s — a clamp would bunch later slots onto the same instant. Native tests: `test_unicast_dupe_cancel_predicate`, `test_unicast_last_hop_slots_and_dupe_flags`, `test_unicast_named_backup_cancels_on_designated_hop_without_finish_proof`.
 
 ## Broadcast Routing
 
@@ -1213,8 +1221,9 @@ MB9c transmits at slot 0. MBe4 hears it → cancels.
 **Unicast Coordination:**
 - Uses the same slot-based scheduling as broadcasts, with ETX-to-destination as the ranking metric
 - Designated next_hop (from `p->next_hop`) gets slot 0; SR candidates sorted by cost start from slot 1 (or slot 0 if no next_hop)
-- Any dupe that can finish, or is ranked ahead with a path, cancels queued unicast relays; a worse-placed copy that cannot finish does not kill a last hop we can deliver
-- Falls back to broadcast-style relay for all destinations not reachable via SR topology
+- Named backups must stamp a different next hop and wait behind that reservation; a zero stamp is suppressed
+- Any dupe that can finish, is ranked ahead with a path, or (for a named backup) is the designated hop / shows hop-limit progress, cancels queued unicast relays; a worse-placed copy that cannot finish does not kill a last hop we can deliver
+- Undesignated NodeDB/downstream-only destinations fall back to broadcast-style relay; a foreign designated hop defers into coordination instead
 
 **Network Adaptation:**
 - Assesses topology health but may not detect sudden changes immediately
@@ -1225,8 +1234,8 @@ MB9c transmits at slot 0. MBe4 hears it → cancels.
 
 SignalRouting gracefully degrades when coordination isn't possible:
 
-1. **Unknown Destinations**: Unicasts to nodes not reachable via SR topology fall back to broadcast-style relay, regardless of whether the destination is known in NodeDB, the downstream table, or neither
-2. **Topology Incomplete**: Uses traditional unicast routing for known but poorly connected destinations
+1. **Unknown Destinations**: Unicasts to nodes not reachable via SR topology and absent from NodeDB/downstream are suppressed. Known-but-not-SR-routable destinations use broadcast-style fallback only when undesignated (or naming us); a foreign `next_hop` defers to coordination / stamp gate
+2. **Topology Incomplete**: Uses traditional unicast routing for known but poorly connected destinations when undesignated
 3. **Legacy Node Priority**: Gives priority to legacy routers/repeaters for compatibility
 4. **Memory/CPU Constraints**: Automatic feature disabling for constrained devices
 
@@ -1252,7 +1261,7 @@ SignalRouting gracefully degrades when coordination isn't possible:
 
 **"No route found for unicast"**
 - Destination not in topology graph
-- SR falls back to broadcast-style relay for all unroutable destinations
+- Undesignated known destinations may fall back to broadcast-style relay; a foreign designated `next_hop` defers to coordination and is suppressed without a different stamp
 - Wait for topology convergence or use opportunistic forwarding
 
 **"Packet not relayed despite good coverage"**
