@@ -142,7 +142,7 @@ It does **not** fire on remote node count changes during graph aging — those a
 [SR]   -> <name>: NO direct connection, but asymmetric link (hearsUs=false) — skipping downstream of <relay>
 [SR]   -> <name>: HAS direct connection, sender confirms reachability
 ```
-When topology arrives from node X, any of X's listed neighbors that *we* cannot hear directly are recorded in the downstream table as `(destination, relay=X)` — but only if X reports `hearsUs=true` for that neighbor (the neighbor can hear X). If `hearsUs=false`, the link is asymmetric and X cannot deliver to that neighbor, so the downstream entry is skipped.
+When topology arrives from node X, any of X's listed neighbors that *we* cannot hear directly are recorded in the downstream table as `(destination, relay=X)` — but only if X reports `hearsUs=true` for that neighbor (the neighbor can hear X). If `hearsUs=false`, the link is asymmetric and X cannot deliver to that neighbor, so the downstream entry is skipped. "Hear directly" means we hold a **Reported** `us→neighbour` edge (our RF measurement). The reverse of that observation is only Inferred, and a listing of us is Mirrored — neither counts. Neighbours we already hear have any stale downstream row for them cleared on the same merge.
 
 ### Authoritative hearsUs override
 ```

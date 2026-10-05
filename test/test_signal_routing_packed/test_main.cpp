@@ -1337,6 +1337,55 @@ void test_a_silent_publisher_loses_our_direct_link()
     TEST_ASSERT_TRUE(hasEdge(gw, pub));
 }
 
+// A neighbour we hear on RF must not be parked downstream of a peer that lists them.
+static void test_topology_does_not_park_a_heard_neighbour_as_downstream()
+{
+    constexpr NodeNum me = 0xB781E8BC;
+    constexpr NodeNum peer = 0xEE594922;
+    constexpr NodeNum heard = 0x63DC8F8C;
+    initGraphTestNodeDb(me);
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+
+    class Harness : public SignalRoutingModule {
+    public:
+        NeighborGraph *graph() { return routingGraph; }
+    };
+    Harness module;
+    TEST_ASSERT_NOT_NULL(module.graph());
+
+    module.updateNeighborInfo(peer, -70, 8.0f, 1000);
+    module.updateNeighborInfo(heard, -75, 11.0f, 1000);
+    // Stale row as if the old them→us check had parked them behind the peer.
+    module.graph()->updateDownstream(heard, peer, 2.0f, millis() / 1000);
+    TEST_ASSERT_EQUAL_UINT32(peer, module.graph()->getDownstreamRelay(heard));
+
+    ingestOneNeighbor(module, peer, heard, true, 0xA11);
+    TEST_ASSERT_FALSE(module.graph()->isDownstream(heard));
+    TEST_ASSERT_EQUAL_UINT32(0, module.graph()->getDownstreamRelay(heard));
+}
+
+// A node we do not hear, listed with hearsUs, is recorded downstream of the topology sender.
+// (Module ingest of a synthetic protobuf is covered elsewhere; this pins the write the merge uses.)
+static void test_topology_still_learns_downstream_for_nodes_we_do_not_hear()
+{
+    constexpr NodeNum me = 0xB781E8BC;
+    constexpr NodeNum peer = 0xEE594922;
+    constexpr NodeNum remote = 0x0D0E0F10;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    const uint32_t now = millis() / 1000;
+    graph.updateEdge(me, peer, 1.0f, now, Edge::Source::Reported);
+    // Same call the topology merge uses when !hasDirectConnection && hearsUs.
+    graph.updateDownstreamExclusive(remote, peer, 2.0f, now, /*evenIfRelayHasEdge=*/true);
+    TEST_ASSERT_TRUE(graph.isDownstream(remote));
+    TEST_ASSERT_EQUAL_UINT32(peer, graph.getDownstreamRelay(remote));
+
+    // Hearing them later must drop that row (same clear the merge runs on HAS direct).
+    graph.clearDownstreamForDestination(remote);
+    TEST_ASSERT_FALSE(graph.isDownstream(remote));
+}
+
 // A neighbour we used to hear, now heard only through a relay, must leave our direct set
 // immediately and sit behind that relay — otherwise unicasts keep aiming at a dead last hop.
 static void test_a_relayed_former_neighbour_becomes_downstream()
@@ -2646,6 +2695,8 @@ void setup()
     RUN_TEST(test_routing_through_us_confirms_the_sender_hears_us);
     RUN_TEST(test_a_guess_never_outranks_or_prices_a_measurement);
     RUN_TEST(test_a_silent_publisher_loses_our_direct_link);
+    RUN_TEST(test_topology_does_not_park_a_heard_neighbour_as_downstream);
+    RUN_TEST(test_topology_still_learns_downstream_for_nodes_we_do_not_hear);
     RUN_TEST(test_a_relayed_former_neighbour_becomes_downstream);
     RUN_TEST(test_chain_walks_to_the_first_hearable_hop);
     RUN_TEST(test_chain_returns_none_on_a_cycle_or_a_broken_path);

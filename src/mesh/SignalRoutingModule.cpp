@@ -968,48 +968,46 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
             continue;
         }
 
-        // A sender we do not hear must not reinstall sender→us: Dijkstra would treat us as a
-        // last hop to them from a stale list after they moved behind a relay.
-        if (neighbor.nodeId != ourNode || senderIsDirect) {
-            updateGraphWithNeighbor(p->from, neighbor.nodeId, neighbor.rssi, neighbor.snr, neighbor.hearsUs);
-        }
-
-        // Create gateway relationship ONLY for nodes we cannot hear directly
-        bool hasDirectConnection = false;
-
-        // Never mark ourselves as downstream of anyone
-        if (neighbor.nodeId == ourNode) {
-            hasDirectConnection = true;
-        } else if (routingGraph) {
-            // A direct connection is confirmed if the neighbor has a Reported edge TO us
-            const NodeEdges *neighborEdges = routingGraph->getEdgesFrom(neighbor.nodeId);
-            if (neighborEdges) {
-                for (uint8_t j = 0; j < neighborEdges->edgeCount; j++) {
-                    if (neighborEdges->edges[j].to == ourNode &&
-                        neighborEdges->edges[j].source == Edge::Source::Reported) {
-                        hasDirectConnection = true;
-                        break;
-                    }
-                }
-            }
-        }
+        // Create gateway relationship ONLY for nodes we cannot hear directly.
+        // Direct = our Reported observation of them (us→them). The reverse of an RF hearing is
+        // only Inferred, and a peer listing us is Mirrored — neither means we hear them.
+        // Checking Reported them→us never fired after the Inferred-reverse change and wrongly
+        // parked neighbours we hear as downstream of the topology sender.
+        const bool hasDirectConnection =
+            neighbor.nodeId == ourNode || hasReportedDirectEdge(neighbor.nodeId);
 
         char neighborName[48];
         getNodeDisplayName(neighbor.nodeId, neighborName, sizeof(neighborName));
 
-        if (!hasDirectConnection && neighbor.hearsUs) {
+        if (hasDirectConnection) {
+            if (neighbor.nodeId != ourNode && routingGraph) {
+                routingGraph->clearDownstreamForDestination(neighbor.nodeId);
+            }
+            LOG_INFO("[SR]   -> %s: HAS direct connection, sender confirms reachability",
+                    neighborName);
+        } else if (neighbor.hearsUs) {
             // Only mark as downstream if the link is bidirectional — the neighbor must be able
             // to hear the topology source, otherwise the source cannot actually deliver to it.
             LOG_INFO("[SR]   -> %s: no direct connection, downstream of %s",
                     neighborName, senderNameForTopo);
-            float etxForDownstream = NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr, currentCostingSpreadingFactor());
-            routingGraph->updateDownstream(neighbor.nodeId, p->from, etxForDownstream, millis() / 1000);
-        } else if (!hasDirectConnection && !neighbor.hearsUs) {
+            if (routingGraph) {
+                float etxForDownstream =
+                    NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr, currentCostingSpreadingFactor());
+                // evenIfRelayHasEdge: the Mirrored sender→listed edge is installed next (and may
+                // already exist on a later list). Without it, updateDownstream no-ops whenever the
+                // relay already shows that edge — which is exactly when topology taught it to us.
+                routingGraph->updateDownstreamExclusive(neighbor.nodeId, p->from, etxForDownstream,
+                                                        millis() / 1000, /*evenIfRelayHasEdge=*/true);
+            }
+        } else {
             LOG_INFO("[SR]   -> %s: asymmetric (hearsUs=false), not downstream of %s",
                     neighborName, senderNameForTopo);
-        } else {
-            LOG_INFO("[SR]   -> %s: HAS direct connection, sender confirms reachability",
-                    neighborName);
+        }
+
+        // A sender we do not hear must not reinstall sender→us: Dijkstra would treat us as a
+        // last hop to them from a stale list after they moved behind a relay.
+        if (neighbor.nodeId != ourNode || senderIsDirect) {
+            updateGraphWithNeighbor(p->from, neighbor.nodeId, neighbor.rssi, neighbor.snr, neighbor.hearsUs);
         }
     }
 

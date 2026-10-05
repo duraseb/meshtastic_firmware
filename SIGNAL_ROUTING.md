@@ -652,7 +652,7 @@ So `planAcknowledgement()` runs a second pass with its own price, only when the 
 
 LoRa links are frequently asymmetric — node A can hear node B but B cannot hear A, or the link quality differs significantly in each direction. SR addresses this at multiple levels:
 
-**Downstream assignment**: When processing a topology broadcast from node X listing neighbor Y, SR only marks Y as downstream of X if X reports `hearsUs=true` for Y — meaning Y can hear X. Without this check, SR might route packets to Y via X even though X cannot deliver to Y.
+**Downstream assignment**: When processing a topology broadcast from node X listing neighbor Y, SR only marks Y as downstream of X if we do **not** already hold a Reported `us→Y` edge (we do not hear Y directly) **and** X reports `hearsUs=true` for Y — meaning Y can hear X. Without the hearsUs check, SR might route packets to Y via X even though X cannot deliver to Y. Without the Reported-us→Y check, neighbours we hear on RF were wrongly parked behind X (the them→us Reported test never fired after reverse RF edges became Inferred). A merge that lists a neighbour we already hear also clears any stale downstream row for them.
 
 **Authoritative hearsUs override**: A node is authoritative about who it can hear. When node Y broadcasts its topology and does NOT list node X as a neighbor, SR clears the `hearsUs` flag on the X→Y edge — even if X previously claimed bidirectionality. This corrects stale or incorrect `hearsUs` claims. The override may flip-flop until both nodes converge (X stops claiming bidi after observing Y's topology), but each cycle brings the graph closer to ground truth.
 

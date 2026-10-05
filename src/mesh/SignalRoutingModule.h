@@ -684,8 +684,10 @@ protected:
     virtual meshtastic_MeshPacket *allocReply() override;
     virtual int32_t runOnce() override;
 
-private:
+    // Reachable to module tests that assert downstream / edge state after topology merges.
     NeighborGraph *routingGraph = nullptr;
+
+private:
     HopHealth hopHealth;
     uint32_t lastGraphUpdate = 0;
     static constexpr uint32_t GRAPH_MAINTENANCE_INTERVAL_SECS = 60;
