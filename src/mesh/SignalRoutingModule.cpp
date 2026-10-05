@@ -2201,6 +2201,9 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     // picker fell back to "relay it ourselves" (our own byte must never go on the wire: legacy nodes
     // would refuse the packet and SR peers would wait for a second copy from us).
     pendingUnicastNextHop = (myNextHop == myNode) ? 0 : myNextHop;
+    // Path pick before guessed-route clearing: Routing ACK retrace suppress needs to know whether
+    // we still have an onward hop that is not the transmitter we heard.
+    const NodeNum onwardHop = pendingUnicastNextHop;
     pendingUnicastFlags = {};
     // Containment. A route the search could only complete by admitting an unconfirmed hop is a
     // guess: the node it names never proved it hears the destination, and a stamped designation
@@ -2234,12 +2237,10 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     // the stamp and then flood. A flood salvage slot is the exception: it deliberately
     // clears next_hop after named hops have had their chance. Applied after ranking.
 
-    // Heard straight from the source, and the source's own topology says the destination hears it:
-    // the destination most likely has the packet already. A routing ACK on that link is never
-    // relayed (a lost ACK is covered by the sender's retransmission). Anything else waits for the
-    // destination's ACK or reply, which cancels the queued relay through the stock
-    // cancelSending(request_id) path; only silence lets the relay go. Colocated receivers lose about
-    // half the frames of a very strong neighbour, so the relay must stay available, just not be first.
+    // Heard straight from the source, and the source's own topology lists the destination: a
+    // Routing ACK on a true local link is not relayed when we cannot improve delivery (no onward
+    // hop, hop is back at the transmitter, or dest already heard this TX). A hub that still has a
+    // path toward a multi-hop originator must carry the receipt.
     uint32_t destAckWaitMs = 0;
     uint32_t destAckDurationMs = 0;
     {
@@ -2262,9 +2263,16 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         }
         if (srcToDest) {
             if (p->decoded.portnum == meshtastic_PortNum_ROUTING_APP && p->decoded.request_id != 0) {
-                LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: routing ACK retraces the link",
-                         p->id, srcName, destName);
-                return false;
+                const bool localMeasured =
+                    Edge::isMeasured(srcToDest->source) &&
+                    srcToDest->getEtx() <= cfgPoorLinkEtxThreshold;
+                const bool noUsefulOnward = onwardHop == 0 || onwardHop == heardFrom;
+                const bool destAlreadyHasIt = srcToDest->hearsUs && hasReportedDirectEdge(destination);
+                if (localMeasured && (noUsefulOnward || destAlreadyHasIt)) {
+                    LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: routing ACK retraces the link",
+                             p->id, srcName, destName);
+                    return false;
+                }
             }
             if (srcToDest->hearsUs) {
                 destAckWaitMs = destAckDurationMs;
@@ -5081,10 +5089,13 @@ NodeNum SignalRoutingModule::resolveRelayIdentity(uint8_t relayId, int16_t rxRss
     if (directCount == 1) {
         bestDirectNode = directCandidates[0].nodeId;
     } else if (directCount > 1 && rxRssi != 0) {
-        // Multiple direct neighbors share this relay byte — use packet ETX to disambiguate
+        // Multiple direct neighbors share this relay byte — use packet ETX to disambiguate.
+        // Equal ETX distance is still ambiguous: naming the wrong full ID writes coverage to
+        // a node that never transmitted (Czar vs Z00b both 0x8c).
         float packetEtx = NeighborGraph::calculateETX(rxRssi, rxSnr, currentCostingSpreadingFactor());
         uint16_t packetEtxFixed = static_cast<uint16_t>(packetEtx * 100.0f);
         uint16_t bestDiff = UINT16_MAX;
+        bool tied = false;
         for (uint8_t i = 0; i < directCount; i++) {
             uint16_t diff = (packetEtxFixed > directCandidates[i].edgeEtx)
                                 ? (packetEtxFixed - directCandidates[i].edgeEtx)
@@ -5092,32 +5103,17 @@ NodeNum SignalRoutingModule::resolveRelayIdentity(uint8_t relayId, int16_t rxRss
             if (diff < bestDiff) {
                 bestDiff = diff;
                 bestDirectNode = directCandidates[i].nodeId;
+                tied = false;
+            } else if (diff == bestDiff && directCandidates[i].nodeId != bestDirectNode) {
+                tied = true;
             }
         }
-    } else if (directCount > 1) {
-        // No RSSI hint — fall back to most recently heard
-        uint32_t newestDirect = 0;
-        for (uint8_t b = 0; b < relayIdentityCacheCount; b++) {
-            if (relayIdentityCache[b].relayId == relayId) {
-                const RelayIdentityCacheEntry *bucket = &relayIdentityCache[b];
-                for (uint8_t i = 0; i < bucket->entryCount; i++) {
-                    if ((nowMs - bucket->entries[i].lastHeardMs) > RELAY_ID_CACHE_TTL_MS) {
-                        continue;
-                    }
-                    for (uint8_t d = 0; d < directCount; d++) {
-                        if (directCandidates[d].nodeId == bucket->entries[i].nodeId) {
-                            if (bucket->entries[i].lastHeardMs >= newestDirect) {
-                                newestDirect = bucket->entries[i].lastHeardMs;
-                                bestDirectNode = bucket->entries[i].nodeId;
-                            }
-                            break;
-                        }
-                    }
-                }
-                break;
-            }
+        if (tied) {
+            bestDirectNode = 0;
         }
     }
+    // directCount > 1 with no RSSI: leave unresolved (same rule as match-relay-byte ambiguity).
+    // Picking "newest" used to collapse distinct full IDs that share a last byte.
 
     // Prefer direct neighbor over non-neighbor when there's a collision
     NodeNum result = bestDirectNode ? bestDirectNode : bestNode;

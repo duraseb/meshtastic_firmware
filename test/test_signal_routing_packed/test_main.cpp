@@ -2643,6 +2643,91 @@ static void test_neighbour_that_does_not_hear_the_transmitter_gets_no_slot()
     TEST_ASSERT_TRUE(module.pendingRelayDelayMs < floorMs + 200);
 }
 
+// Local Routing ACK: originator and dest share a measured hearsUs link, and we hear dest
+// directly — suppress (desk A↔B). A hub with an onward path must still carry a multi-hop ACK.
+static void test_routing_ack_retraces_local_link_but_hub_relays_remote()
+{
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum src = 0xDD0000DD;
+    constexpr NodeNum dest = 0xEE0000EE;
+    initGraphTestNodeDb(me);
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+
+    class GraphWriter : public SignalRoutingModule {
+    public:
+        void note(NodeNum from, NodeNum to, bool hearsUs) { updateGraphWithNeighbor(from, to, -70, 8, hearsUs); }
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+    };
+    GraphWriter local;
+    local.hear(src, -70, 8.0f);
+    local.hear(dest, -70, 8.0f);
+    local.note(src, dest, true);
+    local.note(src, me, true);
+    ingestOneNeighbor(local, src, dest, true, 1);
+
+    meshtastic_MeshPacket ack = meshtastic_MeshPacket_init_zero;
+    ack.from = src;
+    ack.to = dest;
+    ack.id = 0x7007;
+    ack.hop_start = 3;
+    ack.hop_limit = 3;
+    ack.relay_node = 0;
+    ack.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    ack.decoded.portnum = meshtastic_PortNum_ROUTING_APP;
+    ack.decoded.request_id = 0x1234;
+    TEST_ASSERT_FALSE(local.shouldRelayUnicastForCoordination(&ack));
+
+    constexpr NodeNum hub = 0x1080006C;
+    constexpr NodeNum leaf = 0x49B5E08C;
+    constexpr NodeNum city = 0x63DC8F8C;
+    constexpr NodeNum orig = 0x979ED146;
+    initGraphTestNodeDb(hub);
+    GraphWriter bridge;
+    bridge.hear(leaf, -70, 8.0f);
+    bridge.hear(city, -95, 6.0f);
+    bridge.note(city, orig, true);
+    bridge.note(city, hub, true);
+    bridge.note(leaf, orig, false);
+    bridge.note(leaf, hub, true);
+    bridge.note(orig, city, true);
+    ingestOneNeighbor(bridge, city, orig, true, 2);
+    ingestOneNeighbor(bridge, leaf, hub, true, 3);
+    ingestOneNeighbor(bridge, orig, city, true, 4);
+
+    meshtastic_MeshPacket remoteAck = meshtastic_MeshPacket_init_zero;
+    remoteAck.from = leaf;
+    remoteAck.to = orig;
+    remoteAck.id = 0x7008;
+    remoteAck.hop_start = 3;
+    remoteAck.hop_limit = 3;
+    remoteAck.relay_node = 0;
+    remoteAck.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    remoteAck.decoded.portnum = meshtastic_PortNum_ROUTING_APP;
+    remoteAck.decoded.request_id = 0x2a29669d;
+    TEST_ASSERT_TRUE(bridge.shouldRelayUnicastForCoordination(&remoteAck));
+}
+
+// Czar and Z00b share 0x8c: both full IDs stay cached; without RX metrics we do not pick one.
+static void test_shared_relay_byte_keeps_both_identities_ambiguous_without_rssi()
+{
+    constexpr NodeNum me = 0x1080006C;
+    constexpr NodeNum czar = 0x63DC8F8C;
+    constexpr NodeNum zoob = 0x49B5E08C;
+    initGraphTestNodeDb(me);
+
+    class GraphWriter : public SignalRoutingModule {
+    public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+    };
+    GraphWriter module;
+    module.hear(czar, -95, 6.0f);
+    module.hear(zoob, -70, 8.0f);
+    module.rememberRelayIdentity(czar, 0x8C);
+    module.rememberRelayIdentity(zoob, 0x8C);
+    TEST_ASSERT_EQUAL_UINT32(0, module.resolveRelayIdentity(0x8C));
+    TEST_ASSERT_EQUAL_UINT32(zoob, module.resolveRelayIdentity(0x8C, -70, 8.0f));
+}
+
 void setup()
 {
     initializeTestEnvironment();
@@ -2749,6 +2834,8 @@ void setup()
     RUN_TEST(test_is_direct_packet_originator_rule);
     RUN_TEST(test_named_forward_followup_waits_for_our_airtime_and_slot_one);
     RUN_TEST(test_alternate_next_hop_requires_a_distinct_byte);
+    RUN_TEST(test_routing_ack_retraces_local_link_but_hub_relays_remote);
+    RUN_TEST(test_shared_relay_byte_keeps_both_identities_ambiguous_without_rssi);
 
     UNITY_END();
 }
