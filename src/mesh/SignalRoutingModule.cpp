@@ -1905,24 +1905,23 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                 }
             }
 
-            // Infer downstream when the relay hears us. An SR-aware originator must also list
-            // that relay; a stock originator never lists anyone, so the observation is the path.
-            // Hop count and source capability then decide which of those usable paths we keep:
+            // Infer downstream when the relay hears us. A topology publisher (SR-active or
+            // passive) must also list that relay; a source that never lists anyone leaves the
+            // observation as the only signal. Hop count then decides which usable paths we keep:
             // - Former direct neighbour heard only via this relay: they moved.
             // - Single-hop (hop_start - hop_limit == 1): sender went through inferredRelayer.
-            // - Multi-hop, non-SR-aware source (Unknown/Legacy): stock nodes never advertise
+            // - Multi-hop, non-publisher (Unknown/Legacy): stock nodes never advertise
             //   their own topology, so relay observation is the only signal we have.
-            // - Multi-hop, SR-aware source that was never our neighbour: skip — the source
-            //   broadcasts its own topology, which captures relationships more accurately.
+            // - Multi-hop publisher that was never our neighbour: skip — Dijkstra on published
+            //   edges is the multi-hop TX path; a forwarded copy is not.
             // Without the two facts above, the frame only says we heard the originator along the
             // way, which is not a path we can send.
             bool singleHopRelay = (mp.hop_start - mp.hop_limit) == 1;
             CapabilityStatus sourceStatus = getCapabilityStatus(mp.from);
-            bool sourceIsSRAware = (sourceStatus == CapabilityStatus::SRactive ||
+            bool sourcePublishes = (sourceStatus == CapabilityStatus::SRactive ||
                                     sourceStatus == CapabilityStatus::Passive);
             // Hearing the originator via a relay is the other direction from delivering to them.
-            // Keep the row when we can send to the relay. An SR-aware originator must also list
-            // it; a stock originator never lists anyone.
+            // Keep the row when we can send to the relay. A publisher must also list it.
             bool relayHearsUs = false;
             if (nodeDB) {
                 const NodeEdges *mine = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
@@ -1945,9 +1944,15 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                     }
                 }
             }
+            NodeNum existingParent = routingGraph->getDownstreamRelay(mp.from);
+            // Sticky: a forwarded copy must not displace a live parent unless this relayer is on
+            // the originator's published list (TX-path evidence).
+            bool stealsWithoutList = existingParent != 0 && existingParent != inferredRelayer &&
+                                     !destinationListsRelay && !wasDirectNeighbor;
             if (activeRouting && hasDirectConnectionToRelay && relayHearsUs &&
-                (destinationListsRelay || !sourceIsSRAware) &&
-                (wasDirectNeighbor || singleHopRelay || !sourceIsSRAware)) {
+                (destinationListsRelay || !sourcePublishes) &&
+                (wasDirectNeighbor || singleHopRelay || !sourcePublishes) &&
+                !stealsWithoutList) {
                 // Nominal link per hop travelled: the relay's link to the source is not what we measured,
                 // and a multi-hop path must not price like a single good link.
                 uint8_t hopsUsed = mp.hop_start > mp.hop_limit ? mp.hop_start - mp.hop_limit : 1;
@@ -1960,9 +1965,12 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
                 } else {
                     LOG_INFO("[SR] Downstream: %08x via %08x", mp.from, inferredRelayer);
                 }
+            } else if (activeRouting && hasDirectConnectionToRelay && stealsWithoutList) {
+                LOG_INFO("[SR] No downstream %08x via %08x: keeping parent %08x (no list claim)",
+                         mp.from, inferredRelayer, existingParent);
             } else if (activeRouting && hasDirectConnectionToRelay &&
-                       (wasDirectNeighbor || singleHopRelay || !sourceIsSRAware) &&
-                       (!relayHearsUs || (sourceIsSRAware && !destinationListsRelay))) {
+                       (wasDirectNeighbor || singleHopRelay || !sourcePublishes) &&
+                       (!relayHearsUs || (sourcePublishes && !destinationListsRelay))) {
                 LOG_INFO("[SR] No downstream %08x via %08x: relay hears us %d, originator lists relay %d",
                          mp.from, inferredRelayer, relayHearsUs, destinationListsRelay);
             } else if (activeRouting && hasDirectConnectionToRelay && !singleHopRelay) {
