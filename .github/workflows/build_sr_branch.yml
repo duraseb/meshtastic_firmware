@@ -19,6 +19,7 @@ jobs:
           - { pio_env: heltec-v4,               platform: esp32s3  }
           - { pio_env: nrf52_promicro_diy_tcxo, platform: nrf52840 }
           - { pio_env: seeed_xiao_nrf52840_kit, platform: nrf52840 }
+          - { pio_env: seeed_solar_node,        platform: nrf52840 }
           - { pio_env: seeed-xiao-s3,           platform: esp32s3  }
           - { pio_env: rak4631,                  platform: nrf52840 }
           - { pio_env: meshtastic-diy-v1,        platform: esp32    }
@@ -157,13 +158,4 @@ jobs:
             release/*.zip
             release/device-*.sh
             release/device-*.bat
-          retention-days: 30
-
-      - name: Store manifests as artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: manifest-${{ matrix.platform }}-${{ matrix.pio_env }}
-          overwrite: true
-          path: |
-            release/*.mt.json
           retention-days: 30
