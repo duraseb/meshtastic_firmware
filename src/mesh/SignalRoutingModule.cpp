@@ -9,6 +9,7 @@
 #include "NodeDB.h"
 #include "RTC.h"
 #include "Router.h"
+#include "modules/RoutingModule.h"
 #include "NodeRateLimiter.h"
 #include "configuration.h"
 #include "memGet.h"
@@ -2173,15 +2174,30 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         }
     }
 
-    // No route of our own. As a named backup that is only useful when we can stamp a *different*
-    // hop past the designation; a zero stamp is suppressed at the backup gate below.
+    // No route of our own. Designated → NO_ROUTE NACK (not a weak flood). Undesignated flood →
+    // broadcast unique coverage. Named backup keeps the suppressReason path below.
     bool routeVerified = false;
     NodeNum myNextHop = getNextHop(destination, sourceNode, heardFrom, false, &routeVerified);
-    if (myNextHop == 0 && !weAreDesignatedHop) {
-        LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: no route via SR topology", p->id, srcName, destName);
-        if (!relayerNamed) {
-            return false;
+    // Direct edge only: unicastCanFinish is true for non-publishing dests without an edge, which
+    // would skip the flood-coverage path for every NodeDB-only destination.
+    const bool canFinish = hasDirectConnectivity(myNode, destination);
+    // Cost ranking when the picker found a path (or we can finish). Stamp-on-air may still be
+    // cleared later; that is independent. No path at all → coverage (undesignated) / NACK (us).
+    const bool hasCostPath = canFinish || myNextHop != 0;
+    if (weAreDesignatedHop && myNextHop == 0 && !canFinish) {
+        LOG_INFO("[SR-DEC] UNICAST NACK 0x%08x %s->%s: designated with no route", p->id, srcName, destName);
+        if (routingModule) {
+            routingModule->sendAckNak(meshtastic_Routing_Error_NO_ROUTE, sourceNode, p->id, p->channel, 0);
         }
+        return false;
+    }
+    if (!hasCostPath && !weAreDesignatedHop) {
+        if (!relayerNamed) {
+            LOG_INFO("[SR-DEC] UNICAST FLOOD-COVER 0x%08x %s->%s: no path, unique coverage", p->id, srcName,
+                     destName);
+            return shouldRelayBroadcast(p, true);
+        }
+        LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: no route via SR topology", p->id, srcName, destName);
         suppressReason = "no route of our own";
     }
 
@@ -3208,24 +3224,24 @@ bool SignalRoutingModule::shouldRelay(const meshtastic_MeshPacket *p)
         const uint8_t destByte = nodeDB->getLastByteOfNodeNum(p->to);
         const bool namedForeignNextHop =
             p->next_hop != NO_NEXT_HOP_PREFERENCE && p->next_hop != destByte && p->next_hop != ourByte;
+        const bool weAreDesignated =
+            p->next_hop != NO_NEXT_HOP_PREFERENCE && p->next_hop == ourByte;
         const bool knownInNodeDb = nodeDB->getMeshNode(p->to) != nullptr;
         const bool knownDownstream = routingGraph->isDownstream(p->to);
 
-        // A foreign next_hop already owns slot 0. The NodeDB/downstream short-circuits used to
-        // return true with stamp 0 and delay 0, which bypassed designation and stamped a flood
-        // the originator treats as an implicit ACK. Hand those frames to coordination instead
-        // (which suppresses unless we can stamp a different hop and wait behind slot 0).
+        // A foreign next_hop already owns slot 0 — hand to coordination (named-backup stamp gate).
+        // Designated with no route falls through for NO_ROUTE NACK. Undesignated known dests use
+        // broadcast unique coverage (not delay-0 flood).
         if (namedForeignNextHop && (knownInNodeDb || knownDownstream)) {
             LOG_INFO("[SR-DEC] UNICAST DEFER 0x%08x %s->%s: named next_hop 0x%02x, no SR route yet",
                      p->id, senderName, destName, p->next_hop);
             // Fall through to shouldRelayUnicastForCoordination.
-        } else if (knownInNodeDb) {
-            // Undesignated / names us: broadcast-style fallback for legacy/stock destinations.
-            LOG_INFO("[SR-DEC] UNICAST RELAY 0x%08x: %s to %s, known in NodeDB only", p->id, senderName, destName);
-            return true;
-        } else if (knownDownstream) {
-            LOG_INFO("[SR-DEC] UNICAST RELAY 0x%08x %s->%s: downstream only", p->id, senderName, destName);
-            return true;
+        } else if (weAreDesignated) {
+            // Fall through — coordination NACKs when there is still no stampable hop.
+        } else if (knownInNodeDb || knownDownstream) {
+            LOG_INFO("[SR-DEC] UNICAST FLOOD-COVER 0x%08x: %s to %s, no stampable route yet", p->id,
+                     senderName, destName);
+            return shouldRelayBroadcast(p, true);
         } else {
             LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: unknown destination", p->id, senderName, destName);
             return false;
@@ -3306,7 +3322,7 @@ bool SignalRoutingModule::shouldRelay(const meshtastic_MeshPacket *p)
     return shouldRelayUnicastForCoordination(p);
 }
 
-bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
+bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, bool unicastFloodCoverage)
 {
     if (!routingGraph || !nodeDB) {
         return true;
@@ -3322,7 +3338,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     }
 
     // Special handling for unicast packets being relayed with SR coordination
-    if (!isBroadcast(p->to)) {
+    if (!isBroadcast(p->to) && !unicastFloodCoverage) {
         // This is a unicast packet being relayed with SR coordination
         // Relay decision should be based on our ability to reach the destination
         return shouldRelayUnicastForCoordination(p);
@@ -3734,7 +3750,9 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     // coordinate and our copy is the only witness its transmitter can ever get — the signal a
     // want_ack sender turns into its implicit ACK. This is also the state a node is in before
     // it has classified any neighbour, where behaving like a plain rebroadcaster is right.
-    if (!shouldRelay && initialCandidates <= 1) {
+    // Undesignated unicast floods skip this: empty unique coverage means stay silent (no flood
+    // NACKs; originator recovers via want_ack / MAX_RETRANSMIT).
+    if (!unicastFloodCoverage && !shouldRelay && initialCandidates <= 1) {
         shouldRelay = true;
         // Sole candidate by our own reckoning, which another node may not share: keep the
         // tie-break so two nodes that both believe they are alone are still separated.
@@ -3754,7 +3772,10 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p)
     // Scoped to a text message that arrived straight from its originator: that is the class whose
     // delivery a person is shown, and a frame that reached us through a relay was rebroadcast by
     // definition, so its originator already has its confirmation.
-    if (!shouldRelay && slotsGiven == 0 && p->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
+    // Unicast floods with no path stay silent when coverage is empty — no ack pass (originator
+    // recovers via want_ack / MAX_RETRANSMIT). Broadcast text still answers the sender.
+    if (!unicastFloodCoverage && !shouldRelay && slotsGiven == 0 &&
+        p->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
         p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP && isDirectPacket(*p)) {
         uint32_t ackDelay = 0;
         uint8_t ackAhead = 0;

@@ -654,7 +654,9 @@ public:
     void updateNodeActivityForPacket(NodeNum nodeId);
     void updateNodeActivityForPacketAndRelay(const meshtastic_MeshPacket *p);
     bool shouldRelay(const meshtastic_MeshPacket *p);
-    bool shouldRelayBroadcast(const meshtastic_MeshPacket *p);
+    /// Broadcast coverage ladder. When @p unicastFloodCoverage is set, run that ladder for an
+    /// undesignated unicast with no stampable path (no acknowledgement pass).
+    bool shouldRelayBroadcast(const meshtastic_MeshPacket *p, bool unicastFloodCoverage = false);
     /// The next hop to stamp on a relayed unicast. `verified`, when given, reports whether the
     /// hop came from the confirmed backward search: an opportunistic neighbour, the downstream
     /// table, best-effort self relay and direct delivery are all guesses and report false, so

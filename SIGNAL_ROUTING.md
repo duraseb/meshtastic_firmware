@@ -329,10 +329,13 @@ When deciding whether to use SR coordination for unicast packets:
 When a unicast packet arrives for a destination that is not in the SR graph (neither as a direct edge, downstream entry, nor Dijkstra-routable) **and** not in NodeDB, SR suppresses the relay entirely rather than falling back to broadcast-style delivery. Blindly relaying packets for completely unknown nodes wastes airtime with no reasonable chance of delivery.
 
 When the destination *is* known in NodeDB or the downstream table but SR topology is not yet healthy, the short-circuit depends on the wire `next_hop`:
-- **Undesignated / names us** → broadcast-style fallback (`known in NodeDB only` / `downstream only`) as before.
+- **Undesignated** → broadcast **unique-coverage** ladder (`shouldRelayBroadcast(..., unicastFloodCoverage)`), not delay-0 flood. Stay silent when nothing unique remains; no acknowledgement pass and no sole-candidate Sparse echo on unicast floods.
+- **We are the designated hop** with no stampable onward route → Routing `NO_ROUTE` NACK to the originator; do not relay the data. A hand-off whose only route points back still floods with `next_hop` cleared.
 - **Foreign designated hop** → do **not** early-return with stamp 0 and delay 0. Log `UNICAST DEFER` and fall through into `shouldRelayUnicastForCoordination`, which reserves slot 0 for that hop and applies the backup stamp gate (typically suppresses when we have no different next hop).
 
-Destinations that are known through any mechanism may still be relayed when undesignated:
+When topology *is* healthy: path from the route picker (or we can finish the last hop) → cost ranking; undesignated with no path → same coverage ladder as above.
+
+Destinations that are known through any mechanism may still be **considered** when undesignated (coverage or cost), but are no longer auto-relayed at delay 0:
 - Present in NodeDB (legacy/stock nodes not in SR graph)
 - Present in the downstream table (reachable via a relay's topology report)
 - Routable via Dijkstra (direct or multi-hop SR path)
@@ -1114,11 +1117,9 @@ bool topologyHealthy = nodeDB->getMeshNode(destination) != nullptr;
 
 When a unicast packet targets a node not reachable through the SR topology graph, SR applies a three-tier fallback inside `shouldRelay()`, after the `!topologyHealthyForUnicast()` guard:
 
-1. **Known in NodeDB** (e.g., a legacy node not participating in SR) → fall back to broadcast-style relay.
-2. **Known as downstream** (reachable via the downstream routing table but not in the edge graph) → fall back to broadcast-style relay.
-3. **Completely unknown** (not in graph, not in NodeDB, not in downstream table) → fall back to broadcast-style relay.
-
-All three cases relay broadcast-style, giving every destination a chance to be reached while retaining SR coordination for packets with a known route.
+1. **Known in NodeDB / downstream, undesignated, no stampable path** → broadcast unique-coverage ladder (stay silent if nothing unique).
+2. **Designated with no stampable path** → Routing `NO_ROUTE` NACK; no data relay.
+3. **Completely unknown** (not in graph, not in NodeDB, not in downstream table) → suppress.
 
 ## Real-World Examples
 
@@ -1231,7 +1232,7 @@ MB9c transmits at slot 0. MBe4 hears it → cancels.
 - Designated next_hop (from `p->next_hop`) gets slot 0; SR candidates sorted by cost start from slot 1 (or slot 0 if no next_hop)
 - Named backups must stamp a different next hop and wait behind that reservation; a zero stamp is suppressed
 - Any dupe that can finish, is ranked ahead with a path, or (for a named backup) is the designated hop / shows hop-limit progress, cancels queued unicast relays; a worse-placed copy that cannot finish does not kill a last hop we can deliver
-- Undesignated NodeDB/downstream-only destinations fall back to broadcast-style relay; a foreign designated hop defers into coordination instead
+- Undesignated NodeDB/downstream-only destinations use broadcast unique coverage; a foreign designated hop defers into coordination instead
 
 **Network Adaptation:**
 - Assesses topology health but may not detect sudden changes immediately
@@ -1242,7 +1243,7 @@ MB9c transmits at slot 0. MBe4 hears it → cancels.
 
 SignalRouting gracefully degrades when coordination isn't possible:
 
-1. **Unknown Destinations**: Unicasts to nodes not reachable via SR topology and absent from NodeDB/downstream are suppressed. Known-but-not-SR-routable destinations use broadcast-style fallback only when undesignated (or naming us); a foreign `next_hop` defers to coordination / stamp gate
+1. **Unknown Destinations**: Unicasts to nodes not reachable via SR topology and absent from NodeDB/downstream are suppressed. Known-but-not-SR-routable undesignated destinations use unique-coverage flood rules; naming us with no route NACKs; a foreign `next_hop` defers to coordination / stamp gate
 2. **Topology Incomplete**: Uses traditional unicast routing for known but poorly connected destinations when undesignated
 3. **Legacy Node Priority**: Gives priority to legacy routers/repeaters for compatibility
 4. **Memory/CPU Constraints**: Automatic feature disabling for constrained devices
@@ -1269,7 +1270,7 @@ SignalRouting gracefully degrades when coordination isn't possible:
 
 **"No route found for unicast"**
 - Destination not in topology graph
-- Undesignated known destinations may fall back to broadcast-style relay; a foreign designated `next_hop` defers to coordination and is suppressed without a different stamp
+- Undesignated known destinations use unique-coverage flood rules; a foreign designated `next_hop` defers to coordination and is suppressed without a different stamp
 - Wait for topology convergence or use opportunistic forwarding
 
 **"Packet not relayed despite good coverage"**

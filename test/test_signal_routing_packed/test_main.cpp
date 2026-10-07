@@ -2641,6 +2641,65 @@ void test_unicast_named_backup_cancels_on_strong_designated_copy_not_weak_flood(
         "an unrelated peer copy does not cancel on designation alone when finish/rank are unknown");
 }
 
+// Undesignated flood with no stampable path: broadcast coverage, not delay-0. A node that adds
+// nothing beyond the originator's TX stays silent (Lab: angl on Dura→MR22).
+static void test_undesignated_flood_without_route_stays_silent_when_covered()
+{
+    constexpr NodeNum me = 0x5879fa8f;
+    constexpr NodeNum source = 0x979ed146;
+    constexpr NodeNum dest = 0xee594922;
+    initGraphTestNodeDb(me);
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+
+    class GraphWriter : public SignalRoutingModule {
+    public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+    };
+    GraphWriter module;
+    module.hear(source, -40, 12.0f);
+
+    meshtastic_MeshPacket uni = meshtastic_MeshPacket_init_zero;
+    uni.from = source;
+    uni.to = dest;
+    uni.id = 0x5d2e81fc;
+    uni.next_hop = 0;
+    uni.hop_limit = 7;
+    uni.hop_start = 7;
+    uni.relay_node = static_cast<uint8_t>(source & 0xFF);
+    uni.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    TEST_ASSERT_FALSE_MESSAGE(module.shouldRelayUnicastForCoordination(&uni),
+                              "no unique coverage beyond the originator");
+}
+
+// Designated with no onward route: do not relay the data (NO_ROUTE is sent when routingModule is live).
+static void test_designated_hop_with_no_route_does_not_relay()
+{
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum source = 0x979ed146;
+    constexpr NodeNum dest = 0xee594922;
+    initGraphTestNodeDb(me);
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+
+    class GraphWriter : public SignalRoutingModule {
+    public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+    };
+    GraphWriter module;
+    module.hear(source, -40, 12.0f);
+
+    meshtastic_MeshPacket uni = meshtastic_MeshPacket_init_zero;
+    uni.from = source;
+    uni.to = dest;
+    uni.id = 0x7a02;
+    uni.next_hop = static_cast<uint8_t>(me & 0xFF);
+    uni.hop_limit = 3;
+    uni.hop_start = 3;
+    uni.relay_node = static_cast<uint8_t>(source & 0xFF);
+    uni.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    TEST_ASSERT_FALSE_MESSAGE(module.shouldRelayUnicastForCoordination(&uni),
+                              "designated hop with no route must not relay data");
+}
+
 static void test_neighbour_that_does_not_hear_the_transmitter_gets_no_slot()
 {
     constexpr NodeNum me = 0xAA0000AA;
@@ -2868,6 +2927,8 @@ void setup()
     RUN_TEST(test_unicast_last_hop_slots_and_dupe_flags);
     RUN_TEST(test_strong_delivery_hop_respects_poor_link_ceiling);
     RUN_TEST(test_unicast_named_backup_cancels_on_strong_designated_copy_not_weak_flood);
+    RUN_TEST(test_undesignated_flood_without_route_stays_silent_when_covered);
+    RUN_TEST(test_designated_hop_with_no_route_does_not_relay);
     RUN_TEST(test_neighbour_that_does_not_hear_the_transmitter_gets_no_slot);
     RUN_TEST(test_hop_health_two_misses_make_suspect);
     RUN_TEST(test_hop_health_success_resets_and_ttl_expires);
