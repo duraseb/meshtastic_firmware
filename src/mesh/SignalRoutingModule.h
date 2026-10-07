@@ -640,6 +640,11 @@ public:
     }
     UnicastSlotFlags unicastCommitFlags(PacketId packetId) const;
     bool hasPricedDeliveryHop(NodeNum dest) const;
+    /// Measured link to `peer` at or under `cfgPoorLinkEtxThreshold`.
+    bool hasStrongHopTo(NodeNum peer) const;
+    /// Priced last hop and `hasStrongHopTo(dest)`. Strong last hops stamp the destination;
+    /// weak ones flood (`next_hop` unset).
+    bool hasStrongDeliveryHop(NodeNum dest) const;
     bool isSignalRoutingNode(NodeNum nodeId) const { return publishesTopology(nodeId); }
     bool deliveringRelayerIsSR(const meshtastic_MeshPacket *p) const;
     uint32_t nextHopCarryWaitMs(NodeNum nextHop, uint32_t airtimeMs, float rxSnr) const;

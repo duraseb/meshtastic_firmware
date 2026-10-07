@@ -2237,6 +2237,18 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
                  p->id, heardFromName);
         pendingUnicastNextHop = 0;
     }
+    // Strong onward hop: stamp it. Weak: flood on the air (next unset) but remember the intended
+    // peer in nominatedNextHop so only that node can cancel our follow-up.
+    if (pendingUnicastNextHop != 0) {
+        const NodeNum intended = pendingUnicastNextHop;
+        pendingUnicastFlags.nominatedNextHop = intended;
+        const bool strong =
+            (intended == destination) ? hasStrongDeliveryHop(destination) : hasStrongHopTo(intended);
+        if (!strong) {
+            LOG_INFO("[SR] Weak hop to %08x: flooding (no next_hop stamp)", intended);
+            pendingUnicastNextHop = 0;
+        }
+    }
     // A backup transmits only when it will stamp a different hop from the one already on the
     // packet and from the node it heard the packet from. Naming the designated hop again, or
     // clearing the byte, is not another path: stock nodes flood from the wrong side of the
@@ -2330,10 +2342,16 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         if (ourLastByte == p->next_hop) {
             LOG_INFO("[SR-DEC] UNICAST RELAY 0x%08x %s->%s: designated next_hop (slot 0, %ums)",
                      p->id, srcName, destName, earliestMs);
-            if (getCandidateCost(myNode) < UNICAST_DOWNSTREAM_TIER) {
-                pendingUnicastNextHop = destination;
-            }
+            // Keep an intermediate nomination from the strong/weak stamp above; only overwrite
+            // when this leg is itself a priced last hop to the destination.
+            const NodeNum keepNominated = pendingUnicastFlags.nominatedNextHop;
             pendingUnicastFlags = {};
+            if (getCandidateCost(myNode) < UNICAST_DOWNSTREAM_TIER) {
+                pendingUnicastFlags.nominatedNextHop = destination;
+                pendingUnicastNextHop = hasStrongDeliveryHop(destination) ? destination : 0;
+            } else {
+                pendingUnicastFlags.nominatedNextHop = keepNominated;
+            }
             pendingRelayDelayMs = earliestMs;
             routingGraph->recordNodeTransmission(myNode, p->id, currentTime);
             return true;
@@ -2535,7 +2553,6 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         const bool nonfinalFlood = !myDirect && nonDirectSlots >= 2 && lastNonDirectSlot == (uint8_t)mySlot;
         pendingUnicastFlags.lastHopBackup = lastHopBackup;
         pendingUnicastFlags.nonfinalFlood = nonfinalFlood;
-        pendingUnicastFlags.nominatedNextHop = pendingUnicastNextHop;
 
         int64_t totalDelay;
         if (lastHopBackup) {
@@ -2544,7 +2561,9 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
             uint8_t namedSlot = mySlot > 0 ? (uint8_t)(mySlot - 1) : 0;
             totalDelay = (int64_t)srUnicastSlotDelayMs(slotDelay, namedSlot, earliestMs, leaderWait, halfAirtime);
             totalDelay += (int64_t)airtimeMs;
-            totalDelay += (int64_t)nextHopCarryWaitMs(pendingUnicastNextHop, airtimeMs, p->rx_snr);
+            const NodeNum carryPeer = pendingUnicastNextHop != 0 ? pendingUnicastNextHop
+                                                                : pendingUnicastFlags.nominatedNextHop;
+            totalDelay += (int64_t)nextHopCarryWaitMs(carryPeer, airtimeMs, p->rx_snr);
         } else {
             totalDelay = (int64_t)srUnicastSlotDelayMs(slotDelay, (uint8_t)mySlot, earliestMs, leaderWait, halfAirtime);
         }
@@ -2561,7 +2580,8 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         if (nonfinalFlood) {
             pendingUnicastNextHop = 0;
         } else if (getCandidateCost(myNode) < UNICAST_DOWNSTREAM_TIER) {
-            pendingUnicastNextHop = destination;
+            pendingUnicastFlags.nominatedNextHop = destination;
+            pendingUnicastNextHop = hasStrongDeliveryHop(destination) ? destination : 0;
         }
     }
 
@@ -2971,6 +2991,20 @@ bool SignalRoutingModule::hasPricedDeliveryHop(NodeNum dest) const
         return false;
     }
     return unicastCandidateCost(nodeDB->getNodeNum(), dest, 0) < UNICAST_DOWNSTREAM_TIER;
+}
+
+bool SignalRoutingModule::hasStrongHopTo(NodeNum peer) const
+{
+    if (!routingGraph || !nodeDB || peer == 0) {
+        return false;
+    }
+    float cost = routingGraph->hopCost(nodeDB->getNodeNum(), peer);
+    return cost > 0.0f && cost <= cfgPoorLinkEtxThreshold;
+}
+
+bool SignalRoutingModule::hasStrongDeliveryHop(NodeNum dest) const
+{
+    return hasPricedDeliveryHop(dest) && hasStrongHopTo(dest);
 }
 
 bool SignalRoutingModule::deliveringRelayerIsSR(const meshtastic_MeshPacket *p) const

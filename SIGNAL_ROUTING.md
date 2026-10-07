@@ -356,9 +356,14 @@ is known).
 Among SR overhearers, at most two priced last hops get slots if the destination is SR-active or
 passive (early + dest-ACK backup); otherwise one. Extra directs stay silent (`LastHopReserved`).
 The backup waits for dest's ACK of the early last hop (early slot + that copy's airtime + dest-ACK
-wait) and cancels only on dest's own copy. Last hops do not flood. A last-hop `want_ack` toward a
-non-SR dest keeps `NUM_RELIABLE_RETX` without clearing `next_hop`, including after hop_limit
-reaches 0.
+wait) and cancels only on dest's own copy. The early last hop itself always arms one follow-up
+(two air copies): a **strong** link (measured ETX ≤ `poor_link_etx_threshold`) stamps the
+destination as `next_hop`; a **weak** link floods (`next_hop` unset). Only the nominated
+destination (or its ACK/reply) cancels the follow-up — not coverage rank from other peers.
+
+The same strong/weak rule applies to **non-last** unicast forwards: a strong onward hop is stamped
+as `next_hop`; a weak one floods (`next_hop` unset) while remembering the intended peer in
+`nominatedNextHop`. Only that nominated node cancels the follow-up.
 
 Unsolicited dest ACK (no `want_ack`) is hop-0 only when the delivering transmitter is SR: hops away
 0 means the originator, otherwise the resolved relay byte. Stock last hops are not waiting. Dest
@@ -416,13 +421,16 @@ Two of those branches were unreachable until 2026-09-11: the reservation base wa
 When the unicast was heard straight from its source and the source's topology lists the destination with `hearsUs`, the destination most likely has it. A routing ACK on that link is never relayed (a lost ACK is covered by the sender's own retransmission). Any other unicast has every slot, including a designated next hop's slot 0, pushed behind a wait of one airtime plus twice the maximum contention delay at the current utilization, so the destination's ACK or reply, which cancels the queued relay via `cancelSending(request_id)`, arrives first; only silence lets a relay go. Colocated receivers were seen to lose about half the frames of a very strong neighbour, so the relay stays available rather than being suppressed outright.
 
 **Next hop on the relayed copy:**
-When SR approves a unicast relay, `NextHopRouter::sendRelay()` stamps SR's route pick as `next_hop`,
-or the destination when this hop is a priced last hop, or clears the field for a flood-salvage slot
-(the last of two or more non-direct candidates) and when the route picker fell back to "relay it
-ourselves". Named forwards arm the named follow-up (`redirectOnLast`, below); a later flood slot
-in the ranking is not proof that neighbour overheard this copy. Last-hop backups and flood slots
-do not arm a follow-up. Last hops do not flood. Originator want_ack retries still use
-`floodOnLast` so stock neighbours can honour the originator's final flood.
+When SR approves a unicast relay, `NextHopRouter::sendRelay()` stamps SR's route pick as `next_hop`
+when that hop is **strong** (measured ETX ≤ `poor_link_etx_threshold`), or the destination when this
+leg is a strong priced last hop. A **weak** onward hop (intermediate or last) clears `next_hop` on
+the air but keeps the intended peer as `nominatedNextHop` so the follow-up still waits on that node.
+Flood-salvage slots (the last of two or more non-direct candidates) and a route-picker fallback to
+"relay it ourselves" also clear the field. Strong named forwards arm the named follow-up
+(`redirectOnLast`, below); weak forwards arm one flood follow-up cancelled only by the nominee.
+Last-hop backups and flood-salvage slots do not arm a follow-up; other priced last hops arm one
+follow-up as above. Originator want_ack retries still use `floodOnLast` so stock neighbours can
+honour the originator's final flood.
 
 **Hand-off duplicates:** A duplicate whose incoming `next_hop` names us is a hand-off
 (`SignalRoutingModule::isHandOffDuplicate`): cancel any later-slot relay, clear its commit and
@@ -465,7 +473,7 @@ lost unicast. Tests: `test_route_exclusion_yields_alternate`,
 - An SR neighbor that covers `heardFrom` can reach destination → suppress only if they already transmitted this id
 
 **Dupe Cancellation:**
-When a dupe arrives for a committed unicast relay, `areAllNeighborsCovered()` calls `NeighborGraph::unicastDupeCancels()`: cancel if the dupe relayer can finish delivery (priced hop or dest's downstream), or is ranked ahead of us with a path. If we can finish and they cannot, our relay is kept. An unresolved relay byte (or a placeholder identity) cancels only when we cannot finish (the designated or stock hop we were waiting for). A **named backup** also cancels when the heard copy's `relay_node` (or resolved identity) matches the designation byte we armed from, or when a later copy still names that designation with a strictly lower `hop_limit` — even if the graph cannot prove that hop finishes (`UnicastSlotFlags::{designatedNextHop,armedHopLimit}`). Last-hop backup cancels only on dest's own copy. A flood salvage slot stays for a same-hop named SR that cannot finish, and cancels on dest, a finisher, the nominated hop, or another flood copy. A hand-off duplicate (incoming `next_hop` names us) is re-planned rather than cancelled. A named follow-up stops on the nominated hop's copy (a hop-health success) or the destination's reply/ACK (also a success); a copy from the upstream node or the originator leaves it armed, because neither has carried the packet past us; any other copy goes through `areAllNeighborsCovered()` and is neutral for hop health. Late unicast rungs are not clamped to 2 s — a clamp would bunch later slots onto the same instant. Native tests: `test_unicast_dupe_cancel_predicate`, `test_unicast_last_hop_slots_and_dupe_flags`, `test_unicast_named_backup_cancels_on_designated_hop_without_finish_proof`.
+When a dupe arrives for a committed unicast relay, `areAllNeighborsCovered()` calls `NeighborGraph::unicastDupeCancels()`: cancel if the dupe relayer can finish delivery (priced hop or dest's downstream), or is ranked ahead of us with a path. If we can finish and they cannot, our relay is kept. An unresolved relay byte (or a placeholder identity) cancels only when we cannot finish (the designated or stock hop we were waiting for). A **named backup** also cancels when the heard copy's `relay_node` (or resolved identity) matches the designation byte we armed from, or when a later copy still names that designation with a strictly lower `hop_limit` — even if the graph cannot prove that hop finishes (`UnicastSlotFlags::{designatedNextHop,armedHopLimit}`). Last-hop backup cancels only on dest's own copy. A flood salvage slot stays for a same-hop named SR that cannot finish, and cancels on dest, a finisher, the nominated hop, or another flood copy. A hand-off duplicate (incoming `next_hop` names us) is re-planned rather than cancelled. A nominated follow-up (named intermediate or last hop, strong or weak) stops only on the nominated hop's copy (a hop-health success) or the destination's reply/ACK; any other overheard copy — including upstream, originator, or a peer that would win coverage rank — leaves it armed. Committed relays without a nominee still use `areAllNeighborsCovered()`. Late unicast rungs are not clamped to 2 s — a clamp would bunch later slots onto the same instant. Native tests: `test_unicast_dupe_cancel_predicate`, `test_unicast_last_hop_slots_and_dupe_flags`, `test_unicast_named_backup_cancels_on_designated_hop_without_finish_proof`, `test_strong_delivery_hop_respects_poor_link_ceiling`.
 
 ## Broadcast Routing
 

@@ -2569,6 +2569,42 @@ void test_unicast_last_hop_slots_and_dupe_flags()
     }
 }
 
+// Strong last hop names the destination; a link past the poor-link ceiling does not.
+// hasStrongHopTo is the same ceiling for intermediate (non-last) onward hops.
+void test_strong_delivery_hop_respects_poor_link_ceiling()
+{
+    constexpr NodeNum me = 0xAA0000AA;
+    constexpr NodeNum strong = 0xBB0000BB;
+    constexpr NodeNum weak = 0xCC0000CC;
+    initGraphTestNodeDb(me);
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+
+    class GraphWriter : public SignalRoutingModule {
+    public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+        bool strong(NodeNum dest) const { return hasStrongDeliveryHop(dest); }
+        bool strongHop(NodeNum peer) const { return hasStrongHopTo(peer); }
+        NeighborGraph *g() { return routingGraph; }
+    };
+    GraphWriter module;
+    // Excellent link: well under the default poor-link ceiling (7.0).
+    module.hear(strong, -50, 12.0f);
+    module.g()->setEdgeHearsUs(me, strong, true);
+    // Priced last hop past the ceiling (force the measured ETX; RSSI/SNR alone under SF7 can
+    // still land below 7.0).
+    module.hear(weak, -95, 3.0f);
+    module.g()->setEdgeHearsUs(me, weak, true);
+    module.g()->updateEdge(me, weak, 12.0f, millis() / 1000, Edge::Source::Reported);
+    module.g()->setEdgeHearsUs(me, weak, true);
+
+    TEST_ASSERT_TRUE(module.hasPricedDeliveryHop(strong));
+    TEST_ASSERT_TRUE(module.strong(strong));
+    TEST_ASSERT_TRUE(module.strongHop(strong));
+    TEST_ASSERT_TRUE(module.hasPricedDeliveryHop(weak));
+    TEST_ASSERT_FALSE(module.strong(weak));
+    TEST_ASSERT_FALSE(module.strongHop(weak));
+}
+
 // Named-backup cancel must not depend on proving the designated hop can finish — a boot graph
 // cannot answer that, and keeping the backup after hearing Czar is the field failure mode.
 void test_unicast_named_backup_cancels_on_designated_hop_without_finish_proof()
@@ -2824,6 +2860,7 @@ void setup()
     RUN_TEST(test_undecoded_direct_frame_is_recorded_as_a_neighbour);
     RUN_TEST(test_unicast_dupe_cancel_predicate);
     RUN_TEST(test_unicast_last_hop_slots_and_dupe_flags);
+    RUN_TEST(test_strong_delivery_hop_respects_poor_link_ceiling);
     RUN_TEST(test_unicast_named_backup_cancels_on_designated_hop_without_finish_proof);
     RUN_TEST(test_neighbour_that_does_not_hear_the_transmitter_gets_no_slot);
     RUN_TEST(test_hop_health_two_misses_make_suspect);

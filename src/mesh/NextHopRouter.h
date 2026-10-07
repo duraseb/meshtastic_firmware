@@ -115,8 +115,8 @@ class NextHopRouter : public FloodingRouter
     }
 
     // Default for a NodeDB-stamped next hop (stock path). SR named forwards arm
-    // NAMED_FOLLOWUP_TRIES instead; last-hop want_ack toward a non-SR dest uses NUM_RELIABLE_RETX
-    // and does not flood.
+    // NAMED_FOLLOWUP_TRIES instead. A priced last hop arms one follow-up (two air copies);
+    // strong links keep the destination as next_hop, weak links flood (next unset).
     constexpr static uint8_t NUM_INTERMEDIATE_RETX = 4;
     // The number of retransmissions the original sender will do
     constexpr static uint8_t NUM_RELIABLE_RETX = 3;

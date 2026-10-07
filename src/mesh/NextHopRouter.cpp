@@ -96,20 +96,18 @@ bool NextHopRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
             bool stopRetry = true;
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
             if (!isBroadcast(p->to) && signalRoutingModule) {
-                // A named follow-up ends when the nominated hop carries the packet (a hop-health
-                // success). The node we got it from, or the originator retrying, has not carried
-                // it past us, so their copy leaves the follow-up armed.
+                // A nominated follow-up (named intermediate or last hop) ends only when that hop
+                // carries the packet. Upstream / originator copies leave it armed; other peers do
+                // not cancel via coverage rank — only the intended next hop clears the retry.
                 PendingPacket *named = findPendingPacket(p->from, p->id);
-                if (named && !named->redirectOnLast) {
+                if (named && named->nominatedHop == 0 && named->nominatedByte == 0) {
                     named = nullptr;
                 }
                 NodeNum tx = named ? signalRoutingModule->resolveHeardFrom(p, p->from) : 0;
-                if (named && (p->relay_node == named->nominatedByte || (named->nominatedHop != 0 && tx == named->nominatedHop))) {
+                if (named && (p->relay_node == named->nominatedByte ||
+                              (named->nominatedHop != 0 && tx == named->nominatedHop))) {
                     signalRoutingModule->recordHopSuccess(p->to, named->nominatedHop);
-                } else if (named && p->relay_node != 0 &&
-                           (p->relay_node == nodeDB->getLastByteOfNodeNum(p->from) ||
-                            (named->upstream != 0 &&
-                             (tx == named->upstream || p->relay_node == nodeDB->getLastByteOfNodeNum(named->upstream))))) {
+                } else if (named) {
                     stopRetry = false;
                 } else {
                     stopRetry = signalRoutingModule->areAllNeighborsCovered(p);
@@ -330,7 +328,11 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                         if (srNonfinalFlood) {
                             nextHopByte = NO_NEXT_HOP_PREFERENCE;
                         } else if (srPricedLastHop) {
-                            nextHopByte = nodeDB->getLastByteOfNodeNum(p->to);
+                            // Strong last hop: name the destination so peers stand down. Weak: flood
+                            // (unset next_hop) so a second copy can still be salvaged by others.
+                            nextHopByte = signalRoutingModule->hasStrongDeliveryHop(p->to)
+                                              ? nodeDB->getLastByteOfNodeNum(p->to)
+                                              : NO_NEXT_HOP_PREFERENCE;
                         }
                         NextHopRouter::sendRelay(tosend, nextHopByte);
                         return true;
@@ -368,35 +370,69 @@ ErrorCode NextHopRouter::sendRelay(meshtastic_MeshPacket *p, uint8_t nextHop)
 
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
     UnicastSlotFlags flags{};
-    bool destSr = false;
     bool lastHop = false;
     if (signalRoutingModule) {
         flags = signalRoutingModule->unicastCommitFlags(p->id);
-        destSr = signalRoutingModule->isSignalRoutingNode(p->to);
         lastHop = signalRoutingModule->hasPricedDeliveryHop(p->to);
     }
     if (p->hop_limit == 0 && !lastHop) {
         return Router::send(p);
     }
     if (lastHop) {
-        if (!p->want_ack || destSr || flags.lastHopBackup) {
+        // Dest-ACK backup slots already waited for the early last hop; they do not arm a second
+        // series. Every other last hop sends once and arms one follow-up (two air copies total).
+        // Strong hops keep the destination byte; weak hops flood (next unset). Only the
+        // nominated destination cancels the follow-up (plus dest ACK/reply in sniffReceived).
+        if (flags.lastHopBackup) {
             return Router::send(p);
         }
-        startRetransmission(packetPool.allocCopy(*p), NUM_RELIABLE_RETX, false);
+        const bool weakFlood = (nextHop == NO_NEXT_HOP_PREFERENCE);
+        PendingPacket *rec = startRetransmission(packetPool.allocCopy(*p), 2, weakFlood);
+        if (rec && signalRoutingModule && iface) {
+            uint32_t airtime = iface->getPacketTime(p);
+            uint32_t delay = signalRoutingModule->nextHopCarryWaitMs(p->to, airtime, p->rx_snr);
+            uint32_t now = millis();
+            uint32_t release = (int32_t)(p->tx_after - now) > 0 ? p->tx_after : now;
+            rec->nextTxMsec = release + delay;
+            NodeNum nominated = flags.nominatedNextHop != 0 ? flags.nominatedNextHop : p->to;
+            rec->nominatedHop = nominated;
+            rec->nominatedByte = nodeDB->getLastByteOfNodeNum(nominated);
+            rec->upstream = upstream;
+            setReceivedMessage();
+            LOG_INFO("[SR] Last-hop retx armed for 0x%08x next=0x%02x (%s)", p->id, nextHop,
+                     weakFlood ? "weak flood" : "strong designated");
+        }
         return Router::send(p);
     }
-    if (flags.nonfinalFlood || p->next_hop == NO_NEXT_HOP_PREFERENCE) {
+    if (flags.nonfinalFlood) {
         return Router::send(p);
     }
-    // Named non-final forward: repeat to the nominated hop, then one directed alternate (no flood).
-    PendingPacket *rec = startRetransmission(packetPool.allocCopy(*p), 1 + NAMED_FOLLOWUP_TRIES, false);
+    // Non-final forward: strong hops stamp the nominee; weak hops flood (next unset) but still
+    // arm a follow-up cancelled only when that nominated peer carries the frame.
+    NodeNum nominated = signalRoutingModule
+                            ? signalRoutingModule->nominatedHopFor(flags.nominatedNextHop, p->next_hop)
+                            : 0;
+    if (nominated == 0 && p->next_hop == NO_NEXT_HOP_PREFERENCE) {
+        return Router::send(p);
+    }
+    const bool weakFlood = (p->next_hop == NO_NEXT_HOP_PREFERENCE);
+    // Strong: named follow-up with a directed alternate. Weak: one flood follow-up (same as last
+    // hop); only the nominated peer cancels it.
+    const uint8_t tries = weakFlood ? 2 : (uint8_t)(1 + NAMED_FOLLOWUP_TRIES);
+    PendingPacket *rec = startRetransmission(packetPool.allocCopy(*p), tries, weakFlood);
     if (rec && signalRoutingModule && iface) {
         uint32_t airtime = iface->getPacketTime(p);
-        NodeNum nominated = signalRoutingModule->nominatedHopFor(flags.nominatedNextHop, p->next_hop);
-        uint32_t delay = signalRoutingModule->namedForwardFollowupDelayMs(nominated, airtime, p->rx_snr);
-        rec->redirectOnLast = true;
+        if (nominated == 0) {
+            nominated = signalRoutingModule->nominatedHopFor(flags.nominatedNextHop, p->next_hop);
+        }
+        uint32_t delay = weakFlood
+                             ? signalRoutingModule->nextHopCarryWaitMs(nominated, airtime, p->rx_snr)
+                             : signalRoutingModule->namedForwardFollowupDelayMs(nominated, airtime, p->rx_snr);
+        rec->redirectOnLast = !weakFlood;
         rec->nominatedHop = nominated;
-        rec->nominatedByte = p->next_hop;
+        rec->nominatedByte =
+            nominated != 0 ? nodeDB->getLastByteOfNodeNum(nominated)
+                           : (p->next_hop != NO_NEXT_HOP_PREFERENCE ? p->next_hop : (uint8_t)0);
         rec->upstream = upstream;
         rec->followupDelayMs = delay;
         // Counted from the frame leaving the queue: a ranked slot holds it until tx_after.
@@ -404,7 +440,8 @@ ErrorCode NextHopRouter::sendRelay(meshtastic_MeshPacket *p, uint8_t nextHop)
         uint32_t release = (int32_t)(p->tx_after - now) > 0 ? p->tx_after : now;
         rec->nextTxMsec = release + delay;
         setReceivedMessage();
-        LOG_INFO("[SR] Relay retx armed for 0x%08x via next hop 0x%02x", p->id, p->next_hop);
+        LOG_INFO("[SR] Relay retx armed for 0x%08x via next hop 0x%02x%s", p->id, rec->nominatedByte,
+                 weakFlood ? " (weak flood)" : "");
     }
 #else
     if (p->next_hop != NO_NEXT_HOP_PREFERENCE && (p->hop_limit > 0 || p->want_ack))
