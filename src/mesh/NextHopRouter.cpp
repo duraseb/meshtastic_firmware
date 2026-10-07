@@ -32,10 +32,10 @@ ErrorCode NextHopRouter::send(meshtastic_MeshPacket *p)
     p->relay_node = nodeDB->getLastByteOfNodeNum(getNodeNum()); // First set the relayer to us
     wasSeenRecently(p);                                         // FIXME, move this to a sniffSent method
 
-    // NodeDB's learned byte is the stock fallback. An originated unicast from an SR node
-    // names the graph's next hop instead, so the first transmission already tells stock
-    // relays to stand down. A relayed copy is stamped later by sendRelay(); this path is
-    // the one ReliableRouter uses for packets we originate (and for our own retries).
+    // NodeDB's learned byte is the stock fallback when SR is absent. An originated unicast from
+    // an SR node stamps only a *verified* graph hop — never an inbound-gateway guess and never a
+    // stale NodeDB byte that would designate a Lab neighbour that cannot finish (field: Dura
+    // named MB59 for MR22). A relayed copy is stamped later by sendRelay().
     uint8_t nextHopByte = getNextHop(p->to, p->relay_node).value_or(NO_NEXT_HOP_PREFERENCE);
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
     if (!isBroadcast(p->to) && isFromUs(p) && signalRoutingModule) {
@@ -43,6 +43,8 @@ ErrorCode NextHopRouter::send(meshtastic_MeshPacket *p)
         NodeNum hop = signalRoutingModule->getNextHop(p->to, getNodeNum(), getNodeNum(), false, &verified);
         if (verified && hop != 0 && hop != getNodeNum()) {
             nextHopByte = nodeDB->getLastByteOfNodeNum(hop);
+        } else {
+            nextHopByte = NO_NEXT_HOP_PREFERENCE;
         }
     }
 #endif

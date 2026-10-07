@@ -1546,18 +1546,25 @@ bool NeighborGraph::unicastDupeCancels(NodeNum myNode, NodeNum destination, uint
                                        NodeNum myNextHop, const RoutePolicy &policy, UnicastSlotFlags flags,
                                        uint8_t dupeNextHop, uint8_t dupeRelayByte, uint8_t dupeHopLimit) const
 {
-    // Named-backup cancel that does not need a complete graph: the byte on the wire is enough.
+    // Named-backup cancel that does not need a complete graph: the wire bytes are enough.
+    // Cancel only when the designated hop advances the route (non-zero next_hop), not on a weak
+    // flood — that hop admitted it has no stampable path; backups that can stamp another must stay.
     if (flags.designatedNextHop != 0) {
-        if (dupeRelayByte == flags.designatedNextHop) {
-            return true;
-        }
-        if (dupeRelayer != 0 && !Edge::isPlaceholderId(dupeRelayer) &&
-            (uint8_t)(dupeRelayer & 0xFF) == flags.designatedNextHop) {
+        const bool fromDesignated =
+            dupeRelayByte == flags.designatedNextHop ||
+            (dupeRelayer != 0 && !Edge::isPlaceholderId(dupeRelayer) &&
+             (uint8_t)(dupeRelayer & 0xFF) == flags.designatedNextHop);
+        if (fromDesignated && dupeNextHop != 0) {
             return true;
         }
         // Designation progressed: same next_hop byte, strictly fewer hops remaining.
         if (dupeNextHop == flags.designatedNextHop && flags.armedHopLimit != 0 && dupeHopLimit < flags.armedHopLimit) {
             return true;
+        }
+        // Weak flood from the designated hop: do not fall through to !weFinish (that cancels on
+        // an unresolved relay byte alone and silenced Lab backups after MB59 flooded).
+        if (fromDesignated) {
+            return false;
         }
     }
 

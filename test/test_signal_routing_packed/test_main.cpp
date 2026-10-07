@@ -2605,14 +2605,15 @@ void test_strong_delivery_hop_respects_poor_link_ceiling()
     TEST_ASSERT_FALSE(module.strongHop(weak));
 }
 
-// Named-backup cancel must not depend on proving the designated hop can finish — a boot graph
-// cannot answer that, and keeping the backup after hearing Czar is the field failure mode.
-void test_unicast_named_backup_cancels_on_designated_hop_without_finish_proof()
+// Named-backup cancel: strong designated copies cancel without finish proof; weak floods do not
+// (field: MB59 flooded next=0 and silenced backups that would have stamped Czar→city).
+void test_unicast_named_backup_cancels_on_strong_designated_copy_not_weak_flood()
 {
     constexpr NodeNum me = 0x5879fa8f;   // angl
     constexpr NodeNum peer = 0x979ed146; // Dura
     constexpr NodeNum gw = 0x63dc8f8c;   // Czar (designated)
     constexpr NodeNum dest = 0xee594922; // MR22 (unknown to our empty graph)
+    constexpr uint8_t onward = 0x6c;     // FCM6-class onward stamp
     const NeighborGraph::RoutePolicy policy;
     initGraphTestNodeDb(me);
 
@@ -2622,11 +2623,16 @@ void test_unicast_named_backup_cancels_on_designated_hop_without_finish_proof()
     flags.armedHopLimit = 7;
 
     TEST_ASSERT_FALSE(graph.unicastCanFinish(gw, dest, policy));
-    TEST_ASSERT_TRUE_MESSAGE(
+    TEST_ASSERT_FALSE_MESSAGE(
         graph.unicastDupeCancels(me, dest, 0x50, 0, 0, policy, flags, 0, (uint8_t)(gw & 0xFF), 6),
-        "relay byte matching designated next_hop cancels even when identity is unresolved");
-    TEST_ASSERT_TRUE_MESSAGE(graph.unicastDupeCancels(me, dest, 0x51, gw, 0, policy, flags, 0, 0, 6),
-                             "resolved designated hop cancels without finish proof");
+        "weak flood from designated hop must not cancel the named backup");
+    TEST_ASSERT_FALSE_MESSAGE(graph.unicastDupeCancels(me, dest, 0x51, gw, 0, policy, flags, 0, 0, 6),
+                              "resolved designated hop flooding next=0 must not cancel");
+    TEST_ASSERT_TRUE_MESSAGE(
+        graph.unicastDupeCancels(me, dest, 0x54, 0, 0, policy, flags, onward, (uint8_t)(gw & 0xFF), 6),
+        "strong designated copy cancels without finish proof");
+    TEST_ASSERT_TRUE_MESSAGE(graph.unicastDupeCancels(me, dest, 0x55, gw, 0, policy, flags, onward, 0, 6),
+                             "resolved designated hop with onward stamp cancels without finish proof");
     TEST_ASSERT_TRUE_MESSAGE(
         graph.unicastDupeCancels(me, dest, 0x52, peer, 0, policy, flags, (uint8_t)(gw & 0xFF), (uint8_t)(peer & 0xFF), 5),
         "lower hop_limit still naming the designation means that hop progressed");
@@ -2861,7 +2867,7 @@ void setup()
     RUN_TEST(test_unicast_dupe_cancel_predicate);
     RUN_TEST(test_unicast_last_hop_slots_and_dupe_flags);
     RUN_TEST(test_strong_delivery_hop_respects_poor_link_ceiling);
-    RUN_TEST(test_unicast_named_backup_cancels_on_designated_hop_without_finish_proof);
+    RUN_TEST(test_unicast_named_backup_cancels_on_strong_designated_copy_not_weak_flood);
     RUN_TEST(test_neighbour_that_does_not_hear_the_transmitter_gets_no_slot);
     RUN_TEST(test_hop_health_two_misses_make_suspect);
     RUN_TEST(test_hop_health_success_resets_and_ttl_expires);

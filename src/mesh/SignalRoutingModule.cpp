@@ -3891,6 +3891,9 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
     float routeCost = route.getCost();
 
     if (route.nextHop != 0) {
+        // Confirmed Dijkstra, or a downstream-chain egress (calculateRoute may return the chain
+        // hop with verified=false). Bare inbound-gateway is not stampable unless it is also the
+        // chain egress. Originators clear NodeDB when this is false (field: Dura named MB59).
         auto stampable = [&]() -> bool {
             if (route.verified) {
                 return true;
