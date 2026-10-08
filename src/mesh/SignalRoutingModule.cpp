@@ -2516,17 +2516,21 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     // Ordinal slot delay.
     //
     // Candidates hold slots in ranked order. Slot 0 keys up at the earliest floor that applies to
-    // it, never at once. Every later slot first waits for the leader's relay to have left the air
-    // (its contention delay at the current channel utilization plus one airtime), then slots space
-    // out by half an airtime. When Phase 1 reserved slot 0 for a designated next hop, the ranked
-    // candidates follow that reservation instead.
-    // Last-hop backup waits for dest's ACK of the early last hop. A non-final flood slot waits
-    // for the named hop ahead of it, then airtime plus the nominated hop's carry wait.
+    // it, never at once. Every later slot first waits for the leader's relay to have left the air,
+    // then slots space out by half an airtime. peerRelayWait (turnaround + contention + airtime)
+    // is measured from t=0; when earliestMs is larger (LONG_FAST floor), the leader keys later, so
+    // clear time is earliestMs + airtime. Taking only peerRelayWait undercut the floor. When Phase
+    // 1 reserved slot 0 for a designated next hop, the ranked candidates follow that reservation
+    // instead. Last-hop backup waits for dest's ACK of the early last hop. A non-final flood slot
+    // waits for the named hop ahead of it, then airtime plus the nominated hop's carry wait.
     uint32_t leaderWait = 2 * halfAirtime;
     if (router && router->getRadioInterface()) {
         leaderWait = airtimeMs + router->getRadioInterface()->getTxDelayMsecMaxAtUtil();
     }
     leaderWait += SR_PEER_TURNAROUND_MS;
+    if (earliestMs + airtimeMs > leaderWait) {
+        leaderWait = earliestMs + airtimeMs;
+    }
     const uint32_t jitterRange = std::max(halfAirtime / 2, SR_MIN_TIE_BREAK_RANGE_MS);
     const uint32_t jitter = (((uint32_t)(myNode ^ p->id)) % jitterRange) + 1;
 

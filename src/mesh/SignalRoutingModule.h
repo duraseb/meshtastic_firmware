@@ -405,7 +405,8 @@ static inline uint32_t srExpiredRelayReanchorMs(uint32_t rungDelayMs, uint32_t o
  *   - @p earliestMs: stock's contention floor, or the destination's chance to answer where the
  *     source's own list says the destination hears it and that wait is longer.
  *   - @p leaderWaitMs: for a candidate behind a leader, the time for the leader's copy to have
- *     left the air.
+ *     left the air. Caller must pass at least max(peerRelayWaitFromT0, earliestMs + airtime) so
+ *     LONG_FAST (and slower) floors are never undercut when peerRelayWait < earliestMs.
  *   - @p reservedBaseMs: non-zero only when a designated next hop holds slot 0, in which case
  *     every ranked candidate queues behind that reservation instead.
  *
