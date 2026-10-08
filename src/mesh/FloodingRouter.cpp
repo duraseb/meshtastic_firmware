@@ -55,6 +55,14 @@ bool FloodingRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
         printPacket("Ignore dupe incoming msg", p);
         rxDupe++;
 
+#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+        // A later copy may resolve a hearsUs neighbour that the first-heard relay byte could
+        // not (placeholder / non-neighbour). Still learn the graph even though we filter.
+        if (signalRoutingModule) {
+            signalRoutingModule->observeRelayedPacket(*p);
+        }
+#endif
+
         /* If the original transmitter is doing retransmissions (hopStart equals hopLimit) for a reliable transmission, e.g., when
         the ACK got lost, we will handle the packet again to make sure it gets an implicit ACK. */
         bool isRepeated = p->hop_start > 0 && p->hop_start == p->hop_limit;

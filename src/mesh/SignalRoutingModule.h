@@ -615,6 +615,10 @@ public:
     /// Originator retry that should be re-planned like a fresh reception under signal routing.
     bool isOriginatorRetryReplan(const meshtastic_MeshPacket *p);
 
+    /// Relayed-packet graph / downstream learning. Also run on duplicate RX: a later copy may
+    /// resolve a hearsUs neighbour that the first-heard relay byte could not.
+    void observeRelayedPacket(const meshtastic_MeshPacket &mp);
+
     /// Stampable, SR-active next hop to destination with intermediate hops excluded (cache
     /// bypassed), never one whose byte is `nominatedByte`.
     NodeNum alternateNextHop(NodeNum dest, const NodeNum *excluded, uint8_t n, uint8_t nominatedByte);

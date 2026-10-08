@@ -183,6 +183,10 @@ All discovery mechanisms are used to maintain comprehensive network topology:
    downstream of it. Such a copy is recognised by the transmission record kept for our own packet
    ids and is excluded from downstream inference. It *is* the proof the relayer hears us, so
    `hearsUs` on our edge to that relayer is set (mute nodes have no other way to learn it).
+   **Duplicates still observe:** `FloodingRouter` / `NextHopRouter` filter a seen packet before
+   `handleReceived`, but still call `observeRelayedPacket` so a later copy that resolves a real
+   `hearsUs` neighbour can park a stock originator the first-heard placeholder could not
+   (`test_duplicate_relayed_copy_learns_downstream_via_hears_us_neighbor`).
 
 4. **Placeholder System**: Unknown relay nodes are tracked as placeholders until their real identities are discovered through direct contact
 

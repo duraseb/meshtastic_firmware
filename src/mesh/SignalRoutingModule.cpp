@@ -1735,6 +1735,256 @@ void SignalRoutingModule::logNetworkTopology()
 #endif // !DEBUG_MUTE
 }
 
+void SignalRoutingModule::observeRelayedPacket(const meshtastic_MeshPacket &mp)
+{
+    // Measuring a relayer we heard is first-hand observation, not inference: the RSSI and SNR
+    // come off the relayer's own frame, exactly as they do for a frame that arrived direct. So
+    // every node that publishes topology records it, whatever its role. Only the node that
+    // hears a relayer can supply the transmit-direction evidence coverage needs about it
+    // ("does that router reach me?"), and a node that never records it stays permanently
+    // uncovered, so each of its neighbours holds unique coverage of it and relays. What the
+    // active-routing class gates is the inference below — who sits behind the gateway — which
+    // only a node that ranks relays uses.
+    // Entry conditions are checked by callers (handleReceived / duplicate path); still refuse
+    // MQTT / direct / missing relay so a bare call is safe.
+    if (mp.via_mqtt || isDirectPacket(mp) || mp.relay_node == 0) {
+        return;
+    }
+    const bool hasSignalData = (mp.rx_rssi != 0 || mp.rx_snr != 0);
+    if (!canSendTopology()) {
+        LOG_INFO("[SR] Publishes no topology: skipping relayed packet observation");
+    } else {
+        const bool activeRouting = isActiveRoutingRole();
+        NodeNum inferredRelayer = resolveRelayIdentity(mp.relay_node, mp.rx_rssi, mp.rx_snr);
+
+    // If still not resolved, try known nodes (both direct neighbors and topology-known nodes)
+    // We need to check ALL edges, not just Reported ones, because the relay might be
+    // a node we only know through topology broadcasts (Mirrored edges)
+    // Only when the byte names exactly one of our neighbours. Two neighbours sharing a low
+    // byte are indistinguishable in a relayed frame, and the identity decides which node a
+    // measured, published edge is written to: name the wrong one and a peer credits it with
+    // covering us and stops relaying to us. No answer is the safe answer — the caller falls
+    // back to a placeholder, which is never published.
+    if (inferredRelayer == 0 && routingGraph && nodeDB) {
+        const NodeEdges* myEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
+        if (myEdges) {
+            NodeNum onlyMatch = 0;
+            bool ambiguous = false;
+            for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+                NodeNum neighbor = myEdges->edges[i].to;
+                if ((neighbor & 0xFF) == mp.relay_node && !isPlaceholderNode(neighbor)) {
+                    if (onlyMatch != 0 && onlyMatch != neighbor) {
+                        ambiguous = true;
+                        break;
+                    }
+                    onlyMatch = neighbor;
+                }
+            }
+            if (ambiguous) {
+                LOG_INFO("[SR] Relay 0x%02x matches more than one neighbour: not resolved",
+                         mp.relay_node);
+            } else if (onlyMatch != 0) {
+                inferredRelayer = onlyMatch;
+                // Remember this mapping for future use
+                rememberRelayIdentity(onlyMatch, mp.relay_node);
+                LOG_INFO("[SR] Resolved relay 0x%02x to known node %08x",
+                         mp.relay_node, onlyMatch);
+            }
+        }
+    }
+
+    // If we still can't resolve the relay identity, create a placeholder node
+    if (inferredRelayer == 0) {
+        inferredRelayer = createPlaceholderNode(mp.relay_node);
+        // Only log on first encounter — placeholder IDs are deterministic so
+        // the same ID is returned on every unresolved packet for this relay byte.
+        if (!routingGraph->getEdgesFrom(inferredRelayer)) {
+            LOG_INFO("[SR] Created placeholder %08x for unknown relay 0x%02x",
+                     inferredRelayer, mp.relay_node);
+        }
+    }
+
+    // Our own echo teaches us nothing about who is behind whom: a peer relaying a packet we
+    // just transmitted got it from us, so recording the sender as downstream of that peer
+    // invents a path back through ourselves. The two nodes then name each other as next hop
+    // for that destination and a unicast bounces between them.
+    bool ownEcho = routingGraph && nodeDB &&
+                   routingGraph->hasNodeTransmitted(nodeDB->getNodeNum(), mp.id, millis() / 1000);
+    if (ownEcho) {
+        LOG_INFO("[SR] Own echo 0x%08x via 0x%02x: no inference", mp.id, mp.relay_node);
+    }
+    if (!ownEcho && inferredRelayer != 0 && inferredRelayer != mp.from) {
+        // Remember this relay identity mapping for future use (only for real nodes, not placeholders)
+        if (!isPlaceholderNode(inferredRelayer)) {
+            rememberRelayIdentity(inferredRelayer, mp.relay_node);
+        }
+
+        // We know that inferredRelayer relayed a packet from mp.from
+        // This establishes both a gateway relationship and direct connectivity inference
+        LOG_INFO("[SR] Inferred gateway relationship: %08x relayed by %08x",
+                 mp.from, inferredRelayer);
+
+        // Track that both the original sender and relayer are active
+        trackNodeCapability(mp.from, CapabilityStatus::Unknown);
+        trackNodeCapability(inferredRelayer, CapabilityStatus::Unknown);
+
+        // Relay node is actively participating, tracked via SR capability system
+
+        // Record gateway relationship: inferredRelayer is gateway for mp.from
+        // when we have a Reported edge to the relayer. A former direct neighbour heard
+        // only through that relayer is retracted immediately — waiting for publisher
+        // silence left travelling unicasts aimed at a dead last hop.
+        bool hasDirectConnectionToRelay = hasReportedDirectEdge(inferredRelayer);
+        bool wasDirectNeighbor = hasReportedDirectEdge(mp.from);
+        if (wasDirectNeighbor && nodeDB) {
+            if (routingGraph->retractDirectLink(nodeDB->getNodeNum(), mp.from)) {
+                removeDirectSignal(mp.from);
+                markTopologyDirty();
+                LOG_INFO("[SR] %08x heard only via %08x: direct link retracted",
+                         mp.from, inferredRelayer);
+            }
+        }
+
+        // Infer downstream when the relay hears us. A topology publisher (SR-active or
+        // passive) must also list that relay; a source that never lists anyone leaves the
+        // observation as the only signal. Hop count then decides which usable paths we keep:
+        // - Former direct neighbour heard only via this relay: they moved.
+        // - Single-hop (hop_start - hop_limit == 1): sender went through inferredRelayer.
+        // - Multi-hop, non-publisher (Unknown/Legacy): stock nodes never advertise
+        //   their own topology, so relay observation is the only signal we have.
+        // - Multi-hop publisher that was never our neighbour: skip — Dijkstra on published
+        //   edges is the multi-hop TX path; a forwarded copy is not.
+        // Without the two facts above, the frame only says we heard the originator along the
+        // way, which is not a path we can send.
+        bool singleHopRelay = (mp.hop_start - mp.hop_limit) == 1;
+        CapabilityStatus sourceStatus = getCapabilityStatus(mp.from);
+        bool sourcePublishes = (sourceStatus == CapabilityStatus::SRactive ||
+                                sourceStatus == CapabilityStatus::Passive);
+        // Hearing the originator via a relay is the other direction from delivering to them.
+        // Keep the row when we can send to the relay. A publisher must also list it.
+        bool relayHearsUs = false;
+        if (nodeDB) {
+            const NodeEdges *mine = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
+            if (mine) {
+                for (uint8_t i = 0; i < mine->edgeCount; i++) {
+                    if (mine->edges[i].to == inferredRelayer && mine->edges[i].hearsUs) {
+                        relayHearsUs = true;
+                        break;
+                    }
+                }
+            }
+        }
+        bool destinationListsRelay = false;
+        const NodeEdges *originEdges = routingGraph->getEdgesFrom(mp.from);
+        if (originEdges) {
+            for (uint8_t i = 0; i < originEdges->edgeCount; i++) {
+                if (originEdges->edges[i].to == inferredRelayer) {
+                    destinationListsRelay = true;
+                    break;
+                }
+            }
+        }
+        NodeNum existingParent = routingGraph->getDownstreamRelay(mp.from);
+        // Sticky: a forwarded copy must not displace a live parent unless this relayer is on
+        // the originator's published list (TX-path evidence).
+        bool stealsWithoutList = existingParent != 0 && existingParent != inferredRelayer &&
+                                 !destinationListsRelay && !wasDirectNeighbor;
+        // Ball / list-downstream stay; a travelling former neighbour still parks behind the
+        // hop we heard so unicasts do not keep the dead last hop.
+        const bool destInBall = routingGraph->getEdgesFrom(mp.from) != nullptr;
+        NodeNum listParent = 0;
+        uint16_t listCost = 0;
+        const bool listParked = routingGraph->listDownstream(mp.from, listParent, listCost);
+        const bool stealOk = wasDirectNeighbor || (!destInBall && !listParked);
+        if (activeRouting && hasDirectConnectionToRelay && relayHearsUs &&
+            (destinationListsRelay || !sourcePublishes) &&
+            (wasDirectNeighbor || singleHopRelay || !sourcePublishes) &&
+            !stealsWithoutList && stealOk) {
+            // Nominal link per hop travelled: the relay's link to the source is not what we measured,
+            // and a multi-hop path must not price like a single good link.
+            uint8_t hopsUsed = mp.hop_start > mp.hop_limit ? mp.hop_start - mp.hop_limit : 1;
+            float inferredEtx = NeighborGraph::calculateETX(-70, 5.0f, currentCostingSpreadingFactor()) * hopsUsed;
+            routingGraph->updateDownstreamExclusive(mp.from, inferredRelayer, inferredEtx, millis() / 1000,
+                                                    wasDirectNeighbor);
+            if (!singleHopRelay && !wasDirectNeighbor) {
+                LOG_INFO("[SR] Downstream: %08x via %08x (%d hops, stock)",
+                         mp.from, inferredRelayer, mp.hop_start - mp.hop_limit);
+            } else {
+                LOG_INFO("[SR] Downstream: %08x via %08x", mp.from, inferredRelayer);
+            }
+        } else if (activeRouting && hasDirectConnectionToRelay && stealsWithoutList) {
+            LOG_INFO("[SR] No downstream %08x via %08x: keeping parent %08x (no list claim)",
+                     mp.from, inferredRelayer, existingParent);
+        } else if (activeRouting && hasDirectConnectionToRelay &&
+                   (wasDirectNeighbor || singleHopRelay || !sourcePublishes) &&
+                   (!relayHearsUs || (sourcePublishes && !destinationListsRelay))) {
+            LOG_INFO("[SR] No downstream %08x via %08x: relay hears us %d, originator lists relay %d",
+                     mp.from, inferredRelayer, relayHearsUs, destinationListsRelay);
+        } else if (activeRouting && hasDirectConnectionToRelay && !singleHopRelay) {
+            LOG_INFO("[SR] No downstream %08x via %08x: %d hops, SR",
+                     mp.from, inferredRelayer, mp.hop_start - mp.hop_limit);
+        }
+
+        // Infer directed connectivity from relayer to sender when the relayer is a stock node.
+        // SR-aware nodes broadcast their topology, so we don't need to infer connectivity for them.
+        // Observing a relay proves only one direction: relayer → sender. The reverse is not assumed.
+        bool relayerIsLegacy = getCapabilityStatus(inferredRelayer) == CapabilityStatus::Legacy;
+        if (activeRouting && relayerIsLegacy) {
+            // Since the stock relayer successfully relayed a packet from the sender,
+            // we know the relayer can hear the sender (inferredRelayer → mp.from).
+            LOG_INFO("[SR] Inferred: stock %08x hears %08x (relay seen)",
+                     inferredRelayer, mp.from);
+
+            uint32_t monotonicTimestamp = millis() / 1000;
+            int32_t defaultRssi = -70; // default RSSI for inferred connectivity
+            float defaultSnr = 5.0f;  // default SNR for inferred connectivity
+
+            routingGraph->updateEdge(inferredRelayer, mp.from,
+                                     NeighborGraph::calculateETX(defaultRssi, defaultSnr, currentCostingSpreadingFactor()),
+                                     monotonicTimestamp, Edge::Source::Inferred);
+        } else {
+            LOG_INFO("[SR] No inference: %08x not Legacy (%d)",
+                     inferredRelayer, (int)getCapabilityStatus(inferredRelayer));
+        }
+
+        // A relayed frame is a direct RF transmission from its relayer, whatever originated the
+        // payload it carries, so the RSSI and SNR we took off it measure our link to that
+        // relayer as well as a frame it originated would. The measurement therefore establishes
+        // the link rather than only refreshing one: requiring an existing Reported edge meant a
+        // router that relays constantly and originates almost never was measured hundreds of
+        // times and recorded not once. What a relayed frame cannot supply is identity — it
+        // names its relayer in one byte — so an unresolved relayer stays a placeholder, and a
+        // placeholder is never recorded here and never published.
+        if (hasSignalData && !isPlaceholderNode(inferredRelayer)) {
+            uint32_t monotonicTimestamp = millis() / 1000;
+            int changeType = refreshReportedDirectNeighbor(inferredRelayer, mp.rx_rssi, mp.rx_snr, monotonicTimestamp);
+            if (changeType == EDGE_SIGNIFICANT_CHANGE) {
+                markTopologyDirty();
+            }
+        }
+
+        // Record transmission for contention window tracking
+        if (routingGraph) {
+            uint32_t currentTime = millis() / 1000;  // Use monotonic time
+            // Contention-window tracking feeds the relay ranking, which only an active node runs.
+            if (activeRouting) {
+                routingGraph->recordNodeTransmission(mp.from, mp.id, currentTime);
+                routingGraph->recordNodeTransmission(inferredRelayer, mp.id, currentTime);
+            }
+        }
+    }
+    // Hearing them retransmit a packet we originated (or already committed to relay) is the
+    // proof they hear us. That is true of our own echo; gating it on !ownEcho left mute
+    // nodes publishing hearsUs=false on a neighbour that had just relayed them.
+    if (nodeDB && inferredRelayer != 0 && !isPlaceholderNode(inferredRelayer)) {
+        NodeNum ourNode = nodeDB->getNodeNum();
+        if (inferredRelayer != ourNode && (mp.from == ourNode || isCommittedRelay(mp.id))) {
+            markStockNodeRelayedOurPacket(inferredRelayer);
+        }
+    }
+    }
+}
+
 ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &mp)
 {
     // Sanity check: reject packets with obviously corrupted payload sizes
@@ -1867,246 +2117,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
             }
         }
     } else if (notViaMqtt && !isDirectFromSender && mp.relay_node != 0) {
-        // Measuring a relayer we heard is first-hand observation, not inference: the RSSI and SNR
-        // come off the relayer's own frame, exactly as they do for a frame that arrived direct. So
-        // every node that publishes topology records it, whatever its role. Only the node that
-        // hears a relayer can supply the transmit-direction evidence coverage needs about it
-        // ("does that router reach me?"), and a node that never records it stays permanently
-        // uncovered, so each of its neighbours holds unique coverage of it and relays. What the
-        // active-routing class gates is the inference below — who sits behind the gateway — which
-        // only a node that ranks relays uses.
-        if (!canSendTopology()) {
-            LOG_INFO("[SR] Publishes no topology: skipping relayed packet observation");
-        } else {
-            const bool activeRouting = isActiveRoutingRole();
-            NodeNum inferredRelayer = resolveRelayIdentity(mp.relay_node, mp.rx_rssi, mp.rx_snr);
-
-        // If still not resolved, try known nodes (both direct neighbors and topology-known nodes)
-        // We need to check ALL edges, not just Reported ones, because the relay might be
-        // a node we only know through topology broadcasts (Mirrored edges)
-        // Only when the byte names exactly one of our neighbours. Two neighbours sharing a low
-        // byte are indistinguishable in a relayed frame, and the identity decides which node a
-        // measured, published edge is written to: name the wrong one and a peer credits it with
-        // covering us and stops relaying to us. No answer is the safe answer — the caller falls
-        // back to a placeholder, which is never published.
-        if (inferredRelayer == 0 && routingGraph && nodeDB) {
-            const NodeEdges* myEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
-            if (myEdges) {
-                NodeNum onlyMatch = 0;
-                bool ambiguous = false;
-                for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
-                    NodeNum neighbor = myEdges->edges[i].to;
-                    if ((neighbor & 0xFF) == mp.relay_node && !isPlaceholderNode(neighbor)) {
-                        if (onlyMatch != 0 && onlyMatch != neighbor) {
-                            ambiguous = true;
-                            break;
-                        }
-                        onlyMatch = neighbor;
-                    }
-                }
-                if (ambiguous) {
-                    LOG_INFO("[SR] Relay 0x%02x matches more than one neighbour: not resolved",
-                             mp.relay_node);
-                } else if (onlyMatch != 0) {
-                    inferredRelayer = onlyMatch;
-                    // Remember this mapping for future use
-                    rememberRelayIdentity(onlyMatch, mp.relay_node);
-                    LOG_INFO("[SR] Resolved relay 0x%02x to known node %08x",
-                             mp.relay_node, onlyMatch);
-                }
-            }
-        }
-
-        // If we still can't resolve the relay identity, create a placeholder node
-        if (inferredRelayer == 0) {
-            inferredRelayer = createPlaceholderNode(mp.relay_node);
-            // Only log on first encounter — placeholder IDs are deterministic so
-            // the same ID is returned on every unresolved packet for this relay byte.
-            if (!routingGraph->getEdgesFrom(inferredRelayer)) {
-                LOG_INFO("[SR] Created placeholder %08x for unknown relay 0x%02x",
-                         inferredRelayer, mp.relay_node);
-            }
-        }
-
-        // Our own echo teaches us nothing about who is behind whom: a peer relaying a packet we
-        // just transmitted got it from us, so recording the sender as downstream of that peer
-        // invents a path back through ourselves. The two nodes then name each other as next hop
-        // for that destination and a unicast bounces between them.
-        bool ownEcho = routingGraph && nodeDB &&
-                       routingGraph->hasNodeTransmitted(nodeDB->getNodeNum(), mp.id, millis() / 1000);
-        if (ownEcho) {
-            LOG_INFO("[SR] Own echo 0x%08x via 0x%02x: no inference", mp.id, mp.relay_node);
-        }
-        if (!ownEcho && inferredRelayer != 0 && inferredRelayer != mp.from) {
-            // Remember this relay identity mapping for future use (only for real nodes, not placeholders)
-            if (!isPlaceholderNode(inferredRelayer)) {
-                rememberRelayIdentity(inferredRelayer, mp.relay_node);
-            }
-
-            // We know that inferredRelayer relayed a packet from mp.from
-            // This establishes both a gateway relationship and direct connectivity inference
-            LOG_INFO("[SR] Inferred gateway relationship: %08x relayed by %08x",
-                     mp.from, inferredRelayer);
-
-            // Track that both the original sender and relayer are active
-            trackNodeCapability(mp.from, CapabilityStatus::Unknown);
-            trackNodeCapability(inferredRelayer, CapabilityStatus::Unknown);
-
-            // Relay node is actively participating, tracked via SR capability system
-
-            // Record gateway relationship: inferredRelayer is gateway for mp.from
-            // when we have a Reported edge to the relayer. A former direct neighbour heard
-            // only through that relayer is retracted immediately — waiting for publisher
-            // silence left travelling unicasts aimed at a dead last hop.
-            bool hasDirectConnectionToRelay = hasReportedDirectEdge(inferredRelayer);
-            bool wasDirectNeighbor = hasReportedDirectEdge(mp.from);
-            if (wasDirectNeighbor && nodeDB) {
-                if (routingGraph->retractDirectLink(nodeDB->getNodeNum(), mp.from)) {
-                    removeDirectSignal(mp.from);
-                    markTopologyDirty();
-                    LOG_INFO("[SR] %08x heard only via %08x: direct link retracted",
-                             mp.from, inferredRelayer);
-                }
-            }
-
-            // Infer downstream when the relay hears us. A topology publisher (SR-active or
-            // passive) must also list that relay; a source that never lists anyone leaves the
-            // observation as the only signal. Hop count then decides which usable paths we keep:
-            // - Former direct neighbour heard only via this relay: they moved.
-            // - Single-hop (hop_start - hop_limit == 1): sender went through inferredRelayer.
-            // - Multi-hop, non-publisher (Unknown/Legacy): stock nodes never advertise
-            //   their own topology, so relay observation is the only signal we have.
-            // - Multi-hop publisher that was never our neighbour: skip — Dijkstra on published
-            //   edges is the multi-hop TX path; a forwarded copy is not.
-            // Without the two facts above, the frame only says we heard the originator along the
-            // way, which is not a path we can send.
-            bool singleHopRelay = (mp.hop_start - mp.hop_limit) == 1;
-            CapabilityStatus sourceStatus = getCapabilityStatus(mp.from);
-            bool sourcePublishes = (sourceStatus == CapabilityStatus::SRactive ||
-                                    sourceStatus == CapabilityStatus::Passive);
-            // Hearing the originator via a relay is the other direction from delivering to them.
-            // Keep the row when we can send to the relay. A publisher must also list it.
-            bool relayHearsUs = false;
-            if (nodeDB) {
-                const NodeEdges *mine = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
-                if (mine) {
-                    for (uint8_t i = 0; i < mine->edgeCount; i++) {
-                        if (mine->edges[i].to == inferredRelayer && mine->edges[i].hearsUs) {
-                            relayHearsUs = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            bool destinationListsRelay = false;
-            const NodeEdges *originEdges = routingGraph->getEdgesFrom(mp.from);
-            if (originEdges) {
-                for (uint8_t i = 0; i < originEdges->edgeCount; i++) {
-                    if (originEdges->edges[i].to == inferredRelayer) {
-                        destinationListsRelay = true;
-                        break;
-                    }
-                }
-            }
-            NodeNum existingParent = routingGraph->getDownstreamRelay(mp.from);
-            // Sticky: a forwarded copy must not displace a live parent unless this relayer is on
-            // the originator's published list (TX-path evidence).
-            bool stealsWithoutList = existingParent != 0 && existingParent != inferredRelayer &&
-                                     !destinationListsRelay && !wasDirectNeighbor;
-            // Ball / list-downstream stay; a travelling former neighbour still parks behind the
-            // hop we heard so unicasts do not keep the dead last hop.
-            const bool destInBall = routingGraph->getEdgesFrom(mp.from) != nullptr;
-            NodeNum listParent = 0;
-            uint16_t listCost = 0;
-            const bool listParked = routingGraph->listDownstream(mp.from, listParent, listCost);
-            const bool stealOk = wasDirectNeighbor || (!destInBall && !listParked);
-            if (activeRouting && hasDirectConnectionToRelay && relayHearsUs &&
-                (destinationListsRelay || !sourcePublishes) &&
-                (wasDirectNeighbor || singleHopRelay || !sourcePublishes) &&
-                !stealsWithoutList && stealOk) {
-                // Nominal link per hop travelled: the relay's link to the source is not what we measured,
-                // and a multi-hop path must not price like a single good link.
-                uint8_t hopsUsed = mp.hop_start > mp.hop_limit ? mp.hop_start - mp.hop_limit : 1;
-                float inferredEtx = NeighborGraph::calculateETX(-70, 5.0f, currentCostingSpreadingFactor()) * hopsUsed;
-                routingGraph->updateDownstreamExclusive(mp.from, inferredRelayer, inferredEtx, millis() / 1000,
-                                                        wasDirectNeighbor);
-                if (!singleHopRelay && !wasDirectNeighbor) {
-                    LOG_INFO("[SR] Downstream: %08x via %08x (%d hops, stock)",
-                             mp.from, inferredRelayer, mp.hop_start - mp.hop_limit);
-                } else {
-                    LOG_INFO("[SR] Downstream: %08x via %08x", mp.from, inferredRelayer);
-                }
-            } else if (activeRouting && hasDirectConnectionToRelay && stealsWithoutList) {
-                LOG_INFO("[SR] No downstream %08x via %08x: keeping parent %08x (no list claim)",
-                         mp.from, inferredRelayer, existingParent);
-            } else if (activeRouting && hasDirectConnectionToRelay &&
-                       (wasDirectNeighbor || singleHopRelay || !sourcePublishes) &&
-                       (!relayHearsUs || (sourcePublishes && !destinationListsRelay))) {
-                LOG_INFO("[SR] No downstream %08x via %08x: relay hears us %d, originator lists relay %d",
-                         mp.from, inferredRelayer, relayHearsUs, destinationListsRelay);
-            } else if (activeRouting && hasDirectConnectionToRelay && !singleHopRelay) {
-                LOG_INFO("[SR] No downstream %08x via %08x: %d hops, SR",
-                         mp.from, inferredRelayer, mp.hop_start - mp.hop_limit);
-            }
-
-            // Infer directed connectivity from relayer to sender when the relayer is a stock node.
-            // SR-aware nodes broadcast their topology, so we don't need to infer connectivity for them.
-            // Observing a relay proves only one direction: relayer → sender. The reverse is not assumed.
-            bool relayerIsLegacy = getCapabilityStatus(inferredRelayer) == CapabilityStatus::Legacy;
-            if (activeRouting && relayerIsLegacy) {
-                // Since the stock relayer successfully relayed a packet from the sender,
-                // we know the relayer can hear the sender (inferredRelayer → mp.from).
-                LOG_INFO("[SR] Inferred: stock %08x hears %08x (relay seen)",
-                         inferredRelayer, mp.from);
-
-                uint32_t monotonicTimestamp = millis() / 1000;
-                int32_t defaultRssi = -70; // default RSSI for inferred connectivity
-                float defaultSnr = 5.0f;  // default SNR for inferred connectivity
-
-                routingGraph->updateEdge(inferredRelayer, mp.from,
-                                         NeighborGraph::calculateETX(defaultRssi, defaultSnr, currentCostingSpreadingFactor()),
-                                         monotonicTimestamp, Edge::Source::Inferred);
-            } else {
-                LOG_INFO("[SR] No inference: %08x not Legacy (%d)",
-                         inferredRelayer, (int)getCapabilityStatus(inferredRelayer));
-            }
-
-            // A relayed frame is a direct RF transmission from its relayer, whatever originated the
-            // payload it carries, so the RSSI and SNR we took off it measure our link to that
-            // relayer as well as a frame it originated would. The measurement therefore establishes
-            // the link rather than only refreshing one: requiring an existing Reported edge meant a
-            // router that relays constantly and originates almost never was measured hundreds of
-            // times and recorded not once. What a relayed frame cannot supply is identity — it
-            // names its relayer in one byte — so an unresolved relayer stays a placeholder, and a
-            // placeholder is never recorded here and never published.
-            if (hasSignalData && !isPlaceholderNode(inferredRelayer)) {
-                uint32_t monotonicTimestamp = millis() / 1000;
-                int changeType = refreshReportedDirectNeighbor(inferredRelayer, mp.rx_rssi, mp.rx_snr, monotonicTimestamp);
-                if (changeType == EDGE_SIGNIFICANT_CHANGE) {
-                    markTopologyDirty();
-                }
-            }
-
-            // Record transmission for contention window tracking
-            if (routingGraph) {
-                uint32_t currentTime = millis() / 1000;  // Use monotonic time
-                // Contention-window tracking feeds the relay ranking, which only an active node runs.
-                if (activeRouting) {
-                    routingGraph->recordNodeTransmission(mp.from, mp.id, currentTime);
-                    routingGraph->recordNodeTransmission(inferredRelayer, mp.id, currentTime);
-                }
-            }
-        }
-        // Hearing them retransmit a packet we originated (or already committed to relay) is the
-        // proof they hear us. That is true of our own echo; gating it on !ownEcho left mute
-        // nodes publishing hearsUs=false on a neighbour that had just relayed them.
-        if (nodeDB && inferredRelayer != 0 && !isPlaceholderNode(inferredRelayer)) {
-            NodeNum ourNode = nodeDB->getNodeNum();
-            if (inferredRelayer != ourNode && (mp.from == ourNode || isCommittedRelay(mp.id))) {
-                markStockNodeRelayedOurPacket(inferredRelayer);
-            }
-        }
-        }
+        observeRelayedPacket(mp);
     }
 
     if (mp.which_payload_variant == meshtastic_MeshPacket_decoded_tag) {

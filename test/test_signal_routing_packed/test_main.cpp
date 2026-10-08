@@ -3182,6 +3182,48 @@ static void test_unqualified_far_topology_does_not_steal_list_downstream()
     TEST_ASSERT_NULL(module.g()->getEdgesFrom(y));
 }
 
+static void test_duplicate_relayed_copy_learns_downstream_via_hears_us_neighbor()
+{
+    // First-heard via an unresolved relay byte parks nothing; a later observe via a hearsUs
+    // neighbour must still park a stock originator (Czar/Z005/FCM6 race: first RX often 0xf0).
+    constexpr NodeNum me = 0x63DC8F8C;
+    constexpr NodeNum stock = 0x4F5178DC;
+    constexpr NodeNum gateway = 0x108AEF6C;
+    initGraphTestNodeDb(me);
+    config.device.role = meshtastic_Config_DeviceConfig_Role_ROUTER;
+
+    class GraphWriter : public SignalRoutingModule {
+    public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+        NeighborGraph *g() { return routingGraph; }
+        void observe(const meshtastic_MeshPacket &mp) { observeRelayedPacket(mp); }
+    };
+    GraphWriter module;
+    module.hear(gateway, -96, 7.0f);
+    module.g()->setEdgeHearsUs(me, gateway, true);
+
+    meshtastic_MeshPacket first = meshtastic_MeshPacket_init_zero;
+    first.from = stock;
+    first.to = NODENUM_BROADCAST;
+    first.id = 0x91DB7D3C;
+    first.hop_start = 7;
+    first.hop_limit = 5;
+    first.relay_node = 0xF0;
+    first.rx_rssi = -70;
+    first.rx_snr = 8;
+    first.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    first.decoded.portnum = meshtastic_PortNum_POSITION_APP;
+    module.observe(first);
+    TEST_ASSERT_EQUAL_UINT32(0, module.g()->getDownstreamRelay(stock));
+
+    meshtastic_MeshPacket second = first;
+    second.relay_node = static_cast<uint8_t>(gateway & 0xFF);
+    second.rx_rssi = -96;
+    second.rx_snr = 7;
+    module.observe(second);
+    TEST_ASSERT_EQUAL_UINT32(gateway, module.g()->getDownstreamRelay(stock));
+}
+
 static void test_relayed_observe_does_not_steal_ball_dest()
 {
     constexpr NodeNum me = 0xAA0000AA;
@@ -3402,6 +3444,7 @@ void setup()
     RUN_TEST(test_far_sender_naming_l1_and_l2_is_l2_not_l3);
     RUN_TEST(test_unqualified_far_topology_does_not_steal_list_downstream);
     RUN_TEST(test_relayed_observe_does_not_steal_ball_dest);
+    RUN_TEST(test_duplicate_relayed_copy_learns_downstream_via_hears_us_neighbor);
     RUN_TEST(test_topology_pack_prefers_hears_us_and_sr_over_better_etx);
 
     UNITY_END();

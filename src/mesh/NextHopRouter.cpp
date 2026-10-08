@@ -76,6 +76,11 @@ bool NextHopRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
         printPacket("Ignore dupe incoming msg", p);
 
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
+        // A later copy may resolve a hearsUs neighbour that the first-heard relay byte could
+        // not (placeholder / non-neighbour). Still learn the graph even though we filter.
+        if (signalRoutingModule) {
+            signalRoutingModule->observeRelayedPacket(*p);
+        }
         // Hand-off: a duplicate that newly names our byte is processed like a fresh reception.
         if (signalRoutingModule && signalRoutingModule->isHandOffDuplicate(p)) {
             LOG_INFO("[SR] Hand-off 0x%08x: named as next hop", p->id);
