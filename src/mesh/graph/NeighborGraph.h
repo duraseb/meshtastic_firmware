@@ -704,8 +704,8 @@ class NeighborGraph {
     bool tryAdmitListedPublisher(NodeNum sender, NodeNum listed, bool senderIsDirect, uint32_t nowSecs);
 
     /// MeshRustic §6.2: grow ball/downstream from this topology only when the sender is an RF
-    /// neighbour, this frame was heard from them, they already sit in the ball, a ball node
-    /// already points at them, or their list names an L1/L2 we hold.
+    /// neighbour, this frame was heard from them, they already sit in the ball, an L1 lists
+    /// them with hearsUs, or their list names an L1/L2 we hold.
     bool senderHorizonOk(NodeNum sender, bool senderIsDirect, bool heardDirectFromSender,
                          const NodeNum *listedIds, uint8_t listedCount) const;
 
@@ -713,7 +713,13 @@ class NeighborGraph {
     void setNodeClass(NodeNum nodeId, NodeClass nodeClass, NodeNum parentHint = 0);
     void setL1(NodeNum nodeId);
 
+    /// Classify hop depth from current ball evidence (L1 listed with hearsUs, etc.).
+    NodeClass classifyCandidate(NodeNum nodeId) const;
+
     bool hasDirectReportedEdgeTo(NodeNum from, NodeNum to) const;
+
+    /// True when any ball publisher lists nodeId with hearsUs=1 (plan §6.2 bootstrap).
+    bool reachableViaHearsUs(NodeNum nodeId) const;
 
     /// Drop our measured link to `neighbor` and their edge back to us. Used when we hear them
     /// only through a relayer, so Dijkstra stops treating them as a last hop. Returns true if
@@ -771,7 +777,6 @@ class NeighborGraph {
     const Edge *findEdge(const NodeEdges *node, NodeNum to) const;
 
     bool classWithinDepth(NodeClass c) const;
-    NodeClass classifyCandidate(NodeNum nodeId) const;
     NodeClass bootstrapClassFromReachability(NodeNum nodeId) const;
     bool reachableViaNeighbor(NodeNum nodeId) const;
     int8_t selectEvictionVictim(bool protectL1) const;

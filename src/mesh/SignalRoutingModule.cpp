@@ -977,7 +977,8 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     const bool senderIsDirect = hasReportedDirectEdge(p->from);
     const uint32_t nowSecs = millis() / 1000;
     // Horizon: admit a non-direct sender when they already sit in the ball or their list
-    // names an L1/L2 we know (MeshRustic §6.2).
+    // names an L1/L2 we know (MeshRustic §6.2). Classify from ball evidence first; Unknown
+    // fallback is L3 only when the list names an L2 and does not name an L1.
     if (routingGraph && !senderIsDirect) {
         bool namesL1 = false;
         bool namesL2 = false;
@@ -999,7 +1000,7 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
         }
         const bool alreadyInBall = routingGraph->getEdgesFrom(p->from) != nullptr;
         if (alreadyInBall || namesL1 || namesL2) {
-            NodeClass cls = routingGraph->getNodeClass(p->from);
+            NodeClass cls = routingGraph->classifyCandidate(p->from);
             if (cls == NodeClass::Unknown) {
                 cls = (namesL2 && !namesL1 && GRAPH_MAX_DEPTH >= 3) ? NodeClass::L3 : NodeClass::L2;
             }

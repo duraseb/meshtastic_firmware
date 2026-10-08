@@ -136,6 +136,18 @@ bool NeighborGraph::reachableViaNeighbor(NodeNum nodeId) const
     return false;
 }
 
+bool NeighborGraph::reachableViaHearsUs(NodeNum nodeId) const
+{
+    for (uint8_t i = 0; i < neighborCount; i++) {
+        for (uint8_t e = 0; e < neighbors[i].edgeCount; e++) {
+            if (neighbors[i].edges[e].to == nodeId && neighbors[i].edges[e].hearsUs) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 NodeClass NeighborGraph::getNodeClass(NodeNum nodeId) const
 {
     const NodeEdges *n = findNeighbor(nodeId);
@@ -219,6 +231,8 @@ NodeClass NeighborGraph::classifyCandidate(NodeNum nodeId) const
 
 NodeClass NeighborGraph::bootstrapClassFromReachability(NodeNum nodeId) const
 {
+    // Edge presence (not hearsUs) is enough to soft-create reverse Mirrored endpoints for
+    // Dijkstra. Horizon *ingest* still requires hearsUs via reachableViaHearsUs.
     NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
     const NodeEdges *me = findNeighbor(myNode);
     if (me) {
@@ -474,7 +488,9 @@ bool NeighborGraph::senderHorizonOk(NodeNum sender, bool senderIsDirect, bool he
     if (senderIsDirect || heardDirectFromSender) {
         return true;
     }
-    if (findNeighbor(sender) || reachableViaNeighbor(sender)) {
+    // Plan §6.2: already in the ball, or an L1 (etc.) lists them with hearsUs — not merely
+    // an asymmetric edge target.
+    if (findNeighbor(sender) || reachableViaHearsUs(sender)) {
         return true;
     }
     NodeClass cls = getNodeClass(sender);

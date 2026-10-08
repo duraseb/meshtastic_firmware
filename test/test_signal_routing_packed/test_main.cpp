@@ -3069,6 +3069,83 @@ static void test_sender_horizon_ok_requires_anchor()
     TEST_ASSERT_TRUE(graph.senderHorizonOk(far, false, true, listedFar, 1));
 }
 
+// Asymmetric L1→FAR (hearsUs=0) must not unlock FAR via reachableViaHearsUs / senderHorizonOk.
+static void test_asymmetric_edge_does_not_unlock_horizon()
+{
+    constexpr NodeNum me = 0xAA0000AA;
+    constexpr NodeNum l1 = 0xBB0000BB;
+    constexpr NodeNum far = 0xF10000F1;
+    constexpr NodeNum y = 0xEE0000EE;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+    const uint32_t now = millis() / 1000;
+    graph.updateEdge(me, l1, 1.0f, now, Edge::Source::Reported);
+    graph.setL1(l1);
+    graph.updateEdge(l1, far, 2.0f, now, Edge::Source::Mirrored);
+    // hearsUs left false — asymmetric listing still stores the edge, but must not unlock horizon.
+    TEST_ASSERT_NOT_NULL(edgeBetween(graph, l1, far));
+    TEST_ASSERT_FALSE(graph.reachableViaHearsUs(far));
+    NodeNum listedY[] = {y};
+    TEST_ASSERT_FALSE(graph.senderHorizonOk(far, false, false, listedY, 1));
+}
+
+// First ingest of a far sender that names both an L1 and an L2 must class as L2, not L3.
+static void test_far_sender_naming_l1_and_l2_is_l2_not_l3()
+{
+    constexpr NodeNum me = 0xAA0000AA;
+    constexpr NodeNum l1 = 0xBB0000BB;
+    constexpr NodeNum l2 = 0xCC0000CC;
+    constexpr NodeNum far = 0xF10000F1;
+    initGraphTestNodeDb(me);
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+
+    class GraphWriter : public SignalRoutingModule {
+    public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+        NeighborGraph *g() { return routingGraph; }
+        void ingestBoth(const meshtastic_MeshPacket &mp, meshtastic_SignalRoutingInfo *info)
+        {
+            preProcessSignalRoutingPacket(&mp);
+            handleReceivedProtobuf(mp, info);
+        }
+    };
+    GraphWriter module;
+    module.hear(l1, -70, 8.0f);
+    ingestOneNeighbor(module, l1, l2, true, 1);
+    TEST_ASSERT_TRUE(module.g()->getNodeClass(l2) == NodeClass::L2);
+
+    uint8_t packed[64] = {};
+    writePackedTopologyHeader(packed, 2, true);
+    encodePackedNeighborEntry(packed + PACKED_NEIGHBOR_HEADER_SIZE, l1, -75, 7, true, true, 0);
+    encodePackedNeighborEntry(packed + PACKED_NEIGHBOR_HEADER_SIZE + PACKED_NEIGHBOR_ENTRY_SIZE, l2, -80, 5, true,
+                              true, 0);
+    const size_t packedLen = PACKED_NEIGHBOR_HEADER_SIZE + 2 * PACKED_NEIGHBOR_ENTRY_SIZE;
+
+    meshtastic_SignalRoutingInfo info = meshtastic_SignalRoutingInfo_init_zero;
+    info.packed_neighbors.size = packedLen;
+    memcpy(info.packed_neighbors.bytes, packed, packedLen);
+
+    uint8_t payload[96];
+    pb_ostream_t stream = pb_ostream_from_buffer(payload, sizeof(payload));
+    TEST_ASSERT_TRUE(pb_encode(&stream, &meshtastic_SignalRoutingInfo_msg, &info));
+
+    meshtastic_MeshPacket mp = meshtastic_MeshPacket_init_zero;
+    mp.from = far;
+    mp.to = NODENUM_BROADCAST;
+    mp.id = 0x52;
+    mp.hop_start = 3;
+    mp.hop_limit = 2;
+    mp.relay_node = static_cast<uint8_t>(l1 & 0xFF);
+    mp.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    mp.decoded.portnum = meshtastic_PortNum_SIGNAL_ROUTING_APP;
+    mp.decoded.payload.size = stream.bytes_written;
+    memcpy(mp.decoded.payload.bytes, payload, stream.bytes_written);
+
+    module.ingestBoth(mp, &info);
+    TEST_ASSERT_TRUE_MESSAGE(module.g()->getNodeClass(far) == NodeClass::L2,
+                             "naming an L1 makes the sender L2 even when the list also names an L2");
+}
+
 static void test_unqualified_far_topology_does_not_steal_list_downstream()
 {
     constexpr NodeNum me = 0xAA0000AA;
@@ -3321,6 +3398,8 @@ void setup()
     RUN_TEST(test_relayed_copy_does_not_steal_list_downstream);
     RUN_TEST(test_list_downstream_route_is_verified_compose);
     RUN_TEST(test_sender_horizon_ok_requires_anchor);
+    RUN_TEST(test_asymmetric_edge_does_not_unlock_horizon);
+    RUN_TEST(test_far_sender_naming_l1_and_l2_is_l2_not_l3);
     RUN_TEST(test_unqualified_far_topology_does_not_steal_list_downstream);
     RUN_TEST(test_relayed_observe_does_not_steal_ball_dest);
     RUN_TEST(test_topology_pack_prefers_hears_us_and_sr_over_better_etx);
