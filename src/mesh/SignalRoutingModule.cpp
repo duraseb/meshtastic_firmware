@@ -1585,6 +1585,21 @@ bool SignalRoutingModule::hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum 
 }
 
 
+static const char *horizonClassTag(NodeClass c)
+{
+    switch (c) {
+    case NodeClass::L1:
+        return "[L1] ";
+    case NodeClass::L2:
+        return "[L2] ";
+    case NodeClass::L3:
+        return "[L3] ";
+    case NodeClass::Unknown:
+    default:
+        return "[L?] ";
+    }
+}
+
 void SignalRoutingModule::logNetworkTopology()
 {
 #ifdef DEBUG_MUTE
@@ -1625,7 +1640,27 @@ void SignalRoutingModule::logNetworkTopology()
     const NodeEdges* ourEdges = routingGraph->getEdgesFrom(ourNode);
     uint8_t directCount = ourEdges ? ourEdges->edgeCount : 0;
 
-    LOG_INFO("[SR] Network Topology: %d nodes, %u direct neighbors", nodeCount, directCount);
+    // Horizon class census across the ball (Unknown / placeholders omitted).
+    uint8_t l1Count = 0, l2Count = 0, l3Count = 0;
+    for (size_t i = 0; i < rawNodeCount; i++) {
+        switch (routingGraph->getNodeClass(nodeBuf[i])) {
+        case NodeClass::L1:
+            l1Count++;
+            break;
+        case NodeClass::L2:
+            l2Count++;
+            break;
+        case NodeClass::L3:
+            l3Count++;
+            break;
+        case NodeClass::Unknown:
+            break;
+        }
+    }
+
+    LOG_INFO("[SR] Network Topology: %d nodes, %u direct neighbors (L1=%u L2=%u L3=%u)", nodeCount,
+             directCount, static_cast<unsigned>(l1Count), static_cast<unsigned>(l2Count),
+             static_cast<unsigned>(l3Count));
     LOG_INFO("[SR] %s (us)", nameBuf);
 
     if (!ourEdges || ourEdges->edgeCount == 0) {
@@ -1644,6 +1679,7 @@ void SignalRoutingModule::logNetworkTopology()
             } else if (neighborStatus == CapabilityStatus::Passive) {
                 nprefix = "[SR-passive] ";
             }
+            const char* nclass = horizonClassTag(routingGraph->getNodeClass(edge.to));
 
             float etx = edge.getEtx();
             const char* quality;
@@ -1676,8 +1712,8 @@ void SignalRoutingModule::logNetworkTopology()
             size_t dsCount = routingGraph->getDownstreamNodesForRelay(edge.to, dsBuf, dsCosts, MAX_DS_DISPLAY);
 
             const char* bidir = edge.hearsUs ? ", hearsUs" : "";
-            LOG_INFO("[SR]   %s %s%s: %s (ETX=%.1f, %ss, covers %u, relay for %u down%s)",
-                     branch, nprefix, nameBuf, quality, etx, ageBuf,
+            LOG_INFO("[SR]   %s %s%s%s: %s (ETX=%.1f, %ss, covers %u, relay for %u down%s)",
+                     branch, nclass, nprefix, nameBuf, quality, etx, ageBuf,
                      static_cast<unsigned int>(listenerCount), static_cast<unsigned int>(totalDsCount), bidir);
 
             // Show nodes that can hear this neighbor (their topology-reported edges)
@@ -1690,10 +1726,12 @@ void SignalRoutingModule::logNetworkTopology()
                     const char* lprefix = "";
                     if (lStatus == CapabilityStatus::SRactive) lprefix = "[SR-active] ";
                     else if (lStatus == CapabilityStatus::Passive) lprefix = "[SR-passive] ";
+                    const char* lclass = horizonClassTag(routingGraph->getNodeClass(nEdge.to));
 
                     bool lLast = (n == listenerCount - 1) && (totalDsCount == 0);
                     const char* lBranch = lLast ? "\\-" : "+-";
-                    LOG_INFO("[SR]   %s    %s %s%s (ETX=%.1f)", cont, lBranch, lprefix, nameBuf, nEdge.getEtx());
+                    LOG_INFO("[SR]   %s    %s %s%s%s (ETX=%.1f)", cont, lBranch, lclass, lprefix, nameBuf,
+                             nEdge.getEtx());
                 }
             }
 
