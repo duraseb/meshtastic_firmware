@@ -593,7 +593,7 @@ static inline int refreshReportedDirectNeighborObservation(NeighborGraph *graph,
 #define SIGNAL_ROUTING_DIRTY_BROADCAST_SECS 300
 
 // Maximum hops for SR topology broadcasts; capped at min(user config, this value)
-#define SR_BROADCAST_MAX_HOPS 5
+#define SR_BROADCAST_MAX_HOPS 4
 
 // Hop budget of a last-hop unicast (see SignalRoutingModule::capsLastHop).
 static constexpr uint8_t SR_LAST_HOP_BUDGET = 1;
