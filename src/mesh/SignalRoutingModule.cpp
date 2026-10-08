@@ -1834,9 +1834,15 @@ void SignalRoutingModule::observeRelayedPacket(const meshtastic_MeshPacket &mp)
         // when we have a Reported edge to the relayer. A former direct neighbour heard
         // only through that relayer is retracted immediately — waiting for publisher
         // silence left travelling unicasts aimed at a dead last hop.
+        // Exception: we already recorded this packet id from the sender (direct observe path).
+        // A later matched copy via a neighbour is a desk duplicate, not evidence they left.
         bool hasDirectConnectionToRelay = hasReportedDirectEdge(inferredRelayer);
         bool wasDirectNeighbor = hasReportedDirectEdge(mp.from);
-        if (wasDirectNeighbor && nodeDB) {
+        uint32_t nowSecs = millis() / 1000;
+        bool alreadyHeardDirect =
+            mp.id != 0 && routingGraph && routingGraph->hasNodeTransmitted(mp.from, mp.id, nowSecs);
+        bool travelling = wasDirectNeighbor && !alreadyHeardDirect;
+        if (travelling && nodeDB) {
             if (routingGraph->retractDirectLink(nodeDB->getNodeNum(), mp.from)) {
                 removeDirectSignal(mp.from);
                 markTopologyDirty();
@@ -1888,25 +1894,25 @@ void SignalRoutingModule::observeRelayedPacket(const meshtastic_MeshPacket &mp)
         // Sticky: a forwarded copy must not displace a live parent unless this relayer is on
         // the originator's published list (TX-path evidence).
         bool stealsWithoutList = existingParent != 0 && existingParent != inferredRelayer &&
-                                 !destinationListsRelay && !wasDirectNeighbor;
+                                 !destinationListsRelay && !travelling;
         // Ball / list-downstream stay; a travelling former neighbour still parks behind the
         // hop we heard so unicasts do not keep the dead last hop.
         const bool destInBall = routingGraph->getEdgesFrom(mp.from) != nullptr;
         NodeNum listParent = 0;
         uint16_t listCost = 0;
         const bool listParked = routingGraph->listDownstream(mp.from, listParent, listCost);
-        const bool stealOk = wasDirectNeighbor || (!destInBall && !listParked);
+        const bool stealOk = travelling || (!destInBall && !listParked);
         if (activeRouting && hasDirectConnectionToRelay && relayHearsUs &&
             (destinationListsRelay || !sourcePublishes) &&
-            (wasDirectNeighbor || singleHopRelay || !sourcePublishes) &&
+            (travelling || singleHopRelay || !sourcePublishes) &&
             !stealsWithoutList && stealOk) {
             // Nominal link per hop travelled: the relay's link to the source is not what we measured,
             // and a multi-hop path must not price like a single good link.
             uint8_t hopsUsed = mp.hop_start > mp.hop_limit ? mp.hop_start - mp.hop_limit : 1;
             float inferredEtx = NeighborGraph::calculateETX(-70, 5.0f, currentCostingSpreadingFactor()) * hopsUsed;
             routingGraph->updateDownstreamExclusive(mp.from, inferredRelayer, inferredEtx, millis() / 1000,
-                                                    wasDirectNeighbor);
-            if (!singleHopRelay && !wasDirectNeighbor) {
+                                                    travelling);
+            if (!singleHopRelay && !travelling) {
                 LOG_INFO("[SR] Downstream: %08x via %08x (%d hops, stock)",
                          mp.from, inferredRelayer, mp.hop_start - mp.hop_limit);
             } else {
@@ -1916,7 +1922,7 @@ void SignalRoutingModule::observeRelayedPacket(const meshtastic_MeshPacket &mp)
             LOG_INFO("[SR] No downstream %08x via %08x: keeping parent %08x (no list claim)",
                      mp.from, inferredRelayer, existingParent);
         } else if (activeRouting && hasDirectConnectionToRelay &&
-                   (wasDirectNeighbor || singleHopRelay || !sourcePublishes) &&
+                   (travelling || singleHopRelay || !sourcePublishes) &&
                    (!relayHearsUs || (sourcePublishes && !destinationListsRelay))) {
             LOG_INFO("[SR] No downstream %08x via %08x: relay hears us %d, originator lists relay %d",
                      mp.from, inferredRelayer, relayHearsUs, destinationListsRelay);

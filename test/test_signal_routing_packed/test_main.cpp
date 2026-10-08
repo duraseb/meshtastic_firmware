@@ -3224,6 +3224,60 @@ static void test_duplicate_relayed_copy_learns_downstream_via_hears_us_neighbor(
     TEST_ASSERT_EQUAL_UINT32(gateway, module.g()->getDownstreamRelay(stock));
 }
 
+static void test_relayed_duplicate_of_direct_packet_does_not_retract()
+{
+    // Direct then matched copy via a neighbour must keep the L1 (desk Czar duplicate flap).
+    constexpr NodeNum me = 0x0A0B0C0D;
+    constexpr NodeNum peer = 0x11111111;
+    constexpr NodeNum relay = 0x22222222;
+    constexpr uint32_t packetId = 0xC73A8812;
+    initGraphTestNodeDb(me);
+    config.device.role = meshtastic_Config_DeviceConfig_Role_ROUTER;
+
+    class GraphWriter : public SignalRoutingModule {
+    public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+        NeighborGraph *g() { return routingGraph; }
+        void observe(const meshtastic_MeshPacket &mp) { observeRelayedPacket(mp); }
+        void noteTx(NodeNum n, uint32_t id) { routingGraph->recordNodeTransmission(n, id, millis() / 1000); }
+    };
+    GraphWriter module;
+    module.hear(relay, -70, 8.0f);
+    module.g()->setEdgeHearsUs(me, relay, true);
+    module.hear(peer, -7, 12.0f);
+    module.g()->setEdgeHearsUs(me, peer, true);
+    module.g()->updateEdge(relay, peer, 1.2f, millis() / 1000, Edge::Source::Mirrored);
+    module.g()->updateEdge(peer, relay, 1.2f, millis() / 1000, Edge::Source::Mirrored);
+    module.g()->setEdgeHearsUs(relay, peer, true);
+    module.noteTx(peer, packetId);
+    TEST_ASSERT_TRUE(module.g()->hasNodeTransmitted(peer, packetId, millis() / 1000));
+
+    meshtastic_MeshPacket mp = meshtastic_MeshPacket_init_zero;
+    mp.from = peer;
+    mp.to = NODENUM_BROADCAST;
+    mp.id = packetId;
+    mp.hop_start = 3;
+    mp.hop_limit = 2;
+    mp.relay_node = static_cast<uint8_t>(relay & 0xFF);
+    mp.rx_rssi = -70;
+    mp.rx_snr = 8;
+    mp.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    mp.decoded.portnum = meshtastic_PortNum_TELEMETRY_APP;
+    module.observe(mp);
+
+    const NodeEdges *self = module.g()->getEdgesFrom(me);
+    TEST_ASSERT_NOT_NULL(self);
+    bool peerStillDirect = false;
+    for (uint8_t i = 0; i < self->edgeCount; i++) {
+        if (self->edges[i].to == peer && self->edges[i].source == Edge::Source::Reported) {
+            peerStillDirect = true;
+            break;
+        }
+    }
+    TEST_ASSERT_TRUE(peerStillDirect);
+    TEST_ASSERT_EQUAL_UINT32(0, module.g()->getDownstreamRelay(peer));
+}
+
 static void test_relayed_observe_does_not_steal_ball_dest()
 {
     constexpr NodeNum me = 0xAA0000AA;
@@ -3445,6 +3499,7 @@ void setup()
     RUN_TEST(test_unqualified_far_topology_does_not_steal_list_downstream);
     RUN_TEST(test_relayed_observe_does_not_steal_ball_dest);
     RUN_TEST(test_duplicate_relayed_copy_learns_downstream_via_hears_us_neighbor);
+    RUN_TEST(test_relayed_duplicate_of_direct_packet_does_not_retract);
     RUN_TEST(test_topology_pack_prefers_hears_us_and_sr_over_better_etx);
 
     UNITY_END();

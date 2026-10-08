@@ -174,10 +174,14 @@ All discovery mechanisms are used to maintain comprehensive network topology:
    through a resolved relayer, is retracted immediately (`retractDirectLink`) and written as
    downstream of that relayer. Relayed copies do not refresh our measurement of the sender, so
    without this a node that moved behind a hop kept drawing unicasts onto a dead last hop until
-   `PUBLISHER_SILENCE_SECS`. Their later topology must not reinstall `sender → us` unless we hear
-   them again — Dijkstra would treat us as that last hop from a stale list. A later *direct*
-   frame from them (`updateNeighborInfo` + `clearDownstreamForDestination`) restores the neighbour
-   and drops every downstream row for them.
+   `PUBLISHER_SILENCE_SECS`. **Same packet id exception:** if `hasNodeTransmitted` already
+   recorded this `id` from the sender (direct observe path), a later matched relayed copy is a
+   duplicate rebroadcast, not travel — do not retract or park them downstream (desk: angl + Czar
+   flapped L1 after every local TX Czar also keyed). Their later topology must not reinstall
+   `sender → us` unless we hear them again — Dijkstra would treat us as that last hop from a
+   stale list. A later *direct* frame from them (`updateNeighborInfo` +
+   `clearDownstreamForDestination`) restores the neighbour and drops every downstream row for
+   them. Test: `test_relayed_duplicate_of_direct_packet_does_not_retract`.
    **Own echo:** a relayed copy of a packet this node transmitted itself teaches nothing about
    what lies beyond the relayer — the relayer heard us, not the origin, so the origin is not
    downstream of it. Such a copy is recognised by the transmission record kept for our own packet
