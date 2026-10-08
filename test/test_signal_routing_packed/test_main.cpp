@@ -289,6 +289,36 @@ static void test_age_edges_keeps_a_heard_neighbour_with_no_published_list()
     TEST_ASSERT_TRUE(hasReportedDirectEdgeTo(&graph, me, peer));
 }
 
+static void test_age_edges_keeps_empty_l3_publisher_until_admission_ttl()
+{
+    // Parent→L3 measurements live on the parent; the L3 slot itself is often edgeless.
+    // Field (angl 2026-10-07): purging those slots each tick collapsed the ball between hub dumps.
+    constexpr NodeNum me = 0xAA0000AA;
+    constexpr NodeNum l1 = 0xBB0000BB;
+    constexpr NodeNum l2 = 0xCC0000CC;
+    constexpr NodeNum l3 = 0xDD0000DD;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+    const uint32_t t0 = 100;
+    TEST_ASSERT_EQUAL_INT(EDGE_NEW, graph.updateEdge(me, l1, 1.0f, t0, Edge::Source::Reported));
+    graph.setL1(l1);
+    TEST_ASSERT_EQUAL_INT(EDGE_NEW, graph.updateEdge(l1, l2, 2.0f, t0, Edge::Source::Mirrored));
+    graph.setEdgeHearsUs(l1, l2, true);
+    TEST_ASSERT_TRUE(graph.ensurePublisher(l2, NodeClass::L2, l1, t0));
+    TEST_ASSERT_EQUAL_INT(EDGE_NEW, graph.updateEdge(l2, l3, 2.0f, t0, Edge::Source::Mirrored));
+    graph.setEdgeHearsUs(l2, l3, true);
+    TEST_ASSERT_TRUE(graph.ensurePublisher(l3, NodeClass::L3, l2, t0));
+    const NodeEdges *l3Node = graph.getEdgesFrom(l3);
+    TEST_ASSERT_NOT_NULL(l3Node);
+    TEST_ASSERT_EQUAL_UINT8(0, l3Node->edgeCount);
+
+    graph.ageEdges(t0 + 60, 5400);
+    TEST_ASSERT_NOT_NULL(graph.getEdgesFrom(l3));
+
+    graph.ageEdges(t0 + 5401, 5400);
+    TEST_ASSERT_NULL(graph.getEdgesFrom(l3));
+}
+
 static void test_an_improvement_larger_than_the_bar_is_significant()
 {
     constexpr NodeNum me = 0xAAAAAAAA;
@@ -567,6 +597,52 @@ static void test_route_never_uses_a_one_way_edge()
     TEST_ASSERT_EQUAL_UINT32(dest, graph.calculateRoute(dest, 1000, publishes).nextHop);
 }
 
+// Asymmetric L1: we hear A but A does not hear us. A hears B (L2); we reach B through C (L1).
+// The ball stores that picture; the route to A is via C→B→A at receiver prices — not our one-way RX of A.
+static void test_asymmetric_l1_routes_via_l2_hearer_not_our_rx()
+{
+    constexpr NodeNum me = 0xAA0000AA;
+    constexpr NodeNum a = 0xA10000A1;
+    constexpr NodeNum b = 0xB20000B2;
+    constexpr NodeNum c = 0xC30000C3;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    const uint32_t t0 = 1000;
+    // We hear A (L1); A never confirms us (no setEdgeHearsUs(me, a)).
+    graph.updateEdge(me, a, 1.5f, t0, Edge::Source::Reported);
+    // Path to B via C: we hear C; C lists B with hearsUs → B is L2.
+    graph.updateEdge(me, c, 1.0f, t0, Edge::Source::Reported);
+    graph.setEdgeHearsUs(me, c, true);
+    graph.updateEdge(c, me, 1.0f, t0, Edge::Source::Mirrored);
+    graph.updateEdge(c, b, 1.5f, t0, Edge::Source::Mirrored);
+    graph.setEdgeHearsUs(c, b, true);
+    TEST_ASSERT_TRUE(graph.ensurePublisher(b, NodeClass::L2, c, t0));
+    // B's measurement of C prices C→B; A's measurement of B prices B→A.
+    graph.updateEdge(b, c, 1.2f, t0, Edge::Source::Mirrored);
+    graph.updateEdge(a, b, 2.0f, t0, Edge::Source::Mirrored);
+
+    NeighborGraph::RoutePolicy publishes;
+    publishes.publishes = [](void *, NodeNum) { return true; };
+
+    TEST_ASSERT_NOT_NULL(graph.getEdgesFrom(me));
+    TEST_ASSERT_NOT_NULL(graph.getEdgesFrom(a));
+    TEST_ASSERT_TRUE(graph.getNodeClass(b) == NodeClass::L2);
+    TEST_ASSERT_FALSE_MESSAGE(graph.canDeliver(me, a, publishes),
+                              "one-way RX is not a delivery hop into a publishing A");
+    TEST_ASSERT_TRUE(graph.canDeliver(b, a, publishes));
+    TEST_ASSERT_TRUE(graph.canDeliver(c, b, publishes));
+
+    graph.clearCache();
+    Route route = graph.calculateRoute(a, t0, publishes);
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(c, route.nextHop, "leave toward C, not A");
+    TEST_ASSERT_TRUE_MESSAGE(route.verified, "receiver-priced path C→B→A is verified");
+    TEST_ASSERT_EQUAL_UINT8(3, route.hops);
+    // ME→C at C's 1.0 of ME + C→B at B's 1.2 of C + B→A at A's 2.0 of B.
+    TEST_ASSERT_EQUAL_UINT16(100 + 120 + 200, route.costFixed);
+    TEST_ASSERT_TRUE(route.costFixed != static_cast<uint16_t>(150 * UNVERIFIED_HOP_COST_FACTOR));
+}
+
 // Costs are what the receiver of each hop measured: the relay hears us at ETX 3 and the
 // destination hears the relay at ETX 2, however good the relay's signal looks to us.
 static void test_route_cost_is_measured_at_the_receiver()
@@ -815,11 +891,12 @@ static void test_unverified_priced_hop_saturates_instead_of_wrapping()
 }
 
 // Feed one neighbour list so the sender is recorded as an SR publisher and the edge exists.
-static void ingestOneNeighbor(SignalRoutingModule &module, NodeNum from, NodeNum neighbor, bool hearsUs, uint32_t packetId)
+static void fillTopoPacket(meshtastic_MeshPacket &mp, meshtastic_SignalRoutingInfo &info, NodeNum from, NodeNum neighbor,
+                           bool hearsUs, uint32_t packetId, uint8_t hopStart, uint8_t hopLimit, uint8_t relayByte)
 {
     uint8_t packed[32] = {};
     size_t packedLen = buildPackedBuffer(packed, sizeof(packed), neighbor, -90, 5, false, hearsUs, 0);
-    meshtastic_SignalRoutingInfo info = meshtastic_SignalRoutingInfo_init_zero;
+    info = meshtastic_SignalRoutingInfo_init_zero;
     info.packed_neighbors.size = packedLen;
     memcpy(info.packed_neighbors.bytes, packed, packedLen);
 
@@ -827,17 +904,26 @@ static void ingestOneNeighbor(SignalRoutingModule &module, NodeNum from, NodeNum
     pb_ostream_t stream = pb_ostream_from_buffer(payload, sizeof(payload));
     TEST_ASSERT_TRUE(pb_encode(&stream, &meshtastic_SignalRoutingInfo_msg, &info));
 
-    meshtastic_MeshPacket mp = meshtastic_MeshPacket_init_zero;
+    mp = meshtastic_MeshPacket_init_zero;
     mp.from = from;
     mp.to = NODENUM_BROADCAST;
     mp.id = packetId;
-    mp.hop_start = 0;
-    mp.hop_limit = 0;
-    mp.relay_node = static_cast<uint8_t>(from & 0xFF);
+    mp.hop_start = hopStart;
+    mp.hop_limit = hopLimit;
+    mp.relay_node = relayByte;
+    mp.rx_rssi = -80;
+    mp.rx_snr = 6;
     mp.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
     mp.decoded.portnum = meshtastic_PortNum_SIGNAL_ROUTING_APP;
     mp.decoded.payload.size = stream.bytes_written;
     memcpy(mp.decoded.payload.bytes, payload, stream.bytes_written);
+}
+
+static void ingestOneNeighbor(SignalRoutingModule &module, NodeNum from, NodeNum neighbor, bool hearsUs, uint32_t packetId)
+{
+    meshtastic_MeshPacket mp = meshtastic_MeshPacket_init_zero;
+    meshtastic_SignalRoutingInfo info = meshtastic_SignalRoutingInfo_init_zero;
+    fillTopoPacket(mp, info, from, neighbor, hearsUs, packetId, 0, 0, static_cast<uint8_t>(from & 0xFF));
     module.preProcessSignalRoutingPacket(&mp);
 }
 
@@ -854,9 +940,14 @@ static void test_a_backup_does_not_relay_when_its_next_hop_cannot_hear_it()
 
     class GraphWriter : public SignalRoutingModule {
     public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
         void note(NodeNum from, NodeNum to, bool hearsUs) { updateGraphWithNeighbor(from, to, -90, 5, hearsUs); }
     };
     GraphWriter module;
+    // RF-heard L1s (Reported). Mirrored-only me→hop is not an L1 under the horizon gate, so
+    // topology from dest/previous would be refused or park hop as list-downstream.
+    module.hear(hop, -90, 5.0f);
+    module.hear(previous, -90, 5.0f);
     // Reachability before the published lists, or those lists are dropped.
     module.note(me, hop, false);
     module.note(hop, dest, true);
@@ -1364,7 +1455,7 @@ static void test_topology_does_not_park_a_heard_neighbour_as_downstream()
     TEST_ASSERT_EQUAL_UINT32(0, module.graph()->getDownstreamRelay(heard));
 }
 
-// A node we do not hear, listed with hearsUs, is recorded downstream of the topology sender.
+// A node we do not hear, listed with hearsUs, is recorded as list-downstream of the topology sender.
 // (Module ingest of a synthetic protobuf is covered elsewhere; this pins the write the merge uses.)
 static void test_topology_still_learns_downstream_for_nodes_we_do_not_hear()
 {
@@ -1376,10 +1467,14 @@ static void test_topology_still_learns_downstream_for_nodes_we_do_not_hear()
     NeighborGraph graph;
     const uint32_t now = millis() / 1000;
     graph.updateEdge(me, peer, 1.0f, now, Edge::Source::Reported);
-    // Same call the topology merge uses when !hasDirectConnection && hearsUs.
-    graph.updateDownstreamExclusive(remote, peer, 2.0f, now, /*evenIfRelayHasEdge=*/true);
+    // Same call the topology merge uses when !hasDirectConnection && hearsUs (past depth).
+    graph.updateDownstreamListed(remote, peer, 2.0f, now, /*evenIfRelayHasEdge=*/true);
     TEST_ASSERT_TRUE(graph.isDownstream(remote));
     TEST_ASSERT_EQUAL_UINT32(peer, graph.getDownstreamRelay(remote));
+    NodeNum listParent = 0;
+    uint16_t listCost = 0;
+    TEST_ASSERT_TRUE(graph.listDownstream(remote, listParent, listCost));
+    TEST_ASSERT_EQUAL_UINT32(peer, listParent);
 
     // Hearing them later must drop that row (same clear the merge runs on HAS direct).
     graph.clearDownstreamForDestination(remote);
@@ -2808,6 +2903,283 @@ static void test_routing_ack_retraces_local_link_but_hub_relays_remote()
     TEST_ASSERT_TRUE(bridge.shouldRelayUnicastForCoordination(&remoteAck));
 }
 
+// Hearer-priced L2→L1 keeps the publisher when the bootstrap L1→L2 listing expires.
+static void test_hearer_list_keeps_publisher_when_bootstrap_bridge_expires()
+{
+    constexpr NodeNum me = 0xAA0000AA;
+    constexpr NodeNum l1 = 0xBB0000BB;
+    constexpr NodeNum l2 = 0xCC0000CC;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+    const uint32_t t0 = 1000;
+    graph.updateEdge(me, l1, 1.0f, t0, Edge::Source::Reported);
+    graph.updateEdge(l1, l2, 2.0f, t0, Edge::Source::Mirrored);
+    TEST_ASSERT_TRUE(graph.ensurePublisher(l2, NodeClass::L2, l1, t0));
+    graph.updateEdge(l2, l1, 2.0f, t0, Edge::Source::Mirrored);
+    TEST_ASSERT_NOT_NULL(graph.getEdgesFrom(l2));
+
+    TEST_ASSERT_TRUE(graph.removeEdgeAndPrune(l1, l2, 2000));
+    TEST_ASSERT_NOT_NULL(graph.getEdgesFrom(l2));
+    TEST_ASSERT_NOT_NULL(edgeBetween(graph, l2, l1));
+    TEST_ASSERT_FALSE(graph.isDownstream(l2));
+}
+
+// Both bridges gone demotes the far publisher behind the L1 that bridged it.
+static void test_both_bridges_gone_demotes_far_publisher()
+{
+    constexpr NodeNum me = 0xAA0000AA;
+    constexpr NodeNum l1 = 0xBB0000BB;
+    constexpr NodeNum l2 = 0xCC0000CC;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+    // Use wall-clock seconds: getDownstreamRelay ages against millis()/1000.
+    const uint32_t t0 = millis() / 1000;
+    graph.updateEdge(me, l1, 1.0f, t0, Edge::Source::Reported);
+    graph.updateEdge(l1, l2, 2.0f, t0, Edge::Source::Mirrored);
+    graph.setEdgeHearsUs(l1, l2, true);
+    TEST_ASSERT_TRUE(graph.ensurePublisher(l2, NodeClass::L2, l1, t0));
+    TEST_ASSERT_EQUAL_UINT32(l1, graph.getEdgesFrom(l2)->parentHint);
+    graph.updateEdge(l2, l1, 2.0f, t0, Edge::Source::Mirrored);
+    TEST_ASSERT_EQUAL_UINT32(l1, graph.getEdgesFrom(l2)->parentHint);
+    TEST_ASSERT_TRUE(graph.removeEdge(l1, l2));
+    TEST_ASSERT_TRUE(graph.removeEdge(l2, l1));
+    // Demotion stamps lastUpdate with this clock; getDownstreamRelay ages against millis()/1000.
+    // A future stamp underflows the unsigned age check and looks instantly stale.
+    const uint32_t now = millis() / 1000;
+    TEST_ASSERT_TRUE(graph.pruneUnreachableFromRoot(now));
+    TEST_ASSERT_NULL(graph.getEdgesFrom(l2));
+    TEST_ASSERT_EQUAL_UINT32(l1, graph.getDownstreamRelay(l2));
+}
+
+// Orphan via L1 is an unverified gateway handoff (no Dijkstra to dest).
+static void test_orphan_via_l1_is_unverified_gateway_handoff()
+{
+    constexpr NodeNum me = 0xAA0000AA;
+    constexpr NodeNum gw = 0xBB0000BB;
+    constexpr NodeNum far = 0xCC0000CC;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+    const uint32_t now = millis() / 1000;
+    graph.updateEdge(me, gw, 1.0f, now, Edge::Source::Reported);
+    graph.setL1(gw);
+    graph.updateDownstream(far, gw, 2.0f, now);
+    TEST_ASSERT_NULL(graph.getEdgesFrom(far));
+    graph.clearCache();
+    Route route = graph.calculateRoute(far, now);
+    TEST_ASSERT_EQUAL_UINT32(gw, route.nextHop);
+    TEST_ASSERT_FALSE(route.verified);
+    TEST_ASSERT_TRUE(route.mode == RouteMode::OrphanGateway);
+}
+
+// An L2 publisher must not own a silent neighbour of ours (L1 fence).
+static void test_l2_publisher_does_not_own_a_local_silent_neighbour()
+{
+    constexpr NodeNum me = 0xAA0000AA;
+    constexpr NodeNum l1 = 0xBB0000BB;
+    constexpr NodeNum l2 = 0xCC0000CC;
+    constexpr NodeNum silent = 0xDD0000DD;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+    const uint32_t t0 = 1000;
+    graph.updateEdge(me, l1, 1.0f, t0, Edge::Source::Reported);
+    graph.updateEdge(me, silent, 3.0f, t0, Edge::Source::Reported);
+    graph.updateEdge(l1, l2, 1.5f, t0, Edge::Source::Mirrored);
+    graph.setEdgeHearsUs(l1, l2, true);
+    TEST_ASSERT_TRUE(graph.ensurePublisher(l2, NodeClass::L2, l1, t0));
+    graph.updateEdge(l2, silent, 1.0f, t0, Edge::Source::Mirrored);
+
+    NeighborGraph::CoveragePolicy policy;
+    policy.me = me;
+    policy.meRelays = true;
+    policy.poorLinkEtx = 7.0f;
+    policy.isSrActive = [](void *, NodeNum) { return true; };
+    TEST_ASSERT_EQUAL_UINT32(me, graph.coverageOwner(silent, policy));
+}
+
+// Relayed copy must not orphan-steal a list-downstream destination.
+static void test_relayed_copy_does_not_steal_list_downstream()
+{
+    constexpr NodeNum me = 0xAA0000AA;
+    constexpr NodeNum l1 = 0xBB0000BB;
+    constexpr NodeNum l3 = 0xDD0000DD;
+    constexpr NodeNum y = 0xEE0000EE;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+    const uint32_t now = millis() / 1000;
+    graph.updateEdge(me, l1, 1.0f, now, Edge::Source::Reported);
+    graph.setEdgeHearsUs(me, l1, true);
+    TEST_ASSERT_TRUE(graph.ensurePublisher(l3, NodeClass::L3, l1, now));
+    graph.updateDownstreamListed(y, l3, 2.0f, now, true);
+    NodeNum listParent = 0;
+    uint16_t listCost = 0;
+    TEST_ASSERT_TRUE(graph.listDownstream(y, listParent, listCost));
+    TEST_ASSERT_EQUAL_UINT32(l3, listParent);
+
+    // steal_ok is false when dest is list-parked behind a live ball parent.
+    const bool destInBall = graph.getEdgesFrom(y) != nullptr;
+    const bool listParked = graph.listDownstream(y, listParent, listCost);
+    const bool wasDirect = false;
+    const bool stealOk = wasDirect || (!destInBall && !listParked);
+    TEST_ASSERT_FALSE(stealOk);
+    TEST_ASSERT_EQUAL_UINT32(l3, graph.getDownstreamRelay(y));
+}
+
+// List-downstream behind a ball parent composes Dijkstra to M + hop cost, verified.
+static void test_list_downstream_route_is_verified_compose()
+{
+    constexpr NodeNum me = 0xAA0000AA;
+    constexpr NodeNum hub = 0xF60000F6;
+    constexpr NodeNum parent = 0x11000011;
+    constexpr NodeNum dest = 0x22000022;
+    const uint32_t now = millis() / 1000;
+    initGraphTestNodeDb(me);
+
+    NeighborGraph graph;
+    graph.updateEdge(me, hub, 1.2f, now, Edge::Source::Reported);
+    graph.updateEdge(hub, me, 1.2f, now, Edge::Source::Mirrored);
+    graph.updateEdge(hub, parent, 1.4f, now, Edge::Source::Mirrored);
+    graph.updateEdge(parent, hub, 1.4f, now, Edge::Source::Mirrored);
+    TEST_ASSERT_TRUE(graph.ensurePublisher(parent, NodeClass::L2, hub, now));
+    graph.updateDownstreamListed(dest, parent, 2.0f, now, true);
+    graph.clearCache();
+    Route route = graph.calculateRoute(dest, now);
+    TEST_ASSERT_EQUAL_UINT32(hub, route.nextHop);
+    TEST_ASSERT_TRUE(route.verified);
+    TEST_ASSERT_TRUE(route.mode == RouteMode::ListDownstream);
+    Route miss = graph.getCachedRoute(0x99000099, now);
+    TEST_ASSERT_EQUAL_UINT32(0, miss.nextHop);
+    TEST_ASSERT_FALSE(miss.verified);
+}
+
+static void test_sender_horizon_ok_requires_anchor()
+{
+    constexpr NodeNum me = 0xAA0000AA;
+    constexpr NodeNum l1 = 0xBB0000BB;
+    constexpr NodeNum far = 0xFF0000FF;
+    constexpr NodeNum y = 0xEE0000EE;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+    const uint32_t now = millis() / 1000;
+    graph.updateEdge(me, l1, 1.0f, now, Edge::Source::Reported);
+    graph.setL1(l1);
+    NodeNum listedFar[] = {y};
+    TEST_ASSERT_FALSE(graph.senderHorizonOk(far, false, false, listedFar, 1));
+    NodeNum listedL1[] = {l1};
+    TEST_ASSERT_TRUE(graph.senderHorizonOk(far, false, false, listedL1, 1));
+    TEST_ASSERT_TRUE(graph.senderHorizonOk(far, false, true, listedFar, 1));
+}
+
+static void test_unqualified_far_topology_does_not_steal_list_downstream()
+{
+    constexpr NodeNum me = 0xAA0000AA;
+    constexpr NodeNum l1 = 0xBB0000BB;
+    constexpr NodeNum l3 = 0xDD0000DD;
+    constexpr NodeNum y = 0xEE0000EE;
+    constexpr NodeNum far = 0xF10000F1;
+    initGraphTestNodeDb(me);
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+
+    class GraphWriter : public SignalRoutingModule {
+    public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+        NeighborGraph *g() { return routingGraph; }
+        void ingestBoth(const meshtastic_MeshPacket &mp, meshtastic_SignalRoutingInfo *info)
+        {
+            preProcessSignalRoutingPacket(&mp);
+            handleReceivedProtobuf(mp, info);
+        }
+    };
+    GraphWriter module;
+    module.hear(l1, -70, 8.0f);
+    TEST_ASSERT_TRUE(module.g()->ensurePublisher(l3, NodeClass::L3, l1, millis() / 1000));
+    module.g()->updateDownstreamListed(y, l3, 2.0f, millis() / 1000, true);
+    TEST_ASSERT_EQUAL_UINT32(l3, module.g()->getDownstreamRelay(y));
+
+    meshtastic_MeshPacket mp = meshtastic_MeshPacket_init_zero;
+    meshtastic_SignalRoutingInfo info = meshtastic_SignalRoutingInfo_init_zero;
+    fillTopoPacket(mp, info, far, y, true, 0x51, 3, 2, static_cast<uint8_t>(l1 & 0xFF));
+    module.ingestBoth(mp, &info);
+
+    TEST_ASSERT_EQUAL_UINT32(l3, module.g()->getDownstreamRelay(y));
+    TEST_ASSERT_NULL(module.g()->getEdgesFrom(far));
+    TEST_ASSERT_NULL(module.g()->getEdgesFrom(y));
+}
+
+static void test_relayed_observe_does_not_steal_ball_dest()
+{
+    constexpr NodeNum me = 0xAA0000AA;
+    constexpr NodeNum l1 = 0xBB0000BB;
+    constexpr NodeNum dest = 0xCC0000CC;
+    initGraphTestNodeDb(me);
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+
+    class GraphWriter : public SignalRoutingModule {
+    public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+        NeighborGraph *g() { return routingGraph; }
+        ProcessMessage rx(const meshtastic_MeshPacket &mp) { return handleReceived(mp); }
+        void note(NodeNum from, NodeNum to, bool hearsUs) { updateGraphWithNeighbor(from, to, -90, 5, hearsUs); }
+    };
+    GraphWriter module;
+    module.hear(l1, -70, 8.0f);
+    module.g()->setEdgeHearsUs(me, l1, true);
+    TEST_ASSERT_TRUE(module.g()->ensurePublisher(dest, NodeClass::L2, l1, millis() / 1000));
+    module.note(dest, l1, true);
+    ingestOneNeighbor(module, dest, l1, true, 0x61);
+
+    meshtastic_MeshPacket mp = meshtastic_MeshPacket_init_zero;
+    mp.from = dest;
+    mp.to = NODENUM_BROADCAST;
+    mp.id = 0x62;
+    mp.hop_start = 3;
+    mp.hop_limit = 2;
+    mp.relay_node = static_cast<uint8_t>(l1 & 0xFF);
+    mp.rx_rssi = -80;
+    mp.rx_snr = 6;
+    mp.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    mp.decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+    module.rx(mp);
+
+    TEST_ASSERT_NOT_NULL(module.g()->getEdgesFrom(dest));
+    TEST_ASSERT_NOT_EQUAL(l1, module.g()->getDownstreamRelay(dest));
+}
+
+static void test_topology_pack_prefers_hears_us_and_sr_over_better_etx()
+{
+    constexpr NodeNum me = 0xAA0000AA;
+    constexpr NodeNum strongMute = 0xB1000001;
+    constexpr NodeNum midHears = 0xB2000002;
+    constexpr NodeNum weakSr = 0xB3000003;
+    initGraphTestNodeDb(me);
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+
+    class GraphWriter : public SignalRoutingModule {
+    public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+        NeighborGraph *g() { return routingGraph; }
+        uint8_t pack(uint8_t *buf, size_t n) { return packNeighborsForBroadcast(buf, n); }
+    };
+    GraphWriter module;
+    module.hear(strongMute, -50, 12.0f);
+    module.hear(midHears, -70, 8.0f);
+    module.hear(weakSr, -90, 2.0f);
+    module.g()->setEdgeHearsUs(me, midHears, true);
+    module.g()->setEdgeHearsUs(me, weakSr, true);
+    ingestOneNeighbor(module, weakSr, me, true, 0x71);
+
+    uint8_t buf[PACKED_NEIGHBOR_HEADER_SIZE + 8 * PACKED_NEIGHBOR_ENTRY_SIZE] = {};
+    uint8_t n = module.pack(buf, sizeof(buf));
+    TEST_ASSERT_EQUAL_UINT8(3, n);
+    writePackedTopologyHeader(buf, 1, true);
+    PackedNeighborEntry out[8] = {};
+    PackedHeader header = {};
+    uint8_t count = decodePackedNeighbors(buf, PACKED_NEIGHBOR_HEADER_SIZE + n * PACKED_NEIGHBOR_ENTRY_SIZE, out, 8, &header);
+    TEST_ASSERT_EQUAL_UINT8(3, count);
+    TEST_ASSERT_EQUAL_UINT32(weakSr, out[0].nodeId);
+    TEST_ASSERT_EQUAL_UINT32(midHears, out[1].nodeId);
+    TEST_ASSERT_EQUAL_UINT32(strongMute, out[2].nodeId);
+}
+
 // Czar and Z00b share 0x8c: both full IDs stay cached; without RX metrics we do not pick one.
 static void test_shared_relay_byte_keeps_both_identities_ambiguous_without_rssi()
 {
@@ -2844,6 +3216,7 @@ void setup()
     RUN_TEST(test_refresh_reported_direct_neighbor_updates_cache_and_variance);
     RUN_TEST(test_a_single_rf_observation_survives_aging);
     RUN_TEST(test_age_edges_keeps_a_heard_neighbour_with_no_published_list);
+    RUN_TEST(test_age_edges_keeps_empty_l3_publisher_until_admission_ttl);
     RUN_TEST(test_an_improvement_larger_than_the_bar_is_significant);
     RUN_TEST(test_a_degradation_larger_than_the_bar_is_significant);
     RUN_TEST(test_a_change_just_above_half_is_significant_on_a_quiet_edge);
@@ -2856,6 +3229,7 @@ void setup()
     RUN_TEST(test_self_coverage_is_who_hears_the_relay);
     RUN_TEST(test_a_candidates_coverage_is_who_listed_it);
     RUN_TEST(test_route_never_uses_a_one_way_edge);
+    RUN_TEST(test_asymmetric_l1_routes_via_l2_hearer_not_our_rx);
     RUN_TEST(test_route_cost_is_measured_at_the_receiver);
     RUN_TEST(test_variance_outranks_a_slightly_better_mean);
     RUN_TEST(test_silence_variance_follows_age_bands);
@@ -2940,6 +3314,16 @@ void setup()
     RUN_TEST(test_alternate_next_hop_requires_a_distinct_byte);
     RUN_TEST(test_routing_ack_retraces_local_link_but_hub_relays_remote);
     RUN_TEST(test_shared_relay_byte_keeps_both_identities_ambiguous_without_rssi);
+    RUN_TEST(test_hearer_list_keeps_publisher_when_bootstrap_bridge_expires);
+    RUN_TEST(test_both_bridges_gone_demotes_far_publisher);
+    RUN_TEST(test_orphan_via_l1_is_unverified_gateway_handoff);
+    RUN_TEST(test_l2_publisher_does_not_own_a_local_silent_neighbour);
+    RUN_TEST(test_relayed_copy_does_not_steal_list_downstream);
+    RUN_TEST(test_list_downstream_route_is_verified_compose);
+    RUN_TEST(test_sender_horizon_ok_requires_anchor);
+    RUN_TEST(test_unqualified_far_topology_does_not_steal_list_downstream);
+    RUN_TEST(test_relayed_observe_does_not_steal_ball_dest);
+    RUN_TEST(test_topology_pack_prefers_hears_us_and_sr_over_better_etx);
 
     UNITY_END();
 }

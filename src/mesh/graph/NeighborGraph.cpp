@@ -109,6 +109,395 @@ const NodeEdges *NeighborGraph::findNeighbor(NodeNum nodeId) const
     return nullptr;
 }
 
+bool NeighborGraph::classWithinDepth(NodeClass c) const
+{
+    return c != NodeClass::Unknown && nodeClassDepth(c) <= GRAPH_MAX_DEPTH;
+}
+
+bool NeighborGraph::hasDirectReportedEdgeTo(NodeNum from, NodeNum to) const
+{
+    const NodeEdges *node = findNeighbor(from);
+    if (!node) {
+        return false;
+    }
+    const Edge *e = findEdge(node, to);
+    return e && e->source == Edge::Source::Reported;
+}
+
+bool NeighborGraph::reachableViaNeighbor(NodeNum nodeId) const
+{
+    for (uint8_t i = 0; i < neighborCount; i++) {
+        for (uint8_t e = 0; e < neighbors[i].edgeCount; e++) {
+            if (neighbors[i].edges[e].to == nodeId) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+NodeClass NeighborGraph::getNodeClass(NodeNum nodeId) const
+{
+    const NodeEdges *n = findNeighbor(nodeId);
+    return n ? n->nodeClass : NodeClass::Unknown;
+}
+
+void NeighborGraph::setNodeClass(NodeNum nodeId, NodeClass nodeClass, NodeNum parentHint)
+{
+    NodeEdges *node = findNeighbor(nodeId);
+    if (!node) {
+        return;
+    }
+    // Never demote an L1 to a deeper class while it still holds the slot.
+    if (node->nodeClass == NodeClass::L1 && nodeClass != NodeClass::L1) {
+        if (parentHint != 0) {
+            node->parentHint = parentHint;
+        }
+        return;
+    }
+    node->nodeClass = nodeClass;
+    if (parentHint != 0) {
+        node->parentHint = parentHint;
+    }
+}
+
+void NeighborGraph::setL1(NodeNum nodeId)
+{
+    NodeEdges *node = findNeighbor(nodeId);
+    if (!node) {
+        return;
+    }
+    node->nodeClass = NodeClass::L1;
+    node->parentHint = 0;
+}
+
+NodeClass NeighborGraph::classifyCandidate(NodeNum nodeId) const
+{
+    NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
+    if (nodeId == myNode) {
+        return NodeClass::L1;
+    }
+    if (hasDirectReportedEdgeTo(myNode, nodeId)) {
+        return NodeClass::L1;
+    }
+    const NodeEdges *me = findNeighbor(myNode);
+    if (me) {
+        for (uint8_t i = 0; i < me->edgeCount; i++) {
+            NodeNum l1 = me->edges[i].to;
+            if (l1 == 0 || me->edges[i].source != Edge::Source::Reported) {
+                continue;
+            }
+            const NodeEdges *l1Node = findNeighbor(l1);
+            if (l1Node) {
+                const Edge *e = findEdge(l1Node, nodeId);
+                if (e && e->hearsUs) {
+                    return NodeClass::L2;
+                }
+            }
+            const NodeEdges *cand = findNeighbor(nodeId);
+            if (cand && findEdge(cand, l1)) {
+                return NodeClass::L2;
+            }
+        }
+    }
+#if GRAPH_MAX_DEPTH >= 3
+    for (uint8_t i = 0; i < neighborCount; i++) {
+        if (neighbors[i].nodeClass != NodeClass::L2) {
+            continue;
+        }
+        if (findEdge(&neighbors[i], nodeId) && findEdge(&neighbors[i], nodeId)->hearsUs) {
+            return NodeClass::L3;
+        }
+        const NodeEdges *cand = findNeighbor(nodeId);
+        if (cand && findEdge(cand, neighbors[i].nodeId)) {
+            return NodeClass::L3;
+        }
+    }
+#endif
+    return NodeClass::Unknown;
+}
+
+NodeClass NeighborGraph::bootstrapClassFromReachability(NodeNum nodeId) const
+{
+    NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
+    const NodeEdges *me = findNeighbor(myNode);
+    if (me) {
+        for (uint8_t i = 0; i < me->edgeCount; i++) {
+            NodeNum l1 = me->edges[i].to;
+            if (l1 == 0 || me->edges[i].source != Edge::Source::Reported) {
+                continue;
+            }
+            const NodeEdges *l1Node = findNeighbor(l1);
+            if (l1Node && findEdge(l1Node, nodeId)) {
+                return NodeClass::L2;
+            }
+        }
+    }
+#if GRAPH_MAX_DEPTH >= 3
+    for (uint8_t i = 0; i < neighborCount; i++) {
+        if (neighbors[i].nodeClass == NodeClass::L2 && findEdge(&neighbors[i], nodeId)) {
+            return NodeClass::L3;
+        }
+    }
+#endif
+    return NodeClass::Unknown;
+}
+
+int8_t NeighborGraph::selectEvictionVictim(bool protectL1) const
+{
+    NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
+    int8_t best = -1;
+    uint8_t bestRank = 0;
+    uint8_t bestEdges = 0;
+    uint32_t bestAge = 0;
+    for (uint8_t i = 0; i < neighborCount; i++) {
+        const NodeEdges &node = neighbors[i];
+        if (node.nodeId == myNode) {
+            continue;
+        }
+        if (protectL1 && node.nodeClass == NodeClass::L1) {
+            continue;
+        }
+        uint8_t rank = nodeClassEvictionRank(node.nodeClass);
+        if (protectL1 && rank == 0) {
+            continue;
+        }
+        bool better = best < 0 || rank > bestRank ||
+                      (rank == bestRank && (node.edgeCount < bestEdges ||
+                                            (node.edgeCount == bestEdges && node.lastFullUpdate < bestAge)));
+        if (better) {
+            best = static_cast<int8_t>(i);
+            bestRank = rank;
+            bestEdges = node.edgeCount;
+            bestAge = node.lastFullUpdate;
+        }
+    }
+    return best;
+}
+
+bool NeighborGraph::pickL1Parent(NodeNum victim, NodeNum &parentOut, uint16_t &costOut) const
+{
+    NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
+    const NodeEdges *victimNode = findNeighbor(victim);
+    NodeNum hint = victimNode ? victimNode->parentHint : 0;
+    // Prefer the admission parent when it is still a direct neighbour we hold.
+    if (hint != 0 && isOurDirectNeighbor(hint)) {
+        parentOut = hint;
+        costOut = 200;
+        const NodeEdges *me = findNeighbor(myNode);
+        if (me) {
+            const Edge *e = findEdge(me, hint);
+            if (e) {
+                costOut = e->etxFixed;
+            }
+        }
+        return true;
+    }
+    const NodeEdges *me = findNeighbor(myNode);
+    if (!me) {
+        return false;
+    }
+    bool have = false;
+    uint16_t bestCost = 0xFFFF;
+    NodeNum bestParent = 0;
+    for (uint8_t i = 0; i < me->edgeCount; i++) {
+        NodeNum l1 = me->edges[i].to;
+        if (l1 == 0 || me->edges[i].source != Edge::Source::Reported) {
+            continue;
+        }
+        bool listsV = findNeighbor(l1) && findEdge(findNeighbor(l1), victim);
+        bool vLists = victimNode && findEdge(victimNode, l1) && findEdge(victimNode, l1)->hearsUs;
+        if (!listsV && !vLists && hint != l1) {
+            continue;
+        }
+        uint16_t cost = me->edges[i].etxFixed;
+        if (!have || cost < bestCost) {
+            have = true;
+            bestCost = cost;
+            bestParent = l1;
+        }
+    }
+    if (!have) {
+        return false;
+    }
+    parentOut = bestParent;
+    costOut = bestCost;
+    return true;
+}
+
+void NeighborGraph::applyDemotion(NodeNum victim, NodeNum parent, uint16_t costFixed, uint32_t nowSecs)
+{
+    bool listedHears = false;
+    const NodeEdges *parentNode = findNeighbor(parent);
+    if (parentNode) {
+        const Edge *e = findEdge(parentNode, victim);
+        listedHears = e && e->hearsUs;
+    }
+    // Capacity demotion always parks (relay_has_direct_edge=false in MeshRustic).
+    upsertDownstream(victim, parent, costFixed, nowSecs, listedHears);
+    transferDownstream(victim, parent);
+}
+
+void NeighborGraph::removeNodeAt(uint8_t idx)
+{
+    if (idx >= neighborCount) {
+        return;
+    }
+    NodeNum removed = neighbors[idx].nodeId;
+    // Drop edges pointing TO the removed node from remaining nodes.
+    for (uint8_t m = 0; m < neighborCount; m++) {
+        if (m == idx) {
+            continue;
+        }
+        for (uint8_t e = 0; e < neighbors[m].edgeCount;) {
+            if (neighbors[m].edges[e].to == removed) {
+                if (e < neighbors[m].edgeCount - 1) {
+                    neighbors[m].edges[e] = neighbors[m].edges[neighbors[m].edgeCount - 1];
+                }
+                neighbors[m].edgeCount--;
+            } else {
+                e++;
+            }
+        }
+    }
+    if (idx < neighborCount - 1) {
+        neighbors[idx] = neighbors[neighborCount - 1];
+    }
+    neighborCount--;
+}
+
+bool NeighborGraph::evictForCapacity(uint32_t nowSecs, bool demoteToDownstream)
+{
+    NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
+    int8_t idx = selectEvictionVictim(true);
+    if (idx < 0) {
+        // Fallback: oldest non-L0/L1 with the legacy 120 s quiet gate.
+        uint32_t oldest = UINT32_MAX;
+        idx = -1;
+        for (uint8_t i = 0; i < neighborCount; i++) {
+            if (neighbors[i].nodeId == myNode || neighbors[i].nodeClass == NodeClass::L1) {
+                continue;
+            }
+            if (nowSecs - neighbors[i].lastFullUpdate < 120) {
+                continue;
+            }
+            if (neighbors[i].lastFullUpdate < oldest) {
+                oldest = neighbors[i].lastFullUpdate;
+                idx = static_cast<int8_t>(i);
+            }
+        }
+    }
+    if (idx < 0) {
+        return false;
+    }
+    NodeNum victim = neighbors[static_cast<uint8_t>(idx)].nodeId;
+    NodeNum parent = 0;
+    uint16_t costFixed = 0;
+    bool haveParent = pickL1Parent(victim, parent, costFixed);
+    if (demoteToDownstream) {
+        if (!haveParent) {
+            // Plan §8.2: refuse rather than invent a parent when demotion was requested.
+            return false;
+        }
+        applyDemotion(victim, parent, costFixed, nowSecs);
+    } else if (haveParent) {
+        // Soft create path: clear relay rows for the victim (legacy behaviour).
+        clearDownstreamForRelay(victim);
+    }
+    removeNodeAt(static_cast<uint8_t>(idx));
+    return true;
+}
+
+bool NeighborGraph::ensurePublisher(NodeNum nodeId, NodeClass nodeClass, NodeNum parentHint, uint32_t nowSecs)
+{
+    NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
+    if (nodeId == 0 || nodeId == myNode) {
+        return true;
+    }
+    if (!classWithinDepth(nodeClass)) {
+        return false;
+    }
+    if (NodeEdges *existing = findNeighbor(nodeId)) {
+        setNodeClass(nodeId, nodeClass, parentHint);
+        // Re-admission from a parent's list must refresh activity: L2/L3 slots often have no
+        // outbound edges of their own (measurements live on the parent), so ageEdges only has
+        // lastFullUpdate to decide whether they still belong in the ball.
+        existing->lastFullUpdate = nowSecs;
+        return true;
+    }
+    if (neighborCount >= NEIGHBOR_GRAPH_MAX_NEIGHBORS) {
+        if (!evictForCapacity(nowSecs, true)) {
+            return false;
+        }
+    }
+    if (neighborCount >= NEIGHBOR_GRAPH_MAX_NEIGHBORS) {
+        return false;
+    }
+    NodeEdges *node = &neighbors[neighborCount++];
+    node->nodeId = nodeId;
+    node->edgeCount = 0;
+    node->lastFullUpdate = nowSecs;
+    node->nodeClass = nodeClass;
+    node->parentHint = parentHint;
+    return true;
+}
+
+bool NeighborGraph::tryAdmitListedPublisher(NodeNum sender, NodeNum listed, bool senderIsDirect, uint32_t nowSecs)
+{
+    NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
+    if (listed == 0 || listed == myNode) {
+        return false;
+    }
+    if (hasDirectReportedEdgeTo(myNode, listed)) {
+        return true;
+    }
+    NodeClass cls;
+    NodeNum parent;
+    if (senderIsDirect) {
+        cls = NodeClass::L2;
+        parent = sender;
+    } else if (getNodeClass(sender) == NodeClass::L2 && GRAPH_MAX_DEPTH >= 3) {
+        cls = NodeClass::L3;
+        parent = sender;
+    } else {
+        return false;
+    }
+    if (!classWithinDepth(cls)) {
+        return false;
+    }
+    return ensurePublisher(listed, cls, parent, nowSecs);
+}
+
+bool NeighborGraph::senderHorizonOk(NodeNum sender, bool senderIsDirect, bool heardDirectFromSender,
+                                    const NodeNum *listedIds, uint8_t listedCount) const
+{
+    if (senderIsDirect || heardDirectFromSender) {
+        return true;
+    }
+    if (findNeighbor(sender) || reachableViaNeighbor(sender)) {
+        return true;
+    }
+    NodeClass cls = getNodeClass(sender);
+    if (cls == NodeClass::L2 || cls == NodeClass::L3) {
+        return true;
+    }
+    NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
+    for (uint8_t i = 0; i < listedCount; i++) {
+        NodeNum nid = listedIds ? listedIds[i] : 0;
+        if (nid == 0) {
+            continue;
+        }
+        if (hasDirectReportedEdgeTo(myNode, nid)) {
+            return true;
+        }
+        NodeClass listedClass = getNodeClass(nid);
+        if (listedClass == NodeClass::L1 || listedClass == NodeClass::L2) {
+            return true;
+        }
+    }
+    return false;
+}
+
 NodeEdges *NeighborGraph::findOrCreateNeighbor(NodeNum nodeId)
 {
     NodeEdges *node = findNeighbor(nodeId);
@@ -116,56 +505,25 @@ NodeEdges *NeighborGraph::findOrCreateNeighbor(NodeNum nodeId)
         return node;
     }
 
-    if (neighborCount < NEIGHBOR_GRAPH_MAX_NEIGHBORS) {
-        node = &neighbors[neighborCount++];
-        node->nodeId = nodeId;
-        node->edgeCount = 0;
-        node->lastFullUpdate = 0;
-        return node;
-    }
-
-    // Full - evict oldest non-self neighbor
-    uint32_t currentTime = millis() / 1000;
     NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
-    uint32_t oldestTime = UINT32_MAX;
-    uint8_t evictIdx = 0;
-    uint8_t minEdges = 255;
+    uint32_t currentTime = millis() / 1000;
 
-    for (uint8_t i = 0; i < neighborCount; i++) {
-        if (neighbors[i].nodeId == myNode)
-            continue;
-        if (currentTime - neighbors[i].lastFullUpdate < 120)
-            continue;
-
-        if (neighbors[i].lastFullUpdate < oldestTime ||
-            (neighbors[i].lastFullUpdate == oldestTime && neighbors[i].edgeCount < minEdges)) {
-            oldestTime = neighbors[i].lastFullUpdate;
-            minEdges = neighbors[i].edgeCount;
-            evictIdx = i;
+    if (neighborCount >= NEIGHBOR_GRAPH_MAX_NEIGHBORS) {
+        // Soft create: demote if possible, else legacy quiet eviction without inventing a parent.
+        if (!evictForCapacity(currentTime, true) && !evictForCapacity(currentTime, false)) {
+            return nullptr;
         }
     }
-
-    if (oldestTime == UINT32_MAX) {
+    if (neighborCount >= NEIGHBOR_GRAPH_MAX_NEIGHBORS) {
         return nullptr;
     }
 
-    // Also remove downstream entries that reference the evicted node as relay
-    NodeNum evictedNode = neighbors[evictIdx].nodeId;
-    for (uint16_t i = 0; i < downstreamCount;) {
-        if (downstream[i].relay == evictedNode) {
-            if (i < downstreamCount - 1) {
-                downstream[i] = downstream[downstreamCount - 1];
-            }
-            downstreamCount--;
-        } else {
-            i++;
-        }
-    }
-
-    node = &neighbors[evictIdx];
+    node = &neighbors[neighborCount++];
     node->nodeId = nodeId;
     node->edgeCount = 0;
     node->lastFullUpdate = 0;
+    node->nodeClass = (nodeId == myNode) ? NodeClass::L1 : NodeClass::Unknown;
+    node->parentHint = 0;
     return node;
 }
 
@@ -213,33 +571,27 @@ int NeighborGraph::updateEdge(NodeNum from, NodeNum to, float etx, uint32_t time
                               Edge::Source source, bool updateTimestamp)
 {
     NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
+    if (to == 0 || from == 0) {
+        return EDGE_NO_CHANGE;
+    }
 
-    // Only store edges for our node and our direct neighbors
-    // If 'from' is our node, always accept (slot 0 effectively)
-    // If 'from' is already in neighbors[], update that neighbor's edge list
-    // If 'from' is NOT in neighbors[]: only create a slot if 'from' is our direct neighbor
-    //   or if we're adding an edge FROM our node
+    // Only store edges for our node and publishers within the horizon depth.
     bool isOurNode = (from == myNode);
     NodeEdges *existing = findNeighbor(from);
 
     if (!existing && !isOurNode) {
-        // Check if 'from' is one of our direct neighbors (has an edge from us)
-        if (!isOurDirectNeighbor(from)) {
-            // Also allow if 'from' appears as a destination in an existing neighbor's edge list
-            // (i.e., reachable one hop through a known direct neighbor — an SR gateway node).
-            // This lets us store topology data from SR nodes behind our direct neighbors so
-            // Dijkstra can route through them rather than falling back to broadcast-style relay.
-            bool reachableViaNeighbor = false;
-            for (uint8_t i = 0; i < neighborCount && !reachableViaNeighbor; i++) {
-                for (uint8_t e = 0; e < neighbors[i].edgeCount; e++) {
-                    if (neighbors[i].edges[e].to == from) {
-                        reachableViaNeighbor = true;
-                        break;
-                    }
-                }
+        if (Edge::isPlaceholderId(from)) {
+            // Placeholders may create a slot.
+        } else if (!isOurDirectNeighbor(from) && !reachableViaNeighbor(from)) {
+            return EDGE_NO_CHANGE; // Remote node, not reachable via our graph - ignore
+        } else {
+            // Horizon gate: only admit publishers within GRAPH_MAX_DEPTH.
+            NodeClass cls = classifyCandidate(from);
+            if (cls == NodeClass::Unknown) {
+                cls = bootstrapClassFromReachability(from);
             }
-            if (!reachableViaNeighbor) {
-                return EDGE_NO_CHANGE; // Remote node, not reachable via our graph - ignore
+            if (!classWithinDepth(cls) || cls == NodeClass::Unknown) {
+                return EDGE_NO_CHANGE;
             }
         }
     }
@@ -261,6 +613,18 @@ int NeighborGraph::updateEdge(NodeNum from, NodeNum to, float etx, uint32_t time
         NodeEdges *dest = findOrCreateNeighbor(to);
         if (dest && updateTimestamp) {
             dest->lastFullUpdate = timestamp;
+        }
+        if (source == Edge::Source::Reported) {
+            setL1(to);
+        }
+    } else {
+        NodeClass cls = classifyCandidate(from);
+        if (cls == NodeClass::Unknown) {
+            cls = bootstrapClassFromReachability(from);
+        }
+        if (cls != NodeClass::Unknown) {
+            NodeNum parent = node->parentHint;
+            setNodeClass(from, cls, parent);
         }
     }
 
@@ -439,14 +803,23 @@ void NeighborGraph::ageEdges(uint32_t currentTimeSecs, uint32_t ttlSecs)
         // A neighbour we still measure (Reported us→them) is not leftover junk even if they
         // have published no outbound edges — mute nodes never fill those slots. Evicting
         // edgeCount==0 deleted our own heard list every maintenance pass.
+        //
+        // Horizon L2/L3 publishers are the same shape: admission puts them in the ball while
+        // their measurements live on the parent (parent→child Mirrored). Dropping every empty
+        // unheard slot on the next maintenance tick collapsed the L3 ball within ~1 min of each
+        // hub topology dump (angl 2026-10-07). Keep classed ball members until lastFullUpdate
+        // expires; only Unknown soft-creates are purged immediately when empty.
         bool weHearThem = false;
         if (const NodeEdges *self = findNeighbor(myNode)) {
             if (const Edge *mine = findEdge(self, node->nodeId)) {
                 weHearThem = (mine->source == Edge::Source::Reported);
             }
         }
+        const bool classedBall = classWithinDepth(node->nodeClass);
+        const bool stale = (currentTimeSecs - node->lastFullUpdate > ttlSecs);
+        const bool emptyUnknown = (node->edgeCount == 0 && !weHearThem && !classedBall);
 
-        if (currentTimeSecs - node->lastFullUpdate > ttlSecs || (node->edgeCount == 0 && !weHearThem)) {
+        if (stale || emptyUnknown) {
             // Remove downstream entries that reference this neighbor as relay
             NodeNum removedNode = node->nodeId;
             for (uint16_t i = 0; i < downstreamCount;) {
@@ -522,6 +895,9 @@ void NeighborGraph::ageEdges(uint32_t currentTimeSecs, uint32_t ttlSecs)
 
     if (edgesRemoved) {
         routeCacheCount = 0;
+        if (pruneUnreachableFromRoot(currentTimeSecs)) {
+            routeCacheCount = 0;
+        }
     }
 }
 
@@ -559,9 +935,12 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, c
     result.nextHop = 0;
     result.costFixed = 0xFFFF;
     result.timestamp = currentTime;
+    result.verified = false;
+    result.mode = RouteMode::Ball;
+    result.hops = 0;
 
     NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
-    if (myNode == 0) {
+    if (myNode == 0 || destination == 0 || destination == myNode) {
         return result;
     }
 
@@ -579,7 +958,8 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, c
     DNode nodes[MAX_DIJKSTRA];
     uint8_t nodeCount = 0;
 
-    auto search = [&](bool allowUnverified, uint16_t &costOut, NodeNum &nextHopOut, uint8_t &hopsOut) -> bool {
+    auto search = [&](NodeNum searchDest, bool allowUnverified, uint16_t &costOut, NodeNum &nextHopOut,
+                      uint8_t &hopsOut) -> bool {
         nodeCount = 0;
         auto findOrAdd = [&](NodeNum id) -> int8_t {
             for (uint8_t i = 0; i < nodeCount; i++) {
@@ -605,7 +985,7 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, c
             }
         };
 
-        int8_t dstIdx = findOrAdd(destination);
+        int8_t dstIdx = findOrAdd(searchDest);
         if (dstIdx < 0) return false;
         nodes[dstIdx].cost = 0;
 
@@ -624,8 +1004,8 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, c
             nodes[uIdx].visited = true;
             if (n == myNode) break;
 
-            // Every settled node other than the destination would relay on this path.
-            if (n != destination) {
+            // Every settled node other than the search destination would relay on this path.
+            if (n != searchDest) {
                 if (policy.isExcluded(n)) continue;
                 if (policy.routable && !policy.routable(policy.ctx, n)) continue;
             }
@@ -681,7 +1061,7 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, c
                 nextHopOut = nodes[i].prev;
                 NodeNum cur = nodes[i].prev;
                 uint8_t hops = 1;
-                while (cur != destination && cur != 0 && hops < MAX_DIJKSTRA) {
+                while (cur != searchDest && cur != 0 && hops < MAX_DIJKSTRA) {
                     NodeNum next = 0;
                     for (uint8_t j = 0; j < nodeCount; j++) {
                         if (nodes[j].id == cur) {
@@ -699,22 +1079,103 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, c
         return false;
     };
 
-    {
+    const bool destInBall = findNeighbor(destination) != nullptr;
+    NodeNum listParent = 0;
+    uint16_t listHopCost = 0;
+    const bool hasListDs = listDownstream(destination, listParent, listHopCost);
+    NodeNum dsRelay = 0;
+    uint16_t dsCost = 0;
+    const bool hasDs = downstreamRelayAndCost(destination, dsRelay, dsCost);
+    NodeNum parkParent = hasListDs ? listParent : (hasDs ? dsRelay : 0);
+    const bool skipDijkstraToDest = parkParent != 0 && findNeighbor(parkParent) != nullptr;
+
+    // Mode 1: destination is a ball publisher — or a leaf we can still price on ball edges when
+    // it is not parked behind a ball parent (list-downstream and orphans skip Dijkstra to dest).
+    if (destInBall || !skipDijkstraToDest) {
         uint16_t cost;
         NodeNum nextHop;
         uint8_t hops;
-        if (search(false, cost, nextHop, hops)) {
+        if (search(destination, false, cost, nextHop, hops)) {
             result.costFixed = cost;
             result.nextHop = nextHop;
             result.hops = hops;
+            result.verified = true;
+            result.mode = RouteMode::Ball;
         }
     }
 
-    // Fallback: walk dest along downstream until a neighbour we hear.
+    if (result.nextHop != 0) {
+        if (useCache) {
+            if (routeCacheCount < NEIGHBOR_GRAPH_MAX_CACHED_ROUTES) {
+                routeCache[routeCacheCount++] = result;
+            } else {
+                routeCache[0] = result;
+            }
+        }
+        return result;
+    }
+
+    // Mode 2: list-downstream of ball node M — Dijkstra to M, add M→Y cost.
+    auto composeViaParent = [&](NodeNum parent, uint16_t hopCost, bool verified) -> bool {
+        if (!findNeighbor(parent)) {
+            return false;
+        }
+        uint16_t costToM = 0xFFFF;
+        NodeNum nextHop = 0;
+        uint8_t hops = 0;
+        if (!search(parent, false, costToM, nextHop, hops)) {
+            return false;
+        }
+        if (nextHop == 0 || costToM >= 0xFFF0) {
+            return false;
+        }
+        result.nextHop = nextHop;
+        result.costFixed = static_cast<uint16_t>(std::min(uint32_t{0xFFFF}, (uint32_t)costToM + hopCost));
+        result.hops = static_cast<uint8_t>(std::min(255u, (unsigned)hops + 1));
+        result.verified = verified;
+        result.mode = RouteMode::ListDownstream;
+        return true;
+    };
+
+    if (hasListDs) {
+        if (composeViaParent(listParent, listHopCost, true)) {
+            if (useCache) {
+                if (routeCacheCount < NEIGHBOR_GRAPH_MAX_CACHED_ROUTES) {
+                    routeCache[routeCacheCount++] = result;
+                } else {
+                    routeCache[0] = result;
+                }
+            }
+            return result;
+        }
+    }
+
+    // Mode 2b: ball dest whose packed list no longer names its admit parent.
+    if (result.nextHop == 0) {
+        const NodeEdges *destNode = findNeighbor(destination);
+        NodeNum parentHint = destNode ? destNode->parentHint : 0;
+        if (parentHint != 0 && parentHint != destination && parentHint != myNode) {
+            const NodeEdges *parentNode = findNeighbor(parentHint);
+            const Edge *edge = parentNode ? findEdge(parentNode, destination) : nullptr;
+            if (edge && Edge::isMeasured(edge->source)) {
+                if (composeViaParent(parentHint, edge->etxFixed, edge->hearsUs)) {
+                    if (useCache) {
+                        if (routeCacheCount < NEIGHBOR_GRAPH_MAX_CACHED_ROUTES) {
+                            routeCache[routeCacheCount++] = result;
+                        } else {
+                            routeCache[0] = result;
+                        }
+                    }
+                    return result;
+                }
+            }
+        }
+    }
+
+    // Mode 3: orphan gateway handoff — no Dijkstra toward the destination.
     if (result.nextHop == 0) {
         ChainEgress chain = downstreamChainEgress(destination, myNode);
-        if (chain.node != 0 && !policy.isExcluded(chain.node) &&
-            (!policy.routable || policy.routable(policy.ctx, chain.node))) {
+        if (chain.node != 0 && !policy.isExcluded(chain.node)) {
             const NodeEdges *myEdges = findNeighbor(myNode);
             uint16_t costToEgress = 0xFFFF;
             if (myEdges) {
@@ -730,6 +1191,8 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, c
                 result.nextHop = chain.node;
                 result.costFixed = total > 0xFFFF ? 0xFFFF : (uint16_t)total;
                 result.verified = false;
+                result.mode = RouteMode::OrphanGateway;
+                result.hops = chain.hops;
             }
         }
     }
@@ -741,11 +1204,12 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, c
         uint16_t cost;
         NodeNum nextHop;
         uint8_t hops;
-        if (search(true, cost, nextHop, hops)) {
+        if (search(destination, true, cost, nextHop, hops)) {
             result.costFixed = cost;
             result.nextHop = nextHop;
             result.hops = hops;
             result.verified = false;
+            result.mode = RouteMode::Ball;
         }
     }
 
@@ -759,6 +1223,7 @@ Route NeighborGraph::calculateRoute(NodeNum destination, uint32_t currentTime, c
 
     return result;
 }
+
 
 Route NeighborGraph::getCachedRoute(NodeNum destination, uint32_t currentTime)
 {
@@ -777,6 +1242,43 @@ void NeighborGraph::clearCache()
 
 // --- Downstream methods ---
 
+void NeighborGraph::upsertDownstream(NodeNum destination, NodeNum relay, uint16_t costFixed, uint32_t timestamp,
+                                     bool listLearned)
+{
+    for (uint16_t i = 0; i < downstreamCount; i++) {
+        if (downstream[i].destination == destination && downstream[i].relay == relay) {
+            downstream[i].costFixed = costFixed;
+            downstream[i].lastUpdate = timestamp;
+            if (listLearned) {
+                downstream[i].listLearned = true;
+            }
+            return;
+        }
+    }
+    if (downstreamCount < NEIGHBOR_GRAPH_MAX_DOWNSTREAM) {
+        DownstreamEntry &entry = downstream[downstreamCount++];
+        entry.destination = destination;
+        entry.relay = relay;
+        entry.costFixed = costFixed;
+        entry.lastUpdate = timestamp;
+        entry.listLearned = listLearned;
+        return;
+    }
+    uint16_t oldestIdx = 0;
+    uint32_t oldestTime = downstream[0].lastUpdate;
+    for (uint16_t i = 1; i < downstreamCount; i++) {
+        if (downstream[i].lastUpdate < oldestTime) {
+            oldestTime = downstream[i].lastUpdate;
+            oldestIdx = i;
+        }
+    }
+    downstream[oldestIdx].destination = destination;
+    downstream[oldestIdx].relay = relay;
+    downstream[oldestIdx].costFixed = costFixed;
+    downstream[oldestIdx].lastUpdate = timestamp;
+    downstream[oldestIdx].listLearned = listLearned;
+}
+
 void NeighborGraph::updateDownstream(NodeNum destination, NodeNum relay, float totalCost, uint32_t timestamp)
 {
     if (destination == 0 || relay == 0 || destination == relay)
@@ -793,38 +1295,25 @@ void NeighborGraph::updateDownstream(NodeNum destination, NodeNum relay, float t
         return;
 
     uint16_t costFixed = static_cast<uint16_t>(std::min(totalCost * 100.0f, 65535.0f));
+    upsertDownstream(destination, relay, costFixed, timestamp, false);
+}
 
-    // Update existing entry for the same (destination, relay) pair
-    for (uint16_t i = 0; i < downstreamCount; i++) {
-        if (downstream[i].destination == destination && downstream[i].relay == relay) {
-            downstream[i].costFixed = costFixed;
-            downstream[i].lastUpdate = timestamp;
-            return;
-        }
-    }
+void NeighborGraph::updateDownstreamListed(NodeNum destination, NodeNum relay, float totalCost, uint32_t timestamp,
+                                           bool evenIfRelayHasEdge)
+{
+    if (destination == 0 || relay == 0 || destination == relay)
+        return;
 
-    // Add new entry
-    if (downstreamCount < NEIGHBOR_GRAPH_MAX_DOWNSTREAM) {
-        DownstreamEntry &entry = downstream[downstreamCount++];
-        entry.destination = destination;
-        entry.relay = relay;
-        entry.costFixed = costFixed;
-        entry.lastUpdate = timestamp;
-    } else {
-        // Replace oldest entry
-        uint16_t oldestIdx = 0;
-        uint32_t oldestTime = downstream[0].lastUpdate;
-        for (uint16_t i = 1; i < downstreamCount; i++) {
-            if (downstream[i].lastUpdate < oldestTime) {
-                oldestTime = downstream[i].lastUpdate;
-                oldestIdx = i;
-            }
-        }
-        downstream[oldestIdx].destination = destination;
-        downstream[oldestIdx].relay = relay;
-        downstream[oldestIdx].costFixed = costFixed;
-        downstream[oldestIdx].lastUpdate = timestamp;
-    }
+    NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
+    if (destination == myNode)
+        return;
+
+    const NodeEdges *relayNode = findNeighbor(relay);
+    if (!evenIfRelayHasEdge && relayNode && findEdge(relayNode, destination))
+        return;
+
+    uint16_t costFixed = static_cast<uint16_t>(std::min(totalCost * 100.0f, 65535.0f));
+    upsertDownstream(destination, relay, costFixed, timestamp, true);
 }
 
 void NeighborGraph::updateDownstreamExclusive(NodeNum destination, NodeNum relay, float totalCost, uint32_t timestamp,
@@ -856,28 +1345,31 @@ void NeighborGraph::updateDownstreamExclusive(NodeNum destination, NodeNum relay
         }
     }
 
-    // No existing entry — add new
-    if (downstreamCount < NEIGHBOR_GRAPH_MAX_DOWNSTREAM) {
-        DownstreamEntry &entry = downstream[downstreamCount++];
-        entry.destination = destination;
-        entry.relay = relay;
-        entry.costFixed = costFixed;
-        entry.lastUpdate = timestamp;
-    } else {
-        // Replace oldest entry
-        uint16_t oldestIdx = 0;
-        uint32_t oldestTime = downstream[0].lastUpdate;
-        for (uint16_t i = 1; i < downstreamCount; i++) {
-            if (downstream[i].lastUpdate < oldestTime) {
-                oldestTime = downstream[i].lastUpdate;
-                oldestIdx = i;
-            }
+    upsertDownstream(destination, relay, costFixed, timestamp, false);
+}
+
+bool NeighborGraph::listDownstream(NodeNum destination, NodeNum &relayOut, uint16_t &costOut) const
+{
+    uint16_t bestCost = 0xFFFF;
+    NodeNum bestRelay = 0;
+    for (uint16_t i = 0; i < downstreamCount; i++) {
+        if (downstream[i].destination != destination || !downstream[i].listLearned) {
+            continue;
         }
-        downstream[oldestIdx].destination = destination;
-        downstream[oldestIdx].relay = relay;
-        downstream[oldestIdx].costFixed = costFixed;
-        downstream[oldestIdx].lastUpdate = timestamp;
+        if (!findNeighbor(downstream[i].relay)) {
+            continue;
+        }
+        if (downstream[i].costFixed < bestCost) {
+            bestCost = downstream[i].costFixed;
+            bestRelay = downstream[i].relay;
+        }
     }
+    if (bestRelay == 0) {
+        return false;
+    }
+    relayOut = bestRelay;
+    costOut = bestCost;
+    return true;
 }
 
 NodeNum NeighborGraph::getDownstreamRelay(NodeNum destination) const
@@ -1016,12 +1508,16 @@ void NeighborGraph::clearDownstreamForRelay(NodeNum relay)
 
 size_t NeighborGraph::transferDownstream(NodeNum oldRelay, NodeNum newRelay)
 {
+    if (oldRelay == 0 || newRelay == 0 || oldRelay == newRelay) {
+        return 0;
+    }
     uint32_t now = millis() / 1000;
     size_t count = 0;
-    // First pass: add entries under newRelay
+    // First pass: add entries under newRelay (preserve listLearned)
     for (uint16_t i = 0; i < downstreamCount; i++) {
         if (downstream[i].relay == oldRelay) {
-            updateDownstream(downstream[i].destination, newRelay, downstream[i].costFixed / 100.0f, now);
+            upsertDownstream(downstream[i].destination, newRelay, downstream[i].costFixed, now,
+                             downstream[i].listLearned);
             count++;
         }
     }
@@ -1336,7 +1832,113 @@ bool NeighborGraph::removeEdge(NodeNum from, NodeNum to)
     return false;
 }
 
-bool NeighborGraph::retractDirectLink(NodeNum myNode, NodeNum neighbor)
+bool NeighborGraph::removeEdgeAndPrune(NodeNum from, NodeNum to, uint32_t nowSecs)
+{
+    if (!removeEdge(from, to)) {
+        return false;
+    }
+    pruneUnreachableFromRoot(nowSecs);
+    return true;
+}
+
+bool NeighborGraph::pruneUnreachableFromRoot(uint32_t nowSecs)
+{
+    NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
+    if (!findNeighbor(myNode)) {
+        return false;
+    }
+    bool reachable[NEIGHBOR_GRAPH_MAX_NEIGHBORS];
+    NodeNum idAt[NEIGHBOR_GRAPH_MAX_NEIGHBORS];
+    NodeNum stack[NEIGHBOR_GRAPH_MAX_NEIGHBORS];
+    uint8_t ncount = neighborCount;
+    for (uint8_t i = 0; i < ncount; i++) {
+        reachable[i] = false;
+        idAt[i] = neighbors[i].nodeId;
+    }
+    auto idxOf = [&](NodeNum id) -> int8_t {
+        for (uint8_t i = 0; i < ncount; i++) {
+            if (idAt[i] == id) {
+                return static_cast<int8_t>(i);
+            }
+        }
+        return -1;
+    };
+    int8_t root = idxOf(myNode);
+    if (root < 0) {
+        return false;
+    }
+    uint8_t sp = 0;
+    reachable[static_cast<uint8_t>(root)] = true;
+    stack[sp++] = myNode;
+    while (sp > 0) {
+        NodeNum cur = stack[--sp];
+        int8_t ci = idxOf(cur);
+        if (ci < 0) {
+            continue;
+        }
+        // Outgoing edges.
+        for (uint8_t e = 0; e < neighbors[static_cast<uint8_t>(ci)].edgeCount; e++) {
+            NodeNum to = neighbors[static_cast<uint8_t>(ci)].edges[e].to;
+            int8_t ti = idxOf(to);
+            if (ti >= 0 && !reachable[static_cast<uint8_t>(ti)]) {
+                reachable[static_cast<uint8_t>(ti)] = true;
+                if (sp < NEIGHBOR_GRAPH_MAX_NEIGHBORS) {
+                    stack[sp++] = to;
+                }
+            }
+        }
+        // Incoming edges (undirected walk among ball publishers).
+        for (uint8_t i = 0; i < ncount; i++) {
+            if (reachable[i]) {
+                continue;
+            }
+            if (findEdge(&neighbors[i], cur)) {
+                reachable[i] = true;
+                if (sp < NEIGHBOR_GRAPH_MAX_NEIGHBORS) {
+                    stack[sp++] = idAt[i];
+                }
+            }
+        }
+    }
+
+    NodeNum doomed[NEIGHBOR_GRAPH_MAX_NEIGHBORS];
+    uint8_t doomedN = 0;
+    for (uint8_t i = 0; i < ncount; i++) {
+        if (!reachable[i] && idAt[i] != myNode) {
+            doomed[doomedN++] = idAt[i];
+        }
+    }
+    bool changed = false;
+    for (uint8_t d = 0; d < doomedN; d++) {
+        NodeNum victim = doomed[d];
+        NodeNum parent = 0;
+        uint16_t costFixed = 0;
+        if (pickL1Parent(victim, parent, costFixed)) {
+            applyDemotion(victim, parent, costFixed, nowSecs);
+        } else {
+            clearDownstreamForRelay(victim);
+            clearDownstreamForDestination(victim);
+        }
+        // removeNode also clears edges to victim; find index fresh after prior demotions.
+        NodeEdges *node = findNeighbor(victim);
+        if (!node) {
+            continue;
+        }
+        for (uint8_t i = 0; i < neighborCount; i++) {
+            if (neighbors[i].nodeId == victim) {
+                removeNodeAt(i);
+                changed = true;
+                break;
+            }
+        }
+    }
+    if (changed) {
+        routeCacheCount = 0;
+    }
+    return changed;
+}
+
+bool NeighborGraph::retractDirectLink(NodeNum myNode, NodeNum neighbor, bool pruneAfter)
 {
     if (myNode == 0 || neighbor == 0 || myNode == neighbor) {
         return false;
@@ -1344,6 +1946,9 @@ bool NeighborGraph::retractDirectLink(NodeNum myNode, NodeNum neighbor)
     bool removed = removeEdge(myNode, neighbor);
     removeEdge(neighbor, myNode);
     if (removed) {
+        if (pruneAfter) {
+            pruneUnreachableFromRoot(millis() / 1000);
+        }
         routeCacheCount = 0;
     }
     return removed;
@@ -1370,8 +1975,12 @@ uint8_t NeighborGraph::pruneSilentPublishers(NodeNum myNode, uint32_t currentTim
     }
 
     for (uint8_t i = 0; i < count; i++) {
-        retractDirectLink(myNode, gone[i]);
+        retractDirectLink(myNode, gone[i], false);
         LOG_INFO("[SR] %08x silent for %us — direct link retracted", gone[i], silenceSecs);
+    }
+    if (count > 0) {
+        pruneUnreachableFromRoot(currentTimeSecs);
+        routeCacheCount = 0;
     }
     return count;
 }
@@ -1696,6 +2305,11 @@ NodeNum NeighborGraph::coverageOwner(NodeNum target, const CoveragePolicy &polic
     for (uint8_t i = 0; i < neighborCount; i++) {
         NodeNum candidate = neighbors[i].nodeId;
         if (candidate == 0 || candidate == target || (candidate & 0xFF000000) == 0xFF000000) continue;
+        // Ownership is who on *this* RF copy can carry the neighbour. L2/L3 publishers
+        // in the edge ball are not candidates: they did not hear this transmission.
+        if (candidate != me && !hasDirectReportedEdgeTo(me, candidate)) {
+            continue;
+        }
         // Only its own measurement counts: for a stock node the edge exists only because we
         // watched it carry the target's traffic.
         const Edge *edge = findEdge(&neighbors[i], target);
@@ -1875,20 +2489,20 @@ NodeNum NeighborGraph::uniqueCoverageNeighbor(NodeNum myNode, const NodeNum *cov
                                               float poorLinkEtx, const CoveragePolicy *policy) const
 {
     const NodeEdges *myEdges = findNeighbor(myNode);
-    NodeNum found = 0;
+    if (!myEdges) {
+        return 0;
+    }
 
-    forEachPossibleTarget([&](NodeNum neighbor) {
-        if (found != 0) {
-            return;
-        }
+    for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+        NodeNum neighbor = myEdges->edges[i].to;
         if (neighbor == 0 || neighbor == myNode) {
-            return;
+            continue;
         }
 
         // Placeholder neighbors have unknown identity — they could be any of the
         // coveredBy nodes' neighbors, so don't count them as unique coverage
         if ((neighbor & 0xFF000000) == 0xFF000000) {
-            return;
+            continue;
         }
 
         // A publisher we have stopped hearing is nobody's coverage target, so it cannot be ours
@@ -1896,35 +2510,39 @@ NodeNum NeighborGraph::uniqueCoverageNeighbor(NodeNum myNode, const NodeNum *cov
         // path did not, so a queued relay was kept alive for a node the ranking had already agreed
         // nobody could carry. One rule, read the same way on both sides.
         if (policy && isSilentPublisher(neighbor, *policy)) {
-            return;
+            continue;
         }
         if (policy && policy->isDroppedCoverageTarget && policy->isDroppedCoverageTarget(policy->ctx, neighbor)) {
-            return;
+            continue;
         }
 
-        // Skip nodes that are themselves in the coveredBy set
+        bool alreadyCovered = false;
         for (size_t c = 0; c < coveredByCount; c++) {
             if (neighbor == coveredBy[c]) {
-                return;
+                alreadyCovered = true;
+                break;
             }
         }
+        if (alreadyCovered) {
+            continue;
+        }
 
-        const Edge *mine = myEdges ? findEdge(myEdges, neighbor) : nullptr;
-        bool hearsUs = mine && mine->hearsUs;
+        const Edge *mine = &myEdges->edges[i];
+        bool hearsUs = mine->hearsUs;
         bool reports = policy && policy->reports(neighbor);
         // A publisher's list is who can deliver to it. hearsUs on our RX edge is the same fact
         // once they listed us; requiring the flag here dropped a mute neighbour that had named us
         // but whose edge to us had not been flagged yet. Silent neighbours still need an owner.
         if (reports) {
             if (!covers(myNode, neighbor, poorLinkEtx, policy)) {
-                return;
+                continue;
             }
         } else {
             if (!hearsUs && policy && coverageOwner(neighbor, *policy) != myNode) {
-                return;
+                continue;
             }
             if (!covers(myNode, neighbor, poorLinkEtx, policy)) {
-                return;
+                continue;
             }
         }
 
@@ -1937,11 +2555,11 @@ NodeNum NeighborGraph::uniqueCoverageNeighbor(NodeNum myNode, const NodeNum *cov
 
         if (!covered) {
             LOG_INFO("[SR] Relaying for %08x (no transmitter reaches it)", neighbor);
-            found = neighbor;
+            return neighbor;
         }
-    });
+    }
 
-    return found;
+    return 0;
 }
 
 bool NeighborGraph::isGatewayNode(NodeNum nodeId, NodeNum sourceNode) const

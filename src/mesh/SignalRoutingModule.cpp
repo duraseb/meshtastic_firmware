@@ -751,10 +751,19 @@ uint8_t SignalRoutingModule::packNeighborsForBroadcast(uint8_t *outBuf, size_t b
         }
     }
 
-    // Sort by quality (reported first, then by ETX)
-    std::sort(edgePtrs, edgePtrs + edgeCount, [](const Edge *a, const Edge *b) {
+    // Sort: hearsUs, then SR-active, then lower ETX. Dense hubs otherwise drop SR parents that
+    // still hear them when packing into the ~28-per-chunk wire budget (field: FCM6 omitting Czar).
+    std::sort(edgePtrs, edgePtrs + edgeCount, [this](const Edge *a, const Edge *b) {
         if (a->source != b->source) {
             return a->source == Edge::Source::Reported;
+        }
+        if (a->hearsUs != b->hearsUs) {
+            return a->hearsUs;
+        }
+        const bool aSr = getCapabilityStatus(a->to) == CapabilityStatus::SRactive;
+        const bool bSr = getCapabilityStatus(b->to) == CapabilityStatus::SRactive;
+        if (aSr != bSr) {
+            return aSr;
         }
         return a->getEtx() < b->getEtx();
     });
@@ -945,6 +954,12 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
 
     char senderNameForTopo[48];
     getNodeDisplayName(p->from, senderNameForTopo, sizeof(senderNameForTopo));
+    if (isActiveRoutingRole() &&
+        !topologySenderHorizonOk(p->from, isDirectPacket(*p), neighbors, neighborCount)) {
+        LOG_INFO("[SR] Horizon: ignore topology from %s (unqualified far publisher)", senderNameForTopo);
+        setTopologyVersion(lastPreProcessedVersion, lastPreProcessedVersionCount, p->from, receivedVersion, nowMs);
+        return;
+    }
     LOG_INFO("[SR] Processing topology from %s: %d neighbors (v%u, %s, relay=0x%02x)",
               senderNameForTopo, neighborCount, receivedVersion,
               isNewVersion ? "new version" : "continuation", p->relay_node);
@@ -960,6 +975,39 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
 
     // Process each neighbor from the decoded packed data
     const bool senderIsDirect = hasReportedDirectEdge(p->from);
+    const uint32_t nowSecs = millis() / 1000;
+    // Horizon: admit a non-direct sender when they already sit in the ball or their list
+    // names an L1/L2 we know (MeshRustic §6.2).
+    if (routingGraph && !senderIsDirect) {
+        bool namesL1 = false;
+        bool namesL2 = false;
+        NodeNum parent = 0;
+        for (uint8_t i = 0; i < neighborCount; i++) {
+            NodeNum nid = neighbors[i].nodeId;
+            if (hasReportedDirectEdge(nid)) {
+                namesL1 = true;
+                if (parent == 0) {
+                    parent = nid;
+                }
+            }
+            if (routingGraph->getNodeClass(nid) == NodeClass::L2) {
+                namesL2 = true;
+                if (parent == 0) {
+                    parent = nid;
+                }
+            }
+        }
+        const bool alreadyInBall = routingGraph->getEdgesFrom(p->from) != nullptr;
+        if (alreadyInBall || namesL1 || namesL2) {
+            NodeClass cls = routingGraph->getNodeClass(p->from);
+            if (cls == NodeClass::Unknown) {
+                cls = (namesL2 && !namesL1 && GRAPH_MAX_DEPTH >= 3) ? NodeClass::L3 : NodeClass::L2;
+            }
+            if (cls == NodeClass::L2 || cls == NodeClass::L3) {
+                routingGraph->ensurePublisher(p->from, cls, parent, nowSecs);
+            }
+        }
+    }
     for (uint8_t i = 0; i < neighborCount; i++) {
         const PackedNeighborEntry &neighbor = neighbors[i];
 
@@ -980,6 +1028,13 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
         char neighborName[48];
         getNodeDisplayName(neighbor.nodeId, neighborName, sizeof(neighborName));
 
+        // A sender we do not hear must not reinstall sender→us: Dijkstra would treat us as a
+        // last hop to them from a stale list after they moved behind a relay.
+        // Install Mirrored edges before parking so horizon admission can classify from evidence.
+        if (neighbor.nodeId != ourNode || senderIsDirect) {
+            updateGraphWithNeighbor(p->from, neighbor.nodeId, neighbor.rssi, neighbor.snr, neighbor.hearsUs);
+        }
+
         if (hasDirectConnection) {
             if (neighbor.nodeId != ourNode && routingGraph) {
                 routingGraph->clearDownstreamForDestination(neighbor.nodeId);
@@ -987,28 +1042,29 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
             LOG_INFO("[SR]   -> %s: HAS direct connection, sender confirms reachability",
                     neighborName);
         } else if (neighbor.hearsUs) {
-            // Only mark as downstream if the link is bidirectional — the neighbor must be able
-            // to hear the topology source, otherwise the source cannot actually deliver to it.
-            LOG_INFO("[SR]   -> %s: no direct connection, downstream of %s",
-                    neighborName, senderNameForTopo);
+            // Prefer admitting into the edge ball when depth allows (L1 lists L2 with hearsUs,
+            // or L2 lists L3). Otherwise park as list-downstream of the sender.
+            float etxForDownstream =
+                NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr, currentCostingSpreadingFactor());
+            bool admitted = false;
             if (routingGraph) {
-                float etxForDownstream =
-                    NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr, currentCostingSpreadingFactor());
-                // evenIfRelayHasEdge: the Mirrored sender→listed edge is installed next (and may
-                // already exist on a later list). Without it, updateDownstream no-ops whenever the
-                // relay already shows that edge — which is exactly when topology taught it to us.
-                routingGraph->updateDownstreamExclusive(neighbor.nodeId, p->from, etxForDownstream,
-                                                        millis() / 1000, /*evenIfRelayHasEdge=*/true);
+                admitted = routingGraph->tryAdmitListedPublisher(p->from, neighbor.nodeId, senderIsDirect, nowSecs);
+            }
+            if (admitted) {
+                if (routingGraph) {
+                    routingGraph->clearDownstreamForDestination(neighbor.nodeId);
+                }
+                LOG_INFO("[SR]   -> %s: admitted to edge ball via %s", neighborName, senderNameForTopo);
+            } else if (routingGraph) {
+                LOG_INFO("[SR]   -> %s: no direct connection, list-downstream of %s",
+                        neighborName, senderNameForTopo);
+                // evenIfRelayHasEdge: Mirrored sender→listed edge was just installed.
+                routingGraph->updateDownstreamListed(neighbor.nodeId, p->from, etxForDownstream, nowSecs,
+                                                     /*evenIfRelayHasEdge=*/true);
             }
         } else {
             LOG_INFO("[SR]   -> %s: asymmetric (hearsUs=false), not downstream of %s",
                     neighborName, senderNameForTopo);
-        }
-
-        // A sender we do not hear must not reinstall sender→us: Dijkstra would treat us as a
-        // last hop to them from a stale list after they moved behind a relay.
-        if (neighbor.nodeId != ourNode || senderIsDirect) {
-            updateGraphWithNeighbor(p->from, neighbor.nodeId, neighbor.rssi, neighbor.snr, neighbor.hearsUs);
         }
     }
 
@@ -1084,6 +1140,7 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
         // neighbour it dropped survived to the graph TTL and stayed in its coverage set.
         if (routingGraph->retainListedEdges(p->from, listedIds, listedCount)) {
             LOG_INFO("[SR] %08x dropped entries from its list: stale edges removed", p->from);
+            routingGraph->pruneUnreachableFromRoot(millis() / 1000);
         }
     }
 
@@ -1154,6 +1211,11 @@ bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp
     bool directCompleteList = hdr.isCompleteList() && neighborCount > 0 && isDirectPacket(mp);
     if (gateTopologyVersion(mp.from, hdr.topologyVersion, bootBroadcast, directCompleteList, nowMs) ==
         SrTopologyVerdict::Stale) {
+        return false;
+    }
+
+    if (!topologySenderHorizonOk(mp.from, isDirectPacket(mp), neighbors, neighborCount)) {
+        LOG_INFO("[SR] Horizon: ignore topology from %s (unqualified far publisher)", senderName);
         return false;
     }
 
@@ -1950,10 +2012,17 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
             // the originator's published list (TX-path evidence).
             bool stealsWithoutList = existingParent != 0 && existingParent != inferredRelayer &&
                                      !destinationListsRelay && !wasDirectNeighbor;
+            // Ball / list-downstream stay; a travelling former neighbour still parks behind the
+            // hop we heard so unicasts do not keep the dead last hop.
+            const bool destInBall = routingGraph->getEdgesFrom(mp.from) != nullptr;
+            NodeNum listParent = 0;
+            uint16_t listCost = 0;
+            const bool listParked = routingGraph->listDownstream(mp.from, listParent, listCost);
+            const bool stealOk = wasDirectNeighbor || (!destInBall && !listParked);
             if (activeRouting && hasDirectConnectionToRelay && relayHearsUs &&
                 (destinationListsRelay || !sourcePublishes) &&
                 (wasDirectNeighbor || singleHopRelay || !sourcePublishes) &&
-                !stealsWithoutList) {
+                !stealsWithoutList && stealOk) {
                 // Nominal link per hop travelled: the relay's link to the source is not what we measured,
                 // and a multi-hop path must not price like a single good link.
                 uint8_t hopsUsed = mp.hop_start > mp.hop_limit ? mp.hop_start - mp.hop_limit : 1;
@@ -4559,6 +4628,20 @@ void SignalRoutingModule::handleRoutingControlPacket(const meshtastic_MeshPacket
         LOG_INFO("[SR] Routing control variant %u from %s", routing.which_variant, senderName);
         break;
     }
+}
+
+bool SignalRoutingModule::topologySenderHorizonOk(NodeNum sender, bool heardDirectFromSender,
+                                                  const PackedNeighborEntry *neighbors, uint8_t neighborCount) const
+{
+    if (!routingGraph) {
+        return false;
+    }
+    NodeNum listed[MAX_SIGNAL_ROUTING_NEIGHBORS];
+    uint8_t n = neighborCount > MAX_SIGNAL_ROUTING_NEIGHBORS ? MAX_SIGNAL_ROUTING_NEIGHBORS : neighborCount;
+    for (uint8_t i = 0; i < n; i++) {
+        listed[i] = neighbors ? neighbors[i].nodeId : 0;
+    }
+    return routingGraph->senderHorizonOk(sender, hasReportedDirectEdge(sender), heardDirectFromSender, listed, n);
 }
 
 bool SignalRoutingModule::isActiveRoutingRole() const

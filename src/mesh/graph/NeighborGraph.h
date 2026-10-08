@@ -127,6 +127,52 @@ struct NodeSet {
 #define NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE 32
 #endif
 
+/// How deep the priced edge ball grows: 2 = L0+L1+L2; 3 also admits L3 publishers.
+/// See MeshRustic docs/GRAPH_HORIZON_PLAN.md.
+#ifndef GRAPH_MAX_DEPTH
+#define GRAPH_MAX_DEPTH 3
+#endif
+
+/// Admission / eviction hop class for a graph publisher. Dijkstra ignores this; only create,
+/// capacity demotion, and TTL cascade use it. Unknown is farthest (evicted first).
+enum class NodeClass : uint8_t {
+    Unknown = 0,
+    L1 = 1,
+    L2 = 2,
+    L3 = 3,
+};
+
+inline uint8_t nodeClassDepth(NodeClass c)
+{
+    switch (c) {
+    case NodeClass::L1:
+        return 1;
+    case NodeClass::L2:
+        return 2;
+    case NodeClass::L3:
+        return 3;
+    case NodeClass::Unknown:
+        return 255;
+    }
+    return 255;
+}
+
+/// Eviction priority: higher means preferred victim (farthest first).
+inline uint8_t nodeClassEvictionRank(NodeClass c)
+{
+    switch (c) {
+    case NodeClass::Unknown:
+        return 3;
+    case NodeClass::L3:
+        return 2;
+    case NodeClass::L2:
+        return 1;
+    case NodeClass::L1:
+        return 0;
+    }
+    return 3;
+}
+
 #ifndef NEIGHBOR_GRAPH_MAX_DOWNSTREAM
 #define NEIGHBOR_GRAPH_MAX_DOWNSTREAM 900
 #endif
@@ -213,8 +259,11 @@ struct NodeEdges {
     Edge edges[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
     uint8_t edgeCount;
     uint32_t lastFullUpdate; // Full timestamp for aging
+    NodeClass nodeClass;
+    /// L1 through which this deeper publisher was (or is) reachable; 0 if none.
+    NodeNum parentHint;
 
-    NodeEdges() : nodeId(0), edgeCount(0), lastFullUpdate(0) {}
+    NodeEdges() : nodeId(0), edgeCount(0), lastFullUpdate(0), nodeClass(NodeClass::Unknown), parentHint(0) {}
 };
 
 // Cost factor of an unconfirmed hop in the fallback route search: the receiver never listed the
@@ -226,6 +275,13 @@ static constexpr uint16_t UNVERIFIED_HOP_COST_FACTOR = 4;
 // the same link a few hundredths apart, so only a real difference may change ownership.
 static constexpr uint16_t SR_OWNER_COST_BUCKET = 50;
 
+/// How calculateRoute priced the destination (for logs / tests).
+enum class RouteMode : uint8_t {
+    Ball = 0,           // Destination priced inside the edge ball (Dijkstra)
+    ListDownstream = 1, // List-downstream of a ball publisher M: Dijkstra to M + M→Y
+    OrphanGateway = 2,  // Relayed orphan: gateway handoff, no Dijkstra to dest
+};
+
 struct Route {
     NodeNum destination;
     NodeNum nextHop;
@@ -234,10 +290,15 @@ struct Route {
     uint8_t hops; // Path length, 1 for a direct neighbour; 0 from the downstream table or none
     // Every hop priced from the receiver's own measurement. False for the inbound-gateway fallback
     // (a hop into a publisher that has not published a measurement of the sender, at
-    // UNVERIFIED_HOP_COST_FACTOR times the sender's reverse cost) and for downstream-table routes.
+    // UNVERIFIED_HOP_COST_FACTOR times the sender's reverse cost) and for orphan-gateway routes.
+    // True for strict ball paths and for list-downstream when the path to M is strict.
     bool verified;
+    RouteMode mode;
 
-    Route() : destination(0), nextHop(0), costFixed(0), timestamp(0), hops(0), verified(true) {}
+    Route()
+        : destination(0), nextHop(0), costFixed(0), timestamp(0), hops(0), verified(false), mode(RouteMode::Ball)
+    {
+    }
 
     float getCost() const { return costFixed / 100.0f; }
 };
@@ -279,8 +340,11 @@ struct DownstreamEntry {
     NodeNum relay;       // Which direct neighbor reaches it
     uint16_t costFixed;  // Cumulative ETX * 100
     uint32_t lastUpdate; // For aging
+    /// Set when the row came from a publisher's topology with hearsUs (or a capacity demotion
+    /// that kept that evidence). Relayed orphans stay false.
+    bool listLearned;
 
-    DownstreamEntry() : destination(0), relay(0), costFixed(0), lastUpdate(0) {}
+    DownstreamEntry() : destination(0), relay(0), costFixed(0), lastUpdate(0), listLearned(false) {}
 };
 
 /// First neighbour we can hear on a downstream walk from a destination.
@@ -375,6 +439,10 @@ class NeighborGraph {
 
     void updateDownstream(NodeNum destination, NodeNum relay, float totalCost, uint32_t timestamp);
 
+    /// Topology list with hearsUs: last hop is priced from the publisher, not a relayed guess.
+    void updateDownstreamListed(NodeNum destination, NodeNum relay, float totalCost, uint32_t timestamp,
+                                bool evenIfRelayHasEdge = false);
+
     // Like updateDownstream, but ensures each destination has exactly one relay entry.
     // If the destination already exists with a different relay, the relay is replaced.
     // `evenIfRelayHasEdge`: a former direct neighbour heard only via this relay must still
@@ -383,6 +451,10 @@ class NeighborGraph {
                                    bool evenIfRelayHasEdge = false);
 
     NodeNum getDownstreamRelay(NodeNum destination) const;
+
+    /// Parent and last-hop cost when destination was parked from a topology list with hearsUs.
+    /// Returns true when a live list-learned row exists (relay still has a graph slot).
+    bool listDownstream(NodeNum destination, NodeNum &relayOut, uint16_t &costOut) const;
 
     /// First neighbour `myNode` can hear on the downstream walk from `destination`.
     /// `costFixed` is the sum of the downstream rows along that walk, not the hop to the neighbour.
@@ -615,10 +687,38 @@ class NeighborGraph {
     /// Remove one directed edge, leaving both endpoints in the graph.
     bool removeEdge(NodeNum from, NodeNum to);
 
+    /// Remove one directed edge, then prune publishers that lost their only path from us.
+    bool removeEdgeAndPrune(NodeNum from, NodeNum to, uint32_t nowSecs);
+
+    /// After an edge is removed, drop ball publishers that are no longer reachable from us.
+    /// Walk is undirected among remaining ball edges so a hearer-priced L2→L1 still keeps L2
+    /// when the bootstrap L1→L2 listing has expired.
+    bool pruneUnreachableFromRoot(uint32_t nowSecs);
+
+    /// Admit nodeId as a publisher of the given class, demoting a victim into downstream when
+    /// the ball is full. Returns false when admission is refused.
+    bool ensurePublisher(NodeNum nodeId, NodeClass nodeClass, NodeNum parentHint, uint32_t nowSecs);
+
+    /// Admit a listed non-neighbour into the edge ball when horizon depth allows.
+    /// L1 listing X with hearsUs → L2; L2 listing X with hearsUs → L3 if depth≥3.
+    bool tryAdmitListedPublisher(NodeNum sender, NodeNum listed, bool senderIsDirect, uint32_t nowSecs);
+
+    /// MeshRustic §6.2: grow ball/downstream from this topology only when the sender is an RF
+    /// neighbour, this frame was heard from them, they already sit in the ball, a ball node
+    /// already points at them, or their list names an L1/L2 we hold.
+    bool senderHorizonOk(NodeNum sender, bool senderIsDirect, bool heardDirectFromSender,
+                         const NodeNum *listedIds, uint8_t listedCount) const;
+
+    NodeClass getNodeClass(NodeNum nodeId) const;
+    void setNodeClass(NodeNum nodeId, NodeClass nodeClass, NodeNum parentHint = 0);
+    void setL1(NodeNum nodeId);
+
+    bool hasDirectReportedEdgeTo(NodeNum from, NodeNum to) const;
+
     /// Drop our measured link to `neighbor` and their edge back to us. Used when we hear them
     /// only through a relayer, so Dijkstra stops treating them as a last hop. Returns true if
     /// our edge to them existed.
-    bool retractDirectLink(NodeNum myNode, NodeNum neighbor);
+    bool retractDirectLink(NodeNum myNode, NodeNum neighbor, bool pruneAfter = true);
 
     void clearInferredEdgesToNode(NodeNum nodeId);
 
@@ -670,7 +770,19 @@ class NeighborGraph {
     Edge *findEdge(NodeEdges *node, NodeNum to);
     const Edge *findEdge(const NodeEdges *node, NodeNum to) const;
 
+    bool classWithinDepth(NodeClass c) const;
+    NodeClass classifyCandidate(NodeNum nodeId) const;
+    NodeClass bootstrapClassFromReachability(NodeNum nodeId) const;
+    bool reachableViaNeighbor(NodeNum nodeId) const;
+    int8_t selectEvictionVictim(bool protectL1) const;
+    bool pickL1Parent(NodeNum victim, NodeNum &parentOut, uint16_t &costOut) const;
+    void applyDemotion(NodeNum victim, NodeNum parent, uint16_t costFixed, uint32_t nowSecs);
+    bool evictForCapacity(uint32_t nowSecs, bool demoteToDownstream);
+    void removeNodeAt(uint8_t idx);
+
     bool downstreamRelayAndCost(NodeNum destination, NodeNum &relayOut, uint16_t &costOut) const;
+    void upsertDownstream(NodeNum destination, NodeNum relay, uint16_t costFixed, uint32_t timestamp,
+                          bool listLearned);
 
     // Every node that has a slot, and every destination of those slots' edges. Coverage walks
     // this set so a publisher that listed a candidate is counted even when the candidate never

@@ -685,6 +685,7 @@ public:
 protected:
     virtual bool handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshtastic_SignalRoutingInfo *p) override;
     void updateGraphWithNeighbor(NodeNum sender, NodeNum neighborId, int8_t rssi, int8_t snr, bool hearsUs);
+    uint8_t packNeighborsForBroadcast(uint8_t *outBuf, size_t bufSize);
     // Set hearsUs on our edge to `sender` when its topology lists us as a direct neighbor (logs on transition).
     void noteTopologySenderHearsUs(NodeNum sender, NodeNum listedNeighbor);
     virtual ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override;
@@ -821,7 +822,8 @@ private:
     uint32_t topologyResyncMs() const { return 2 * cfgBroadcastSecs * 1000; }
 
     bool isSignalBasedCapable(NodeNum nodeId) const;
-    uint8_t packNeighborsForBroadcast(uint8_t *outBuf, size_t bufSize);
+    bool topologySenderHorizonOk(NodeNum sender, bool heardDirectFromSender, const PackedNeighborEntry *neighbors,
+                                 uint8_t neighborCount) const;
     void sendTopologyPacket(NodeNum dest, const uint8_t *packedData, size_t packedLen, uint8_t topologyVersion = 0, uint32_t txAfterMs = 0);
 
     DirectNeighborSignal directSignals[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
