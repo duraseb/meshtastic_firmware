@@ -115,7 +115,18 @@ void NodeRateLimiter::debugSetBootMs(uint32_t bootMs_)
 
 void NodeRateLimiter::debugSeedYoung(NodeNum nodeId, uint32_t firstSeenMs)
 {
-    noteOriginator(nodeId, firstSeenMs);
+    // Insert directly into young[] (bypasses warm-up→alumni).
+    if (findYoung(nodeId) >= 0 || inAlumni(nodeId) || youngCount >= MAX_YOUNG_ENTRIES) {
+        return;
+    }
+    young[youngCount].nodeId = nodeId;
+    young[youngCount].firstSeenMs = firstSeenMs;
+    youngCount++;
+}
+
+bool NodeRateLimiter::debugYoungTableFull() const
+{
+    return activeYoungCount(nowMs()) >= MAX_YOUNG_ENTRIES;
 }
 
 bool NodeRateLimiter::debugTakeAnnounce(NodeNum *ids, uint8_t &count)
@@ -614,17 +625,18 @@ bool NodeRateLimiter::inAlumni(NodeNum nodeId) const
     return false;
 }
 
-void NodeRateLimiter::addAlumni(NodeNum nodeId)
+bool NodeRateLimiter::addAlumni(NodeNum nodeId)
 {
     if (inAlumni(nodeId)) {
-        return;
+        return true;
     }
-    if (alumniCount < MAX_YOUNG_ENTRIES) {
-        alumni[alumniCount++] = nodeId;
-        return;
+    if (alumniCount >= MAX_ALUMNI_ENTRIES) {
+        // Never FIFO-evict: forgetting an established id lets noteOriginator
+        // re-insert it as young. Prefer holding aged entries in young[] instead.
+        return false;
     }
-    memmove(&alumni[0], &alumni[1], (MAX_YOUNG_ENTRIES - 1) * sizeof(alumni[0]));
-    alumni[MAX_YOUNG_ENTRIES - 1] = nodeId;
+    alumni[alumniCount++] = nodeId;
+    return true;
 }
 
 void NodeRateLimiter::removeYoungAt(uint8_t idx)
@@ -637,17 +649,56 @@ void NodeRateLimiter::removeYoungAt(uint8_t idx)
     youngCount--;
 }
 
+bool NodeRateLimiter::youngAgeActive(uint32_t firstSeenMs, uint32_t now)
+{
+    return (now - firstSeenMs) < YOUNG_AGE_MS;
+}
+
+uint8_t NodeRateLimiter::activeYoungCount(uint32_t now) const
+{
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < youngCount; i++) {
+        if (youngAgeActive(young[i].firstSeenMs, now)) {
+            n++;
+        }
+    }
+    return n;
+}
+
+int NodeRateLimiter::findAgedYoung(uint32_t now) const
+{
+    for (uint8_t i = 0; i < youngCount; i++) {
+        if (!youngAgeActive(young[i].firstSeenMs, now)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 void NodeRateLimiter::expireIfOld(NodeNum nodeId, uint32_t now)
 {
     int idx = findYoung(nodeId);
     if (idx < 0) {
         return;
     }
-    uint32_t age = now - young[idx].firstSeenMs;
-    if (age >= YOUNG_AGE_MS) {
-        addAlumni(nodeId);
+    if (youngAgeActive(young[idx].firstSeenMs, now)) {
+        return;
+    }
+    // Graduated: remember as alumni when there is room; otherwise leave the
+    // row in young[] so isYoung stays false by age and we never re-youth.
+    if (addAlumni(nodeId)) {
         removeYoungAt((uint8_t)idx);
     }
+}
+
+void NodeRateLimiter::insertYoung(NodeNum nodeId, uint32_t now)
+{
+    if (youngCount >= MAX_YOUNG_ENTRIES) {
+        return;
+    }
+    young[youngCount].nodeId = nodeId;
+    young[youngCount].firstSeenMs = now;
+    youngCount++;
 }
 
 void NodeRateLimiter::noteOriginator(NodeNum nodeId, uint32_t now)
@@ -656,23 +707,40 @@ void NodeRateLimiter::noteOriginator(NodeNum nodeId, uint32_t now)
     if (findYoung(nodeId) >= 0 || inAlumni(nodeId)) {
         return;
     }
-    if (youngCount < MAX_YOUNG_ENTRIES) {
-        young[youngCount].nodeId = nodeId;
-        young[youngCount].firstSeenMs = now;
-        youngCount++;
+    // Warm-up mesh is established, not young: everyone looks new after boot.
+    if (!warmedUp(now)) {
+        (void)addAlumni(nodeId);
+        return;
     }
+    if (youngCount < MAX_YOUNG_ENTRIES) {
+        insertYoung(nodeId, now);
+        return;
+    }
+    // Physical full: reclaim an aged-parked slot so a real new identity still
+    // enters young[] and charges the bucket. Prefer alumni; if alumni is also
+    // full, drop the parked row (rare overflow — may re-youth later) rather
+    // than fail-closed-charging the rest of a busy mesh.
+    int idx = findAgedYoung(now);
+    if (idx < 0) {
+        return;
+    }
+    NodeNum old = young[idx].nodeId;
+    (void)addAlumni(old);
+    removeYoungAt((uint8_t)idx);
+    insertYoung(nodeId, now);
 }
 
 bool NodeRateLimiter::isYoung(NodeNum nodeId, uint32_t now) const
 {
     int idx = findYoung(nodeId);
     if (idx >= 0) {
-        return (now - young[idx].firstSeenMs) < YOUNG_AGE_MS;
+        return youngAgeActive(young[idx].firstSeenMs, now);
     }
     if (inAlumni(nodeId)) {
         return false;
     }
-    return youngCount >= MAX_YOUNG_ENTRIES;
+    // Fail-closed only when 32 simultaneous *age-active* young; parked rows do not count.
+    return activeYoungCount(now) >= MAX_YOUNG_ENTRIES;
 }
 
 bool NodeRateLimiter::relayAnyLimited() const
@@ -697,10 +765,11 @@ void NodeRateLimiter::maybeAnnounce(uint32_t now, float chutil)
         return;
     }
     pendingAnnounceCount = 0;
-    uint8_t n = youngCount < ANNOUNCE_MAX_IDS ? youngCount : ANNOUNCE_MAX_IDS;
-    for (uint8_t i = 0; i < n; i++) {
-        pendingAnnounceIds[i] = young[i].nodeId;
-        pendingAnnounceCount++;
+    for (uint8_t i = 0; i < youngCount && pendingAnnounceCount < ANNOUNCE_MAX_IDS; i++) {
+        if (!youngAgeActive(young[i].firstSeenMs, now)) {
+            continue;
+        }
+        pendingAnnounceIds[pendingAnnounceCount++] = young[i].nodeId;
     }
     lastAnnounceMs = now;
     announceEver = true;

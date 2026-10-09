@@ -844,18 +844,25 @@ Per-originator buckets cannot contain a forged-identity flood: a new `from` on
 every frame lands in a fresh slot. RELAY limits amplification by whoever
 rebroadcasts; it does not make a new identity cost anything.
 
-Traffic from an originator first heard less than **30 minutes** ago is charged
-to **one shared YOUNG bucket** (trip **48** / clear **12**, same 90 s window,
-RELAY-style hysteresis), regardless of how many such originators there are.
-Age is first-sighting, not NodeInfo (an unauthenticated broadcast) and not
-decode (undecodable traffic already has UNKNOWN). First-sighting records are
-kept only while the node is young (**32** slots; field max simultaneous young
-was 6) and deleted at 30 minutes. No record with room in the table means
-established (fail open — a node quiet for hours, and the post-boot warm-up);
-no record with the table full means young (fail closed — overflow is the flood
-this control exists for). The bucket is not enforced until this node has been
-running 30 minutes: first sightings are not persisted, and a freshly booted
-node would otherwise treat the entire mesh as young.
+Traffic from an originator first heard less than **30 minutes** ago *after this
+node has warmed up* is charged to **one shared YOUNG bucket** (trip **48** /
+clear **12**, same 90 s window, RELAY-style hysteresis), regardless of how many
+such originators there are. Age is first-sighting, not NodeInfo (an
+unauthenticated broadcast) and not decode (undecodable traffic already has
+UNKNOWN). First-sighting records are kept only while the node is young (**32**
+slots; field max simultaneous young was 6) and move to an alumni set at 30
+minutes (**128** slots). Alumni never FIFO-evicts: forgetting an established id
+would let it be re-inserted as young. If alumni is full, the aged row may stay
+parked in the young table but is not young for charging, coverage, or the
+diagnostic, and does not make the table "full" for fail-closed. A new
+post-warm-up identity may reclaim a parked slot (alumni preferred; rare
+alumni-full drop of the parked row) so mint floods still enter young[] and
+charge. During the post-boot 30-minute warm-up, decoded originators go straight
+to alumni and never enter the young table — everyone looks new after boot, and
+the bucket is not enforced until warm-up ends. No record without 32 simultaneous
+*age-active* young means established (fail open — quiet nodes and busy-mesh
+overflow past alumni); no record with 32 age-active young means young (fail
+closed — that is the mint flood).
 
 This is identification, not authentication. A patient attacker with airtime
 still establishes identities after thirty minutes each; what the control buys
@@ -871,11 +878,11 @@ When the young bucket is limiting, a node whose traffic is being dropped is
 otherwise be treated as stock and given an owner who holds a relay for a node
 nobody will relay for.
 
-A hop-1 diagnostic with at most four fixed-width node IDs (`Y !xxxxxxxx …`)
-may be announced on trip (30 min refractory; suppressed while RELAY is
-limiting or channel utilisation is high). Local log and the phone/host
-interface fire; the mesh broadcast stays off until a config bit exists.
-Our own transmissions never meet the receive-path limiter and need no
+A hop-1 diagnostic with prefix `Young nodes Rate Limit` and at most four
+fixed-width node IDs may be announced on trip (30 min refractory; suppressed
+while RELAY is limiting or channel utilisation is high). Local log and the
+phone/host interface fire; the mesh broadcast stays off until a config bit
+exists. Our own transmissions never meet the receive-path limiter and need no
 exemption.
 
 ### Exemptions

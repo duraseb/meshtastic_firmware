@@ -851,13 +851,13 @@ void Router::handleReceived(meshtastic_MeshPacket *p, RxSource src)
         NodeNum youngIds[NodeRateLimiter::ANNOUNCE_MAX_IDS];
         uint8_t youngN = 0;
         if (nodeRateLimiter->takeYoungAnnounce(youngIds, youngN)) {
-            char msg[48];
+            char msg[80];
             int pos = 0;
-            pos += snprintf(msg + pos, sizeof(msg) - (size_t)pos, "Y");
+            pos += snprintf(msg + pos, sizeof(msg) - (size_t)pos, "Young nodes Rate Limit");
             for (uint8_t i = 0; i < youngN && pos > 0; i++) {
                 pos += snprintf(msg + pos, sizeof(msg) - (size_t)pos, " !%08x", youngIds[i]);
             }
-            LOG_WARN("[RateLimit] young %s", msg);
+            LOG_WARN("[RateLimit] %s", msg);
             if (service) {
                 meshtastic_MeshPacket *ann = allocForSending();
                 if (ann) {

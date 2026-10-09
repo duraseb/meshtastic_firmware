@@ -425,6 +425,14 @@ static bool dropText(NodeRateLimiter &limiter, NodeNum from, uint32_t id)
     return limiter.shouldDrop(&p);
 }
 
+/// hop_limit 0 so long alumni-fill loops do not trip the RELAY bucket.
+static bool dropTextOriginatorOnly(NodeRateLimiter &limiter, NodeNum from, uint32_t id)
+{
+    meshtastic_MeshPacket p =
+        makePacket(from, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TEXT_MESSAGE_APP, id);
+    return limiter.shouldDrop(&p);
+}
+
 static void test_established_originator_is_never_charged_to_young()
 {
     prepareEnv();
@@ -494,8 +502,8 @@ static void test_no_record_fails_open_with_room_and_closed_when_full()
     for (uint8_t i = 0; i < NodeRateLimiter::MAX_YOUNG_ENTRIES; i++) {
         limiter.debugSeedYoung(0xB2000000 + i, NodeRateLimiter::WARMUP_MS);
     }
-    TEST_ASSERT_TRUE(limiter.debugYoungCount() == NodeRateLimiter::MAX_YOUNG_ENTRIES);
-    TEST_ASSERT_TRUE_MESSAGE(limiter.debugIsYoung(0xB3000001), "no record and a full table means young");
+    TEST_ASSERT_TRUE(limiter.debugYoungTableFull());
+    TEST_ASSERT_TRUE_MESSAGE(limiter.debugIsYoung(0xB3000001), "no record and 32 active young means fail-closed young");
     TEST_ASSERT_FALSE(limiter.debugTracksYoung(0xB3000001));
 }
 
@@ -510,6 +518,107 @@ static void test_young_bucket_is_not_enforced_during_warmup()
                                   "warmup replaces persistence: do not drop the mesh as young after boot");
     }
     TEST_ASSERT_FALSE(limiter.debugYoungLimited());
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(0, limiter.debugYoungCount(), "warm-up sightings must not enter the young table");
+    TEST_ASSERT_TRUE_MESSAGE(limiter.debugAlumniCount() > 0, "warm-up sightings are established (alumni)");
+    TEST_ASSERT_TRUE(limiter.debugInAlumni(0xC1000000));
+}
+
+static void test_warmup_nodes_stay_established_after_warmup()
+{
+    prepareEnv();
+    NodeRateLimiter::testNowOverride = 1000;
+    NodeRateLimiter limiter;
+    const NodeNum from = 0xC2000001;
+    TEST_ASSERT_FALSE(dropText(limiter, from, 1));
+    TEST_ASSERT_TRUE(limiter.debugInAlumni(from));
+    TEST_ASSERT_FALSE(limiter.debugTracksYoung(from));
+    for (uint32_t i = 0; i < NodeRateLimiter::YOUNG_TRIP; i++) {
+        NodeRateLimiter::testNowOverride = NodeRateLimiter::WARMUP_MS + 1 + i;
+        TEST_ASSERT_FALSE_MESSAGE(limiter.debugIsYoung(from), "boot-neighbour must not become young after warm-up");
+        TEST_ASSERT_EQUAL_UINT32(0, limiter.debugYoungCharge());
+        dropText(limiter, from, 2 + i);
+    }
+    TEST_ASSERT_FALSE(limiter.debugYoungLimited());
+}
+
+static void test_alumni_never_reyouths_when_table_turns_over()
+{
+    prepareEnv();
+    NodeRateLimiter::testNowOverride = NodeRateLimiter::WARMUP_MS;
+    NodeRateLimiter limiter;
+    limiter.debugSetBootMs(0);
+    const uint32_t t0 = NodeRateLimiter::WARMUP_MS;
+    NodeNum nextId = 0xD1000000;
+    while (limiter.debugAlumniCount() < NodeRateLimiter::MAX_ALUMNI_ENTRIES) {
+        NodeNum waveStart = nextId;
+        uint8_t room = NodeRateLimiter::MAX_YOUNG_ENTRIES - limiter.debugYoungCount();
+        for (uint8_t j = 0; j < room; j++) {
+            limiter.debugSeedYoung(waveStart + j, t0);
+        }
+        nextId = waveStart + room;
+        NodeRateLimiter::testNowOverride = t0 + NodeRateLimiter::YOUNG_AGE_MS;
+        for (uint8_t j = 0; j < room; j++) {
+            TEST_ASSERT_FALSE_MESSAGE(dropTextOriginatorOnly(limiter, waveStart + j, 1 + j),
+                                      "graduate into alumni");
+        }
+    }
+    TEST_ASSERT_EQUAL_UINT8(NodeRateLimiter::MAX_ALUMNI_ENTRIES, limiter.debugAlumniCount());
+    const NodeNum early = 0xD1000000;
+    TEST_ASSERT_TRUE(limiter.debugInAlumni(early));
+    const NodeNum parked = 0xD2000001;
+    limiter.debugSeedYoung(parked, t0);
+    NodeRateLimiter::testNowOverride = t0 + NodeRateLimiter::YOUNG_AGE_MS + 1;
+    TEST_ASSERT_FALSE(dropTextOriginatorOnly(limiter, parked, 1));
+    TEST_ASSERT_TRUE_MESSAGE(limiter.debugTracksYoung(parked), "aged entry stays parked when alumni is full");
+    TEST_ASSERT_FALSE(limiter.debugIsYoung(parked));
+    for (uint32_t i = 0; i < NodeRateLimiter::YOUNG_TRIP; i++) {
+        NodeRateLimiter::testNowOverride = t0 + NodeRateLimiter::YOUNG_AGE_MS + 2 + i;
+        TEST_ASSERT_FALSE(limiter.debugIsYoung(early));
+        dropTextOriginatorOnly(limiter, early, 2 + i);
+    }
+    TEST_ASSERT_FALSE(limiter.debugTracksYoung(early));
+    TEST_ASSERT_TRUE(limiter.debugInAlumni(early));
+    TEST_ASSERT_FALSE(limiter.debugYoungLimited());
+}
+
+static void test_parked_rows_do_not_fail_closed_a_busy_mesh()
+{
+    prepareEnv();
+    NodeRateLimiter::testNowOverride = NodeRateLimiter::WARMUP_MS;
+    NodeRateLimiter limiter;
+    limiter.debugSetBootMs(0);
+    const uint32_t t0 = NodeRateLimiter::WARMUP_MS;
+    NodeNum next = 0xE1000000;
+    while (limiter.debugAlumniCount() < NodeRateLimiter::MAX_ALUMNI_ENTRIES) {
+        NodeNum wave = next;
+        uint8_t room = NodeRateLimiter::MAX_YOUNG_ENTRIES - limiter.debugYoungCount();
+        for (uint8_t j = 0; j < room; j++) {
+            limiter.debugSeedYoung(wave + j, t0);
+        }
+        next = wave + room;
+        NodeRateLimiter::testNowOverride = t0 + NodeRateLimiter::YOUNG_AGE_MS;
+        for (uint8_t j = 0; j < room; j++) {
+            dropTextOriginatorOnly(limiter, wave + j, 1 + j);
+        }
+    }
+    for (uint8_t i = 0; i < NodeRateLimiter::MAX_YOUNG_ENTRIES; i++) {
+        limiter.debugSeedYoung(0xE2000000 + i, t0);
+    }
+    const uint32_t parkedNow = t0 + NodeRateLimiter::YOUNG_AGE_MS + 1;
+    NodeRateLimiter::testNowOverride = parkedNow;
+    for (uint8_t i = 0; i < NodeRateLimiter::MAX_YOUNG_ENTRIES; i++) {
+        dropTextOriginatorOnly(limiter, 0xE2000000 + i, 1 + i);
+        TEST_ASSERT_TRUE(limiter.debugTracksYoung(0xE2000000 + i));
+        TEST_ASSERT_FALSE(limiter.debugIsYoung(0xE2000000 + i));
+    }
+    TEST_ASSERT_EQUAL_UINT8(NodeRateLimiter::MAX_YOUNG_ENTRIES, limiter.debugYoungCount());
+    TEST_ASSERT_FALSE_MESSAGE(limiter.debugYoungTableFull(), "aged-parked must not count as active-full");
+    TEST_ASSERT_FALSE_MESSAGE(limiter.debugIsYoung(0xE3000001),
+                              "busy-mesh overflow must fail open, not charge ordinary traffic");
+    TEST_ASSERT_FALSE(dropTextOriginatorOnly(limiter, 0xE3000001, 99));
+    TEST_ASSERT_TRUE(limiter.debugTracksYoung(0xE3000001));
+    TEST_ASSERT_TRUE(limiter.debugIsYoung(0xE3000001));
+    TEST_ASSERT_EQUAL_UINT8(NodeRateLimiter::MAX_YOUNG_ENTRIES, limiter.debugYoungCount());
 }
 
 static void test_young_bucket_clears_below_clear_without_a_silent_window()
@@ -876,6 +985,9 @@ void setup()
     RUN_TEST(test_young_record_is_released_after_thirty_minutes);
     RUN_TEST(test_no_record_fails_open_with_room_and_closed_when_full);
     RUN_TEST(test_young_bucket_is_not_enforced_during_warmup);
+    RUN_TEST(test_warmup_nodes_stay_established_after_warmup);
+    RUN_TEST(test_alumni_never_reyouths_when_table_turns_over);
+    RUN_TEST(test_parked_rows_do_not_fail_closed_a_busy_mesh);
     RUN_TEST(test_young_bucket_clears_below_clear_without_a_silent_window);
     RUN_TEST(test_undecodable_traffic_does_not_charge_young);
     RUN_TEST(test_young_announce_respects_refractory_and_congestion);

@@ -82,9 +82,13 @@ class NodeRateLimiter
     uint8_t debugRelayCount() const { return relayCount; }
     bool debugTracksYoung(NodeNum nodeId) const;
     uint8_t debugYoungCount() const { return youngCount; }
+    bool debugInAlumni(NodeNum nodeId) const { return inAlumni(nodeId); }
+    uint8_t debugAlumniCount() const { return alumniCount; }
     bool debugIsYoung(NodeNum nodeId) const;
     bool debugYoungLimited() const { return youngBucket.limited; }
     uint32_t debugYoungCharge() const { return youngBucket.count; }
+    /// Age-active young slots full (parked/aged rows do not count).
+    bool debugYoungTableFull() const;
     bool debugTracksDest(NodeNum nodeId) const;
     bool debugDestLimited(NodeNum nodeId) const;
     uint32_t debugDestCharge(NodeNum nodeId) const;
@@ -141,6 +145,10 @@ class NodeRateLimiter
     bool announceBroadcastEnabled() const { return cfgAnnounceBroadcast; }
 
     static constexpr uint8_t MAX_YOUNG_ENTRIES = 32;
+    /// Established ids after graduation or warm-up. Sized for a busy city mesh so
+    /// aged rows rarely need to park in young[] (parking plus fail-closed would
+    /// charge ordinary traffic). Never FIFO-evicts.
+    static constexpr uint8_t MAX_ALUMNI_ENTRIES = 128;
     static constexpr uint32_t YOUNG_AGE_MS = 30u * 60u * 1000u;
     static constexpr uint32_t WARMUP_MS = 30u * 60u * 1000u;
     // 48 is 2× the measured 24-packet / 90 s legitimate peak of young traffic; 12 is
@@ -221,7 +229,7 @@ class NodeRateLimiter
     };
     YoungSighting young[MAX_YOUNG_ENTRIES];
     uint8_t youngCount = 0;
-    NodeNum alumni[MAX_YOUNG_ENTRIES] = {};
+    NodeNum alumni[MAX_ALUMNI_ENTRIES] = {};
     uint8_t alumniCount = 0;
     BucketState youngBucket;
     DestEntry dests[MAX_DEST_ENTRIES];
@@ -274,9 +282,13 @@ class NodeRateLimiter
     bool warmedUp(uint32_t now) const;
     int findYoung(NodeNum nodeId) const;
     bool inAlumni(NodeNum nodeId) const;
-    void addAlumni(NodeNum nodeId);
+    bool addAlumni(NodeNum nodeId);
     void removeYoungAt(uint8_t idx);
+    static bool youngAgeActive(uint32_t firstSeenMs, uint32_t now);
+    uint8_t activeYoungCount(uint32_t now) const;
+    int findAgedYoung(uint32_t now) const;
     void expireIfOld(NodeNum nodeId, uint32_t now);
+    void insertYoung(NodeNum nodeId, uint32_t now);
     void noteOriginator(NodeNum nodeId, uint32_t now);
     bool isYoung(NodeNum nodeId, uint32_t now) const;
     bool relayAnyLimited() const;
