@@ -1643,6 +1643,17 @@ static inline float rssiQualityFactor(int32_t rssi)
 // spreading-factor overload directly with the actual configured value, not this one — otherwise
 // the curve prices against a demodulator threshold the radio isn't using, by up to 12.5 dB of
 // margin (SF7 to SF12's spread). See SignalRoutingModule.h's currentCostingSpreadingFactor().
+bool NeighborGraph::normalizeRxSignal(int32_t &rssi, float snr)
+{
+    if (rssi == 0 && snr == 0.0f) {
+        return false;
+    }
+    if (rssi == 0) {
+        rssi = SATURATED_RX_RSSI_DBM;
+    }
+    return true;
+}
+
 float NeighborGraph::calculateETX(int32_t rssi, float snr, meshtastic_Config_LoRaConfig_ModemPreset preset)
 {
     float bwKHz = 0.0f;

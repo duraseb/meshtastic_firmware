@@ -123,6 +123,21 @@ static void test_merge_cost_from_decoded_signal()
     TEST_ASSERT_FLOAT_WITHIN(0.001f, expected, etx);
 }
 
+static void test_normalize_rx_signal_remaps_clipped_rssi()
+{
+    int32_t rssi = 0;
+    TEST_ASSERT_FALSE(NeighborGraph::normalizeRxSignal(rssi, 0.0f));
+    TEST_ASSERT_EQUAL_INT32(0, rssi);
+
+    rssi = 0;
+    TEST_ASSERT_TRUE(NeighborGraph::normalizeRxSignal(rssi, 14.0f));
+    TEST_ASSERT_EQUAL_INT32(NeighborGraph::SATURATED_RX_RSSI_DBM, rssi);
+
+    rssi = -70;
+    TEST_ASSERT_TRUE(NeighborGraph::normalizeRxSignal(rssi, 8.0f));
+    TEST_ASSERT_EQUAL_INT32(-70, rssi);
+}
+
 static void test_reject_v2_format_returns_zero()
 {
     uint8_t buf[32] = {};
@@ -3383,6 +3398,7 @@ void setup()
     RUN_TEST(test_encode_decode_round_trip);
     RUN_TEST(test_packed_layout_offsets);
     RUN_TEST(test_merge_cost_from_decoded_signal);
+    RUN_TEST(test_normalize_rx_signal_remaps_clipped_rssi);
     RUN_TEST(test_reject_v2_format_returns_zero);
     RUN_TEST(test_direct_signal_upsert_lookup_and_prune);
     RUN_TEST(test_empty_topology_reply_delay_range_and_determinism);

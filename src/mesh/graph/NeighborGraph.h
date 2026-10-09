@@ -430,6 +430,15 @@ class NeighborGraph {
     // and delegates here; both share one implementation.
     static float calculateETX(int32_t rssi, float snr, uint8_t spreadingFactor);
 
+    /// SX126x RssiPkt register 0 means 0 dBm (strong-end clip). Meshtastic also uses RSSI 0 as
+    /// "no reading". Remap the clip so a desk-adjacent link is not stored or published as unset
+    /// (field 2026-10-09: MR3a↔MB1d L1 stuck at RSSI=0).
+    static constexpr int32_t SATURATED_RX_RSSI_DBM = -30;
+
+    /// Returns false when both readings are unset. Remaps rssi 0 → SATURATED_RX_RSSI_DBM when SNR
+    /// shows RF was measured.
+    static bool normalizeRxSignal(int32_t &rssi, float snr);
+
     static void etxToSignal(float etx, meshtastic_Config_LoRaConfig_ModemPreset preset, int32_t &rssi, int32_t &snr);
 
     // See the calculateETX(int32_t, float, uint8_t) overload above for why this exists.

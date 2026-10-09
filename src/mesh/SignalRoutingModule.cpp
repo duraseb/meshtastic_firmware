@@ -1788,12 +1788,14 @@ void SignalRoutingModule::observeRelayedPacket(const meshtastic_MeshPacket &mp)
     if (mp.via_mqtt || isDirectPacket(mp) || mp.relay_node == 0) {
         return;
     }
-    const bool hasSignalData = (mp.rx_rssi != 0 || mp.rx_snr != 0);
+    int32_t rxRssi = mp.rx_rssi;
+    const float rxSnr = mp.rx_snr;
+    const bool hasSignalData = NeighborGraph::normalizeRxSignal(rxRssi, rxSnr);
     if (!canSendTopology()) {
         LOG_INFO("[SR] Publishes no topology: skipping relayed packet observation");
     } else {
         const bool activeRouting = isActiveRoutingRole();
-        NodeNum inferredRelayer = resolveRelayIdentity(mp.relay_node, mp.rx_rssi, mp.rx_snr);
+        NodeNum inferredRelayer = resolveRelayIdentity(mp.relay_node, rxRssi, rxSnr);
 
     // If still not resolved, try known nodes (both direct neighbors and topology-known nodes)
     // We need to check ALL edges, not just Reported ones, because the relay might be
@@ -2001,7 +2003,7 @@ void SignalRoutingModule::observeRelayedPacket(const meshtastic_MeshPacket &mp)
         // placeholder is never recorded here and never published.
         if (hasSignalData && !isPlaceholderNode(inferredRelayer)) {
             uint32_t monotonicTimestamp = millis() / 1000;
-            int changeType = refreshReportedDirectNeighbor(inferredRelayer, mp.rx_rssi, mp.rx_snr, monotonicTimestamp);
+            int changeType = refreshReportedDirectNeighbor(inferredRelayer, rxRssi, rxSnr, monotonicTimestamp);
             if (changeType == EDGE_SIGNIFICANT_CHANGE) {
                 markTopologyDirty();
             }
@@ -2049,18 +2051,20 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
 
     // Only track DIRECT neighbors - packets heard directly over radio with no relays
     // Conditions for a direct neighbor:
-    // 1. Has valid signal data (rx_rssi or rx_snr)
+    // 1. Has valid signal data (normalizeRxSignal: unset 0/0 refused; clipped RSSI=0 remapped)
     // 2. Not received via MQTT
     // 3. Direct detection using hopStart and hopLimit:
     //    - hopStart == hopLimit: packet hasn't been relayed (direct transmission)
     //    - In SR, we keep hopLimit >= 1 even for passive nodes, so direct means no decrement from original
-    //    
+    //
     // relay_node can be ambiguous when multiple nodes share the same last byte,
     // so hopStart/hopLimit is more reliable for detecting direct neighbors.
-    
-    bool hasSignalData = (mp.rx_rssi != 0 || mp.rx_snr != 0);
+
+    int32_t rxRssi = mp.rx_rssi;
+    const float rxSnr = mp.rx_snr;
+    bool hasSignalData = NeighborGraph::normalizeRxSignal(rxRssi, rxSnr);
     bool notViaMqtt = !mp.via_mqtt;
-    
+
     bool isDirectFromSender = isDirectPacket(mp);
     uint8_t fromLastByte = mp.from & 0xFF;
 
@@ -2069,21 +2073,21 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
         LOG_INFO("[SR] Packet from 0x%08x: relay=0x%02x hs=%d hl=%d direct=%d",
                   mp.from, mp.relay_node, mp.hop_start, mp.hop_limit, isDirectFromSender);
     }
-    
+
     // Update node activity only when appropriate:
     // - Active nodes: all packets (need full topology)
     // - Passive nodes: only direct packets (only need direct neighbors)
     if (shouldUpdateNodeActivity || isActiveRoutingRole() || (hasSignalData && notViaMqtt && isDirectFromSender)) {
         updateNodeActivityForPacketAndRelay(&mp);
     }
-    
+
     // Update SignalRouting graph for directly-heard nodes
     // Active routing nodes: track all nodes for topology-based routing
     // Passive nodes: only track directly-heard nodes (don't relay, so no point in tracking relayed nodes)
     if (routingGraph && notViaMqtt) {
         if (hasSignalData && isDirectFromSender) {
             // Direct reception - add to graph and clear any stale downstream relationship
-            updateNeighborInfo(mp.from, mp.rx_rssi, mp.rx_snr, mp.rx_time);
+            updateNeighborInfo(mp.from, rxRssi, rxSnr, mp.rx_time);
             routingGraph->clearDownstreamForDestination(mp.from);
         } else if (isActiveRoutingRole() && !isDirectFromSender && mp.relay_node != 0) {
             // Relayed packet from active routing node - update activity for topology
@@ -2121,7 +2125,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
         getNodeDisplayName(mp.from, senderName, sizeof(senderName));
 
         float etx =
-            NeighborGraph::calculateETX(mp.rx_rssi, mp.rx_snr, currentCostingSpreadingFactor());
+            NeighborGraph::calculateETX(rxRssi, rxSnr, currentCostingSpreadingFactor());
 
         // When a node is confirmed as a direct neighbor, clear any downstream entries that
         // listed it as a destination reachable via some other relay — those are now obsolete.
@@ -2132,7 +2136,7 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
         }
 
         LOG_INFO("[SR] Direct neighbor %s: RSSI=%d, SNR=%.1f, ETX=%.2f",
-                 senderName, mp.rx_rssi, mp.rx_snr, etx);
+                 senderName, rxRssi, rxSnr, etx);
 
         // Record that this node transmitted (for contention window tracking)
         if (routingGraph) {
@@ -2862,15 +2866,16 @@ void SignalRoutingModule::observeForGraph(const meshtastic_MeshPacket &mp)
     if (!routingGraph || mp.via_mqtt) {
         return;
     }
-    // Same test the receive path uses: a frame with no signal reading did not come off our radio,
-    // and one that has been relayed measures somebody else's link, not ours.
-    if (mp.rx_rssi == 0 && mp.rx_snr == 0) {
+    // Same test the receive path uses: unset 0/0 refused; clipped RSSI=0 remapped to a strong
+    // sentinel so it is not stored as the Meshtastic "no reading" value.
+    int32_t rxRssi = mp.rx_rssi;
+    if (!NeighborGraph::normalizeRxSignal(rxRssi, mp.rx_snr)) {
         return;
     }
     if (!isDirectPacket(mp)) {
         return;
     }
-    updateNeighborInfo(mp.from, mp.rx_rssi, mp.rx_snr, mp.rx_time);
+    updateNeighborInfo(mp.from, rxRssi, mp.rx_snr, mp.rx_time);
     routingGraph->clearDownstreamForDestination(mp.from);
 }
 
@@ -4533,8 +4538,9 @@ void SignalRoutingModule::handlePositionPacket(const meshtastic_MeshPacket &mp, 
               "rssi=%d snr=%.1f",
               senderName, isDirectNeighbor ? "true" : "false", latitude, longitude, speed, dop, mp.rx_rssi, mp.rx_snr);
 
-    if (isDirectNeighbor && mp.rx_rssi != 0) {
-        updateNeighborInfo(mp.from, mp.rx_rssi, mp.rx_snr, mp.rx_time);
+    int32_t rxRssi = mp.rx_rssi;
+    if (isDirectNeighbor && NeighborGraph::normalizeRxSignal(rxRssi, mp.rx_snr)) {
+        updateNeighborInfo(mp.from, rxRssi, mp.rx_snr, mp.rx_time);
     }
 }
 
