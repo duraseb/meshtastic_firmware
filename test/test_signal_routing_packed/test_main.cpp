@@ -1907,7 +1907,8 @@ static void test_topology_header_chunk_flags_round_trip()
 
 static void test_topology_version_verdict_rules()
 {
-    const uint32_t resync = 1200000; // 2 x 600 s
+    const uint32_t period = SIGNAL_ROUTING_BROADCAST_SECS * 1000;
+    const uint32_t resync = 2 * period + 20 * 1000;
     // First contact accepts any version, including one past the 128 window (FCM6 was at 148).
     TEST_ASSERT_EQUAL(SrTopologyVerdict::FirstContact, srTopologyVersionVerdict(148, 0, 0, 5000, resync, false));
     TEST_ASSERT_EQUAL(SrTopologyVerdict::FirstContact, srTopologyVersionVerdict(0, 0, 0, 5000, resync, true));
@@ -1921,7 +1922,10 @@ static void test_topology_version_verdict_rules()
     // Far behind last is a restarted counter (Inno 26→1). Apply on the first list.
     TEST_ASSERT_EQUAL(SrTopologyVerdict::CounterReset, srTopologyVersionVerdict(1, 26, 5000, 6000, resync, false));
     TEST_ASSERT_EQUAL(SrTopologyVerdict::CounterReset, srTopologyVersionVerdict(2, 26, 5000, 6000, resync, false));
-    // ...until two silent intervals, or its version-0 boot broadcast (small behind still waits).
+    // Two intervals alone still reject stale reports during the 20-second margin.
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(25, 26, 5000, 5000 + 2 * period, resync, false));
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::Accept, srTopologyVersionVerdict(27, 26, 5000, 5000 + 2 * period, resync, false));
+    // ...until two silent intervals plus margin, or its version-0 boot broadcast (small behind still waits).
     TEST_ASSERT_EQUAL(SrTopologyVerdict::SilenceResync, srTopologyVersionVerdict(25, 26, 5000, 5000 + resync, resync, false));
     TEST_ASSERT_EQUAL(SrTopologyVerdict::BootReset, srTopologyVersionVerdict(0, 26, 5000, 6000, resync, true));
     // After a boot reset the first neighbour list is version 1, not another 0.

@@ -819,11 +819,11 @@ private:
                                           bool directCompleteList, uint32_t nowMs);
     // A peer's topology version is accepted when it moves forward by less than half the counter range
     // (or repeats). A header-only broadcast with version 0 is the peer's boot announcement and resets
-    // what we track. After two silent broadcast intervals any version is accepted again. A complete
+    // what we track. After two silent broadcast intervals plus 20 seconds any version is accepted again. A complete
     // list heard from the originator also rebases: the neighbour is transmitting now, so its counter
     // is the one that matters, not the one we stored before it restarted. A version far behind the
     // last accepted one is a restarted counter, not a delayed copy of the previous list.
-    uint32_t topologyResyncMs() const { return 2 * cfgBroadcastSecs * 1000; }
+    uint32_t topologyResyncMs() const { return 2 * cfgBroadcastSecs * 1000 + 20 * 1000; }
 
     bool isSignalBasedCapable(NodeNum nodeId) const;
     bool topologySenderHorizonOk(NodeNum sender, bool heardDirectFromSender, const PackedNeighborEntry *neighbors,
