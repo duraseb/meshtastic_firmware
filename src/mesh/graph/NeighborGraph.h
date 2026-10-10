@@ -128,7 +128,6 @@ struct NodeSet {
 #endif
 
 /// How deep the priced edge ball grows: 2 = L0+L1+L2; 3 also admits L3 publishers.
-/// See MeshRustic docs/GRAPH_HORIZON_PLAN.md.
 #ifndef GRAPH_MAX_DEPTH
 #define GRAPH_MAX_DEPTH 3
 #endif

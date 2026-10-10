@@ -149,7 +149,7 @@ Every healthy link now prices into one cost bucket, and that is accepted, not a 
 
 The second consequence is assessed separately: `etxChangeThreshold` is an absolute ETX delta (default 0.5, "half a retransmission"), and an edge update is significant when `|new - old| > threshold + variance`, with variance the per-edge EWMA of absolute ETX changes — all three terms in ETX units. The comparison is symmetric, so an improvement past the bar marks topology dirty the same way a degradation does. Variance raises the bar on a link that swings repeatedly, which is what keeps a single unstable neighbour from driving early broadcasts; a stable link keeps reporting at the 0.5 floor. Field traffic under the margin curve is almost entirely either no change at all or a jump well above any bar between 0.2 and 1.0, so the saturated healthy band — not the threshold — is what keeps the graph quiet, and the dirty broadcast floor caps how often an early send can fire.
 
-**Silence-aware variance is local scoring; the wire is unchanged.** Each node keeps `lastHeardSecs` on its own `Reported` RX edges (direct originator or on-air relay gateway only; zero means never heard: no live surcharge). Age since that stamp adds a silence component with `T` = `NeighborGraph::TOPOLOGY_BROADCAST_SECS` = `SIGNAL_ROUTING_BROADCAST_SECS` = 600 s: `< T/2` none, `T/2…T` slight, `T…2T` much more, `≥ 2T` saturate. Dijkstra and `deliveryHopCost` add `stored_variance×5` on peers' lists and `effective_variance×10` on our RX edges. An unverified reverse hop saturates `etx×UNVERIFIED_HOP_COST_FACTOR` first, then adds that variance term. The egress hop `me → N` takes the dearer of N's list of us and our RX of N only when we have RF-heard N (`lastHeardSecs != 0`). After `≥T/2` quiet, the next RF hear folds the gap into the stored EWMA before `lastHeardSecs` resets, so cost does not snap back to the fresh-link price. Packed `etxVariance`, `covers` / `hopCost` / acknowledgements, and the dirty-topology bar still use stored EWMA / raw mean ETX. Native tests: `test_silence_variance_follows_age_bands`, `test_delivery_cost_rises_with_silence_on_our_rx_edge`, `test_variance_outranks_a_slightly_better_mean_when_a_neighbour_is_silent`, `test_silence_fold_keeps_scar_after_a_long_gap_packet`, `test_last_heard_follows_the_on_air_transmitter`, `test_in_window_hear_does_not_fold_silence_but_etx_jump_still_raises`, `test_packed_variance_stays_stored_while_silence_is_live`, `test_egress_silence_applies_only_after_we_have_heard_them`, `test_unverified_priced_hop_saturates_instead_of_wrapping`.
+**Silence-aware variance is local scoring; the wire is unchanged.** Each node keeps `lastHeardSecs` on its own `Reported` RX edges (direct originator or on-air relay gateway only; zero means never heard: no live surcharge). Age since that stamp adds a silence component with `T` = `NeighborGraph::TOPOLOGY_BROADCAST_SECS` = `SIGNAL_ROUTING_BROADCAST_SECS`: `< T/2` none, `T/2…T` slight, `T…2T` much more, `≥ 2T` saturate. Dijkstra and `deliveryHopCost` add `stored_variance×5` on peers' lists and `effective_variance×10` on our RX edges. An unverified reverse hop saturates `etx×UNVERIFIED_HOP_COST_FACTOR` first, then adds that variance term. The egress hop `me → N` takes the dearer of N's list of us and our RX of N only when we have RF-heard N (`lastHeardSecs != 0`). After `≥T/2` quiet, the next RF hear folds the gap into the stored EWMA before `lastHeardSecs` resets, so cost does not snap back to the fresh-link price. Packed `etxVariance`, `covers` / `hopCost` / acknowledgements, and the dirty-topology bar still use stored EWMA / raw mean ETX. Native tests: `test_silence_variance_follows_age_bands`, `test_delivery_cost_rises_with_silence_on_our_rx_edge`, `test_variance_outranks_a_slightly_better_mean_when_a_neighbour_is_silent`, `test_silence_fold_keeps_scar_after_a_long_gap_packet`, `test_last_heard_follows_the_on_air_transmitter`, `test_in_window_hear_does_not_fold_silence_but_etx_jump_still_raises`, `test_packed_variance_stays_stored_while_silence_is_live`, `test_egress_silence_applies_only_after_we_have_heard_them`, `test_unverified_priced_hop_saturates_instead_of_wrapping`.
 
 ### Topology Graph
 
@@ -215,7 +215,7 @@ Passive nodes maintain a simplified Level 1 topology containing ONLY directly-he
 
 6. **No Gateway Inference**: Downstream relationships and multi-hop topology are not tracked
 
-**Mute Node Topology Sharing**: 
+**Mute Node Topology Sharing**:
 CLIENT_MUTE nodes broadcast their direct neighbor information to help active SignalRouting nodes discover network topology, even though mute nodes don't participate in packet relaying. Active nodes learn about mute node neighbors for discovery purposes but don't consider routing paths through mute nodes since they don't relay. CLIENT_MUTE nodes maintain their direct neighbor graph (add/remove expired connections) but use simplified topology tracking.
 
 **Key Benefit of Passive Mode:**
@@ -1075,23 +1075,23 @@ The default values for the configurable parameters above are defined in `SignalR
 
 ```cpp
 // SignalRoutingModule.h
-#define SIGNAL_ROUTING_BROADCAST_SECS        600   // periodic topology broadcast interval (10 min)
-#define SIGNAL_ROUTING_DIRTY_BROADCAST_SECS  300   // minimum gap before early dirty broadcast (5 min)
-#define SR_BROADCAST_MAX_HOPS                  4   // hop_limit cap for topology packets
-#define MAX_SIGNAL_ROUTING_NEIGHBORS          28   // neighbors per broadcast payload (packed binary, fits 233-byte limit)
+#define SIGNAL_ROUTING_BROADCAST_SECS           // periodic topology broadcast interval (10 min)
+#define SIGNAL_ROUTING_DIRTY_BROADCAST_SECS     // minimum gap before early dirty broadcast (5 min)
+#define SR_BROADCAST_MAX_HOPS                   // hop_limit cap for topology packets
+#define MAX_SIGNAL_ROUTING_NEIGHBORS            // neighbors per broadcast payload (packed binary, fits 233-byte limit)
 
 // SignalRoutingModule.h (private, class scope)
-static constexpr uint32_t NODE_TTL_SECS = 5400;   // 90 min — graph aging TTL for all nodes
-static constexpr uint32_t RELAY_ID_CACHE_TTL_MS = 600 * 1000;  // relay byte → NodeNum cache
-static constexpr uint32_t ROUTE_CACHE_TIMEOUT_SECS = 300;      // Dijkstra result cache validity
-static constexpr uint32_t CAPABILITY_TTL_SECS = SIGNAL_ROUTING_BROADCAST_SECS * 3 + 10;  // node capability cache
-static constexpr uint32_t PUBLISHER_SILENCE_SECS = SIGNAL_ROUTING_BROADCAST_SECS * 2;  // retract our direct link to a silent publisher
+static constexpr uint32_t NODE_TTL_SECS;   // graph aging TTL for all nodes
+static constexpr uint32_t RELAY_ID_CACHE_TTL_MS;  // relay byte → NodeNum cache
+static constexpr uint32_t ROUTE_CACHE_TIMEOUT_SECS;      // Dijkstra result cache validity
+static constexpr uint32_t CAPABILITY_TTL_SECS;  // node capability cache
+static constexpr uint32_t PUBLISHER_SILENCE_SECS;  // retract our direct link to a silent publisher
 
 // NeighborGraph.h (private instance variable)
 float etxChangeThreshold = 0.5f;   // absolute ETX delta for a significant edge change (base; per-edge etxVariance added)
 uint8_t etxVariance;               // EWMA of |ETX change| × 20 on each edge — stored on the wire; live silence is local
 uint32_t lastHeardSecs;            // last RF hear as on-air TX on our Reported RX edge; 0 = no silence surcharge
-static constexpr uint32_t TOPOLOGY_BROADCAST_SECS = 600;  // same T as SIGNAL_ROUTING_BROADCAST_SECS
+static constexpr uint32_t TOPOLOGY_BROADCAST_SECS;  // same T as SIGNAL_ROUTING_BROADCAST_SECS
 ```
 
 ### Prompt Dirty-Topology Rebroadcast (`markTopologyDirty()`)

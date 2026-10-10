@@ -585,12 +585,12 @@ static inline int refreshReportedDirectNeighborObservation(NeighborGraph *graph,
     return changeType;
 }
 
-// Broadcast interval for signal routing info (10 minutes)
-#define SIGNAL_ROUTING_BROADCAST_SECS 600
+// Broadcast interval for signal routing info
+#define SIGNAL_ROUTING_BROADCAST_SECS 900
 
 // Minimum inter-broadcast interval: dirty topology triggers an early broadcast only after this
 // many seconds have elapsed since the last broadcast.
-#define SIGNAL_ROUTING_DIRTY_BROADCAST_SECS 300
+#define SIGNAL_ROUTING_DIRTY_BROADCAST_SECS 600
 
 // Maximum hops for SR topology broadcasts; capped at min(user config, this value)
 #define SR_BROADCAST_MAX_HOPS 4
@@ -704,11 +704,11 @@ private:
     HopHealth hopHealth;
     uint32_t lastGraphUpdate = 0;
     static constexpr uint32_t GRAPH_MAINTENANCE_INTERVAL_SECS = 60;
-    static constexpr uint32_t NODE_TTL_SECS = 7200;    // 2 hours for all nodes in the graph
-    static constexpr uint32_t CAPABILITY_TTL_SECS = SIGNAL_ROUTING_BROADCAST_SECS * 3 + 10;  // detect when SR node stops being SR
+    static constexpr uint32_t NODE_TTL_SECS = 10800;    // 3 hours for all nodes in the graph
+    static constexpr uint32_t CAPABILITY_TTL_SECS = SIGNAL_ROUTING_BROADCAST_SECS * 3 + 20;  // detect when SR node stops being SR
     // A publisher that misses two consecutive lists with nothing else heard from it is gone: we
     // retract our direct link rather than keep owing it coverage for the whole graph TTL.
-    static constexpr uint32_t PUBLISHER_SILENCE_SECS = SIGNAL_ROUTING_BROADCAST_SECS * 2;
+    static constexpr uint32_t PUBLISHER_SILENCE_SECS = SIGNAL_ROUTING_BROADCAST_SECS * 2 +20;
     static constexpr uint32_t RELAY_ID_CACHE_TTL_MS = 600 * 1000;  // 10 min
 
     bool signalBasedRoutingEnabled = true;
