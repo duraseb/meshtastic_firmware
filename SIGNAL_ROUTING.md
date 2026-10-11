@@ -332,9 +332,10 @@ not rewrite the remaining budget. If the incoming hop fields are inverted (`hop_
 is known).
 
 Among SR overhearers, at most two priced last hops get slots if the destination is SR-active or
-passive (early + dest-ACK backup); otherwise one. Extra directs stay silent (`LastHopReserved`).
-The backup waits for dest's ACK of the early last hop (early slot + that copy's airtime + dest-ACK
-wait) and cancels only on dest's own copy. The early last hop itself always arms one follow-up
+passive (early + ACK-window backup); otherwise one. Extra directs stay silent (`LastHopReserved`).
+The backup waits through the destination's expected ACK window after the early last hop (early slot
++ that copy's airtime + ACK wait) and cancels only on the destination's own copy. The early last hop
+itself always arms one follow-up
 (two air copies): a **strong** link (measured ETX ≤ `poor_link_etx_threshold`) stamps the
 destination as `next_hop`; a **weak** link floods (`next_hop` unset). Only the nominated
 destination (or its ACK/reply) cancels the follow-up — not coverage rank from other peers.
@@ -343,9 +344,11 @@ The same strong/weak rule applies to **non-last** unicast forwards: a strong onw
 as `next_hop`; a weak one floods (`next_hop` unset) while remembering the intended peer in
 `nominatedNextHop`. Only that nominated node cancels the follow-up.
 
-Unsolicited dest ACK (no `want_ack`) is hop-0 only when the delivering transmitter is SR: hops away
-0 means the originator, otherwise the resolved relay byte. Stock last hops are not waiting. Dest
-ACK / reply still cancels a queued backup via `cancelSending(request_id)`.
+SignalRouting does not synthesize a hop-0 delivery ACK for a unicast that did not request one.
+That extra Routing packet could itself be mistaken for a delivery that needs acknowledgment,
+creating an ACK feedback loop between SR peers. Normal `want_ack` ACK/NAK handling and application
+replies still follow the receive path and can cancel a queued backup. Builds that exclude
+SignalRouting retain the stock NextHopRouter delivery signal.
 
 ### Speculative Retransmission
 
@@ -383,7 +386,7 @@ transmitter), three tiers that never overlap:
 
 This ensures last-hop delivery nodes are always scheduled before intermediate relays, and within each tier the lower ETX wins. A neighbour that does not hear the transmitter (`knownToHear`) is not a candidate even if it has a path to the destination: ranking it made every overhearer wait for a slot that never fired. We ourselves always count — we overheard the frame. Native test: `test_neighbour_that_does_not_hear_the_transmitter_gets_no_slot`. Costs are compared in half-ETX buckets (`SR_COST_BUCKET_FIXED`), for unicast candidates and for the broadcast ranking's average cost alike: a node prices its own link from its own measurements and a peer's link from the peer's packed report, so near-equal costs differ by a few hundredths in a direction that varies per node, and exact comparison let two colocated nodes rank each other in opposite orders and take the same slot. Within a bucket the packet-id-parity node-id tie-break decides identically everywhere.
 
-**Channel-access model:** waits are built from stock's own contention geometry (the preset's CAD slot time and its contention window), the frame airtime, and a fixed guard after somebody else's frame — the turnaround, `SR_PEER_TURNAROUND_MS` = 250 ms. The ACK gate is turnaround + twice the maximum contention delay + the reply airtime; the wait behind a designated SR next hop is turnaround + maximum contention + one airtime; the coordinated broadcast ladder and undesignated unicast slot 0 both start at stock's contention floor, `getRelayFloorMsec()` = 2 × CWmax × slot time (rung k at floor + k × half airtime). The turnaround remains the peer re-arm used by dest-ACK and peer-relay waits, not the ladder origin.
+**Channel-access model:** waits are built from stock's own contention geometry (the preset's CAD slot time and its contention window), the frame airtime, and a fixed guard after somebody else's frame — the turnaround, `SR_PEER_TURNAROUND_MS` = 250 ms. The expected destination-ACK window is turnaround + twice the maximum contention delay + the reply airtime; the wait behind a designated SR next hop is turnaround + maximum contention + one airtime; the coordinated broadcast ladder and undesignated unicast slot 0 both start at stock's contention floor, `getRelayFloorMsec()` = 2 × CWmax × slot time (rung k at floor + k × half airtime). The turnaround remains the peer re-arm used by dest-ACK and peer-relay waits, not the ladder origin.
 
 **The turnaround is margin, not a measured deaf window.** Peers take up to ~170 ms of per-packet processing between a frame ending and the decoded packet reaching their router, and that figure was once read here as time off air. It is not: the radio re-arms the receiver before delivering the frame upward, so a peer is listening again long before it has finished with the frame it just took. Nothing above depends on the 170 ms figure.
 
