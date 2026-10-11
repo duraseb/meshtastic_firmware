@@ -2609,24 +2609,6 @@ bool SignalRoutingModule::hasStrongDeliveryHop(NodeNum dest) const
     return hasPricedDeliveryHop(dest) && hasStrongHopTo(dest);
 }
 
-bool SignalRoutingModule::deliveringRelayerIsSR(const meshtastic_MeshPacket *p) const
-{
-    if (!p) {
-        return false;
-    }
-    NodeNum node = 0;
-    if (getHopsAway(*p) == 0) {
-        node = p->from;
-    } else if (p->relay_node == 0) {
-        return false;
-    } else {
-        node = resolveRelayIdentity(p->relay_node);
-    }
-    if (node == 0) {
-        return false;
-    }
-    return publishesTopology(node);
-}
 
 uint32_t SignalRoutingModule::nextHopCarryWaitMs(NodeNum nextHop, uint32_t airtimeMs, float rxSnr) const
 {

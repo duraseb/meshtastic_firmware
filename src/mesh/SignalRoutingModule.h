@@ -540,7 +540,6 @@ class SignalRoutingModule : public ProtobufModule<meshtastic_SignalRoutingInfo>,
 
     bool hasStrongDeliveryHop(NodeNum dest) const;
     bool isSignalRoutingNode(NodeNum nodeId) const { return publishesTopology(nodeId); }
-    bool deliveringRelayerIsSR(const meshtastic_MeshPacket *p) const;
     uint32_t nextHopCarryWaitMs(NodeNum nextHop, uint32_t airtimeMs, float rxSnr) const;
 
     uint32_t namedForwardFollowupDelayMs(NodeNum nextHop, uint32_t airtimeMs, float rxSnr) const;

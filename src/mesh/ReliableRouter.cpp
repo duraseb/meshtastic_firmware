@@ -127,15 +127,11 @@ void ReliableRouter::sniffReceived(const meshtastic_MeshPacket *p, const meshtas
                     sendAckNak(meshtastic_Routing_Error_NO_CHANNEL, getFrom(p), p->id, channels.getPrimaryIndex(),
                                routingModule->getHopLimitForResponse(*p));
                 }
-            } else if (
-#if !MESHTASTIC_EXCLUDE_SIGNALROUTING
-                signalRoutingModule && signalRoutingModule->deliveringRelayerIsSR(p)
-#else
-                p->next_hop == nodeDB->getLastByteOfNodeNum(getNodeNum()) && p->hop_limit > 0
-#endif
-            ) {
-                // Hop-0 ACK so the last SR hop hears delivery. Stock last hops are not waiting.
+#if MESHTASTIC_EXCLUDE_SIGNALROUTING
+            } else if (p->next_hop == nodeDB->getLastByteOfNodeNum(getNodeNum()) && p->hop_limit > 0) {
+                // Preserve the stock NextHopRouter delivery signal. SR disables this inferred ACK path.
                 sendAckNak(meshtastic_Routing_Error_NONE, getFrom(p), p->id, p->channel, 0);
+#endif
             }
         } else {
             LOG_DEBUG("Another module replied to this message, no need for 2nd ack");
