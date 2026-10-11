@@ -43,9 +43,19 @@ pass that runs only when the ranking left the ladder empty — see the acknowled
 
 ### Channel QoS relay gating
 ```
-[QoS] Drop relay 0x<id> from 0x<from>: tier <LOW|MEDIUM|HIGH>, chutil <N>% >= <threshold>%
+[QoS] Drop relay 0x<id> from <name> (<from>, <portnum>): <packet>, tier <LOW|MEDIUM|HIGH>, chutil <N>% >= <threshold>%
 ```
-Fires when channel utilization exceeds the tier threshold. Tiers: LOW (telemetry/position, >25%), MEDIUM (non-primary text, >30%), HIGH (routing/traceroute, >38%). CRITICAL (primary text, admin) is never dropped. If no QoS messages appear, channel utilization is below all thresholds.
+The message includes the packet ID, originator name and ID, decoded port, tier, measured utilization, and threshold. The gate fires at or above the tier threshold: LOW (telemetry, position, node info, unknown or undecoded payloads, 25%), MEDIUM (text outside the configured primary channel, 30%), and HIGH (routing control, SR routing, traceroute, 38%). Text on the configured primary channel and admin traffic are CRITICAL and bypass the utilization read. QoS runs before relay selection; it does not block local delivery. Missing QoS messages do not prove utilization is low: DEBUG_MUTE can suppress them, and CRITICAL traffic does not enter the gate.
+
+### Inbound rate limiting
+```
+[RateLimit] Initialized: enabled=<0|1> ...
+[RateLimit] <node> <bucket> <limited|unlimited> (count=<N> trip=<N> clear=<N>)
+[RateLimit] Dropping packet ...
+[RateLimit] Dropping undecoded packet ...
+[RateLimit] Skip rebroadcast ... (limited)
+```
+The initialization line reports whether the limiter is enabled and its effective settings. Bucket transition messages identify the originator or relay and show the count and trip/clear thresholds. Router drop messages indicate an inbound rejection; a rebroadcast skip means a candidate was already limited. `NodeRateLimiter::wouldDrop()` is a read-only check used on duplicate and retry paths, so it may suppress a relay without changing bucket counts or logging a transition. An expired limit can be cleared during this check or the next charged packet. Compare these messages with the receive path in `Router::handleReceived()` and relay path in `NextHopRouter`; channel QoS and SR policy can also suppress a relay for independent reasons.
 
 ### Contention band (per transmission)
 ```
@@ -120,6 +130,7 @@ cancelSending id=0x<id>, removed=<0|1>      ← 1=cancelled before TX, 0=already
 [SR] Topology dirty — sending early broadcast
 [SR] Network Topology: <N> nodes, <K> direct neighbors
 ```
+Topology lists larger than one packet are sent as indexed chunks of one version. `SignalRoutingModule::processTopology()` accepts each chunk index once, so a delayed duplicate cannot restart collection or block completion. A list is complete only when all indexes are present; a missing or out-of-order continuation does not retract existing edges or hearsUs claims. Legacy chunks without indexes use packet identity and cannot authorize retraction while incomplete. The authoritative hearsUs override runs only after a complete list.
 
 ### Broadcast timing
 ```
@@ -127,7 +138,7 @@ cancelSending id=0x<id>, removed=<0|1>      ← 1=cancelled before TX, 0=already
 [SR] Sending empty boot broadcast
 [SR] Direct neighbor lost during aging — marking topology dirty
 ```
-The dirty broadcast respects a minimum inter-broadcast interval of `cfgDirtyBroadcastSecs`. When `markTopologyDirty()` is called it schedules `runOnce()` to wake at `max(0, cfgDirtyBroadcastSecs − elapsed_since_last_broadcast)`. If no topology changes occur the periodic broadcast fires every `cfgBroadcastSecs`.
+The dirty broadcast respects a minimum inter-broadcast interval of `cfgDirtyBroadcastSecs`. `SignalRoutingModule::markTopologyDirty()` uses `SignalRoutingModule::wakeWithin()` to bring `runOnce()` forward to the eligible dirty-broadcast deadline; an earlier bootstrap reply or retransmission wake remains scheduled. If no topology changes occur the periodic broadcast fires every `cfgBroadcastSecs`.
 
 `markTopologyDirty()` is intentionally scoped to direct-edge events only:
 - A new direct neighbor is heard, or significant ETX change on an existing one (`updateNeighborInfo`)

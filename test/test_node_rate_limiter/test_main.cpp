@@ -3,11 +3,11 @@
 
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
 
+#include "airtime.h"
 #include "mesh/NodeDB.h"
 #include "mesh/NodeRateLimiter.h"
 #include "mesh/Router.h"
 #include "mesh/SignalRoutingModule.h"
-#include "airtime.h"
 #include "mesh/generated/meshtastic/portnums.pb.h"
 #include <cstring>
 
@@ -199,12 +199,11 @@ static void test_rotating_from_hits_shared_relay_bucket()
     // Distinct originators stay under OTHER (4); shared unresolved RELAY accumulates.
     for (uint32_t i = 0; i < 59; i++) {
         NodeNum from = 0xA0000000u + i;
-        auto p = makePacket(from, NODENUM_BROADCAST, 3, 3, (uint8_t)(0x10 + (i % 200)), meshtastic_PortNum_TELEMETRY_APP,
-                            500 + i);
+        auto p =
+            makePacket(from, NODENUM_BROADCAST, 3, 3, (uint8_t)(0x10 + (i % 200)), meshtastic_PortNum_TELEMETRY_APP, 500 + i);
         TEST_ASSERT_FALSE(limiter.shouldDrop(&p));
     }
-    auto pTrip =
-        makePacket(0xA0000000u + 59, NODENUM_BROADCAST, 3, 3, 0x99, meshtastic_PortNum_TELEMETRY_APP, 559);
+    auto pTrip = makePacket(0xA0000000u + 59, NODENUM_BROADCAST, 3, 3, 0x99, meshtastic_PortNum_TELEMETRY_APP, 559);
     TEST_ASSERT_TRUE(limiter.shouldDrop(&pTrip));
 }
 
@@ -428,8 +427,7 @@ static bool dropText(NodeRateLimiter &limiter, NodeNum from, uint32_t id)
 /// hop_limit 0 so long alumni-fill loops do not trip the RELAY bucket.
 static bool dropTextOriginatorOnly(NodeRateLimiter &limiter, NodeNum from, uint32_t id)
 {
-    meshtastic_MeshPacket p =
-        makePacket(from, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TEXT_MESSAGE_APP, id);
+    meshtastic_MeshPacket p = makePacket(from, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TEXT_MESSAGE_APP, id);
     return limiter.shouldDrop(&p);
 }
 
@@ -488,7 +486,8 @@ static void test_young_record_is_released_after_thirty_minutes()
     TEST_ASSERT_EQUAL_UINT8(1, limiter.debugYoungCount());
     NodeRateLimiter::testNowOverride = NodeRateLimiter::WARMUP_MS + NodeRateLimiter::YOUNG_AGE_MS;
     TEST_ASSERT_FALSE(dropText(limiter, from, 2));
-    TEST_ASSERT_FALSE_MESSAGE(limiter.debugTracksYoung(from), "first-sighting record is deleted once the node is no longer young");
+    TEST_ASSERT_FALSE_MESSAGE(limiter.debugTracksYoung(from),
+                              "first-sighting record is deleted once the node is no longer young");
     TEST_ASSERT_EQUAL_UINT8(0, limiter.debugYoungCount());
 }
 
@@ -558,8 +557,7 @@ static void test_alumni_never_reyouths_when_table_turns_over()
         nextId = waveStart + room;
         NodeRateLimiter::testNowOverride = t0 + NodeRateLimiter::YOUNG_AGE_MS;
         for (uint8_t j = 0; j < room; j++) {
-            TEST_ASSERT_FALSE_MESSAGE(dropTextOriginatorOnly(limiter, waveStart + j, 1 + j),
-                                      "graduate into alumni");
+            TEST_ASSERT_FALSE_MESSAGE(dropTextOriginatorOnly(limiter, waveStart + j, 1 + j), "graduate into alumni");
         }
     }
     TEST_ASSERT_EQUAL_UINT8(NodeRateLimiter::MAX_ALUMNI_ENTRIES, limiter.debugAlumniCount());
@@ -613,8 +611,7 @@ static void test_parked_rows_do_not_fail_closed_a_busy_mesh()
     }
     TEST_ASSERT_EQUAL_UINT8(NodeRateLimiter::MAX_YOUNG_ENTRIES, limiter.debugYoungCount());
     TEST_ASSERT_FALSE_MESSAGE(limiter.debugYoungTableFull(), "aged-parked must not count as active-full");
-    TEST_ASSERT_FALSE_MESSAGE(limiter.debugIsYoung(0xE3000001),
-                              "busy-mesh overflow must fail open, not charge ordinary traffic");
+    TEST_ASSERT_FALSE_MESSAGE(limiter.debugIsYoung(0xE3000001), "busy-mesh overflow must fail open, not charge ordinary traffic");
     TEST_ASSERT_FALSE(dropTextOriginatorOnly(limiter, 0xE3000001, 99));
     TEST_ASSERT_TRUE(limiter.debugTracksYoung(0xE3000001));
     TEST_ASSERT_TRUE(limiter.debugIsYoung(0xE3000001));
@@ -696,10 +693,11 @@ static void test_young_announce_respects_refractory_and_congestion()
     TEST_ASSERT_FALSE_MESSAGE(congested.debugTakeAnnounce(ids, n), "suppressed while channel utilisation is high");
 
     NodeRateLimiter::testChutilOverride = 0.0f;
-    NodeRateLimiter::testNowOverride = 0;
+    NodeRateLimiter::testNowOverride = NodeRateLimiter::WARMUP_MS - 100;
     NodeRateLimiter relayBusy;
+    relayBusy.debugSetBootMs(0);
     for (uint32_t i = 0; i < 60; i++) {
-        NodeRateLimiter::testNowOverride = i;
+        NodeRateLimiter::testNowOverride = NodeRateLimiter::WARMUP_MS - 100 + i;
         auto p = makePacket(0xA4000000 + i, NODENUM_BROADCAST, 3, 3, 0x10, meshtastic_PortNum_TELEMETRY_APP, 600 + i);
         relayBusy.shouldDrop(&p);
     }
@@ -942,6 +940,153 @@ static void test_dest_volume_full_limited_table_does_not_evict()
     }
 }
 
+static void test_graduated_young_and_boot_never_restart_at_millis_wrap()
+{
+    prepareEnv();
+    NodeRateLimiter::testNowOverride = NodeRateLimiter::WARMUP_MS;
+    NodeRateLimiter limiter;
+    limiter.debugSetBootMs(0);
+    limiter.debugSeedYoung(kRemote, NodeRateLimiter::WARMUP_MS);
+    TEST_ASSERT_TRUE(limiter.debugIsYoung(kRemote));
+    NodeRateLimiter::testNowOverride = 2 * NodeRateLimiter::WARMUP_MS;
+    TEST_ASSERT_FALSE(limiter.debugIsYoung(kRemote));
+    NodeRateLimiter::testNowOverride = NodeRateLimiter::WARMUP_MS + 1;
+    TEST_ASSERT_FALSE(limiter.debugIsYoung(kRemote));
+}
+
+static void test_idle_originator_ban_expires_for_destinations_and_duplicates()
+{
+    prepareEnv();
+    NodeRateLimiter::testNowOverride = 100;
+    NodeRateLimiter limiter;
+    auto spam = makePacket(kRemote, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 9100);
+    for (unsigned i = 0; i < NodeRateLimiter::DEFAULT_OTHER_TRIP; ++i) {
+        limiter.shouldDrop(&spam);
+    }
+    auto reply = makePacket(destSender(0), kRemote, 0, 0, 0, meshtastic_PortNum_TEXT_MESSAGE_APP, 9101);
+    TEST_ASSERT_TRUE(limiter.wouldDrop(&reply));
+    NodeRateLimiter::testNowOverride = 2100;
+    TEST_ASSERT_FALSE(limiter.wouldDrop(&reply));
+    TEST_ASSERT_FALSE(limiter.wouldDrop(&spam));
+    TEST_ASSERT_FALSE(limiter.shouldDrop(&reply));
+    TEST_ASSERT_FALSE(limiter.shouldDrop(&spam));
+}
+
+static void test_idle_dest_ban_expires_without_a_recovery_probe()
+{
+    prepareEnv();
+    NodeRateLimiter limiter;
+    constexpr NodeNum dest = 0x0D057ABC;
+    TEST_ASSERT_TRUE(chargeDestStorm(limiter, dest, 20, 0));
+    auto text = makePacket(destSender(40), dest, 3, 3, 0, meshtastic_PortNum_TEXT_MESSAGE_APP, 9200);
+    TEST_ASSERT_TRUE(limiter.wouldDrop(&text));
+    NodeRateLimiter::testNowOverride = 2019;
+    TEST_ASSERT_FALSE(limiter.wouldDrop(&text));
+    TEST_ASSERT_FALSE(limiter.shouldDrop(&text));
+}
+
+static void test_zero_start_dest_window_resets_sender_diversity()
+{
+    prepareEnv();
+    NodeRateLimiter limiter;
+    constexpr NodeNum dest = 0x0D057ABC;
+    for (unsigned i = 0; i < 2; ++i) {
+        NodeRateLimiter::testNowOverride = 0;
+        auto p = makePacket(destSender(i), dest, 3, 3, 0, meshtastic_PortNum_NODEINFO_APP, 9300 + i);
+        TEST_ASSERT_FALSE(limiter.shouldDrop(&p));
+    }
+    NodeRateLimiter::testNowOverride = 1000;
+    auto p = makePacket(destSender(2), dest, 3, 3, 0, meshtastic_PortNum_NODEINFO_APP, 9302);
+    TEST_ASSERT_FALSE(limiter.shouldDrop(&p));
+    TEST_ASSERT_EQUAL_UINT8(1, limiter.debugDestSenders(dest));
+    TEST_ASSERT_EQUAL_UINT32(1, limiter.debugDestCharge(dest));
+}
+
+static void test_text_cannot_trip_dest_volume_without_sender_diversity()
+{
+    prepareEnv();
+    NodeRateLimiter limiter;
+    constexpr NodeNum dest = 0x0D057ABC;
+    for (unsigned i = 0; i < 24; ++i) {
+        NodeRateLimiter::testNowOverride = i;
+        auto p = makePacket(destSender(i % 2), dest, 3, 3, 0, meshtastic_PortNum_NODEINFO_APP, 9400 + i);
+        limiter.shouldDrop(&p);
+    }
+    auto text = makePacket(destSender(40), dest, 3, 3, 0, meshtastic_PortNum_TEXT_MESSAGE_APP, 9430);
+    TEST_ASSERT_FALSE(limiter.shouldDrop(&text));
+    TEST_ASSERT_FALSE(limiter.debugDestLimited(dest));
+}
+
+static void test_full_originator_table_preserves_active_bans()
+{
+    prepareEnv();
+    NodeRateLimiter::testNowOverride = 100;
+    NodeRateLimiter limiter;
+    for (unsigned i = 0; i < 16; ++i) {
+        auto p = makePacket(destSender(i), NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 9500 + i);
+        for (unsigned j = 0; j < NodeRateLimiter::DEFAULT_OTHER_TRIP; ++j) {
+            limiter.shouldDrop(&p);
+        }
+    }
+    auto newcomer = makePacket(kRemote, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 9520);
+    TEST_ASSERT_TRUE(limiter.wouldDrop(&newcomer));
+    TEST_ASSERT_TRUE(limiter.shouldDrop(&newcomer));
+    for (unsigned i = 0; i < 16; ++i) {
+        TEST_ASSERT_TRUE(limiter.debugOriginatorLimited(destSender(i)));
+    }
+    NodeRateLimiter::testNowOverride = 2100;
+    TEST_ASSERT_FALSE(limiter.wouldDrop(&newcomer));
+    TEST_ASSERT_FALSE(limiter.shouldDrop(&newcomer));
+}
+
+static void test_idle_relay_ban_expires_for_read_only_gate()
+{
+    prepareEnv();
+    NodeRateLimiter::testNowOverride = 100;
+    NodeRateLimiter::testResolveRelayHook = resolveHookOnly11;
+    testNodeDB->setFavorite(kRemote);
+    NodeRateLimiter limiter;
+    auto p = makePacket(kRemote, NODENUM_BROADCAST, 3, 3, 0x11, meshtastic_PortNum_TELEMETRY_APP, 9600);
+    for (unsigned i = 0; i < 60; ++i) {
+        limiter.shouldDrop(&p);
+    }
+    TEST_ASSERT_TRUE(limiter.wouldDrop(&p));
+    NodeRateLimiter::testNowOverride = 2100;
+    TEST_ASSERT_FALSE(limiter.wouldDrop(&p));
+    TEST_ASSERT_FALSE(limiter.shouldDrop(&p));
+}
+
+static void test_limiter_window_recovery_across_millis_wrap()
+{
+    prepareEnv();
+    NodeRateLimiter::testNowOverride = UINT32_MAX - 500;
+    NodeRateLimiter limiter;
+    auto p = makePacket(kRemote, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 9700);
+    for (unsigned i = 0; i < NodeRateLimiter::DEFAULT_OTHER_TRIP; ++i) {
+        limiter.shouldDrop(&p);
+    }
+    NodeRateLimiter::testNowOverride = 1499;
+    TEST_ASSERT_FALSE(limiter.wouldDrop(&p));
+    TEST_ASSERT_FALSE(limiter.shouldDrop(&p));
+}
+
+static void test_oversized_window_and_airtime_do_not_overflow()
+{
+    prepareEnv(UINT32_MAX);
+    NodeRateLimiter::testNowOverride = 100;
+    NodeRateLimiter limiter;
+    uint32_t trip, clear;
+    limiter.debugRelayBudgets(UINT32_MAX, trip, clear);
+    TEST_ASSERT_EQUAL_UINT32(12000, trip);
+    TEST_ASSERT_EQUAL_UINT32(3000, clear);
+    auto p = makePacket(kRemote, NODENUM_BROADCAST, 0, 0, 0, meshtastic_PortNum_TELEMETRY_APP, 9800);
+    for (unsigned i = 0; i < NodeRateLimiter::DEFAULT_OTHER_TRIP; ++i) {
+        limiter.shouldDrop(&p);
+    }
+    NodeRateLimiter::testNowOverride = 5000;
+    TEST_ASSERT_TRUE(limiter.wouldDrop(&p));
+}
+
 } // namespace
 
 void setUp(void) {}
@@ -966,6 +1111,15 @@ void setup()
 {
     UNITY_BEGIN();
     RUN_TEST(test_unresolved_relay_is_only_charged_once_resolution_is_possible);
+    RUN_TEST(test_graduated_young_and_boot_never_restart_at_millis_wrap);
+    RUN_TEST(test_idle_originator_ban_expires_for_destinations_and_duplicates);
+    RUN_TEST(test_idle_dest_ban_expires_without_a_recovery_probe);
+    RUN_TEST(test_zero_start_dest_window_resets_sender_diversity);
+    RUN_TEST(test_text_cannot_trip_dest_volume_without_sender_diversity);
+    RUN_TEST(test_full_originator_table_preserves_active_bans);
+    RUN_TEST(test_idle_relay_ban_expires_for_read_only_gate);
+    RUN_TEST(test_limiter_window_recovery_across_millis_wrap);
+    RUN_TEST(test_oversized_window_and_airtime_do_not_overflow);
     RUN_TEST(test_other_bucket_trips_at_its_threshold);
     RUN_TEST(test_to_us_is_never_limited);
     RUN_TEST(test_admin_app_counts_as_other_when_not_to_us);

@@ -15,6 +15,24 @@
 #include <functional>
 #include <limits>
 
+// Dividing a wrapping millis() directly would age every graph record at the 49-day rollover.
+struct SrMonotonicClock {
+    uint32_t lastMs = 0;
+    uint32_t elapsedSecs = 0;
+    uint16_t remainderMs = 0;
+
+    uint32_t seconds(uint32_t nowMs)
+    {
+        const uint32_t elapsedMs = nowMs - lastMs;
+        lastMs = nowMs;
+        elapsedSecs += elapsedMs / 1000;
+        const uint32_t remainder = remainderMs + elapsedMs % 1000;
+        elapsedSecs += remainder / 1000;
+        remainderMs = remainder % 1000;
+        return elapsedSecs;
+    }
+};
+
 // Fixed-size node set — replaces std::unordered_set<NodeNum> to avoid heap allocations.
 // Capacity: enough for one node's edges + some margin. Keeps stack usage predictable.
 static constexpr size_t NODE_SET_MAX = 48;
@@ -359,6 +377,10 @@ class NeighborGraph {
 
 
     NeighborGraph();
+    uint32_t nowSeconds() const;
+#if defined(UNIT_TEST)
+    void debugAdvanceClock(uint32_t nowMs) const { graphClock.seconds(nowMs); }
+#endif
 
     // --- Core methods ---
 
@@ -757,6 +779,7 @@ class NeighborGraph {
     static constexpr uint32_t TOPOLOGY_BROADCAST_SECS = 600;
 
   private:
+    mutable SrMonotonicClock graphClock;
     float etxChangeThreshold = 0.5f; // Absolute ETX delta to register an edge change as significant
     NodeEdges neighbors[NEIGHBOR_GRAPH_MAX_NEIGHBORS];
     uint8_t neighborCount;

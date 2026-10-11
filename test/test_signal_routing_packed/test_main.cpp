@@ -1,8 +1,8 @@
 #include "TestUtil.h"
 #include "mesh/NodeDB.h"
+#include "mesh/SignalRoutingModule.h"
 #include "mesh/graph/HopHealth.h"
 #include "mesh/graph/NeighborGraph.h"
-#include "mesh/SignalRoutingModule.h"
 #include <cmath>
 #include <cstring>
 #include <pb_encode.h>
@@ -154,7 +154,7 @@ static void test_reject_v2_format_returns_zero()
     uint8_t count = decodePackedNeighbors(buf, PACKED_NEIGHBOR_HEADER_SIZE + PACKED_NEIGHBOR_ENTRY_SIZE, out, 1, &header);
 
     TEST_ASSERT_EQUAL_UINT8(0, count);
-    TEST_ASSERT_EQUAL_UINT8(2, header.formatVersion);
+    TEST_ASSERT_EQUAL_UINT8(0, header.formatVersion);
 }
 
 static void test_direct_signal_upsert_lookup_and_prune()
@@ -277,9 +277,9 @@ static void test_a_single_rf_observation_survives_aging()
     DirectNeighborSignal signals[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE] = {};
     uint8_t signalCount = 0;
 
-    TEST_ASSERT_EQUAL_INT(EDGE_NEW, refreshReportedDirectNeighborObservation(
-                                        &graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, me, peer, -22, 12.0f,
-                                        100));
+    TEST_ASSERT_EQUAL_INT(EDGE_NEW,
+                          refreshReportedDirectNeighborObservation(&graph, signals, signalCount,
+                                                                   NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, me, peer, -22, 12.0f, 100));
     TEST_ASSERT_TRUE(hasReportedDirectEdgeTo(&graph, me, peer));
 
     const NodeEdges *theirs = graph.getEdgesFrom(peer);
@@ -343,8 +343,7 @@ static void test_an_improvement_larger_than_the_bar_is_significant()
 
     TEST_ASSERT_EQUAL_INT(EDGE_NEW, graph.updateEdge(me, peer, 3.0f, 1000, Edge::Source::Reported));
     // Absolute drop of 1.0 ETX clears the 0.5 floor on a quiet edge.
-    TEST_ASSERT_EQUAL_INT(EDGE_SIGNIFICANT_CHANGE,
-                          graph.updateEdge(me, peer, 2.0f, 1001, Edge::Source::Reported));
+    TEST_ASSERT_EQUAL_INT(EDGE_SIGNIFICANT_CHANGE, graph.updateEdge(me, peer, 2.0f, 1001, Edge::Source::Reported));
 }
 
 static void test_a_degradation_larger_than_the_bar_is_significant()
@@ -355,8 +354,7 @@ static void test_a_degradation_larger_than_the_bar_is_significant()
     NeighborGraph graph;
 
     TEST_ASSERT_EQUAL_INT(EDGE_NEW, graph.updateEdge(me, peer, 2.0f, 1000, Edge::Source::Reported));
-    TEST_ASSERT_EQUAL_INT(EDGE_SIGNIFICANT_CHANGE,
-                          graph.updateEdge(me, peer, 3.0f, 1001, Edge::Source::Reported));
+    TEST_ASSERT_EQUAL_INT(EDGE_SIGNIFICANT_CHANGE, graph.updateEdge(me, peer, 3.0f, 1001, Edge::Source::Reported));
 }
 
 static void test_a_change_just_above_half_is_significant_on_a_quiet_edge()
@@ -369,8 +367,7 @@ static void test_a_change_just_above_half_is_significant_on_a_quiet_edge()
     NeighborGraph graph;
 
     graph.updateEdge(me, peer, 2.0f, 1000, Edge::Source::Reported);
-    TEST_ASSERT_EQUAL_INT(EDGE_SIGNIFICANT_CHANGE,
-                          graph.updateEdge(me, peer, 2.55f, 1001, Edge::Source::Reported));
+    TEST_ASSERT_EQUAL_INT(EDGE_SIGNIFICANT_CHANGE, graph.updateEdge(me, peer, 2.55f, 1001, Edge::Source::Reported));
 }
 
 static void test_a_change_smaller_than_the_bar_is_not_significant_either_way()
@@ -405,10 +402,8 @@ static void test_variance_raises_the_bar_so_a_noisy_edge_stops_reporting_small_j
         graph.updateEdge(me, noisy, 2.0f, 3000, Edge::Source::Reported);
     }
 
-    TEST_ASSERT_EQUAL_INT(EDGE_SIGNIFICANT_CHANGE,
-                          graph.updateEdge(me, quiet, 3.0f, 4000, Edge::Source::Reported));
-    TEST_ASSERT_EQUAL_INT(EDGE_NO_CHANGE,
-                          graph.updateEdge(me, noisy, 3.0f, 4000, Edge::Source::Reported));
+    TEST_ASSERT_EQUAL_INT(EDGE_SIGNIFICANT_CHANGE, graph.updateEdge(me, quiet, 3.0f, 4000, Edge::Source::Reported));
+    TEST_ASSERT_EQUAL_INT(EDGE_NO_CHANGE, graph.updateEdge(me, noisy, 3.0f, 4000, Edge::Source::Reported));
 }
 
 static void test_a_brand_new_edge_is_significant_unconditionally()
@@ -437,8 +432,8 @@ static void test_relay_refresh_skips_without_reported_edge()
     TEST_ASSERT_FALSE(hasReportedDirectEdgeTo(&graph, localNode, placeholderGateway));
 
     if (hasReportedDirectEdgeTo(&graph, localNode, placeholderGateway)) {
-        refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE,
-                                                 localNode, placeholderGateway, -70, 12.0f, 1001);
+        refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, localNode,
+                                                 placeholderGateway, -70, 12.0f, 1001);
     }
 
     const DirectNeighborSignal *direct = lookupDirectNeighborSignal(signals, signalCount, directNeighbor);
@@ -457,8 +452,8 @@ static void test_mirrored_edge_update_does_not_upgrade_reported_edge()
     DirectNeighborSignal signals[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE] = {};
     uint8_t signalCount = 0;
 
-    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, localNode,
-                                             neighbor, -75, 8.0f, 2000);
+    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, localNode, neighbor,
+                                             -75, 8.0f, 2000);
 
     float mirroredEtx = NeighborGraph::calculateETX(-50, 15.0f, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST);
     int mirroredChange = graph.updateEdge(localNode, neighbor, mirroredEtx, 2001, Edge::Source::Mirrored);
@@ -643,8 +638,7 @@ static void test_asymmetric_l1_routes_via_l2_hearer_not_our_rx()
     TEST_ASSERT_NOT_NULL(graph.getEdgesFrom(me));
     TEST_ASSERT_NOT_NULL(graph.getEdgesFrom(a));
     TEST_ASSERT_TRUE(graph.getNodeClass(b) == NodeClass::L2);
-    TEST_ASSERT_FALSE_MESSAGE(graph.canDeliver(me, a, publishes),
-                              "one-way RX is not a delivery hop into a publishing A");
+    TEST_ASSERT_FALSE_MESSAGE(graph.canDeliver(me, a, publishes), "one-way RX is not a delivery hop into a publishing A");
     TEST_ASSERT_TRUE(graph.canDeliver(b, a, publishes));
     TEST_ASSERT_TRUE(graph.canDeliver(c, b, publishes));
 
@@ -769,12 +763,12 @@ static void test_last_heard_follows_the_on_air_transmitter()
     NeighborGraph graph;
     DirectNeighborSignal signals[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE] = {};
     uint8_t signalCount = 0;
-    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, PEER,
-                                             -70, 8.0f, 1000);
-    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, HUB, -72,
-                                             7.0f, 2000);
-    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, HUB, -65,
-                                             9.0f, 3000);
+    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, PEER, -70, 8.0f,
+                                             1000);
+    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, HUB, -72, 7.0f,
+                                             2000);
+    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, HUB, -65, 9.0f,
+                                             3000);
     const Edge *peer = edgeBetween(graph, ME, PEER);
     const Edge *hub = edgeBetween(graph, ME, HUB);
     TEST_ASSERT_NOT_NULL(peer);
@@ -794,14 +788,14 @@ static void test_in_window_hear_does_not_fold_silence_but_etx_jump_still_raises(
     DirectNeighborSignal signals[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE] = {};
     uint8_t signalCount = 0;
     const uint32_t t0 = 4'000'000;
-    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, PEER,
-                                             -70, 8.0f, t0);
+    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, PEER, -70, 8.0f,
+                                             t0);
     const uint8_t quiet = edgeBetween(graph, ME, PEER)->etxVariance;
-    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, PEER,
-                                             -70, 8.0f, t0 + T / 4);
+    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, PEER, -70, 8.0f,
+                                             t0 + T / 4);
     TEST_ASSERT_EQUAL_UINT8(quiet, edgeBetween(graph, ME, PEER)->etxVariance);
-    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, PEER,
-                                             -90, -15.0f, t0 + T / 4 + 1);
+    refreshReportedDirectNeighborObservation(&graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, PEER, -90,
+                                             -15.0f, t0 + T / 4 + 1);
     TEST_ASSERT_GREATER_THAN(quiet, edgeBetween(graph, ME, PEER)->etxVariance);
 }
 
@@ -815,13 +809,13 @@ static void test_silence_fold_keeps_scar_after_a_long_gap_packet()
     DirectNeighborSignal signals[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE] = {};
     uint8_t signalCount = 0;
     const uint32_t t0 = 1'000'000;
-    TEST_ASSERT_EQUAL_INT(EDGE_NEW, refreshReportedDirectNeighborObservation(
-                                        &graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, PEER, -70,
-                                        8.0f, t0));
+    TEST_ASSERT_EQUAL_INT(EDGE_NEW,
+                          refreshReportedDirectNeighborObservation(&graph, signals, signalCount,
+                                                                   NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, PEER, -70, 8.0f, t0));
     const float fresh = graph.deliveryHopCost(PEER, ME, false, t0);
-    TEST_ASSERT_EQUAL_INT(EDGE_NO_CHANGE, refreshReportedDirectNeighborObservation(
-                                              &graph, signals, signalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, PEER,
-                                              -70, 8.0f, t0 + 2 * T + 1));
+    TEST_ASSERT_EQUAL_INT(EDGE_NO_CHANGE, refreshReportedDirectNeighborObservation(&graph, signals, signalCount,
+                                                                                   NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, ME, PEER,
+                                                                                   -70, 8.0f, t0 + 2 * T + 1));
     const float after = graph.deliveryHopCost(PEER, ME, false, t0 + 2 * T + 1);
     TEST_ASSERT_TRUE(after > fresh);
 }
@@ -953,9 +947,10 @@ static void test_a_backup_does_not_relay_when_its_next_hop_cannot_hear_it()
     initGraphTestNodeDb(me);
     config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
 
-    class GraphWriter : public SignalRoutingModule {
-    public:
-        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+    class GraphWriter : public SignalRoutingModule
+    {
+      public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr); }
         void note(NodeNum from, NodeNum to, bool hearsUs) { updateGraphWithNeighbor(from, to, -90, 5, hearsUs); }
     };
     GraphWriter module;
@@ -1328,9 +1323,11 @@ void test_routing_through_us_confirms_the_sender_hears_us()
 
     auto hearsUs = [&](NodeNum n) {
         const NodeEdges *mine = graph.getEdgesFrom(me);
-        if (!mine) return false;
+        if (!mine)
+            return false;
         for (uint8_t i = 0; i < mine->edgeCount; i++) {
-            if (mine->edges[i].to == n) return mine->edges[i].hearsUs;
+            if (mine->edges[i].to == n)
+                return mine->edges[i].hearsUs;
         }
         return false;
     };
@@ -1375,7 +1372,8 @@ void test_a_guess_never_outranks_or_prices_a_measurement()
     TEST_ASSERT_NOT_NULL(gwEdges);
     const Edge *kept = nullptr;
     for (uint8_t i = 0; i < gwEdges->edgeCount; i++) {
-        if (gwEdges->edges[i].to == far) kept = &gwEdges->edges[i];
+        if (gwEdges->edges[i].to == far)
+            kept = &gwEdges->edges[i];
     }
     TEST_ASSERT_NOT_NULL(kept);
     TEST_ASSERT_EQUAL_UINT16(1587, kept->etxFixed);
@@ -1416,9 +1414,11 @@ void test_a_silent_publisher_loses_our_direct_link()
 
     auto hasEdge = [&](NodeNum from, NodeNum to) {
         const NodeEdges *edges = graph.getEdgesFrom(from);
-        if (!edges) return false;
+        if (!edges)
+            return false;
         for (uint8_t i = 0; i < edges->edgeCount; i++) {
-            if (edges->edges[i].to == to) return true;
+            if (edges->edges[i].to == to)
+                return true;
         }
         return false;
     };
@@ -1452,15 +1452,16 @@ static void test_topology_does_not_park_a_heard_neighbour_as_downstream()
     initGraphTestNodeDb(me);
     config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
 
-    class Harness : public SignalRoutingModule {
-    public:
+    class Harness : public SignalRoutingModule
+    {
+      public:
         NeighborGraph *graph() { return routingGraph; }
     };
     Harness module;
     TEST_ASSERT_NOT_NULL(module.graph());
 
-    module.updateNeighborInfo(peer, -70, 8.0f, 1000);
-    module.updateNeighborInfo(heard, -75, 11.0f, 1000);
+    module.updateNeighborInfo(peer, -70, 8.0f);
+    module.updateNeighborInfo(heard, -75, 11.0f);
     // Stale row as if the old them→us check had parked them behind the peer.
     module.graph()->updateDownstream(heard, peer, 2.0f, millis() / 1000);
     TEST_ASSERT_EQUAL_UINT32(peer, module.graph()->getDownstreamRelay(heard));
@@ -1670,8 +1671,7 @@ void test_a_dropped_young_node_is_not_a_coverage_target()
     policy.poorLinkEtx = 7.0f;
     TEST_ASSERT_TRUE(graph.admitsCoverage(me, silent, 7.0f, &policy));
     policy.isDroppedCoverageTarget = [](void *, NodeNum n) { return n == blocked; };
-    TEST_ASSERT_FALSE_MESSAGE(graph.admitsCoverage(me, silent, 7.0f, &policy),
-                              "dropped traffic is nobody's to carry");
+    TEST_ASSERT_FALSE_MESSAGE(graph.admitsCoverage(me, silent, 7.0f, &policy), "dropped traffic is nobody's to carry");
     NodeNum coveredBy[1] = {0x33333333};
     TEST_ASSERT_EQUAL_UINT32(0, graph.uniqueCoverageNeighbor(me, coveredBy, 1, 7.0f, &policy));
 }
@@ -1860,20 +1860,309 @@ static void test_ranking_costs_within_a_bucket_tie_on_node_id()
 
 } // namespace
 
+class ReviewGraphModule : public SignalRoutingModule
+{
+  public:
+    void hear(NodeNum node, int32_t rssi = -70, float snr = 8) { updateNeighborInfo(node, rssi, snr); }
+    NeighborGraph *graph() { return routingGraph; }
+    void receive(const meshtastic_MeshPacket &p) { handleReceived(p); }
+    void ingest(const meshtastic_MeshPacket &p, meshtastic_SignalRoutingInfo &info) { handleReceivedProtobuf(p, &info); }
+    void receiveWithoutGraph(const meshtastic_MeshPacket &p)
+    {
+        auto *saved = routingGraph;
+        routingGraph = nullptr;
+        handleReceived(p);
+        observeRelayedPacket(p);
+        routingGraph = saved;
+    }
+    uint8_t pack(uint8_t *buf, size_t len) { return packNeighborsForBroadcast(buf, len); }
+    int32_t tick() { return runOnce(); }
+};
+
+static void test_receive_without_graph_or_nodedb_is_safe()
+{
+    initGraphTestNodeDb(0xAA0000AA);
+    ReviewGraphModule module;
+    meshtastic_MeshPacket p = meshtastic_MeshPacket_init_zero;
+    p.from = 0xBB0000BB;
+    p.rx_rssi = -70;
+    p.rx_snr = 8;
+    const auto count = module.graph()->getNodeCount();
+    module.receiveWithoutGraph(p);
+    p.hop_start = 2;
+    p.hop_limit = 1;
+    p.relay_node = 0xCC;
+    module.receiveWithoutGraph(p);
+    auto *saved = nodeDB;
+    nodeDB = nullptr;
+    module.receive(p);
+    module.observeRelayedPacket(p);
+    nodeDB = saved;
+    TEST_ASSERT_EQUAL_UINT32(count, module.graph()->getNodeCount());
+}
+
+static void test_graph_clock_preserves_fractional_seconds_across_millis_wrap()
+{
+    SrMonotonicClock clock;
+    TEST_ASSERT_EQUAL_UINT32(4294967, clock.seconds(UINT32_MAX - 95));
+    TEST_ASSERT_EQUAL_UINT32(4294967, clock.seconds(204));
+    TEST_ASSERT_EQUAL_UINT32(4294968, clock.seconds(704));
+    TEST_ASSERT_EQUAL_UINT32(4294968, clock.seconds(704));
+    TEST_ASSERT_EQUAL_UINT32(8589932, clock.seconds(UINT32_MAX - 2000));
+    TEST_ASSERT_EQUAL_UINT32(8589935, clock.seconds(999));
+}
+
+static void test_downstream_queries_share_the_extended_graph_clock()
+{
+    constexpr NodeNum me = 0xAA0000AA, peer = 0xBB0000BB, dest = 0xCC0000CC;
+    initGraphTestNodeDb(me);
+    NeighborGraph graph;
+    // Simulate the sample before rollover; the next sample uses the current low millis() value.
+    graph.debugAdvanceClock(UINT32_MAX - 1000);
+    const uint32_t now = graph.nowSeconds();
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(4294967, now);
+    graph.updateDownstream(dest, peer, 2.0f, now);
+    TEST_ASSERT_EQUAL_UINT32(peer, graph.getDownstreamRelay(dest));
+    TEST_ASSERT_EQUAL_UINT32(1, graph.getDownstreamCountForRelay(peer));
+    NodeNum nodes[1] = {};
+    TEST_ASSERT_EQUAL_UINT32(1, graph.getDownstreamNodesForRelay(peer, nodes, nullptr, 1));
+    TEST_ASSERT_EQUAL_UINT32(dest, nodes[0]);
+    TEST_ASSERT_TRUE(graph.isRelayFor(peer, dest));
+    TEST_ASSERT_TRUE(graph.unicastCanFinish(peer, dest, {}));
+}
+
+static void test_later_insurance_does_not_postpone_existing_wakeup()
+{
+    initGraphTestNodeDb(0xAA0000AA);
+    ReviewGraphModule module;
+    module.hear(0xBB0000BB);
+    module.graph()->setEdgeHearsUs(0xAA0000AA, 0xBB0000BB, true);
+    const uint32_t deadline = module.debugNextRunMs();
+    meshtastic_MeshPacket p = meshtastic_MeshPacket_init_zero;
+    p.from = 0xAA0000AA;
+    p.to = NODENUM_BROADCAST;
+    p.id = 0xACA0;
+    module.maybeScheduleBroadcastRetransmit(&p);
+    TEST_ASSERT_EQUAL_UINT32(deadline, module.debugNextRunMs());
+}
+
+static void test_topology_is_ingested_on_normal_receive_without_relay_preprocessing()
+{
+    constexpr NodeNum me = 0xAA0000AA, peer = 0xBB0000BB, dest = 0xCC0000CC;
+    initGraphTestNodeDb(me);
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+    ReviewGraphModule module;
+    meshtastic_MeshPacket p;
+    meshtastic_SignalRoutingInfo info;
+    fillTopoPacket(p, info, peer, dest, true, 0xABC1, 0, 0, peer & 0xFF);
+    module.receive(p);
+    TEST_ASSERT_TRUE(module.isSignalRoutingNode(peer));
+    TEST_ASSERT_NOT_NULL(edgeBetween(*module.graph(), peer, dest));
+}
+
+static void test_malformed_packed_lists_never_expose_valid_header()
+{
+    uint8_t bytes[32] = {};
+    writePackedTopologyHeader(bytes, 0, true);
+    PackedHeader header = {};
+    PackedNeighborEntry out[1] = {};
+    bytes[1] = 0;
+    TEST_ASSERT_EQUAL_UINT8(0, decodePackedNeighbors(bytes, 5, out, 1, &header));
+    TEST_ASSERT_EQUAL_UINT8(0, header.formatVersion);
+    bytes[1] = PACKED_NEIGHBOR_ENTRY_SIZE;
+    TEST_ASSERT_EQUAL_UINT8(0, decodePackedNeighbors(bytes, 6, out, 1, &header));
+    TEST_ASSERT_EQUAL_UINT8(0, header.formatVersion);
+    TEST_ASSERT_EQUAL_UINT8(0, decodePackedNeighbors(bytes, 21, out, 1, &header));
+    TEST_ASSERT_EQUAL_UINT8(0, header.formatVersion);
+    TEST_ASSERT_EQUAL_UINT8(0, decodePackedNeighbors(bytes, 13, nullptr, 1, &header));
+    TEST_ASSERT_EQUAL_UINT8(0, header.formatVersion);
+    TEST_ASSERT_EQUAL_UINT8(0, decodePackedNeighbors(bytes, 5, nullptr, 0, &header));
+    TEST_ASSERT_EQUAL_UINT8(PACKED_NEIGHBOR_FORMAT_VERSION, header.formatVersion);
+}
+
+static void test_topology_pack_rejects_null_and_short_buffers()
+{
+    initGraphTestNodeDb(0xAA0000AA);
+    ReviewGraphModule module;
+    module.hear(0xBB0000BB);
+    uint8_t bytes[5] = {1, 2, 3, 4, 5};
+    const uint8_t expected[5] = {1, 2, 3, 4, 5};
+    TEST_ASSERT_EQUAL_UINT8(0, module.pack(nullptr, 100));
+    TEST_ASSERT_EQUAL_UINT8(0, module.pack(bytes, 4));
+    TEST_ASSERT_EQUAL_MEMORY(expected, bytes, sizeof(bytes));
+}
+
+static void test_cached_single_relay_cannot_hide_a_direct_byte_collision()
+{
+    constexpr NodeNum me = 0xAA0000AA, a = 0xBB00008C, b = 0xCC00008C;
+    initGraphTestNodeDb(me);
+    ReviewGraphModule module;
+    module.hear(a, -95, 6);
+    module.hear(b, -70, 8);
+    module.rememberRelayIdentity(a, 0x8C);
+    TEST_ASSERT_EQUAL_UINT32(0, module.resolveRelayIdentity(0x8C));
+    TEST_ASSERT_EQUAL_UINT32(b, module.resolveRelayIdentity(0x8C, -70, 8));
+    module.rememberRelayIdentity(0xDD00007D, 0x8C);
+    TEST_ASSERT_EQUAL_UINT32(1, module.relayIdentityCacheSize());
+}
+
+static void test_ambiguous_duplicate_does_not_cancel_committed_broadcast()
+{
+    constexpr NodeNum me = 0xAA0000AA, a = 0xBB00008C, b = 0xCC00008C, source = 0xDD0000DD;
+    initGraphTestNodeDb(me);
+    ReviewGraphModule module;
+    module.hear(a);
+    module.hear(b);
+    module.graph()->setEdgeHearsUs(me, a, true);
+    module.graph()->setEdgeHearsUs(me, b, true);
+    module.commitRelay(0xABC2, source, 500);
+    meshtastic_MeshPacket dupe = meshtastic_MeshPacket_init_zero;
+    dupe.from = source;
+    dupe.to = NODENUM_BROADCAST;
+    dupe.id = 0xABC2;
+    dupe.relay_node = 0x8C;
+    TEST_ASSERT_FALSE(module.areAllNeighborsCovered(&dupe));
+}
+
+static void test_empty_complete_list_retracts_old_topology()
+{
+    constexpr NodeNum me = 0xAA0000AA, peer = 0xBB0000BB, dest = 0xCC0000CC;
+    initGraphTestNodeDb(me);
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+    ReviewGraphModule module;
+    module.hear(peer);
+    ingestOneNeighbor(module, peer, dest, true, 0xABC3);
+    TEST_ASSERT_NOT_NULL(edgeBetween(*module.graph(), peer, dest));
+    meshtastic_SignalRoutingInfo info = meshtastic_SignalRoutingInfo_init_zero;
+    writePackedTopologyHeader(info.packed_neighbors.bytes, 8, true);
+    info.packed_neighbors.size = PACKED_NEIGHBOR_HEADER_SIZE;
+    meshtastic_MeshPacket p = meshtastic_MeshPacket_init_zero;
+    p.from = peer;
+    p.to = NODENUM_BROADCAST;
+    p.id = 0xABC4;
+    p.relay_node = peer & 0xFF;
+    module.ingest(p, info);
+    TEST_ASSERT_NULL(edgeBetween(*module.graph(), peer, dest));
+    const Edge *direct = edgeBetween(*module.graph(), me, peer);
+    TEST_ASSERT_NOT_NULL(direct);
+    TEST_ASSERT_FALSE(direct->hearsUs);
+}
+
+static void test_missing_middle_topology_chunk_cannot_retract_known_links()
+{
+    constexpr NodeNum me = 0xAA0000AA, peer = 0xBB0000BB, dest = 0xCC0000CC;
+    initGraphTestNodeDb(me);
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+    ReviewGraphModule module;
+    module.hear(peer);
+    ingestOneNeighbor(module, peer, dest, true, 0xABC5);
+    meshtastic_SignalRoutingInfo info = meshtastic_SignalRoutingInfo_init_zero;
+    meshtastic_MeshPacket p = meshtastic_MeshPacket_init_zero;
+    p.from = peer;
+    p.to = NODENUM_BROADCAST;
+    p.id = 0xABC6;
+    p.relay_node = peer & 0xFF;
+    writePackedTopologyHeader(info.packed_neighbors.bytes, 8, true, true, false, 0);
+    encodePackedNeighborEntry(info.packed_neighbors.bytes + 5, 0xDD0000DD, -70, 8, false, true, 0);
+    info.packed_neighbors.size = 13;
+    module.ingest(p, info);
+    p.id++;
+    writePackedTopologyHeader(info.packed_neighbors.bytes, 8, true, false, true, 2);
+    module.ingest(p, info);
+    TEST_ASSERT_NOT_NULL(edgeBetween(*module.graph(), peer, dest));
+}
+
+static void test_topology_continuations_ingest_once_and_complete_retraction()
+{
+    constexpr NodeNum me = 0xAA0000AA, peer = 0xBB0000BB, old = 0xCC0000CC;
+    constexpr NodeNum first = 0xDD0000DD, last = 0xEE0000EE;
+    initGraphTestNodeDb(me);
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+    ReviewGraphModule module;
+    module.hear(peer);
+    ingestOneNeighbor(module, peer, old, true, 0xABC8);
+    meshtastic_SignalRoutingInfo info = meshtastic_SignalRoutingInfo_init_zero;
+    meshtastic_MeshPacket p = meshtastic_MeshPacket_init_zero;
+    p.from = peer;
+    p.to = NODENUM_BROADCAST;
+    p.id = 0xABC9;
+    p.relay_node = peer & 0xFF;
+    info.packed_neighbors.size = 13;
+    writePackedTopologyHeader(info.packed_neighbors.bytes, 8, true, true, false, 0);
+    encodePackedNeighborEntry(info.packed_neighbors.bytes + 5, first, -70, 8, false, true, 0);
+    module.ingest(p, info);
+    module.ingest(p, info);
+    TEST_ASSERT_NOT_NULL(edgeBetween(*module.graph(), peer, old));
+    p.id++;
+    writePackedTopologyHeader(info.packed_neighbors.bytes, 8, true, false, true, 1);
+    encodePackedNeighborEntry(info.packed_neighbors.bytes + 5, last, -70, 8, false, true, 0);
+    module.ingest(p, info);
+    TEST_ASSERT_NOT_NULL(edgeBetween(*module.graph(), peer, first));
+    TEST_ASSERT_NOT_NULL(edgeBetween(*module.graph(), peer, last));
+    TEST_ASSERT_NULL(edgeBetween(*module.graph(), peer, old));
+}
+
+static void test_interleaved_duplicate_chunks_do_not_block_retraction()
+{
+    constexpr NodeNum me = 0xAA0000AA, peer = 0xBB0000BB, old = 0xCC0000CC;
+    constexpr NodeNum listed[] = {0xDD0000DD, 0xEE0000EE, 0xAB0000AB, 0xAC0000AC};
+    initGraphTestNodeDb(me);
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+    ReviewGraphModule module;
+    module.hear(peer);
+    ingestOneNeighbor(module, peer, old, true, 0xABD0);
+    meshtastic_SignalRoutingInfo infos[4] = {};
+    meshtastic_MeshPacket packets[4] = {};
+    for (uint8_t i = 0; i < 4; i++) {
+        auto &p = packets[i];
+        p.from = peer;
+        p.to = NODENUM_BROADCAST;
+        p.id = 0xABD1 + i;
+        p.relay_node = peer & 0xFF;
+        writePackedTopologyHeader(infos[i].packed_neighbors.bytes, 8, true, i < 3, i > 0, i);
+        encodePackedNeighborEntry(infos[i].packed_neighbors.bytes + 5, listed[i], -70, 8, false, true, 0);
+        infos[i].packed_neighbors.size = 13;
+    }
+    module.ingest(packets[0], infos[0]);
+    module.ingest(packets[1], infos[1]);
+    module.ingest(packets[0], infos[0]); // delayed duplicate of the first chunk
+    module.ingest(packets[2], infos[2]);
+    module.ingest(packets[1], infos[1]); // delayed duplicate of a middle chunk
+    module.ingest(packets[3], infos[3]);
+    for (auto node : listed) {
+        TEST_ASSERT_NOT_NULL(edgeBetween(*module.graph(), peer, node));
+    }
+    TEST_ASSERT_NULL(edgeBetween(*module.graph(), peer, old));
+}
+
+static void test_relay_planning_clears_stale_outputs_and_handles_null()
+{
+    initGraphTestNodeDb(0xAA0000AA);
+    ReviewGraphModule module;
+    module.pendingRelayDelayMs = 500;
+    module.pendingUnicastNextHop = 0xBB0000BB;
+    TEST_ASSERT_FALSE(module.shouldRelay(nullptr));
+    TEST_ASSERT_EQUAL_UINT32(0, module.pendingRelayDelayMs);
+    TEST_ASSERT_EQUAL_UINT32(0, module.pendingUnicastNextHop);
+    TEST_ASSERT_FALSE(module.shouldRelayBroadcast(nullptr));
+    TEST_ASSERT_FALSE(module.shouldRelayUnicastForCoordination(nullptr));
+    TEST_ASSERT_FALSE(module.capsLastHop(nullptr));
+}
+
 void setUp(void) {}
 
 void tearDown(void) {}
 
 static void test_topology_version_window_is_forward_only_and_wraps()
 {
-    TEST_ASSERT_TRUE(srTopologyVersionInWindow(1, 0));     // first report from an unknown peer
-    TEST_ASSERT_TRUE(srTopologyVersionInWindow(6, 5));     // next version
-    TEST_ASSERT_TRUE(srTopologyVersionInWindow(5, 5));     // repeat / continuation chunk
-    TEST_ASSERT_TRUE(srTopologyVersionInWindow(2, 250));   // wraparound
-    TEST_ASSERT_TRUE(srTopologyVersionInWindow(132, 5));   // +127 still forward
-    TEST_ASSERT_FALSE(srTopologyVersionInWindow(4, 5));    // backwards
-    TEST_ASSERT_FALSE(srTopologyVersionInWindow(133, 5));  // +128 reads as backwards
-    TEST_ASSERT_FALSE(srTopologyVersionInWindow(1, 98));   // rebooted peer: large behind / boot / silence
+    TEST_ASSERT_TRUE(srTopologyVersionInWindow(1, 0));    // first report from an unknown peer
+    TEST_ASSERT_TRUE(srTopologyVersionInWindow(6, 5));    // next version
+    TEST_ASSERT_TRUE(srTopologyVersionInWindow(5, 5));    // repeat / continuation chunk
+    TEST_ASSERT_TRUE(srTopologyVersionInWindow(2, 250));  // wraparound
+    TEST_ASSERT_TRUE(srTopologyVersionInWindow(132, 5));  // +127 still forward
+    TEST_ASSERT_FALSE(srTopologyVersionInWindow(4, 5));   // backwards
+    TEST_ASSERT_FALSE(srTopologyVersionInWindow(133, 5)); // +128 reads as backwards
+    TEST_ASSERT_FALSE(srTopologyVersionInWindow(1, 98));  // rebooted peer: large behind / boot / silence
     TEST_ASSERT_TRUE(srTopologyVersionLargeBehind(1, 26));
     TEST_ASSERT_FALSE(srTopologyVersionLargeBehind(25, 26));
     TEST_ASSERT_TRUE(srTopologyVersionClimbing(2, 1));
@@ -1943,8 +2232,7 @@ static void test_topology_version_verdict_rules()
     TEST_ASSERT_EQUAL(SrTopologyVerdict::DirectResync,
                       srTopologyVersionVerdict(12, 13, 5000, 6000, resync, false, false, 0, true));
     // Relayed copies keep the stale reject so a delayed old list cannot clobber a newer one.
-    TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale,
-                      srTopologyVersionVerdict(12, 13, 5000, 6000, resync, false, false, 0, false));
+    TEST_ASSERT_EQUAL(SrTopologyVerdict::Stale, srTopologyVersionVerdict(12, 13, 5000, 6000, resync, false, false, 0, false));
 }
 
 /// An expired rung keeps the separation the ladder gave it, rather than redrawing at random.
@@ -2386,8 +2674,9 @@ static void test_undecoded_direct_frame_is_recorded_as_a_neighbour()
     constexpr NodeNum stranger = 0x46ce027c;
     initGraphTestNodeDb(me);
 
-    class ObservingModule : public SignalRoutingModule {
-    public:
+    class ObservingModule : public SignalRoutingModule
+    {
+      public:
         bool admitsEncrypted() const { return encryptedOk; }
         ProcessMessage observe(const meshtastic_MeshPacket &mp) { return handleReceived(mp); }
     };
@@ -2568,8 +2857,9 @@ static void test_alternate_next_hop_requires_a_distinct_byte()
     initGraphTestNodeDb(me);
     config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
 
-    class GraphWriter : public SignalRoutingModule {
-    public:
+    class GraphWriter : public SignalRoutingModule
+    {
+      public:
         void note(NodeNum from, NodeNum to, bool hearsUs) { updateGraphWithNeighbor(from, to, -90, 5, hearsUs); }
     };
     GraphWriter module;
@@ -2693,9 +2983,10 @@ void test_strong_delivery_hop_respects_poor_link_ceiling()
     initGraphTestNodeDb(me);
     config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
 
-    class GraphWriter : public SignalRoutingModule {
-    public:
-        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+    class GraphWriter : public SignalRoutingModule
+    {
+      public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr); }
         bool strong(NodeNum dest) const { return hasStrongDeliveryHop(dest); }
         bool strongHop(NodeNum peer) const { return hasStrongHopTo(peer); }
         NeighborGraph *g() { return routingGraph; }
@@ -2737,22 +3028,19 @@ void test_unicast_named_backup_cancels_on_strong_designated_copy_not_weak_flood(
     flags.armedHopLimit = 7;
 
     TEST_ASSERT_FALSE(graph.unicastCanFinish(gw, dest, policy));
-    TEST_ASSERT_FALSE_MESSAGE(
-        graph.unicastDupeCancels(me, dest, 0x50, 0, 0, policy, flags, 0, (uint8_t)(gw & 0xFF), 6),
-        "weak flood from designated hop must not cancel the named backup");
+    TEST_ASSERT_FALSE_MESSAGE(graph.unicastDupeCancels(me, dest, 0x50, 0, 0, policy, flags, 0, (uint8_t)(gw & 0xFF), 6),
+                              "weak flood from designated hop must not cancel the named backup");
     TEST_ASSERT_FALSE_MESSAGE(graph.unicastDupeCancels(me, dest, 0x51, gw, 0, policy, flags, 0, 0, 6),
                               "resolved designated hop flooding next=0 must not cancel");
-    TEST_ASSERT_TRUE_MESSAGE(
-        graph.unicastDupeCancels(me, dest, 0x54, 0, 0, policy, flags, onward, (uint8_t)(gw & 0xFF), 6),
-        "strong designated copy cancels without finish proof");
+    TEST_ASSERT_TRUE_MESSAGE(graph.unicastDupeCancels(me, dest, 0x54, 0, 0, policy, flags, onward, (uint8_t)(gw & 0xFF), 6),
+                             "strong designated copy cancels without finish proof");
     TEST_ASSERT_TRUE_MESSAGE(graph.unicastDupeCancels(me, dest, 0x55, gw, 0, policy, flags, onward, 0, 6),
                              "resolved designated hop with onward stamp cancels without finish proof");
     TEST_ASSERT_TRUE_MESSAGE(
         graph.unicastDupeCancels(me, dest, 0x52, peer, 0, policy, flags, (uint8_t)(gw & 0xFF), (uint8_t)(peer & 0xFF), 5),
         "lower hop_limit still naming the designation means that hop progressed");
-    TEST_ASSERT_FALSE_MESSAGE(
-        graph.unicastDupeCancels(me, dest, 0x53, peer, 0, policy, flags, 0, (uint8_t)(peer & 0xFF), 6),
-        "an unrelated peer copy does not cancel on designation alone when finish/rank are unknown");
+    TEST_ASSERT_FALSE_MESSAGE(graph.unicastDupeCancels(me, dest, 0x53, peer, 0, policy, flags, 0, (uint8_t)(peer & 0xFF), 6),
+                              "an unrelated peer copy does not cancel on designation alone when finish/rank are unknown");
 }
 
 // Undesignated flood with no stampable path: broadcast coverage, not delay-0. A node that adds
@@ -2765,9 +3053,10 @@ static void test_undesignated_flood_without_route_stays_silent_when_covered()
     initGraphTestNodeDb(me);
     config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
 
-    class GraphWriter : public SignalRoutingModule {
-    public:
-        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+    class GraphWriter : public SignalRoutingModule
+    {
+      public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr); }
     };
     GraphWriter module;
     module.hear(source, -40, 12.0f);
@@ -2781,8 +3070,7 @@ static void test_undesignated_flood_without_route_stays_silent_when_covered()
     uni.hop_start = 7;
     uni.relay_node = static_cast<uint8_t>(source & 0xFF);
     uni.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
-    TEST_ASSERT_FALSE_MESSAGE(module.shouldRelayUnicastForCoordination(&uni),
-                              "no unique coverage beyond the originator");
+    TEST_ASSERT_FALSE_MESSAGE(module.shouldRelayUnicastForCoordination(&uni), "no unique coverage beyond the originator");
 }
 
 // Designated with no onward route: do not relay the data (NO_ROUTE is sent when routingModule is live).
@@ -2794,9 +3082,10 @@ static void test_designated_hop_with_no_route_does_not_relay()
     initGraphTestNodeDb(me);
     config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
 
-    class GraphWriter : public SignalRoutingModule {
-    public:
-        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+    class GraphWriter : public SignalRoutingModule
+    {
+      public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr); }
     };
     GraphWriter module;
     module.hear(source, -40, 12.0f);
@@ -2810,8 +3099,7 @@ static void test_designated_hop_with_no_route_does_not_relay()
     uni.hop_start = 3;
     uni.relay_node = static_cast<uint8_t>(source & 0xFF);
     uni.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
-    TEST_ASSERT_FALSE_MESSAGE(module.shouldRelayUnicastForCoordination(&uni),
-                              "designated hop with no route must not relay data");
+    TEST_ASSERT_FALSE_MESSAGE(module.shouldRelayUnicastForCoordination(&uni), "designated hop with no route must not relay data");
 }
 
 static void test_neighbour_that_does_not_hear_the_transmitter_gets_no_slot()
@@ -2834,8 +3122,9 @@ static void test_neighbour_that_does_not_hear_the_transmitter_gets_no_slot()
         TEST_ASSERT_TRUE(graph.unicastHeardTransmitter(tx, hub, me));
     }
 
-    class GraphWriter : public SignalRoutingModule {
-    public:
+    class GraphWriter : public SignalRoutingModule
+    {
+      public:
         void note(NodeNum from, NodeNum to, bool hearsUs) { updateGraphWithNeighbor(from, to, -90, 5, hearsUs); }
     };
     GraphWriter module;
@@ -2868,10 +3157,11 @@ static void test_routing_ack_retraces_local_link_but_hub_relays_remote()
     initGraphTestNodeDb(me);
     config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
 
-    class GraphWriter : public SignalRoutingModule {
-    public:
+    class GraphWriter : public SignalRoutingModule
+    {
+      public:
         void note(NodeNum from, NodeNum to, bool hearsUs) { updateGraphWithNeighbor(from, to, -70, 8, hearsUs); }
-        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr); }
     };
     GraphWriter local;
     local.hear(src, -70, 8.0f);
@@ -3118,9 +3408,10 @@ static void test_far_sender_naming_l1_and_l2_is_l2_not_l3()
     initGraphTestNodeDb(me);
     config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
 
-    class GraphWriter : public SignalRoutingModule {
-    public:
-        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+    class GraphWriter : public SignalRoutingModule
+    {
+      public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr); }
         NeighborGraph *g() { return routingGraph; }
         void ingestBoth(const meshtastic_MeshPacket &mp, meshtastic_SignalRoutingInfo *info)
         {
@@ -3136,8 +3427,7 @@ static void test_far_sender_naming_l1_and_l2_is_l2_not_l3()
     uint8_t packed[64] = {};
     writePackedTopologyHeader(packed, 2, true);
     encodePackedNeighborEntry(packed + PACKED_NEIGHBOR_HEADER_SIZE, l1, -75, 7, true, true, 0);
-    encodePackedNeighborEntry(packed + PACKED_NEIGHBOR_HEADER_SIZE + PACKED_NEIGHBOR_ENTRY_SIZE, l2, -80, 5, true,
-                              true, 0);
+    encodePackedNeighborEntry(packed + PACKED_NEIGHBOR_HEADER_SIZE + PACKED_NEIGHBOR_ENTRY_SIZE, l2, -80, 5, true, true, 0);
     const size_t packedLen = PACKED_NEIGHBOR_HEADER_SIZE + 2 * PACKED_NEIGHBOR_ENTRY_SIZE;
 
     meshtastic_SignalRoutingInfo info = meshtastic_SignalRoutingInfo_init_zero;
@@ -3175,9 +3465,10 @@ static void test_unqualified_far_topology_does_not_steal_list_downstream()
     initGraphTestNodeDb(me);
     config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
 
-    class GraphWriter : public SignalRoutingModule {
-    public:
-        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+    class GraphWriter : public SignalRoutingModule
+    {
+      public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr); }
         NeighborGraph *g() { return routingGraph; }
         void ingestBoth(const meshtastic_MeshPacket &mp, meshtastic_SignalRoutingInfo *info)
         {
@@ -3211,9 +3502,10 @@ static void test_duplicate_relayed_copy_learns_downstream_via_hears_us_neighbor(
     initGraphTestNodeDb(me);
     config.device.role = meshtastic_Config_DeviceConfig_Role_ROUTER;
 
-    class GraphWriter : public SignalRoutingModule {
-    public:
-        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+    class GraphWriter : public SignalRoutingModule
+    {
+      public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr); }
         NeighborGraph *g() { return routingGraph; }
         void observe(const meshtastic_MeshPacket &mp) { observeRelayedPacket(mp); }
     };
@@ -3253,9 +3545,10 @@ static void test_relayed_duplicate_of_direct_packet_does_not_retract()
     initGraphTestNodeDb(me);
     config.device.role = meshtastic_Config_DeviceConfig_Role_ROUTER;
 
-    class GraphWriter : public SignalRoutingModule {
-    public:
-        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+    class GraphWriter : public SignalRoutingModule
+    {
+      public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr); }
         NeighborGraph *g() { return routingGraph; }
         void observe(const meshtastic_MeshPacket &mp) { observeRelayedPacket(mp); }
         void noteTx(NodeNum n, uint32_t id) { routingGraph->recordNodeTransmission(n, id, millis() / 1000); }
@@ -3305,9 +3598,10 @@ static void test_relayed_observe_does_not_steal_ball_dest()
     initGraphTestNodeDb(me);
     config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
 
-    class GraphWriter : public SignalRoutingModule {
-    public:
-        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+    class GraphWriter : public SignalRoutingModule
+    {
+      public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr); }
         NeighborGraph *g() { return routingGraph; }
         ProcessMessage rx(const meshtastic_MeshPacket &mp) { return handleReceived(mp); }
         void note(NodeNum from, NodeNum to, bool hearsUs) { updateGraphWithNeighbor(from, to, -90, 5, hearsUs); }
@@ -3345,9 +3639,10 @@ static void test_topology_pack_prefers_hears_us_and_sr_over_better_etx()
     initGraphTestNodeDb(me);
     config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
 
-    class GraphWriter : public SignalRoutingModule {
-    public:
-        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+    class GraphWriter : public SignalRoutingModule
+    {
+      public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr); }
         NeighborGraph *g() { return routingGraph; }
         uint8_t pack(uint8_t *buf, size_t n) { return packNeighborsForBroadcast(buf, n); }
     };
@@ -3380,9 +3675,10 @@ static void test_shared_relay_byte_keeps_both_identities_ambiguous_without_rssi(
     constexpr NodeNum zoob = 0x49B5E08C;
     initGraphTestNodeDb(me);
 
-    class GraphWriter : public SignalRoutingModule {
-    public:
-        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr, millis() / 1000); }
+    class GraphWriter : public SignalRoutingModule
+    {
+      public:
+        void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr); }
     };
     GraphWriter module;
     module.hear(czar, -95, 6.0f);
@@ -3399,6 +3695,20 @@ void setup()
 
     UNITY_BEGIN();
 
+    RUN_TEST(test_receive_without_graph_or_nodedb_is_safe);
+    RUN_TEST(test_graph_clock_preserves_fractional_seconds_across_millis_wrap);
+    RUN_TEST(test_downstream_queries_share_the_extended_graph_clock);
+    RUN_TEST(test_later_insurance_does_not_postpone_existing_wakeup);
+    RUN_TEST(test_topology_is_ingested_on_normal_receive_without_relay_preprocessing);
+    RUN_TEST(test_malformed_packed_lists_never_expose_valid_header);
+    RUN_TEST(test_topology_pack_rejects_null_and_short_buffers);
+    RUN_TEST(test_cached_single_relay_cannot_hide_a_direct_byte_collision);
+    RUN_TEST(test_ambiguous_duplicate_does_not_cancel_committed_broadcast);
+    RUN_TEST(test_empty_complete_list_retracts_old_topology);
+    RUN_TEST(test_missing_middle_topology_chunk_cannot_retract_known_links);
+    RUN_TEST(test_topology_continuations_ingest_once_and_complete_retraction);
+    RUN_TEST(test_interleaved_duplicate_chunks_do_not_block_retraction);
+    RUN_TEST(test_relay_planning_clears_stale_outputs_and_handles_null);
     RUN_TEST(test_encode_decode_round_trip);
     RUN_TEST(test_packed_layout_offsets);
     RUN_TEST(test_merge_cost_from_decoded_signal);

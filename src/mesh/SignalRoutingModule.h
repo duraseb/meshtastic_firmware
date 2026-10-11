@@ -2,46 +2,42 @@
 #include "ProtobufModule.h"
 #include "concurrency/OSThread.h"
 #include "mesh/generated/meshtastic/mesh.pb.h"
-#include "mesh/generated/meshtastic/telemetry.pb.h"
 
 #include "MeshRadio.h"
 #include "graph/HopHealth.h"
 #include "graph/NeighborGraph.h"
 
-// Routing protocol version for compatibility checking
 #define SIGNAL_ROUTING_VERSION 3
 
-// Packed neighbor format constants
 static constexpr uint8_t PACKED_NEIGHBOR_FORMAT_VERSION = 1;
-static constexpr uint8_t PACKED_NEIGHBOR_ENTRY_SIZE = 8; // bytes per entry: 4 node_id + 1 rssi + 1 snr + 1 flags + 1 etx_variance
-static constexpr uint8_t PACKED_NEIGHBOR_HEADER_SIZE = 5; // format_version + entry_size + routing_version + topology_version + header_flags
+static constexpr uint8_t PACKED_NEIGHBOR_ENTRY_SIZE = 8;
+static constexpr uint8_t PACKED_NEIGHBOR_HEADER_SIZE = 5;
 static constexpr uint8_t PACKED_NEIGHBOR_FLAG_SR_ACTIVE = 0x01;
 static constexpr uint8_t PACKED_NEIGHBOR_FLAG_HEARS_US = 0x02;
 static constexpr uint8_t PACKED_HEADER_FLAG_SR_ACTIVE = 0x01;
-static constexpr uint8_t PACKED_HEADER_FLAG_MORE_CHUNKS = 0x02;   // more chunks of this version follow
-static constexpr uint8_t PACKED_HEADER_FLAG_CONTINUATION = 0x04;  // not the first chunk of this version
+static constexpr uint8_t PACKED_HEADER_FLAG_MORE_CHUNKS = 0x02;
+static constexpr uint8_t PACKED_HEADER_FLAG_CONTINUATION = 0x04;
 
-// Maximum neighbors per SR broadcast packet (28 fit in 233 byte payload with packed encoding)
 #define MAX_SIGNAL_ROUTING_NEIGHBORS 28
 
-// Write the 5-byte packed header. Receivers only apply the "unlisted neighbour does not hear the
-// sender" rule once they hold the whole list, so every chunk except the last carries moreChunks and
-// every chunk except the first carries continuation.
 static inline void writePackedTopologyHeader(uint8_t *buf, uint8_t topologyVersion, bool signalRoutingActive,
-                                             bool moreChunks = false, bool continuation = false)
+                                             bool moreChunks = false, bool continuation = false, uint8_t chunkIndex = 0)
 {
     buf[0] = PACKED_NEIGHBOR_FORMAT_VERSION;
     buf[1] = PACKED_NEIGHBOR_ENTRY_SIZE;
     buf[2] = SIGNAL_ROUTING_VERSION;
     buf[3] = topologyVersion;
-    uint8_t flags = 0;
-    if (signalRoutingActive) flags |= PACKED_HEADER_FLAG_SR_ACTIVE;
-    if (moreChunks) flags |= PACKED_HEADER_FLAG_MORE_CHUNKS;
-    if (continuation) flags |= PACKED_HEADER_FLAG_CONTINUATION;
+    // Reserved v1 bits let new receivers detect lost chunks while old receivers retain compatibility.
+    uint8_t flags = static_cast<uint8_t>(chunkIndex << 3);
+    if (signalRoutingActive)
+        flags |= PACKED_HEADER_FLAG_SR_ACTIVE;
+    if (moreChunks)
+        flags |= PACKED_HEADER_FLAG_MORE_CHUNKS;
+    if (continuation)
+        flags |= PACKED_HEADER_FLAG_CONTINUATION;
     buf[4] = flags;
 }
 
-/// First observation caches `current` and is not a change. A later different value is.
 inline bool srObserveModemPreset(bool &known, uint8_t &cached, uint8_t current)
 {
     if (!known) {
@@ -56,7 +52,6 @@ inline bool srObserveModemPreset(bool &known, uint8_t &cached, uint8_t current)
     return true;
 }
 
-// Decoded packed neighbor entry for iteration
 struct PackedNeighborEntry {
     NodeNum nodeId;
     int8_t rssi;
@@ -66,54 +61,47 @@ struct PackedNeighborEntry {
     uint8_t etxVariance;
 };
 
-// Decoded packed header metadata
 struct PackedHeader {
     uint8_t formatVersion;
     uint8_t entrySize;
     uint8_t routingVersion;
     uint8_t topologyVersion;
     bool signalRoutingActive;
-    bool moreChunks;   // set on every chunk except the last of a multi-packet list
-    bool continuation; // set on every chunk except the first of a multi-packet list
-    // A single packet (or a sender predating the chunk flags) carries the whole list.
+    bool moreChunks;
+    uint8_t chunkIndex;
+    bool continuation;
+
     bool isCompleteList() const { return !moreChunks && !continuation; }
 };
 
-// Decode packed_neighbors bytes. Returns number of entries decoded into outEntries.
-// outEntries must have room for at least maxEntries elements.
-// header is filled with the packet-level metadata from the 5-byte header.
-static inline uint8_t decodePackedNeighbors(const uint8_t *data, size_t dataLen,
-                                            PackedNeighborEntry *outEntries, uint8_t maxEntries,
-                                            PackedHeader *header = nullptr)
+static inline uint8_t decodePackedNeighbors(const uint8_t *data, size_t dataLen, PackedNeighborEntry *outEntries,
+                                            uint8_t maxEntries, PackedHeader *header = nullptr)
 {
-    if (!data || dataLen < PACKED_NEIGHBOR_HEADER_SIZE) {
+    if (header) {
+        *header = {};
+    }
+    if (!data || dataLen < PACKED_NEIGHBOR_HEADER_SIZE || data[0] != PACKED_NEIGHBOR_FORMAT_VERSION ||
+        data[1] < PACKED_NEIGHBOR_ENTRY_SIZE) {
         return 0;
     }
-
+    const size_t payloadLen = dataLen - PACKED_NEIGHBOR_HEADER_SIZE;
+    const uint8_t entrySize = data[1];
+    const size_t count = payloadLen / entrySize;
+    if (payloadLen % entrySize != 0 || count > maxEntries || (count > 0 && !outEntries) ||
+        ((data[4] & PACKED_HEADER_FLAG_CONTINUATION) == 0 && (data[4] >> 3) != 0)) {
+        return 0;
+    }
     if (header) {
         header->formatVersion = data[0];
-        header->entrySize = data[1];
+        header->entrySize = entrySize;
         header->routingVersion = data[2];
         header->topologyVersion = data[3];
         header->signalRoutingActive = (data[4] & PACKED_HEADER_FLAG_SR_ACTIVE) != 0;
         header->moreChunks = (data[4] & PACKED_HEADER_FLAG_MORE_CHUNKS) != 0;
         header->continuation = (data[4] & PACKED_HEADER_FLAG_CONTINUATION) != 0;
+        header->chunkIndex = data[4] >> 3;
     }
-
-    if (data[0] != PACKED_NEIGHBOR_FORMAT_VERSION) {
-        return 0;
-    }
-
-    uint8_t entrySize = data[1];
-    if (entrySize < PACKED_NEIGHBOR_ENTRY_SIZE || entrySize == 0) {
-        return 0; // unknown or too-small entry format
-    }
-
-    size_t payloadLen = dataLen - PACKED_NEIGHBOR_HEADER_SIZE;
-    uint8_t entryCount = payloadLen / entrySize;
-    if (entryCount > maxEntries) {
-        entryCount = maxEntries;
-    }
+    const uint8_t entryCount = static_cast<uint8_t>(count);
 
     for (uint8_t i = 0; i < entryCount; i++) {
         const uint8_t *e = &data[PACKED_NEIGHBOR_HEADER_SIZE + i * entrySize];
@@ -128,8 +116,8 @@ static inline uint8_t decodePackedNeighbors(const uint8_t *data, size_t dataLen,
     return entryCount;
 }
 
-static inline void encodePackedNeighborEntry(uint8_t *entry, NodeNum nodeId, int8_t rssi, int8_t snr,
-                                             bool signalRoutingActive, bool hearsUs, uint8_t etxVariance)
+static inline void encodePackedNeighborEntry(uint8_t *entry, NodeNum nodeId, int8_t rssi, int8_t snr, bool signalRoutingActive,
+                                             bool hearsUs, uint8_t etxVariance)
 {
     entry[0] = static_cast<uint8_t>((nodeId >> 0) & 0xFF);
     entry[1] = static_cast<uint8_t>((nodeId >> 8) & 0xFF);
@@ -152,7 +140,7 @@ struct DirectNeighborSignal {
     NodeNum nodeId = 0;
     int8_t rssi = 0;
     int8_t snr = 0;
-    uint32_t lastRx = 0; // monotonic seconds (millis()/1000)
+    uint32_t lastRx = 0;
 };
 
 static inline const DirectNeighborSignal *lookupDirectNeighborSignal(const DirectNeighborSignal *table, uint8_t count,
@@ -166,8 +154,8 @@ static inline const DirectNeighborSignal *lookupDirectNeighborSignal(const Direc
     return nullptr;
 }
 
-static inline void upsertDirectNeighborSignal(DirectNeighborSignal *table, uint8_t &count, size_t maxEntries,
-                                              NodeNum nodeId, int8_t rssi, int8_t snr, uint32_t nowSecs)
+static inline void upsertDirectNeighborSignal(DirectNeighborSignal *table, uint8_t &count, size_t maxEntries, NodeNum nodeId,
+                                              int8_t rssi, int8_t snr, uint32_t nowSecs)
 {
     for (uint8_t i = 0; i < count; i++) {
         if (table[i].nodeId == nodeId) {
@@ -215,8 +203,7 @@ static inline void removeDirectNeighborSignal(DirectNeighborSignal *table, uint8
     }
 }
 
-static inline void pruneDirectNeighborSignals(DirectNeighborSignal *table, uint8_t &count, uint32_t nowSecs,
-                                              uint32_t ttlSecs)
+static inline void pruneDirectNeighborSignals(DirectNeighborSignal *table, uint8_t &count, uint32_t nowSecs, uint32_t ttlSecs)
 {
     for (uint8_t i = 0; i < count;) {
         if ((nowSecs - table[i].lastRx) > ttlSecs) {
@@ -230,26 +217,19 @@ static inline void pruneDirectNeighborSignals(DirectNeighborSignal *table, uint8
     }
 }
 
-// Jittered delay before replying to an empty SR-active bootstrap topology (direct neighbor).
 static constexpr uint32_t EMPTY_TOPOLOGY_REPLY_DELAY_BASE_MS = 5000;
 static constexpr uint32_t EMPTY_TOPOLOGY_REPLY_DELAY_JITTER_MS = 11001;
 
 static inline uint32_t computeEmptyTopologyReplyDelayMs(NodeNum senderNodeId, PacketId packetId, NodeNum ourNodeId)
 {
-    return EMPTY_TOPOLOGY_REPLY_DELAY_BASE_MS +
-           ((senderNodeId ^ packetId ^ ourNodeId) % EMPTY_TOPOLOGY_REPLY_DELAY_JITTER_MS);
+    return EMPTY_TOPOLOGY_REPLY_DELAY_BASE_MS + ((senderNodeId ^ packetId ^ ourNodeId) % EMPTY_TOPOLOGY_REPLY_DELAY_JITTER_MS);
 }
 
-// A peer's topology version is in the accept window when it repeats the last accepted one or moves
-// forward by less than half the u8 range (wraparound-safe). Anything else is stale unless a rebase
-// rule in gateTopologyVersion() applies.
 static inline bool srTopologyVersionInWindow(uint8_t received, uint8_t last)
 {
     return static_cast<uint8_t>(received - last) < 0x80;
 }
 
-// Delayed copies of the previous one or two broadcasts sit a few counts behind `last`. Farther
-// behind is a restarted counter (Inno flash: last=26, received=1), not an older in-flight list.
 static constexpr uint8_t SR_TOPOLOGY_DELAYED_BEHIND_MAX = 7;
 
 static inline uint8_t srTopologyVersionBehind(uint8_t received, uint8_t last)
@@ -269,42 +249,18 @@ static inline bool srTopologyVersionClimbing(uint8_t received, uint8_t staleVers
     return step >= 1 && step <= SR_TOPOLOGY_DELAYED_BEHIND_MAX;
 }
 
-// Why a topology report from a peer is (or is not) processed. Pure function of the tracked state so
-// the rule is unit-testable; gateTopologyVersion() applies it from both ingest paths.
 enum class SrTopologyVerdict : uint8_t {
-    Stale,         // backwards or too far ahead, and no reason to re-base
-    Accept,        // repeat or forward move inside the window
-    FirstContact,  // nothing accepted from this sender yet: any version is the base
-    BootReset,     // header-only version-0 broadcast: the sender's counter restarted
-    SilenceResync, // nothing accepted for two broadcast intervals: take this version as the new base
-    RestartClimb,  // the boot broadcast was lost: rejected versions climbing in a new epoch
-    DirectResync,  // complete list heard from the originator: the air is newer than the tracked counter
-    CounterReset,  // received sits far behind last: the sender restarted, not a delayed old list
+    Stale,
+    Accept,
+    FirstContact,
+    BootReset,
+    SilenceResync,
+    RestartClimb,
+    DirectResync,
+    CounterReset,
 };
 
-// staleValid/staleVersion: the report last rejected from this sender, if any. Late copies of old
-// reports sit 1–2 behind the last accepted version; a new epoch climbs from the first reject
-// (v=1 then v=2, or v=1 then v=3 if one list was missed).
-/**
- * How long a committed relay whose scheduled send time has already passed should still wait.
- *
- * The rung it was given encodes its position among the candidates, and every node computed that
- * ladder from the same origin. Drawing a fresh random delay discards the position: two nodes whose
- * rungs both expired then key up at the same instant, which is worse than either transmitting
- * late — neither cancels the other, and a third node may decode neither. What survives the expiry
- * is the part of the rung that distinguishes us from the other candidates, its offset above the
- * shared origin, so that is what is re-anchored to now. Floored at one slot time so an expired
- * rung 0 does not key up instantly, which is the thrash the early-band floor exists to prevent.
- */
-/// Hands out relay positions in rank order: the stock-router window first, the ladder past the
-/// transition once the window is full.
-///
-/// A stock ROUTER's delay is a hardware-seeded draw from that window, seeded by an SNR that never
-/// reaches the wire — so a reserved position orders *our expectation* of the draw, not the draw.
-/// That is why reservations are one slot time apart, stock's own granularity here, rather than one
-/// half-airtime: spacing an expectation by the airtime of a frame we are not sending claims a
-/// precision we do not have, and it is the only spacing under which the window has a capacity.
-/// A rung of ours is the opposite — a real transmit time — so it takes a rung's separation.
+// Stock reservations model an unknown hardware-seeded draw; only actual SR transmissions justify airtime spacing.
 struct SrPositionAllocator {
     uint32_t windowWidthMs = 0;
     uint32_t slotTimeMs = 0;
@@ -318,18 +274,13 @@ struct SrPositionAllocator {
     bool anyPlaced = false;
     bool ladderFrozen = false;
 
-    /// `positions` is `2 * CWmax - 1`, the slots the window holds at stock's granularity.
     SrPositionAllocator(uint32_t slotTime, uint32_t halfAirtime, uint32_t origin, uint8_t positions)
         : windowWidthMs(slotTime * positions), slotTimeMs(slotTime), halfAirtimeMs(halfAirtime), originMs(origin),
           maxPositions(positions)
     {
     }
 
-    /// Where the ladder's first rung goes.
-    ///
-    /// The empty case is separate on purpose: folding it into the formula leaves the last position
-    /// at zero and degenerates to a bare half-airtime, seconds of it at the slow presets on a mesh
-    /// with no router at all.
+    // An empty router window must not add a phantom half-airtime at slow presets.
     uint32_t firstRungMs() const
     {
         if (!anyPlaced) {
@@ -339,16 +290,10 @@ struct SrPositionAllocator {
         return cleared > originMs ? cleared : originMs;
     }
 
-    /// A stock relay router's position: one slot time wide, inside the window.
     uint32_t takeReserved() { return place(slotTimeMs); }
 
-    /// A rung of an SR ROUTER: inside the window while a half-airtime still fits, otherwise on the
-    /// ladder past the transition. Sitting inside the window is what makes a top-ranked SR ROUTER
-    /// early. Non-ROUTER SR-active roles must use [`takeLateRung`] instead.
     uint32_t takeRung() { return place(halfAirtimeMs); }
 
-    /// Late ladder rung for non-ROUTER SR-active candidates: always past the stock/SR-ROUTER early
-    /// window (preset-bound `relay_floor` / `originMs`), never a position below that border.
     uint32_t takeLateRung()
     {
         uint32_t at = spill();
@@ -356,7 +301,6 @@ struct SrPositionAllocator {
         return at;
     }
 
-    /// Where a transmission goes when nothing was placed ahead of it.
     uint32_t firstFreeMs() { return anyPlaced ? spill() : originMs; }
 
   private:
@@ -389,6 +333,7 @@ struct SrPositionAllocator {
     }
 };
 
+// A fresh random draw would synchronize peers whose scheduled rungs expired together.
 static inline uint32_t srExpiredRelayReanchorMs(uint32_t rungDelayMs, uint32_t originMs, uint32_t slotTimeMs)
 {
     uint32_t offset = rungDelayMs > originMs ? rungDelayMs - originMs : 0;
@@ -396,24 +341,7 @@ static inline uint32_t srExpiredRelayReanchorMs(uint32_t rungDelayMs, uint32_t o
     return offset > floorMs ? offset : floorMs;
 }
 
-/**
- * When a unicast relay candidate at @p slotIndex may key up.
- *
- * Three waits govern it, and every one is a floor measured from the frame we just heard, so they
- * compose by max and never by addition — summing two of them delays a relay by a whole contention
- * window and buys nothing:
- *   - @p earliestMs: stock's contention floor, or the destination's chance to answer where the
- *     source's own list says the destination hears it and that wait is longer.
- *   - @p leaderWaitMs: for a candidate behind a leader, the time for the leader's copy to have
- *     left the air. Caller must pass at least max(peerRelayWaitFromT0, earliestMs + airtime) so
- *     LONG_FAST (and slower) floors are never undercut when peerRelayWait < earliestMs.
- *   - @p reservedBaseMs: non-zero only when a designated next hop holds slot 0, in which case
- *     every ranked candidate queues behind that reservation instead.
- *
- * Rung spacing is added to the surviving floor, never folded into the max: applied the other way
- * round a large floor would swallow the spacing and drop two adjacent rungs onto one millisecond.
- * The caller adds its own strictly positive jitter on top.
- */
+// Shared-origin timing floors compose by max; rung separation must survive the winning floor.
 static inline uint32_t srUnicastSlotDelayMs(uint32_t reservedBaseMs, uint8_t slotIndex, uint32_t earliestMs,
                                             uint32_t leaderWaitMs, uint32_t halfAirtimeMs)
 {
@@ -427,26 +355,28 @@ static inline uint32_t srUnicastSlotDelayMs(uint32_t reservedBaseMs, uint8_t slo
     return base + ((uint32_t)slotIndex - 1) * halfAirtimeMs;
 }
 
-static inline SrTopologyVerdict srTopologyVersionVerdict(uint8_t received, uint8_t last, uint32_t lastAcceptMs,
-                                                         uint32_t nowMs, uint32_t resyncMs, bool bootBroadcast,
-                                                         bool staleValid = false, uint8_t staleVersion = 0,
-                                                         bool directCompleteList = false)
+static inline SrTopologyVerdict srTopologyVersionVerdict(uint8_t received, uint8_t last, uint32_t lastAcceptMs, uint32_t nowMs,
+                                                         uint32_t resyncMs, bool bootBroadcast, bool staleValid = false,
+                                                         uint8_t staleVersion = 0, bool directCompleteList = false)
 {
-    if (lastAcceptMs == 0) return SrTopologyVerdict::FirstContact; // entries are only created on accept, with nowMs >= 1
-    if (bootBroadcast) return SrTopologyVerdict::BootReset;
-    if (srTopologyVersionInWindow(received, last)) return SrTopologyVerdict::Accept;
-    // Inno 26→1 is 25 behind, not a delayed v=25. Apply on the first list, not the second climb.
-    if (srTopologyVersionLargeBehind(received, last)) return SrTopologyVerdict::CounterReset;
+    if (lastAcceptMs == 0)
+        return SrTopologyVerdict::FirstContact;
+    if (bootBroadcast)
+        return SrTopologyVerdict::BootReset;
+    if (srTopologyVersionInWindow(received, last))
+        return SrTopologyVerdict::Accept;
+
+    if (srTopologyVersionLargeBehind(received, last))
+        return SrTopologyVerdict::CounterReset;
     uint32_t silent = nowMs - lastAcceptMs;
-    if (silent >= resyncMs && silent < 0x80000000u) return SrTopologyVerdict::SilenceResync;
-    // +1 is the usual reboot after a missed boot broadcast; allow a few missed lists so v=1 then
-    // v=3 still rebases. Delayed old reports sit 1–2 behind `last` and never climb from there.
-    if (staleValid && srTopologyVersionClimbing(received, staleVersion)) return SrTopologyVerdict::RestartClimb;
-    // The originator is on the air with a complete list whose counter looks backwards. That is a
-    // restarted neighbour, not a late copy of an old report (those arrive relayed, hop already
-    // burned). Waiting for a second climbing reject or two silent intervals left Czar ignoring
-    // Inno's post-flash lists until Czar itself rebooted.
-    if (directCompleteList) return SrTopologyVerdict::DirectResync;
+    if (silent >= resyncMs && silent < 0x80000000u)
+        return SrTopologyVerdict::SilenceResync;
+
+    if (staleValid && srTopologyVersionClimbing(received, staleVersion))
+        return SrTopologyVerdict::RestartClimb;
+
+    if (directCompleteList)
+        return SrTopologyVerdict::DirectResync;
     return SrTopologyVerdict::Stale;
 }
 
@@ -467,13 +397,7 @@ static inline bool hasReportedDirectEdgeTo(const NeighborGraph *graph, NodeNum m
     return false;
 }
 
-// A topology sender that lists us among its directly heard neighbors has proven it hears us.
-// SR-passive senders broadcast topology but never relay, so this is the only way they can earn
-// `hearsUs` on our edge to them (SR-active senders also earn it by relaying our packets).
-// Returns true only when the flag transitions false -> true, so callers can log the event once.
-/// Record that `sender` hears us, reporting whether that is new information. One definition for
-/// every source of the evidence: a peer listing us, a peer carrying our traffic, or a peer
-/// routing through us.
+// Passive publishers never relay our packets, so their lists provide the reachability evidence.
 static inline bool confirmSenderHearsUs(NeighborGraph *graph, NodeNum myNode, NodeNum sender)
 {
     if (!graph || sender == 0 || sender == myNode) {
@@ -496,8 +420,7 @@ static inline bool confirmSenderHearsUs(NeighborGraph *graph, NodeNum myNode, No
     return false;
 }
 
-static inline bool confirmTopologySenderHearsUs(NeighborGraph *graph, NodeNum myNode, NodeNum sender,
-                                                NodeNum listedNeighbor)
+static inline bool confirmTopologySenderHearsUs(NeighborGraph *graph, NodeNum myNode, NodeNum sender, NodeNum listedNeighbor)
 {
     if (listedNeighbor != myNode) {
         return false;
@@ -505,11 +428,7 @@ static inline bool confirmTopologySenderHearsUs(NeighborGraph *graph, NodeNum my
     return confirmSenderHearsUs(graph, myNode, sender);
 }
 
-// The same listing proves the sender hears every other node it names. If that node has reported an
-// edge to the sender, mark it heard, so we model our peers' coverage of the sender the way they model
-// it themselves. Without this, two nodes that both just learned a passive neighbour each saw the other
-// as not covering it and both took slot 0 for its packets. No edge is invented: only an existing edge
-// listed -> sender is flagged. Returns true only on a false -> true transition.
+// Peers must agree on a passive neighbor's coverage or both choose the first relay slot.
 static inline bool confirmTopologySenderHearsNeighbor(NeighborGraph *graph, NodeNum sender, NodeNum listedNeighbor)
 {
     if (!graph || listedNeighbor == sender || listedNeighbor == 0) {
@@ -532,14 +451,7 @@ static inline bool confirmTopologySenderHearsNeighbor(NeighborGraph *graph, Node
     return false;
 }
 
-// The spreading factor the radio is actually demodulating at, mirroring
-// RadioInterface::applyModemConfig's own derivation exactly: preset-derived only when
-// config.lora.use_preset is set, otherwise the explicitly configured custom value. Costing a link
-// against the preset's spreading factor when a custom one is in use prices against the wrong
-// demodulator threshold — up to 12.5 dB of margin error (SF7 to SF12), enough to move a link across
-// the coverage ceiling. Every NeighborGraph::calculateETX/etxToSignal call site in this module uses
-// this instead of config.lora.modem_preset directly, so costing agrees with the radio whether or
-// not a preset is in force.
+// A custom modem must be priced against its actual demodulator threshold, not its preset label.
 static inline uint8_t currentCostingSpreadingFactor()
 {
     if (config.lora.use_preset) {
@@ -552,7 +464,6 @@ static inline uint8_t currentCostingSpreadingFactor()
     return static_cast<uint8_t>(config.lora.spread_factor);
 }
 
-// Update Reported direct-neighbor edges and the outbound topology signal cache from a local RF observation.
 static inline int refreshReportedDirectNeighborObservation(NeighborGraph *graph, DirectNeighborSignal *signals,
                                                            uint8_t &signalCount, size_t maxSignals, NodeNum myNode,
                                                            NodeNum nodeId, int32_t rssi, float snr, uint32_t nowSecs)
@@ -563,21 +474,10 @@ static inline int refreshReportedDirectNeighborObservation(NeighborGraph *graph,
 
     float etx = NeighborGraph::calculateETX(rssi, snr, currentCostingSpreadingFactor());
     graph->foldSilenceBeforeReportedHear(myNode, nodeId, nowSecs);
-    // The measured direction is what we publish, so it alone decides whether the topology changed.
-    // Write it first: `updateEdge` refuses a `from` that is not already our direct neighbour, so
-    // an Inferred reverse attempted before this was dropped, the dest slot stayed edgeless, and
-    // `ageEdges` deleted both the slot and this Reported edge on the next 60 s pass.
+    // The measured direction must exist first or graph admission can reject its inferred reverse.
     int changeType = graph->updateEdge(myNode, nodeId, etx, nowSecs, Edge::Source::Reported);
     graph->stampReportedLastHeard(myNode, nodeId, nowSecs);
-    // We measured one direction: the frame we just received. How well the neighbour hears *us* is
-    // an assumption of symmetry, so the reverse edge is `Inferred`, the same class this module
-    // already gives the reverse direction synthesised while merging a topology. Recorded as
-    // `Reported` it took the top rank and could never be displaced — classes rank Inferred <
-    // Mirrored < Reported and a weaker one never overwrites a stronger — so the neighbour's own
-    // published measurement of us could never land, and every node credited itself with more
-    // coverage than its peers credited it with. The edge stays as evidence a link exists both ways;
-    // it simply no longer prices one. Delivery cost is unaffected: the lookup tries the receive
-    // direction first and falls back to this same observation on the forward edge.
+    // Symmetry is an assumption; ranking its reverse as measured would block stronger peer evidence.
     (void)graph->updateEdge(nodeId, myNode, etx, nowSecs, Edge::Source::Inferred);
 
     int8_t clampedSnr = static_cast<int8_t>(std::max(-128.f, std::min(127.f, snr)));
@@ -585,52 +485,42 @@ static inline int refreshReportedDirectNeighborObservation(NeighborGraph *graph,
     return changeType;
 }
 
-// Broadcast interval for signal routing info
 #define SIGNAL_ROUTING_BROADCAST_SECS 900
 
-// Minimum inter-broadcast interval: dirty topology triggers an early broadcast only after this
-// many seconds have elapsed since the last broadcast.
 #define SIGNAL_ROUTING_DIRTY_BROADCAST_SECS 600
 
-// Maximum hops for SR topology broadcasts; capped at min(user config, this value)
 #define SR_BROADCAST_MAX_HOPS 4
 
-// Hop budget of a last-hop unicast (see SignalRoutingModule::capsLastHop).
 static constexpr uint8_t SR_LAST_HOP_BUDGET = 1;
 
 class SignalRoutingModule : public ProtobufModule<meshtastic_SignalRoutingInfo>, private concurrency::OSThread
 {
-public:
+  public:
     SignalRoutingModule();
+    ~SignalRoutingModule() override;
 
-    // Delete copy constructor and assignment operator since this class manages dynamic memory and threading
-    SignalRoutingModule(const SignalRoutingModule&) = delete;
-    SignalRoutingModule& operator=(const SignalRoutingModule&) = delete;
+    SignalRoutingModule(const SignalRoutingModule &) = delete;
+    SignalRoutingModule &operator=(const SignalRoutingModule &) = delete;
+
+#if defined(UNIT_TEST)
+    uint32_t debugNextRunMs() const { return _cached_next_run; }
+#endif
 
     bool shouldUseSignalBasedRouting(const meshtastic_MeshPacket *p);
 
-    /// Duplicate whose incoming next_hop names us: hand-off from the previous relay.
     bool isHandOffDuplicate(const meshtastic_MeshPacket *p);
 
-    /// Originator retry that should be re-planned like a fresh reception under signal routing.
     bool isOriginatorRetryReplan(const meshtastic_MeshPacket *p);
 
-    /// Relayed-packet graph / downstream learning. Also run on duplicate RX: a later copy may
-    /// resolve a hearsUs neighbour that the first-heard relay byte could not.
     void observeRelayedPacket(const meshtastic_MeshPacket &mp);
 
-    /// Stampable, SR-active next hop to destination with intermediate hops excluded (cache
-    /// bypassed), never one whose byte is `nominatedByte`.
     NodeNum alternateNextHop(NodeNum dest, const NodeNum *excluded, uint8_t n, uint8_t nominatedByte);
 
-    /// Full id of the hop a stamped `next_hop` byte names: `flagged` when its byte matches, else
-    /// the resolved relay identity (0 when unknown).
     NodeNum nominatedHopFor(NodeNum flagged, uint8_t nextHopByte) const;
 
     void recordHopMiss(NodeNum destination, NodeNum nextHop);
     void recordHopSuccess(NodeNum destination, NodeNum nextHop);
 
-    /** The next hop SR chose for the unicast it just approved in shouldRelay() (0 = none); cleared on read. */
     NodeNum takePendingUnicastNextHop()
     {
         NodeNum n = pendingUnicastNextHop;
@@ -645,127 +535,95 @@ public:
     }
     UnicastSlotFlags unicastCommitFlags(PacketId packetId) const;
     bool hasPricedDeliveryHop(NodeNum dest) const;
-    /// Measured link to `peer` at or under `cfgPoorLinkEtxThreshold`.
+
     bool hasStrongHopTo(NodeNum peer) const;
-    /// Priced last hop and `hasStrongHopTo(dest)`. Strong last hops stamp the destination;
-    /// weak ones flood (`next_hop` unset).
+
     bool hasStrongDeliveryHop(NodeNum dest) const;
     bool isSignalRoutingNode(NodeNum nodeId) const { return publishesTopology(nodeId); }
     bool deliveringRelayerIsSR(const meshtastic_MeshPacket *p) const;
     uint32_t nextHopCarryWaitMs(NodeNum nextHop, uint32_t airtimeMs, float rxSnr) const;
-    /// Wait between named follow-up tries, from handing our frame to the radio: our own
-    /// contention and airtime, then max(carry wait, end of ranked slot 1 with its tie-break).
+
     uint32_t namedForwardFollowupDelayMs(NodeNum nextHop, uint32_t airtimeMs, float rxSnr) const;
-    void updateNodeActivityForPacket(NodeNum nodeId);
     void updateNodeActivityForPacketAndRelay(const meshtastic_MeshPacket *p);
     bool shouldRelay(const meshtastic_MeshPacket *p);
-    /// Broadcast coverage ladder. When @p unicastFloodCoverage is set, run that ladder for an
-    /// undesignated unicast with no stampable path (no acknowledgement pass).
+
     bool shouldRelayBroadcast(const meshtastic_MeshPacket *p, bool unicastFloodCoverage = false);
-    /// The next hop to stamp on a relayed unicast. `verified`, when given, reports whether the
-    /// hop came from the confirmed backward search: an opportunistic neighbour, the downstream
-    /// table, best-effort self relay and direct delivery are all guesses and report false, so
-    /// callers can refuse to designate a node that never proved it hears the destination. A hop
-    /// the search confirmed carries the search's own verdict even when it could not be shown to
-    /// hear this particular transmitter — that is a question about this frame, not the path.
+
     NodeNum getNextHop(NodeNum destination, NodeNum sourceNode = 0, NodeNum heardFrom = 0, bool allowOpportunistic = true,
                        bool *verified = nullptr);
-    NodeNum findBetterPositionedNeighbor(NodeNum destination, NodeNum sourceNode, NodeNum heardFrom,
-                                       float ourRouteCost, uint32_t currentTime);
+    NodeNum findBetterPositionedNeighbor(NodeNum destination, NodeNum sourceNode, NodeNum heardFrom, float ourRouteCost,
+                                         uint32_t currentTime);
     bool shouldRelayUnicastForCoordination(const meshtastic_MeshPacket *p);
     bool hasDirectConnectivity(NodeNum nodeA, NodeNum nodeB);
-    bool hasVerifiedConnectivity(NodeNum transmitter, NodeNum receiver, bool* unknownOut = nullptr);
-    void updateNeighborInfo(NodeNum nodeId, int32_t rssi, float snr, uint32_t lastRxTime);
+    bool hasVerifiedConnectivity(NodeNum transmitter, NodeNum receiver, bool *unknownOut = nullptr);
+    void updateNeighborInfo(NodeNum nodeId, int32_t rssi, float snr);
     void sendSignalRoutingInfo(NodeNum dest = NODENUM_BROADCAST);
-    // Call when this node originates and sends any packet (not a relay).
-    // Resets the topology-broadcast keepalive timer so we don't send redundant broadcasts
-    // while we are already visible to neighbors due to recent transmissions.
 
-    // Returns true if the packet was received directly from the sender (not relayed).
-    // Checks both hop_start==hop_limit and relay_node matching the sender's last byte.
     static bool isDirectPacket(const meshtastic_MeshPacket &mp);
-    void preProcessSignalRoutingPacket(const meshtastic_MeshPacket *p, uint32_t packetReceivedTimestamp = 0);
+    void preProcessSignalRoutingPacket(const meshtastic_MeshPacket *p);
 
-protected:
+  protected:
     virtual bool handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshtastic_SignalRoutingInfo *p) override;
     void updateGraphWithNeighbor(NodeNum sender, NodeNum neighborId, int8_t rssi, int8_t snr, bool hearsUs);
     uint8_t packNeighborsForBroadcast(uint8_t *outBuf, size_t bufSize);
-    // Set hearsUs on our edge to `sender` when its topology lists us as a direct neighbor (logs on transition).
+
     void noteTopologySenderHearsUs(NodeNum sender, NodeNum listedNeighbor);
     virtual ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override;
     virtual bool wantPacket(const meshtastic_MeshPacket *p) override { return true; }
     virtual meshtastic_MeshPacket *allocReply() override;
     virtual int32_t runOnce() override;
 
-    // Reachable to module tests that assert downstream / edge state after topology merges.
     NeighborGraph *routingGraph = nullptr;
 
-private:
+  private:
+    uint32_t nowSeconds() const;
+    void wakeWithin(uint32_t delayMs);
+    void maintainGraph(uint32_t currentTime);
+    void processTopology(const meshtastic_MeshPacket &mp, const meshtastic_SignalRoutingInfo &info);
     HopHealth hopHealth;
     uint32_t lastGraphUpdate = 0;
     static constexpr uint32_t GRAPH_MAINTENANCE_INTERVAL_SECS = 60;
-    static constexpr uint32_t NODE_TTL_SECS = 10800;    // 3 hours for all nodes in the graph
-    static constexpr uint32_t CAPABILITY_TTL_SECS = SIGNAL_ROUTING_BROADCAST_SECS * 3 + 20;  // detect when SR node stops being SR
-    // A publisher that misses two consecutive lists with nothing else heard from it is gone: we
-    // retract our direct link rather than keep owing it coverage for the whole graph TTL.
-    static constexpr uint32_t PUBLISHER_SILENCE_SECS = SIGNAL_ROUTING_BROADCAST_SECS * 2 +20;
-    static constexpr uint32_t RELAY_ID_CACHE_TTL_MS = 600 * 1000;  // 10 min
+    static constexpr uint32_t NODE_TTL_SECS = 10800;
+    static constexpr uint32_t CAPABILITY_TTL_SECS = SIGNAL_ROUTING_BROADCAST_SECS * 3 + 20;
+
+    static constexpr uint32_t PUBLISHER_SILENCE_SECS = SIGNAL_ROUTING_BROADCAST_SECS * 2 + 20;
+    static constexpr uint32_t RELAY_ID_CACHE_TTL_MS = 600 * 1000;
 
     bool signalBasedRoutingEnabled = true;
-    /// One-shot guard for the own-role boot line (config is not loaded in the constructor).
+
     bool loggedOwnRole = false;
     bool operatingPresetKnown = false;
     uint8_t operatingPreset = 0;
     bool needsBootBroadcast = false;
-    bool topologyDirty = false; // Set when topology changes; triggers early broadcast via runOnce
-    bool topologyBroadcastActive = false; // True while sendSignalRoutingInfo() is sending
+    bool topologyDirty = false;
+    bool topologyBroadcastActive = false;
     uint32_t lastBroadcast = 0;
-    // Signed age of the last topology transmission: negative while `lastBroadcast` is ahead of
-    // the caller's timestamp, so an interval test can never be satisfied by an unsigned wrap.
+
     int32_t sinceLastBroadcast(uint32_t nowMs) const { return (int32_t)(nowMs - lastBroadcast); }
 
     struct PendingTopologyReply {
         bool active = false;
         uint32_t fireAfterMs = 0;
-        // When the empty bootstrap broadcast asked for our list. A list transmitted after this
-        // has already answered it, whatever triggered that list.
+
         uint32_t requestedMs = 0;
     };
     PendingTopologyReply pendingTopologyReply;
-    // Bootstrap replies are rate-limited: a burst of empty broadcasts (many reboots, or a rogue) must not
-    // make every node answer each one with its list. The requester is in our graph regardless and gets
-    // the next periodic broadcast.
+    // A reboot burst must not make every peer broadcast its list for every request.
     static constexpr uint32_t BOOTSTRAP_REPLY_MIN_INTERVAL_MS = 120000;
-    // Channel-access model: after a frame ends a
-    // receiver spends up to ~170 ms (measured here: "Packet RX" 69-172 ms) reading it out before it
-    // listens again. Every "how long does a peer need" wait and the first relay slot start from this.
-    /// Minimum spacing between two relay rungs, whatever the airtime says.
-    ///
-    /// Absolute, in an otherwise preset-derived geometry, and it binds about half the time: at
-    /// SHORT_SLOW it applies to every frame up to 54 bytes. Expressing it in slot times was tried
-    /// and withdrawn — the tie-break range below is derived from the *floored* half, so a
-    /// slot-time floor would shrink two colocated nodes' rung-0 separation into the band where they
-    /// demonstrably stop hearing each other. It stays, with a stated purpose rather than an
-    /// inherited number: the smallest separation at which two colocated nodes reliably hear one
-    /// another. Revisiting it needs a measurement of when a cancel actually fires.
+    // Receivers need turnaround time to hear the next relay after reading the previous frame.
+    // Colocated radios need this measured separation to hear and cancel each other.
     static constexpr uint32_t SR_MIN_RUNG_SPACING_MS = 50;
 
-    /// Minimum de-correlation between two nodes that computed the same rung. Coupled to
-    /// SR_MIN_RUNG_SPACING_MS: it must stay strictly below the spacing, or two adjacent rungs can
-    /// swap and the earlier-ranked node transmits second — voiding the coverage absorption the
-    /// ranking performed on its behalf.
+    // Tie-break jitter must stay below rung spacing or adjacent candidates can reverse order.
     static constexpr uint32_t SR_MIN_TIE_BREAK_RANGE_MS = 20;
 
-    /// Fallback rung spacing when no airtime is available.
     static constexpr uint32_t SR_FALLBACK_HALF_AIRTIME_MS = 150;
 
     static constexpr uint32_t SR_PEER_TURNAROUND_MS = 250;
-    /// Fallback ladder origin when the radio has no floor yet. Production uses
-    /// `getRelayFloorMsec()` (`2·CWmax·slot_time`) as the transition.
+
     static constexpr uint32_t SR_SLOT_ORIGIN_MS = SR_PEER_TURNAROUND_MS;
-    uint32_t lastBootstrapReplyMs = 0; // 0 = never
-    // When we last transmitted a list that actually carried neighbours (0 = never). The
-    // header-only boot broadcast does not count: it tells a requester nothing about who we hear.
+    uint32_t lastBootstrapReplyMs = 0;
+
     uint32_t lastTopologyListMs = 0;
     uint8_t currentTopologyVersion = 0;
 
@@ -773,9 +631,10 @@ private:
     struct TopologyVersionEntry {
         NodeNum nodeId = 0;
         uint8_t version = 0;
-        uint32_t lastAcceptMs = 0; // millis() of the last accepted report, 0 = never
-        // Version of the last report rejected as stale: a rebooted peer whose boot broadcast we
-        // missed shows as rejected versions climbing one by one.
+        PacketId packetId = 0;
+        uint32_t processedChunks = 0;
+        uint32_t lastAcceptMs = 0;
+
         uint8_t staleVersion = 0;
         bool staleValid = false;
     };
@@ -784,67 +643,55 @@ private:
     TopologyVersionEntry lastPreProcessedVersion[MAX_TOPOLOGY_VERSION_ENTRIES];
     uint8_t lastPreProcessedVersionCount = 0;
 
-    // Neighbour ids listed so far by multi-chunk topology reports, one slot per sender (see
-    // preProcessSignalRoutingPacket). A single slot let any other node's report invalidate a hub's list.
     static constexpr uint8_t PENDING_LISTED_SLOTS = 4;
     struct PendingListed {
         NodeNum ids[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
         uint8_t count = 0;
         NodeNum sender = 0;
         uint8_t version = 0;
+        uint8_t nextChunk = 1;
         bool valid = false;
     };
     PendingListed pendingListed[PENDING_LISTED_SLOTS];
-    // The slot gathering `sender`'s chunks: its open one, else a free one, else slot 0.
+
     uint8_t pendingListedSlot(NodeNum sender) const
     {
         for (uint8_t i = 0; i < PENDING_LISTED_SLOTS; i++)
-            if (pendingListed[i].valid && pendingListed[i].sender == sender) return i;
+            if (pendingListed[i].valid && pendingListed[i].sender == sender)
+                return i;
         for (uint8_t i = 0; i < PENDING_LISTED_SLOTS; i++)
-            if (!pendingListed[i].valid) return i;
+            if (!pendingListed[i].valid)
+                return i;
         return 0;
     }
 
     static TopologyVersionEntry *findTopologyEntry(TopologyVersionEntry *table, uint8_t count, NodeNum nodeId);
-    // The version last rejected as stale from nodeId (false when none since the last accept).
+
     bool getTopologyStale(const TopologyVersionEntry *table, uint8_t count, NodeNum nodeId, uint8_t *staleVersion) const;
     void noteTopologyStale(TopologyVersionEntry *table, uint8_t count, NodeNum nodeId, uint8_t received);
     uint8_t getTopologyVersion(const TopologyVersionEntry *table, uint8_t count, NodeNum nodeId,
                                uint32_t *lastAcceptMs = nullptr) const;
-    void setTopologyVersion(TopologyVersionEntry *table, uint8_t &count, NodeNum nodeId, uint8_t version,
-                            uint32_t nowMs = 0);
-    // Shared ingest gate: records stale rejects so RestartClimb can arm, even when shouldRelay()
-    // never called preProcess (stock flood, hop_limit 0, thin topology).
-    SrTopologyVerdict gateTopologyVersion(NodeNum from, uint8_t receivedVersion, bool bootBroadcast,
-                                          bool directCompleteList, uint32_t nowMs);
-    // A peer's topology version is accepted when it moves forward by less than half the counter range
-    // (or repeats). A header-only broadcast with version 0 is the peer's boot announcement and resets
-    // what we track. After two silent broadcast intervals plus 20 seconds any version is accepted again. A complete
-    // list heard from the originator also rebases: the neighbour is transmitting now, so its counter
-    // is the one that matters, not the one we stored before it restarted. A version far behind the
-    // last accepted one is a restarted counter, not a delayed copy of the previous list.
+    void setTopologyVersion(TopologyVersionEntry *table, uint8_t &count, NodeNum nodeId, uint8_t version, uint32_t nowMs = 0,
+                            PacketId packetId = 0, uint32_t chunkBit = 0);
+
+    SrTopologyVerdict gateTopologyVersion(NodeNum from, uint8_t receivedVersion, bool bootBroadcast, bool directCompleteList,
+                                          uint32_t nowMs);
+
     uint32_t topologyResyncMs() const { return 2 * cfgBroadcastSecs * 1000 + 20 * 1000; }
 
-    bool isSignalBasedCapable(NodeNum nodeId) const;
     bool topologySenderHorizonOk(NodeNum sender, bool heardDirectFromSender, const PackedNeighborEntry *neighbors,
                                  uint8_t neighborCount) const;
-    void sendTopologyPacket(NodeNum dest, const uint8_t *packedData, size_t packedLen, uint8_t topologyVersion = 0, uint32_t txAfterMs = 0);
+    void sendTopologyPacket(NodeNum dest, const uint8_t *packedData, size_t packedLen, uint32_t txAfterMs = 0);
 
     DirectNeighborSignal directSignals[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
     uint8_t directSignalCount = 0;
 
-    void upsertDirectSignal(NodeNum nodeId, int8_t rssi, int8_t snr, uint32_t nowSecs);
     const DirectNeighborSignal *lookupDirectSignal(NodeNum nodeId) const;
     void removeDirectSignal(NodeNum nodeId);
     void pruneDirectSignals(uint32_t nowSecs);
     void syncDirectSignalsWithGraph();
 
-    enum class CapabilityStatus : uint8_t {
-        Unknown = 0,
-        SRactive,
-        Passive,
-        Legacy
-    };
+    enum class CapabilityStatus : uint8_t { Unknown = 0, SRactive, Passive, Legacy };
 
     struct CapabilityRecord {
         CapabilityStatus status = CapabilityStatus::Unknown;
@@ -874,21 +721,18 @@ private:
     RelayIdentityCacheEntry relayIdentityCache[MAX_RELAY_IDENTITY_ENTRIES];
     uint8_t relayIdentityCacheCount = 0;
 
-
     void trackNodeCapability(NodeNum nodeId, CapabilityStatus status);
     void pruneCapabilityCache(uint32_t nowSecs);
     CapabilityStatus getCapabilityStatus(NodeNum nodeId) const;
-    // The node broadcasts neighbour lists (SR active or passive), so its lists are evidence.
+
     bool publishesTopology(NodeNum nodeId) const
     {
         CapabilityStatus s = getCapabilityStatus(nodeId);
         return s == CapabilityStatus::SRactive || s == CapabilityStatus::Passive;
     }
-    // The coverage rules' view of this module: who reports, who relays, and our own eligibility.
+
     NeighborGraph::CoveragePolicy coveragePolicy() const;
 
-
-    // The route search's view of this module: routable intermediate hops and topology publishers.
     NeighborGraph::RoutePolicy routePolicy() const;
 
     bool topologyHealthyForBroadcast() const;
@@ -896,50 +740,37 @@ private:
     bool isImmediateRelayRouter(NodeNum nodeId) const;
     bool isLegacyRouter(NodeNum nodeId) const;
     void pruneRelayIdentityCache(uint32_t nowMs);
-public:
+
+  public:
     NodeNum resolveHeardFrom(const meshtastic_MeshPacket *p, NodeNum sourceNode) const;
     void rememberRelayIdentity(NodeNum nodeId, uint8_t relayId);
     NodeNum resolveRelayIdentity(uint8_t relayId, int16_t rxRssi = 0, float rxSnr = 0) const;
-    /// Placeholder NodeNums use Edge::PLACEHOLDER_NODE_BASE (see isPlaceholderNode).
-    static bool isPlaceholderNodeId(NodeNum nodeId) { return (nodeId & 0xFF000000u) == 0xFF000000u; }
-    bool isPlaceholderNode(NodeNum nodeId) const; // existing impl; kept public for rate limiter
 
-    /**
-     * Record what a frame says about our own direct links, without running anything else.
-     *
-     * The inbound rate limiter drops frames before the modules run, so without this the graph
-     * never sees the traffic the limiter is judging. That matters because resolving a relay byte
-     * needs direct neighbours in the graph: after a reboot nothing resolves, every relayed frame
-     * charges the one shared unresolved bucket, and the drops then stop the graph ever filling.
-     * The limiter starves the thing it depends on. Calling this on the drop path breaks that loop.
-     */
+    static bool isPlaceholderNodeId(NodeNum nodeId) { return (nodeId & 0xFF000000u) == 0xFF000000u; }
+    bool isPlaceholderNode(NodeNum nodeId) const;
+
+    // Dropped traffic must still feed direct-link evidence or the limiter can starve its own relay resolver.
     void observeForGraph(const meshtastic_MeshPacket &mp);
 
-    /**
-     * True once the graph holds at least one direct neighbour, i.e. once a relay byte has
-     * something to resolve against. Before that, an unresolved byte says nothing about the sender.
-     */
     bool hasEstablishedGraph() const;
 
-    /// Rate-limit eviction: true if node has any edge table in the routing graph.
     bool rateLimitNodeInGraph(NodeNum nodeId) const;
-    /// Rate-limit eviction: graph hop distance (1 = direct); 0 if unknown / not routable.
+
     uint8_t rateLimitGraphHops(NodeNum nodeId) const;
-    /// Drop the neighbour graph and everything learned on the previous air; queue an empty boot list.
+
     void purgeGraphForPresetChange();
-    /// After the radio has applied current LoRa settings. Drops the graph only if the preset changed.
+
     void radioReconfigured();
     uint8_t publishedTopologyVersion() const { return currentTopologyVersion; }
     bool bootBroadcastPending() const { return needsBootBroadcast; }
     uint8_t relayIdentityCacheSize() const { return relayIdentityCacheCount; }
-private:
+
+  private:
     bool isActiveRoutingRole() const;
     bool canSendTopology() const;
     void handleNodeInfoPacket(const meshtastic_MeshPacket &mp);
     CapabilityStatus capabilityFromRole(meshtastic_Config_DeviceConfig_Role role) const;
-    void handleSniffedPayload(const meshtastic_MeshPacket &mp, bool isDirectNeighbor);
-    void handlePositionPacket(const meshtastic_MeshPacket &mp, bool isDirectNeighbor);
-    void handleTelemetryPacket(const meshtastic_MeshPacket &mp);
+    void handleSniffedPayload(const meshtastic_MeshPacket &mp);
     void handleRoutingControlPacket(const meshtastic_MeshPacket &mp);
 
     NodeNum createPlaceholderNode(uint8_t relayId);
@@ -961,7 +792,6 @@ private:
     bool hasReportedDirectEdge(NodeNum neighborId) const;
     void markStockNodeRelayedOurPacket(NodeNum stockNode);
 
-    // Committed relay tracking — prevents dupe cancellation of SR relay decisions
     static constexpr size_t MAX_COMMITTED_RELAYS = 8;
     static constexpr size_t MAX_HEARD_TRANSMITTERS = 6;
     struct CommittedRelay {
@@ -971,14 +801,14 @@ private:
         NodeNum heardTransmitters[MAX_HEARD_TRANSMITTERS];
         uint8_t heardTransmitterCount = 0;
         UnicastSlotFlags unicastFlags;
-        CommittedRelay() : packetId(0), originalHeardFrom(0), txDelayMs(0), heardTransmitterCount(0), unicastFlags() {
+        CommittedRelay() : packetId(0), originalHeardFrom(0), txDelayMs(0), heardTransmitterCount(0), unicastFlags()
+        {
             memset(heardTransmitters, 0, sizeof(heardTransmitters));
         }
     };
     CommittedRelay committedRelays[MAX_COMMITTED_RELAYS];
     uint8_t committedRelayCount = 0;
 
-    // Broadcast retransmit insurance: one-shot T1 resend after ROUTER_LATE window if no relay heard
     static constexpr size_t MAX_PENDING_RETRANSMITS = 4;
     struct PendingRetransmit {
         PacketId packetId = 0;
@@ -988,10 +818,8 @@ private:
         PendingRetransmit() : packetId(0), packet(nullptr), fireAfterMs(0), canceled(false) {}
     };
     PendingRetransmit pendingRetransmits[MAX_PENDING_RETRANSMITS];
-    bool isRetransmitting = false; // Guard: prevents T2 scheduling when T1 is being fired
+    bool isRetransmitting = false;
 
-    // Runtime-configurable values loaded from moduleConfig.signal_routing at construction.
-    // All default to the compile-time constants; overridden when has_signal_routing is set.
     uint32_t cfgBroadcastSecs = SIGNAL_ROUTING_BROADCAST_SECS;
     uint32_t cfgDirtyBroadcastSecs = SIGNAL_ROUTING_DIRTY_BROADCAST_SECS;
     uint32_t cfgNodeTtlSecs = NODE_TTL_SECS;
@@ -1000,80 +828,33 @@ private:
     bool t1RetransmitEnabled = true;
 
     bool hasAnyHearsUsNeighbor() const;
-    /// Does this frame's originator still need a rebroadcast from us as its acknowledgement:
-    /// it asked (want_ack), it reached us directly, and its own evidence elects us.
-    /**
-     * Will @p node rebroadcast regardless and *not* stand down on hearing our copy?
-     *
-     * A separate question from whether it relays early, and from whether it is a relay router at
-     * all: stock refuses to cancel a duplicate for ROUTER and ROUTER_LATE, so relaying behind one
-     * of those adds a frame rather than replacing one. Its own name rather than a narrowing of the
-     * relay-router test, which also answers candidate admission and the owner elections and must
-     * not move.
-     *
-     * CLIENT_BASE is deliberately absent. Stock also refuses to cancel there, but only for traffic
-     * involving a favourited node, and a favourite list is local configuration that never reaches
-     * the wire — no peer can evaluate it. The occasional duplicate alongside one is accepted.
-     */
+
+    // CLIENT_BASE cancellation depends on local favorites that peers cannot know.
     bool willNotCancelForUs(NodeNum node) const;
 
-    /**
-     * Answer a message its originator is waiting on, when the coverage ranking had nothing to
-     * offer. Returns true when we should relay, and writes our delay to @p delayMsOut.
-     */
-    bool planAcknowledgement(const meshtastic_MeshPacket *p, NodeNum sourceNode, NodeNum heardFrom,
-                             uint32_t halfAirtime, uint32_t *delayMsOut, uint8_t *slotsAheadOut);
+    bool planAcknowledgement(const meshtastic_MeshPacket *p, NodeNum sourceNode, NodeNum heardFrom, uint32_t halfAirtime,
+                             uint32_t *delayMsOut, uint8_t *slotsAheadOut);
 
-public:
-    uint32_t pendingRelayDelayMs = 0; // Set by shouldRelayBroadcast, consumed by commitRelay
-    // Set by shouldRelayUnicastForCoordination: the next hop to stamp on our relayed copy (0 = none).
+  public:
+    uint32_t pendingRelayDelayMs = 0;
+
     NodeNum pendingUnicastNextHop = 0;
     UnicastSlotFlags pendingUnicastFlags;
 
     void commitRelay(PacketId packetId, NodeNum originalHeardFrom, uint32_t txDelayMs = 0);
     bool isCommittedRelay(PacketId packetId) const;
     uint32_t getCommittedRelayDelay(PacketId packetId) const;
-    /**
-     * How long a committed relay whose scheduled send time has already passed should still wait.
-     *
-     * The rung it was given encodes its position among the candidates, and every node computed
-     * that ladder the same way. Drawing a fresh random delay instead discards the position: two
-     * nodes whose rungs both expired then key up at the same instant, which is worse than either
-     * transmitting late — neither cancels the other and a third node may decode neither. What
-     * survives the expiry is the part of the rung that distinguishes us from the other
-     * candidates, its offset above the shared origin, so that is what gets re-anchored to now.
-     * Floored at one slot time so an expired rung 0 does not key up instantly.
-     */
-    /**
-     * Where the relay ladder starts: stock's border between the router window and the
-     * contention window every other role draws from, `2*CWmax*slot_time`, which the radio
-     * publishes as `getRelayFloorMsec()`. The window of reservations ends exactly there, so
-     * the two are one geometry. Falls back to the peer turnaround when no radio is attached
-     * (host tests), which leaves the window empty and every position on the ladder.
-     */
+
     uint32_t ladderTransitionMs() const;
     uint32_t expiredRelayReanchorMs(PacketId packetId, uint32_t slotTimeMs) const;
     void clearCommittedRelay(PacketId packetId);
-    // True when every neighbour we would cover is already covered by the transmitters heard for
-    // this packet (cancel the queued relay). When false and uniqueNeighbor is non-null, it is set
-    // to one neighbour we still uniquely reach — named on the keep line so a capture can say whom.
+
     bool areAllNeighborsCovered(const meshtastic_MeshPacket *p, NodeNum *uniqueNeighbor = nullptr);
-    // Returns the hop_limit to set for a unicast to a direct hearsUs neighbor when stock
-    // neighbors are present, or -1 if no limiting should be applied.
-    // Good links (ETX < 3.0): 0 hops (direct delivery, no further relay)
-    // Marginal links: 1 hop (allow one retry relay if our TX is lost)
-    // Is a unicast to p->to a last hop: the destination is a direct neighbour that hears us and
-    // stock neighbours are listening? Such a frame goes out with SR_LAST_HOP_BUDGET and the
-    // destination named as next hop, so stock neighbours (which relay a unicast only when the next
-    // hop is unset or their own byte) leave it alone while the destination still reads it as a
-    // direct, ACK-worthy frame with a populated hop_start.
+
     bool capsLastHop(const meshtastic_MeshPacket *p);
-    // T1 insurance for a broadcast we originated: if nobody relays it inside the worst-case
-    // window, resend once. A relay we committed to needs no insurance — the relay is the copy.
+
     void maybeScheduleBroadcastRetransmit(const meshtastic_MeshPacket *p);
-    // T1 insurance for a broadcast we deferred (no ranked slot): if nobody retransmits, a late
-    // copy still reaches the source. Every deferring node arms one, so each waits `staggerMs`
-    // past the window; firing together would collide exactly when the ranked relay went missing.
+    // Multiple deferring insurers need distinct delays when the ranked relay goes missing.
     void armDeferredBroadcastRetransmit(const meshtastic_MeshPacket *p, uint32_t staggerMs, uint8_t ladderRungs);
     void scheduleT1Broadcast(const meshtastic_MeshPacket *p, uint32_t staggerMs, bool deferred, uint8_t ladderRungs);
     void cancelBroadcastRetransmit(PacketId packetId);

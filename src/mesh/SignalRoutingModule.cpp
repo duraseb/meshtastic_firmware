@@ -3,28 +3,30 @@
 
 #if !MESHTASTIC_EXCLUDE_SIGNALROUTING
 
-#include "graph/NeighborGraph.h"
+#include "ChannelQoS.h"
 #include "MeshService.h"
 #include "MeshTypes.h"
 #include "NodeDB.h"
+#include "NodeRateLimiter.h"
 #include "RTC.h"
 #include "Router.h"
-#include "modules/RoutingModule.h"
-#include "NodeRateLimiter.h"
 #include "configuration.h"
+#include "graph/NeighborGraph.h"
 #include "memGet.h"
+#include "modules/RoutingModule.h"
 #include "pb_decode.h"
 #include <Arduino.h>
 #include <algorithm>
+#include <cmath>
 
 SignalRoutingModule *signalRoutingModule;
 
-// --- Fixed-size topology version table helpers ---
 SignalRoutingModule::TopologyVersionEntry *SignalRoutingModule::findTopologyEntry(TopologyVersionEntry *table, uint8_t count,
                                                                                   NodeNum nodeId)
 {
     for (uint8_t i = 0; i < count; i++) {
-        if (table[i].nodeId == nodeId) return &table[i];
+        if (table[i].nodeId == nodeId)
+            return &table[i];
     }
     return nullptr;
 }
@@ -33,7 +35,8 @@ uint8_t SignalRoutingModule::getTopologyVersion(const TopologyVersionEntry *tabl
                                                 uint32_t *lastAcceptMs) const
 {
     const TopologyVersionEntry *e = findTopologyEntry(const_cast<TopologyVersionEntry *>(table), count, nodeId);
-    if (lastAcceptMs) *lastAcceptMs = e ? e->lastAcceptMs : 0;
+    if (lastAcceptMs)
+        *lastAcceptMs = e ? e->lastAcceptMs : 0;
     return e ? e->version : 0;
 }
 
@@ -41,31 +44,35 @@ bool SignalRoutingModule::getTopologyStale(const TopologyVersionEntry *table, ui
                                            uint8_t *staleVersion) const
 {
     const TopologyVersionEntry *e = findTopologyEntry(const_cast<TopologyVersionEntry *>(table), count, nodeId);
-    if (!e) return false;
-    if (staleVersion) *staleVersion = e->staleVersion;
+    if (!e)
+        return false;
+    if (staleVersion)
+        *staleVersion = e->staleVersion;
     return e->staleValid;
 }
 
 void SignalRoutingModule::noteTopologyStale(TopologyVersionEntry *table, uint8_t count, NodeNum nodeId, uint8_t received)
 {
     TopologyVersionEntry *e = findTopologyEntry(table, count, nodeId);
-    if (!e) return;
+    if (!e)
+        return;
     e->staleVersion = received;
     e->staleValid = true;
 }
 
 void SignalRoutingModule::setTopologyVersion(TopologyVersionEntry *table, uint8_t &count, NodeNum nodeId, uint8_t version,
-                                             uint32_t nowMs)
+                                             uint32_t nowMs, PacketId packetId, uint32_t chunkBit)
 {
-    // nowMs 0 keeps the stored accept time (callers pass a non-zero millis() when a report is accepted).
     if (TopologyVersionEntry *e = findTopologyEntry(table, count, nodeId)) {
-        // A repeat of the last accepted version is a continuation chunk or a delayed copy still
-        // in the air. Clearing staleValid here disarmed RestartClimb: Inno v=1 was noted stale,
-        // then a leftover v=26 was accepted as "in window" and the next v=2 had no climb state.
+        // Delayed copies and continuation chunks must not erase evidence of a restarted counter.
         const bool sameVersion = (e->version == version);
         e->version = version;
-        if (nowMs) e->lastAcceptMs = nowMs;
-        if (!sameVersion) e->staleValid = false;
+        e->packetId = packetId;
+        e->processedChunks = chunkBit ? ((sameVersion ? e->processedChunks : 0) | chunkBit) : 0;
+        if (nowMs)
+            e->lastAcceptMs = nowMs;
+        if (!sameVersion)
+            e->staleValid = false;
         return;
     }
     TopologyVersionEntry *slot;
@@ -73,11 +80,18 @@ void SignalRoutingModule::setTopologyVersion(TopologyVersionEntry *table, uint8_
         slot = &table[count];
         count++;
     } else {
-        // Overwrite oldest (slot 0) and shift isn't worth it — just overwrite first slot
         slot = &table[0];
+        for (uint8_t i = 1; i < count; i++) {
+            if (nowMs - table[i].lastAcceptMs > nowMs - slot->lastAcceptMs) {
+                slot = &table[i];
+            }
+        }
     }
+    *slot = {};
     slot->nodeId = nodeId;
     slot->version = version;
+    slot->packetId = packetId;
+    slot->processedChunks = chunkBit;
     slot->lastAcceptMs = nowMs;
     slot->staleValid = false;
 }
@@ -89,9 +103,9 @@ SrTopologyVerdict SignalRoutingModule::gateTopologyVersion(NodeNum from, uint8_t
     uint8_t lastProcessedVersion = getTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, from, &lastAcceptMs);
     uint8_t staleVersion = 0;
     bool staleValid = getTopologyStale(lastTopologyVersion, lastTopologyVersionCount, from, &staleVersion);
-    SrTopologyVerdict verdict = srTopologyVersionVerdict(receivedVersion, lastProcessedVersion, lastAcceptMs, nowMs,
-                                                         topologyResyncMs(), bootBroadcast, staleValid, staleVersion,
-                                                         directCompleteList);
+    SrTopologyVerdict verdict =
+        srTopologyVersionVerdict(receivedVersion, lastProcessedVersion, lastAcceptMs, nowMs, topologyResyncMs(), bootBroadcast,
+                                 staleValid, staleVersion, directCompleteList);
     if (verdict == SrTopologyVerdict::Stale) {
         noteTopologyStale(lastTopologyVersion, lastTopologyVersionCount, from, receivedVersion);
         LOG_INFO("[SR] Ignoring stale topology from %08x (v%u, last %u)", from, receivedVersion, lastProcessedVersion);
@@ -110,21 +124,18 @@ SrTopologyVerdict SignalRoutingModule::gateTopologyVersion(NodeNum from, uint8_t
         } else if (verdict == SrTopologyVerdict::CounterReset) {
             why = "counter restarted";
         }
-        LOG_INFO("[SR] Topology version resync from %08x: received %u, last %u (%s)", from, receivedVersion,
-                 lastProcessedVersion, why);
+        LOG_INFO("[SR] Topology version resync from %08x: received %u, last %u (%s)", from, receivedVersion, lastProcessedVersion,
+                 why);
     }
     setTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, from, bootBroadcast ? 0 : receivedVersion, nowMs);
     return verdict;
 }
 
-    // The coverage rules' view of this module: who reports, who relays, and our own eligibility.
 NeighborGraph::CoveragePolicy SignalRoutingModule::coveragePolicy() const
 {
     NeighborGraph::CoveragePolicy p;
     p.ctx = const_cast<SignalRoutingModule *>(this);
-    p.publishesTopology = [](void *c, NodeNum n) {
-        return static_cast<const SignalRoutingModule *>(c)->publishesTopology(n);
-    };
+    p.publishesTopology = [](void *c, NodeNum n) { return static_cast<const SignalRoutingModule *>(c)->publishesTopology(n); };
     p.isStockRelayRouter = [](void *c, NodeNum n) {
         return static_cast<const SignalRoutingModule *>(c)->isImmediateRelayRouter(n);
     };
@@ -141,15 +152,12 @@ NeighborGraph::CoveragePolicy SignalRoutingModule::coveragePolicy() const
     p.me = nodeDB ? nodeDB->getNodeNum() : 0;
     p.meRelays = isActiveRoutingRole();
     p.poorLinkEtx = cfgPoorLinkEtxThreshold;
-    p.nowSecs = millis() / 1000;
+    p.nowSecs = nowSeconds();
     p.publisherSilenceSecs = PUBLISHER_SILENCE_SECS;
-    p.isDroppedCoverageTarget = [](void *, NodeNum n) {
-        return nodeRateLimiter && nodeRateLimiter->isDroppedCoverageTarget(n);
-    };
+    p.isDroppedCoverageTarget = [](void *, NodeNum n) { return nodeRateLimiter && nodeRateLimiter->isDroppedCoverageTarget(n); };
     return p;
 }
 
-    // The route search's view of this module: routable intermediate hops and topology publishers.
 NeighborGraph::RoutePolicy SignalRoutingModule::routePolicy() const
 {
     NeighborGraph::RoutePolicy p;
@@ -177,7 +185,7 @@ bool SignalRoutingModule::isHandOffDuplicate(const meshtastic_MeshPacket *p)
     if (!isActiveRoutingRole() || !shouldUseSignalBasedRouting(p)) {
         return false;
     }
-    if (routingGraph->hasNodeTransmitted(nodeDB->getNodeNum(), p->id, millis() / 1000)) {
+    if (routingGraph->hasNodeTransmitted(nodeDB->getNodeNum(), p->id, nowSeconds())) {
         return false;
     }
     return true;
@@ -198,7 +206,7 @@ bool SignalRoutingModule::isOriginatorRetryReplan(const meshtastic_MeshPacket *p
     if (p->next_hop != NO_NEXT_HOP_PREFERENCE && p->next_hop != ourByte) {
         return false;
     }
-    if (routingGraph->hasNodeTransmitted(nodeDB->getNodeNum(), p->id, millis() / 1000)) {
+    if (routingGraph->hasNodeTransmitted(nodeDB->getNodeNum(), p->id, nowSeconds())) {
         return false;
     }
     if (isCommittedRelay(p->id)) {
@@ -215,14 +223,12 @@ NodeNum SignalRoutingModule::alternateNextHop(NodeNum dest, const NodeNum *exclu
     NeighborGraph::RoutePolicy policy = routePolicy();
     policy.excluded = excluded;
     policy.excludedCount = n;
-    uint32_t currentTime = millis() / 1000;
+    uint32_t currentTime = nowSeconds();
     Route route = routingGraph->calculateRoute(dest, currentTime, policy);
     if (route.nextHop == 0) {
         return 0;
     }
-    // An alternate sharing the nominated byte would be read as the silent hop again. A stock
-    // neighbour judges a duplicate by the first next_hop it recorded, so having heard our first
-    // copy it drops one that newly names it: only an SR alternate can take it.
+    // Stock peers remember the first designation, so only an SR alternate can accept a changed one.
     if (nodeDB->getLastByteOfNodeNum(route.nextHop) == nominatedByte ||
         getCapabilityStatus(route.nextHop) != CapabilityStatus::SRactive) {
         return 0;
@@ -258,8 +264,8 @@ void SignalRoutingModule::recordHopSuccess(NodeNum destination, NodeNum nextHop)
     }
 }
 
-// Helper to get node display name for logging
-static void getNodeDisplayName(NodeNum nodeId, char *buf, size_t bufSize) {
+static void getNodeDisplayName(NodeNum nodeId, char *buf, size_t bufSize)
+{
 #ifdef DEBUG_MUTE
     (void)nodeId;
     if (bufSize > 0) {
@@ -279,27 +285,27 @@ static void getNodeDisplayName(NodeNum nodeId, char *buf, size_t bufSize) {
 #endif
 }
 
-// Helper to compute age in seconds; returns -1 if unknown/invalid
 static int32_t computeAgeSecs(uint32_t last, uint32_t now)
 {
-    static constexpr uint32_t MAX_AGE_DISPLAY_SEC = 30 * 24 * 60 * 60; // 30 days
-    if (!last) return -1;
-    // Guard against bogus future timestamps (e.g., legacy nodes that send 0/invalid)
-    if (last > now + 86400) return -1;
+    static constexpr uint32_t MAX_AGE_DISPLAY_SEC = 30 * 24 * 60 * 60;
+    if (!last)
+        return -1;
+
+    if (last > now + 86400)
+        return -1;
     int32_t age = static_cast<int32_t>(now - last);
-    if (age < 0) age = 0;
-    if (static_cast<uint32_t>(age) > MAX_AGE_DISPLAY_SEC) return -1;
+    if (age < 0)
+        age = 0;
+    if (static_cast<uint32_t>(age) > MAX_AGE_DISPLAY_SEC)
+        return -1;
     return age;
 }
-
-
 
 bool SignalRoutingModule::isDirectPacket(const meshtastic_MeshPacket &mp)
 {
     if (mp.hop_start != mp.hop_limit)
         return false;
-    // If relay_node is set and doesn't match the sender's last byte,
-    // a different node relayed this (stock nodes may not decrement hop_limit)
+    // Some stock relays preserve hop_limit, so hop counts alone cannot prove direct reception.
     if (mp.relay_node != 0 && mp.relay_node != (mp.from & 0xFF))
         return false;
     return true;
@@ -310,7 +316,7 @@ SignalRoutingModule::SignalRoutingModule()
       concurrency::OSThread("SignalRouting")
 {
 #ifdef ARCH_STM32WL
-    // STM32WL only has 64KB RAM total - disable signal routing entirely
+
     LOG_INFO("[SR] Disabled on STM32WL (insufficient RAM)");
     routingGraph = nullptr;
     disable();
@@ -318,8 +324,7 @@ SignalRoutingModule::SignalRoutingModule()
 #endif
 
 #ifdef ARCH_RP2040
-    // RP2040 RAM guard: Graph uses ~25-35KB worst case (100 nodes, 6 edges each)
-    // 30KB threshold leaves headroom for graph + Dijkstra temp allocations
+
     uint32_t freeHeap = memGet.getFreeHeap();
     if (freeHeap < 30 * 1024) {
         LOG_WARN("[SR] RP2040 RAM low (%u free), SR disabled", freeHeap);
@@ -345,72 +350,122 @@ SignalRoutingModule::SignalRoutingModule()
         return;
     }
 
-    // Load config overrides. Numeric fields: 0 means "use firmware default". Bool fields: if the
-    // message exists, the value is used as-is (proto3 default false = disabled).
     if (moduleConfig.has_signal_routing) {
         const auto &srCfg = moduleConfig.signal_routing;
         signalBasedRoutingEnabled = srCfg.enabled;
         t1RetransmitEnabled = srCfg.t1_retransmit_enabled;
         if (srCfg.topology_broadcast_secs != 0) {
-            cfgBroadcastSecs = srCfg.topology_broadcast_secs;
+            cfgBroadcastSecs = std::min<uint32_t>(srCfg.topology_broadcast_secs, (INT32_MAX - 20000u) / 2000u);
         }
         if (srCfg.dirty_broadcast_secs != 0) {
-            cfgDirtyBroadcastSecs = srCfg.dirty_broadcast_secs;
+            cfgDirtyBroadcastSecs = std::min<uint32_t>(srCfg.dirty_broadcast_secs, INT32_MAX / 1000u);
         }
         if (srCfg.node_ttl_secs != 0) {
             cfgNodeTtlSecs = srCfg.node_ttl_secs;
         }
         if (srCfg.broadcast_max_hops != 0) {
-            cfgBroadcastMaxHops = srCfg.broadcast_max_hops;
+            cfgBroadcastMaxHops = std::min<uint32_t>(srCfg.broadcast_max_hops, HOP_MAX);
         }
-        if (srCfg.poor_link_etx_threshold > 0.0f) {
-            // A non-positive threshold would disable the coverage ceiling outright; the zero
-            // sentinel exists for graph-level defaults, not as a configurable setting.
+        if (std::isfinite(srCfg.poor_link_etx_threshold) && srCfg.poor_link_etx_threshold > 0.0f) {
             cfgPoorLinkEtxThreshold = srCfg.poor_link_etx_threshold;
         }
-        if (srCfg.etx_change_threshold != 0.0f) {
+        if (std::isfinite(srCfg.etx_change_threshold) && srCfg.etx_change_threshold > 0.0f) {
             routingGraph->setEtxChangeThreshold(srCfg.etx_change_threshold);
         }
-        LOG_INFO("[SR] Cfg: en=%d t1=%d bcast=%us dirty=%us ttl=%us hops=%u etx=%.1f d=%.2f",
-                 signalBasedRoutingEnabled, t1RetransmitEnabled, cfgBroadcastSecs, cfgDirtyBroadcastSecs,
-                 cfgNodeTtlSecs, cfgBroadcastMaxHops, cfgPoorLinkEtxThreshold,
-                 routingGraph->getEtxChangeThreshold());
+        LOG_INFO("[SR] Cfg: en=%d t1=%d bcast=%us dirty=%us ttl=%us hops=%u etx=%.1f d=%.2f", signalBasedRoutingEnabled,
+                 t1RetransmitEnabled, cfgBroadcastSecs, cfgDirtyBroadcastSecs, cfgNodeTtlSecs, cfgBroadcastMaxHops,
+                 cfgPoorLinkEtxThreshold, routingGraph->getEtxChangeThreshold());
     }
 
     trackNodeCapability(nodeDB->getNodeNum(), CapabilityStatus::SRactive);
 
-    // We want to see all packets for signal quality updates
     isPromiscuous = true;
-    // Direct RF hearing is a neighbour whether or not the payload decrypts: identity and channel
-    // live in the clear header, and MeshModule skips modules with encryptedOk left false. Without
-    // this a foreign-channel or wrong-PSK frame is heard on air and never enters the graph.
+    // Undecryptable RF frames still supply direct-link evidence from their clear headers.
     encryptedOk = true;
 
-    // The radio is already running this preset (NodeDB has loaded by the time we are
-    // constructed). Cache it so the first live apply of a *different* preset is a change,
-    // not a first sighting that would leave the old graph in place.
+    // Caching the initial preset ensures the first live change invalidates the old graph.
     operatingPresetKnown = true;
     operatingPreset = static_cast<uint8_t>(config.lora.modem_preset);
 
-    // Send empty SR broadcast shortly after boot to announce our presence.
-    // SR neighbors that receive this will trigger an early broadcast of their
-    // own topology, helping us bootstrap our graph quickly.
     needsBootBroadcast = true;
     setIntervalFromNow(5 * 1000);
 
     LOG_INFO("[SR] Module initialized (version %d)", SIGNAL_ROUTING_VERSION);
 }
 
+SignalRoutingModule::~SignalRoutingModule()
+{
+    for (auto &pending : pendingRetransmits) {
+        if (pending.packet) {
+            packetPool.release(pending.packet);
+        }
+    }
+    delete routingGraph;
+    if (signalRoutingModule == this) {
+        signalRoutingModule = nullptr;
+    }
+}
+
+uint32_t SignalRoutingModule::nowSeconds() const
+{
+    return routingGraph ? routingGraph->nowSeconds() : 0;
+}
+
+void SignalRoutingModule::maintainGraph(uint32_t currentTime)
+{
+    // RF silence must age the graph just as incoming traffic does.
+
+    if (routingGraph && canSendTopology()) {
+        if (currentTime - lastGraphUpdate >= GRAPH_MAINTENANCE_INTERVAL_SECS) {
+            uint32_t nodeCountBefore = routingGraph->getNodeCount();
+
+            uint8_t directBefore = routingGraph->countDirectNeighbors();
+            routingGraph->ageEdges(currentTime, cfgNodeTtlSecs);
+            NeighborGraph::CoveragePolicy livenessPolicy = coveragePolicy();
+            if (routingGraph->pruneSilentPublishers(nodeDB->getNodeNum(), currentTime, PUBLISHER_SILENCE_SECS, &livenessPolicy) >
+                0) {
+                markTopologyDirty();
+            }
+
+            uint32_t nodeCountAfter = routingGraph->getNodeCount();
+            lastGraphUpdate = currentTime;
+
+            if (nodeCountBefore != nodeCountAfter) {
+                LOG_INFO("[SR] Graph aged: %u -> %u nodes", nodeCountBefore, nodeCountAfter);
+            } else {
+                LOG_INFO("[SR] Graph aged (no node count change)");
+            }
+
+            if (routingGraph->countDirectNeighbors() != directBefore) {
+                markTopologyDirty();
+            }
+            syncDirectSignalsWithGraph();
+
+            if (!routingGraph->getEdgesFrom(nodeDB->getNodeNum())) {
+                LOG_WARN("[SR] Graph aging removed local node edges - topology unstable");
+            }
+        }
+    }
+}
+
+void SignalRoutingModule::wakeWithin(uint32_t delayMs)
+{
+    // A later request must not postpone an already scheduled bootstrap or insurance copy.
+    const int32_t remaining = static_cast<int32_t>(static_cast<uint32_t>(_cached_next_run) - millis());
+    if (remaining > 0 && delayMs < static_cast<uint32_t>(remaining)) {
+        setIntervalFromNow(delayMs);
+    }
+}
+
 void SignalRoutingModule::markTopologyDirty()
 {
     if (!topologyDirty) {
         topologyDirty = true;
-        // Wake runOnce() to fire the early broadcast as soon as the minimum inter-broadcast
-        // delay has elapsed since the last broadcast. If it already has, wake immediately.
+
         int32_t minDelay = (int32_t)(cfgDirtyBroadcastSecs * 1000);
         int32_t age = sinceLastBroadcast(millis());
         uint32_t wakeIn = (age >= minDelay) ? 0 : (uint32_t)(minDelay - (age > 0 ? age : 0));
-        setIntervalFromNow(wakeIn);
+        wakeWithin(wakeIn);
     }
 }
 
@@ -470,8 +525,7 @@ void SignalRoutingModule::scheduleEmptyTopologyReply(NodeNum senderNodeId, Packe
     }
 
     if (lastBootstrapReplyMs != 0 && millis() - lastBootstrapReplyMs < BOOTSTRAP_REPLY_MIN_INTERVAL_MS) {
-        LOG_INFO("[SR] Bootstrap reply rate-limited (%ums, %08x)",
-                 millis() - lastBootstrapReplyMs, senderNodeId);
+        LOG_INFO("[SR] Bootstrap reply rate-limited (%ums, %08x)", millis() - lastBootstrapReplyMs, senderNodeId);
         return;
     }
     NodeNum ourNode = nodeDB->getNodeNum();
@@ -483,7 +537,7 @@ void SignalRoutingModule::scheduleEmptyTopologyReply(NodeNum senderNodeId, Packe
         pendingTopologyReply.fireAfterMs = fireAfter;
         pendingTopologyReply.requestedMs = millis();
         LOG_INFO("[SR] Topology reply in %ums (bootstrap from %08x)", delayMs, senderNodeId);
-        setIntervalFromNow(delayMs < 20 ? 20 : delayMs);
+        wakeWithin(std::max<uint32_t>(20, delayMs));
     }
 }
 
@@ -501,26 +555,18 @@ int SignalRoutingModule::refreshReportedDirectNeighbor(NodeNum nodeId, int32_t r
         return EDGE_NO_CHANGE;
     }
     return refreshReportedDirectNeighborObservation(routingGraph, directSignals, directSignalCount,
-                                                    NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, nodeDB->getNodeNum(), nodeId,
-                                                    rssi, snr, nowSecs);
-}
-
-// Write the 5-byte packed header into buf (see writePackedTopologyHeader for the chunk flags).
-static inline void writePackedHeader(uint8_t *buf, uint8_t topologyVersion, bool signalRoutingActive,
-                                     bool moreChunks = false, bool continuation = false)
-{
-    writePackedTopologyHeader(buf, topologyVersion, signalRoutingActive, moreChunks, continuation);
+                                                    NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, nodeDB->getNodeNum(), nodeId, rssi, snr,
+                                                    nowSecs);
 }
 
 int32_t SignalRoutingModule::runOnce()
 {
+    if (!routingGraph || !nodeDB) {
+        return disable();
+    }
     uint32_t nowMs = millis();
-    uint32_t nowSecs = millis() / 1000;  // Use monotonic time for aging
+    uint32_t nowSecs = nowSeconds();
 
-    // Our own configured role, once, on the first pass — the constructor runs before config is
-    // loaded. Nothing logged it before, so a capture could not say which band this node draws in
-    // or whether its peers should reserve air for it, and any argument from the log about roles
-    // was circular. Also states the modem preset, since every ladder delay is derived from it.
     if (!loggedOwnRole) {
         loggedOwnRole = true;
         LOG_INFO("[SR] Own role=%s (%d) preset=%s node=0x%08x", DisplayFormatters::getDeviceRole(config.device.role),
@@ -531,9 +577,9 @@ int32_t SignalRoutingModule::runOnce()
 
     pruneCapabilityCache(nowSecs);
     pruneRelayIdentityCache(nowMs);
+    maintainGraph(nowSecs);
     pruneDirectSignals(nowSecs);
 
-    // --- Fire pending T1 broadcast retransmits ---
     for (uint8_t i = 0; i < MAX_PENDING_RETRANSMITS; i++) {
         PendingRetransmit &pr = pendingRetransmits[i];
         if (pr.canceled || pr.packet == nullptr || pr.packetId == 0) {
@@ -543,31 +589,33 @@ int32_t SignalRoutingModule::runOnce()
             LOG_INFO("[SR] T1 firing 0x%08x: no relay heard, retransmitting", pr.packetId);
             meshtastic_MeshPacket *toSend = pr.packet;
             pr.packet = nullptr;
-            pr.canceled = true; // Mark done before send to block T2 scheduling
-            // Clear stale tx_after from the original packet's scheduling — the copy was made
-            // seconds ago and its tx_after is far in the past. Without this, setTransmitDelay()
-            // sees an expired tx_after and draws an immediate short delay, causing busyRx spam
-            // if the radio happens to be receiving.
+            pr.canceled = true;
+            const bool originated = isFromUs(toSend);
+            if (!originated &&
+                (!isActiveRoutingRole() ||
+                 config.device.rebroadcast_mode == meshtastic_Config_DeviceConfig_RebroadcastMode_NONE ||
+                 (nodeRateLimiter && nodeRateLimiter->wouldDrop(toSend)) || (channelQoS && !channelQoS->canRelay(toSend)))) {
+                packetPool.release(toSend);
+                continue;
+            }
+            // An expired transmit deadline would bypass normal radio contention for the delayed copy.
             toSend->tx_after = 0;
             isRetransmitting = true;
-            router->send(toSend); // dispatches through FloodingRouter::send()
+            if (router) {
+                router->send(toSend);
+            } else {
+                packetPool.release(toSend);
+            }
             isRetransmitting = false;
         }
     }
 
     if (routingGraph && signalBasedRoutingEnabled) {
-        // One list per pass. A send commits `lastBroadcast` from a fresh millis(), so it can be
-        // later than the `nowMs` this pass captured: the periodic and dirty tests must not read
-        // that as an ancient broadcast (unsigned wrap made a bootstrap reply and the periodic
-        // list leave 30 ms apart under consecutive versions, and every relayer duplicated both).
+        // A send can advance lastBroadcast beyond this pass's timestamp; a second list would duplicate relay work.
         bool sentTopologyThisPass = false;
         if (pendingTopologyReply.active && (int32_t)(nowMs - pendingTopologyReply.fireAfterMs) >= 0) {
-            // A list transmitted after the request already answered it. The reply is not gated
-            // on lastBroadcast (a booting neighbour must not wait out the periodic interval),
-            // so without this the periodic list and a queued reply go out back to back under
-            // consecutive versions, and every relayer duplicates both.
-            bool answered =
-                lastTopologyListMs != 0 && (int32_t)(lastTopologyListMs - pendingTopologyReply.requestedMs) > 0;
+            // A periodic list can already have answered the bootstrap request.
+            bool answered = lastTopologyListMs != 0 && (int32_t)(lastTopologyListMs - pendingTopologyReply.requestedMs) > 0;
             pendingTopologyReply.active = false;
             if (answered) {
                 LOG_INFO("[SR] Bootstrap reply dropped: list sent %ums ago",
@@ -581,17 +629,13 @@ int32_t SignalRoutingModule::runOnce()
             }
         }
 
-        // Send empty SR broadcast at boot to announce presence and trigger
-        // neighbor topology responses, regardless of whether we have neighbors yet
-        if (needsBootBroadcast) {
+        if (needsBootBroadcast && !sentTopologyThisPass && canSendTopology()) {
             needsBootBroadcast = false;
             LOG_INFO("[SR] Sending empty boot broadcast");
             uint8_t bootBuf[PACKED_NEIGHBOR_HEADER_SIZE];
-            // Consume version 0 so the first neighbour list is version 1. A hardcoded 0 here
-            // left currentTopologyVersion at 0, so the first real list was also v=0 and peers
-            // that missed this empty packet treated it as stale against their pre-reboot last.
+            // Reusing the boot version for the first real list would hide the counter restart from peers that missed boot.
             uint8_t bootVersion = currentTopologyVersion++;
-            writePackedHeader(bootBuf, bootVersion, isActiveRoutingRole());
+            writePackedTopologyHeader(bootBuf, bootVersion, isActiveRoutingRole());
             sendTopologyPacket(NODENUM_BROADCAST, bootBuf, PACKED_NEIGHBOR_HEADER_SIZE);
             commitTopologyTxTimestamp();
             sentTopologyThisPass = true;
@@ -602,17 +646,12 @@ int32_t SignalRoutingModule::runOnce()
             sentTopologyThisPass = true;
         } else if (!sentTopologyThisPass && topologyDirty &&
                    sinceLastBroadcast(nowMs) >= (int32_t)(cfgDirtyBroadcastSecs * 1000)) {
-            // Topology changed and the minimum inter-broadcast interval has elapsed
-            // since the last broadcast — send the early broadcast now.
             LOG_INFO("[SR] Topology dirty — sending early broadcast");
             sendSignalRoutingInfo();
             topologyDirty = false;
             commitTopologyTxTimestamp();
         }
 
-        // Topology logging: log on every dirty wakeup and at least every GRAPH_MAINTENANCE_INTERVAL_SECS seconds.
-        // topologyDirty is intentionally NOT cleared before this point so that if the broadcast
-        // was deferred (min interval not yet elapsed), we still log the pending change.
         static uint32_t lastTopologyLog = 0;
         if (topologyDirty || nowMs - lastTopologyLog >= GRAPH_MAINTENANCE_INTERVAL_SECS * 1000) {
             logNetworkTopology();
@@ -621,15 +660,15 @@ int32_t SignalRoutingModule::runOnce()
     }
 
     uint32_t broadcastCycle = topologyDirty ? cfgDirtyBroadcastSecs * 1000 : cfgBroadcastSecs * 1000;
-    // A list sent in this pass leaves `lastBroadcast` ahead of `nowMs`; unsigned arithmetic read
-    // that as a full cycle elapsed and asked to be woken immediately.
+
     int32_t age = sinceLastBroadcast(nowMs);
     uint32_t elapsed = age > 0 ? (uint32_t)age : 0;
     uint32_t timeToBroadcast = (elapsed < broadcastCycle) ? (broadcastCycle - elapsed) : 0;
 
-    uint32_t nextDelay = timeToBroadcast;
+    uint32_t nextDelay = signalBasedRoutingEnabled && canSendTopology()
+                             ? std::min<uint32_t>(timeToBroadcast, GRAPH_MAINTENANCE_INTERVAL_SECS * 1000)
+                             : GRAPH_MAINTENANCE_INTERVAL_SECS * 1000;
 
-    // Wake up early enough to fire any pending T1 retransmits on time
     for (uint8_t i = 0; i < MAX_PENDING_RETRANSMITS; i++) {
         const PendingRetransmit &pr = pendingRetransmits[i];
         if (pr.canceled || pr.packet == nullptr || pr.packetId == 0) {
@@ -656,20 +695,15 @@ int32_t SignalRoutingModule::runOnce()
 
 void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
 {
-    // Allow mute nodes to broadcast their direct neighbors to help active SR nodes
-    // make better unicast routing decisions, even though mute nodes don't participate in relaying
-    if (!canSendTopology()) {
+    if (!signalBasedRoutingEnabled || !routingGraph || !nodeDB || !service || !canSendTopology() || topologyBroadcastActive) {
         return;
     }
 
     topologyBroadcastActive = true;
 
-    // Pack all neighbors into a large buffer (header placeholder + entries)
-    static constexpr size_t MAX_TOTAL_PACKED = MAX_SIGNAL_ROUTING_NEIGHBORS * 6 * PACKED_NEIGHBOR_ENTRY_SIZE + PACKED_NEIGHBOR_HEADER_SIZE;
-    // Static, not a local: this is 1349 bytes and the nRF52 Arduino loop task has a 4 KB stack
-    // in total (LOOP_STACK_SZ, 1024 words). Both this function and the relay decision run on
-    // that one thread and neither recurses, so a shared buffer is safe and keeps the deepest
-    // call chain clear of the limit. Nothing here relies on zero-initialisation.
+    static constexpr size_t MAX_TOTAL_PACKED =
+        NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE * PACKED_NEIGHBOR_ENTRY_SIZE + PACKED_NEIGHBOR_HEADER_SIZE;
+    // The nRF52 loop has a 4 KB stack; serialized, nonrecursive sends can safely share this buffer.
     static uint8_t allPacked[MAX_TOTAL_PACKED];
     uint8_t totalNeighbors = packNeighborsForBroadcast(allPacked, sizeof(allPacked));
 
@@ -680,26 +714,22 @@ void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
     }
 
     if (totalNeighbors == 0) {
-        // Send empty broadcast to announce SR capability.
         uint8_t emptyBuf[PACKED_NEIGHBOR_HEADER_SIZE];
-        writePackedHeader(emptyBuf, topologyVersion, srActive);
+        writePackedTopologyHeader(emptyBuf, topologyVersion, srActive);
         sendTopologyPacket(dest, emptyBuf, PACKED_NEIGHBOR_HEADER_SIZE);
         topologyBroadcastActive = false;
         return;
     }
 
-    // Split into chunks of MAX_SIGNAL_ROUTING_NEIGHBORS and send multiple packets
     uint8_t packetsNeeded = (totalNeighbors + MAX_SIGNAL_ROUTING_NEIGHBORS - 1) / MAX_SIGNAL_ROUTING_NEIGHBORS;
 
     char ourName[48];
     getNodeDisplayName(nodeDB->getNodeNum(), ourName, sizeof(ourName));
 
-    LOG_INFO("[SR] SENDING: %u neighbors in %u packet(s) from %s (v%u)",
-             totalNeighbors, packetsNeeded, ourName, topologyVersion);
+    LOG_INFO("[SR] SENDING: %u neighbors in %u packet(s) from %s (v%u)", totalNeighbors, packetsNeeded, ourName, topologyVersion);
 
-    // Space multi-packet broadcasts by 2× the packet airtime so relaying nodes
-    // finish transmitting packet N before packet N+1 arrives.
-    uint32_t packetSpacingMs = 300; // conservative fallback
+    // Relayers need time to finish one chunk before receiving the next.
+    uint32_t packetSpacingMs = 300;
     if (router && router->getRadioInterface()) {
         meshtastic_SignalRoutingInfo dummyInfo = meshtastic_SignalRoutingInfo_init_zero;
         size_t chunkLen = PACKED_NEIGHBOR_HEADER_SIZE +
@@ -715,25 +745,24 @@ void SignalRoutingModule::sendSignalRoutingInfo(NodeNum dest)
         uint8_t startNeighbor = packetIndex * MAX_SIGNAL_ROUTING_NEIGHBORS;
         uint8_t count = std::min((uint8_t)MAX_SIGNAL_ROUTING_NEIGHBORS, (uint8_t)(totalNeighbors - startNeighbor));
 
-        // Build per-packet packed buffer: 5-byte header + this chunk's entries
         static uint8_t chunkBuf[PACKED_NEIGHBOR_HEADER_SIZE + MAX_SIGNAL_ROUTING_NEIGHBORS * PACKED_NEIGHBOR_ENTRY_SIZE];
-        writePackedHeader(chunkBuf, topologyVersion, srActive, packetIndex + 1 < packetsNeeded, packetIndex > 0);
+        writePackedTopologyHeader(chunkBuf, topologyVersion, srActive, packetIndex + 1 < packetsNeeded, packetIndex > 0,
+                                  packetIndex);
         size_t dataOffset = PACKED_NEIGHBOR_HEADER_SIZE + startNeighbor * PACKED_NEIGHBOR_ENTRY_SIZE;
         memcpy(&chunkBuf[PACKED_NEIGHBOR_HEADER_SIZE], &allPacked[dataOffset], count * PACKED_NEIGHBOR_ENTRY_SIZE);
         size_t chunkLen = PACKED_NEIGHBOR_HEADER_SIZE + count * PACKED_NEIGHBOR_ENTRY_SIZE;
 
         uint32_t txAfter = packetIndex > 0 ? millis() + packetIndex * packetSpacingMs : 0;
-        sendTopologyPacket(dest, chunkBuf, chunkLen, 0, txAfter);
+        sendTopologyPacket(dest, chunkBuf, chunkLen, txAfter);
     }
 
-    // Update our own capability after sending
     trackNodeCapability(nodeDB->getNodeNum(), isActiveRoutingRole() ? CapabilityStatus::SRactive : CapabilityStatus::Passive);
     topologyBroadcastActive = false;
 }
 
 uint8_t SignalRoutingModule::packNeighborsForBroadcast(uint8_t *outBuf, size_t bufSize)
 {
-    if (!routingGraph || !nodeDB) {
+    if (!outBuf || bufSize < PACKED_NEIGHBOR_HEADER_SIZE || !routingGraph || !nodeDB) {
         return 0;
     }
 
@@ -742,7 +771,6 @@ uint8_t SignalRoutingModule::packNeighborsForBroadcast(uint8_t *outBuf, size_t b
         return 0;
     }
 
-    // Collect non-placeholder edge pointers into a fixed-size array for sorting
     const Edge *edgePtrs[NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE];
     uint8_t edgeCount = 0;
     for (uint8_t i = 0; i < nodeEdges->edgeCount && edgeCount < NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE; i++) {
@@ -751,8 +779,7 @@ uint8_t SignalRoutingModule::packNeighborsForBroadcast(uint8_t *outBuf, size_t b
         }
     }
 
-    // Sort: hearsUs, then SR-active, then lower ETX. Dense hubs otherwise drop SR parents that
-    // still hear them when packing into the ~28-per-chunk wire budget (field: FCM6 omitting Czar).
+    // Dense hubs must preserve reachable SR parents when the packed list fills.
     std::sort(edgePtrs, edgePtrs + edgeCount, [this](const Edge *a, const Edge *b) {
         if (a->source != b->source) {
             return a->source == Edge::Source::Reported;
@@ -768,10 +795,8 @@ uint8_t SignalRoutingModule::packNeighborsForBroadcast(uint8_t *outBuf, size_t b
         return a->getEtx() < b->getEtx();
     });
 
-    // Reserve header space (caller fills in the full 5-byte header per chunk via writePackedHeader)
     memset(outBuf, 0, PACKED_NEIGHBOR_HEADER_SIZE);
 
-    // Pack each neighbor as 8 bytes: [4B node_id LE][1B rssi][1B snr][1B flags][1B etx_variance]
     uint8_t count = 0;
     size_t maxEntries = (bufSize - PACKED_NEIGHBOR_HEADER_SIZE) / PACKED_NEIGHBOR_ENTRY_SIZE;
     for (uint8_t i = 0; i < edgeCount && count < maxEntries; i++) {
@@ -788,8 +813,8 @@ uint8_t SignalRoutingModule::packNeighborsForBroadcast(uint8_t *outBuf, size_t b
         uint8_t *entry = &outBuf[PACKED_NEIGHBOR_HEADER_SIZE + count * PACKED_NEIGHBOR_ENTRY_SIZE];
 
         CapabilityStatus neighborStatus = getCapabilityStatus(edge->to);
-        encodePackedNeighborEntry(entry, edge->to, sig->rssi, sig->snr,
-                                  neighborStatus == CapabilityStatus::SRactive, edge->hearsUs, edge->etxVariance);
+        encodePackedNeighborEntry(entry, edge->to, sig->rssi, sig->snr, neighborStatus == CapabilityStatus::SRactive,
+                                  edge->hearsUs, edge->etxVariance);
 
         count++;
     }
@@ -797,7 +822,7 @@ uint8_t SignalRoutingModule::packNeighborsForBroadcast(uint8_t *outBuf, size_t b
     return count;
 }
 
-void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const uint8_t *packedData, size_t packedLen, uint8_t /*topologyVersion*/, uint32_t txAfterMs)
+void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const uint8_t *packedData, size_t packedLen, uint32_t txAfterMs)
 {
     meshtastic_SignalRoutingInfo info = meshtastic_SignalRoutingInfo_init_zero;
 
@@ -815,34 +840,25 @@ void SignalRoutingModule::sendTopologyPacket(NodeNum dest, const uint8_t *packed
         p->tx_after = txAfterMs;
     }
 
+    // sendToMesh transfers ownership and can release the packet synchronously.
+    const PacketId packetId = p->id;
     service->sendToMesh(p);
 
-    // Record our transmission for contention window tracking
     if (routingGraph) {
-        uint32_t currentTime = millis() / 1000;  // Use monotonic time
-        routingGraph->recordNodeTransmission(nodeDB->getNodeNum(), p->id, currentTime);
+        uint32_t currentTime = nowSeconds();
+        routingGraph->recordNodeTransmission(nodeDB->getNodeNum(), packetId, currentTime);
     }
 }
 
-
 void SignalRoutingModule::updateGraphWithNeighbor(NodeNum sender, NodeNum neighborId, int8_t rssi, int8_t snr, bool hearsUs)
 {
-    // Add/update edge from sender to this neighbor
     if (routingGraph) {
-        float etx = (rssi != 0 || snr != 0)
-                        ? NeighborGraph::calculateETX(rssi, snr, currentCostingSpreadingFactor())
-                        : 1.0f;
-        uint32_t currentTime = millis() / 1000;
+        float etx = (rssi != 0 || snr != 0) ? NeighborGraph::calculateETX(rssi, snr, currentCostingSpreadingFactor()) : 1.0f;
+        uint32_t currentTime = nowSeconds();
 
-        // Do NOT refresh the edge timestamp from topology broadcasts: the timestamp must reflect
-        // when the edge was last directly observed, not when we received someone's topology report.
-        // Refreshing it here would create phantom references — a dead node stays in the graph
-        // as long as any neighbor keeps mentioning it, potentially chaining across multiple hops.
-        // New edges (first creation) still receive currentTime from the new-edge path in updateEdge.
-        routingGraph->updateEdge(sender, neighborId, etx, currentTime,
-                                 Edge::Source::Mirrored, /*updateTimestamp=*/false);
+        // A peer repeatedly mentioning a dead node must not keep its link alive.
+        routingGraph->updateEdge(sender, neighborId, etx, currentTime, Edge::Source::Mirrored, false);
 
-        // Propagate the bidirectional link flag from the authoritative sender
         routingGraph->setEdgeHearsUs(sender, neighborId, hearsUs);
 
         noteTopologySenderHearsUs(sender, neighborId);
@@ -866,81 +882,72 @@ void SignalRoutingModule::noteTopologySenderHearsUs(NodeNum sender, NodeNum list
     }
 }
 
-void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPacket *p, uint32_t packetReceivedTimestamp)
+void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPacket *p)
 {
-    if (!routingGraph || !p) return;
-
-    // Skip processing entirely for packets we sent (detected as rebroadcasts)
-    // This prevents topology pollution from our own rebroadcasted packets
-    NodeNum ourNode = nodeDB ? nodeDB->getNodeNum() : 0;
-    uint32_t currentTime = millis() / 1000;
-    if (routingGraph->hasNodeTransmitted(ourNode, p->id, currentTime)) {
-        LOG_INFO("[SR] Own topology echo %08x", p->id);
+    if (!p || p->which_payload_variant != meshtastic_MeshPacket_decoded_tag ||
+        p->decoded.portnum != meshtastic_PortNum_SIGNAL_ROUTING_APP ||
+        p->decoded.payload.size > sizeof(p->decoded.payload.bytes)) {
         return;
     }
-
-    // Only process SignalRoutingInfo packets
-    if (p->decoded.portnum != meshtastic_PortNum_SIGNAL_ROUTING_APP) {
-        LOG_INFO("[SR] Non-SR packet in preProcess (portnum=%d)", p->decoded.portnum);
-        return;
-    }
-    // Reject packets from invalid node IDs (0 is invalid)
-    if (p->from == 0) {
-        LOG_WARN("[SR] Ignoring SR broadcast from invalid node ID 0");
-        return;
-    }
-    
-    // For passive nodes: only process SR broadcasts from direct neighbors
-    // Active nodes: process all SR broadcasts for full topology
-    if (!isActiveRoutingRole()) {
-        // Passive node: check if SR broadcast is from direct sender
-        if (!isDirectPacket(*p)) {
-            LOG_INFO("[SR] Passive: ignoring bcast 0x%08x (hs=%d hl=%d)",
-                     p->from, p->hop_start, p->hop_limit);
-            return;
-        }
-    }
-
-    // Decode the protobuf to get the packed binary blob
     meshtastic_SignalRoutingInfo info = meshtastic_SignalRoutingInfo_init_zero;
-    if (!pb_decode_from_bytes(p->decoded.payload.bytes, p->decoded.payload.size,
-                              &meshtastic_SignalRoutingInfo_msg, &info)) {
-        LOG_WARN("[SR] Bad SignalRoutingInfo from %08x (size=%u)",
-                 p->from, p->decoded.payload.size);
+    if (!pb_decode_from_bytes(p->decoded.payload.bytes, p->decoded.payload.size, &meshtastic_SignalRoutingInfo_msg, &info)) {
+        LOG_WARN("[SR] Bad SignalRoutingInfo from %08x (size=%u)", p->from, p->decoded.payload.size);
         return;
     }
 
-    // Decode packed neighbors and header
+    processTopology(*p, info);
+}
+
+void SignalRoutingModule::processTopology(const meshtastic_MeshPacket &mp, const meshtastic_SignalRoutingInfo &info)
+{
+    const auto *p = &mp;
+    if (!routingGraph || !nodeDB || !p->from || isPlaceholderNode(p->from) || p->via_mqtt || isFromUs(p)) {
+        return;
+    }
+    if (!isActiveRoutingRole() && !isDirectPacket(*p)) {
+        return;
+    }
+    const NodeNum ourNode = nodeDB->getNodeNum();
+    if (routingGraph->hasNodeTransmitted(ourNode, p->id, nowSeconds())) {
+        return;
+    }
+    if (info.packed_neighbors.size > sizeof(info.packed_neighbors.bytes)) {
+        return;
+    }
     PackedHeader hdr = {};
     PackedNeighborEntry neighbors[MAX_SIGNAL_ROUTING_NEIGHBORS];
-    uint8_t neighborCount = decodePackedNeighbors(info.packed_neighbors.bytes, info.packed_neighbors.size,
-                                                   neighbors, MAX_SIGNAL_ROUTING_NEIGHBORS, &hdr);
+    uint8_t neighborCount = decodePackedNeighbors(info.packed_neighbors.bytes, info.packed_neighbors.size, neighbors,
+                                                  MAX_SIGNAL_ROUTING_NEIGHBORS, &hdr);
 
-    // V2 packets land on field 3 but fail the format_version check — treat as stock node, skip
     if (hdr.formatVersion != PACKED_NEIGHBOR_FORMAT_VERSION) {
         return;
     }
 
-    // Version acceptance is shared with handleReceivedProtobuf via gateTopologyVersion():
-    // shouldRelay() (this path) is not the only ingest, and RestartClimb must arm on either.
+    const TopologyVersionEntry *processed = findTopologyEntry(lastPreProcessedVersion, lastPreProcessedVersionCount, p->from);
+    // Indexed chunks can arrive again after a different chunk. Remember every index in this version;
+    // legacy continuations have index zero and must still use packet identity instead.
+    const uint32_t chunkBit = hdr.continuation ? (hdr.chunkIndex ? (uint32_t{1} << hdr.chunkIndex) : 0)
+                                             : (hdr.moreChunks ? 1 : 0);
+    if (processed && processed->version == hdr.topologyVersion &&
+        (processed->packetId == p->id || (processed->processedChunks & chunkBit))) {
+        return;
+    }
     uint8_t receivedVersion = hdr.topologyVersion;
     uint8_t lastProcessedVersion = getTopologyVersion(lastTopologyVersion, lastTopologyVersionCount, p->from);
     uint32_t nowMs = millis();
-    if (nowMs == 0) nowMs = 1;
+    if (nowMs == 0)
+        nowMs = 1;
 
-    // Passive peers reboot too: their header-only version-0 broadcast resets the tracked version as well.
-    // The notice is about the sender's counter, not the link, so a relayed copy counts: angl heard
-    // Czar's restart only through a relay and called Czar stale for twenty minutes.
-    bool bootBroadcast = neighborCount == 0 && receivedVersion == 0;
+    // A relayed boot notice still proves the originator restarted its version counter.
+    bool bootBroadcast =
+        info.packed_neighbors.size == PACKED_NEIGHBOR_HEADER_SIZE && hdr.isCompleteList() && receivedVersion == 0;
     bool directCompleteList = hdr.isCompleteList() && neighborCount > 0 && isDirectPacket(*p);
-    if (gateTopologyVersion(p->from, receivedVersion, bootBroadcast, directCompleteList, nowMs) ==
-        SrTopologyVerdict::Stale) {
+    if (gateTopologyVersion(p->from, receivedVersion, bootBroadcast, directCompleteList, nowMs) == SrTopologyVerdict::Stale) {
         return;
     }
 
     bool isNewVersion = (receivedVersion != lastProcessedVersion);
 
-    // Update capability status for the sender
     CapabilityStatus newStatus = hdr.signalRoutingActive ? CapabilityStatus::SRactive : CapabilityStatus::Passive;
     CapabilityStatus oldStatus = getCapabilityStatus(p->from);
     trackNodeCapability(p->from, newStatus);
@@ -948,37 +955,32 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     if (oldStatus != newStatus) {
         char senderName[64];
         getNodeDisplayName(p->from, senderName, sizeof(senderName));
-        LOG_INFO("[SR] Capability update: %s changed from %d to %d",
-                senderName, (int)oldStatus, (int)newStatus);
+        LOG_INFO("[SR] Capability update: %s changed from %d to %d", senderName, (int)oldStatus, (int)newStatus);
     }
 
     char senderNameForTopo[48];
     getNodeDisplayName(p->from, senderNameForTopo, sizeof(senderNameForTopo));
-    if (isActiveRoutingRole() &&
-        !topologySenderHorizonOk(p->from, isDirectPacket(*p), neighbors, neighborCount)) {
+    if (isActiveRoutingRole() && !topologySenderHorizonOk(p->from, isDirectPacket(*p), neighbors, neighborCount)) {
         LOG_INFO("[SR] Horizon: ignore topology from %s (unqualified far publisher)", senderNameForTopo);
-        setTopologyVersion(lastPreProcessedVersion, lastPreProcessedVersionCount, p->from, receivedVersion, nowMs);
+        setTopologyVersion(lastPreProcessedVersion, lastPreProcessedVersionCount, p->from, receivedVersion, nowMs, p->id, chunkBit);
         return;
     }
-    LOG_INFO("[SR] Processing topology from %s: %d neighbors (v%u, %s, relay=0x%02x)",
-              senderNameForTopo, neighborCount, receivedVersion,
-              isNewVersion ? "new version" : "continuation", p->relay_node);
+    LOG_INFO("[SR] Processing topology from %s: %d neighbors (v%u, %s, relay=0x%02x)", senderNameForTopo, neighborCount,
+             receivedVersion, isNewVersion ? "new version" : "continuation", p->relay_node);
 
-    // Empty SR broadcast from a direct SR neighbor = bootstrap request — reply after jitter, not immediately.
     if (neighborCount == 0 && isDirectPacket(*p) && hdr.signalRoutingActive) {
-        LOG_INFO("[SR] Empty broadcast from %s: topology reply scheduled",
-                 senderNameForTopo);
+        LOG_INFO("[SR] Empty broadcast from %s: topology reply scheduled", senderNameForTopo);
         scheduleEmptyTopologyReply(p->from, p->id);
     }
 
-    // Mirrored edges are not cleared on new topology versions — they age out naturally.
+    if (!isActiveRoutingRole()) {
+        setTopologyVersion(lastPreProcessedVersion, lastPreProcessedVersionCount, p->from, receivedVersion, nowMs, p->id, chunkBit);
+        return;
+    }
 
-    // Process each neighbor from the decoded packed data
     const bool senderIsDirect = hasReportedDirectEdge(p->from);
-    const uint32_t nowSecs = millis() / 1000;
-    // Horizon: admit a non-direct sender when they already sit in the ball or their list
-    // names an L1/L2 we know (MeshRustic §6.2). Classify from ball evidence first; Unknown
-    // fallback is L3 only when the list names an L2 and does not name an L1.
+    const uint32_t nowSecs = nowSeconds();
+
     if (routingGraph && !senderIsDirect) {
         bool namesL1 = false;
         bool namesL2 = false;
@@ -1012,26 +1014,18 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
     for (uint8_t i = 0; i < neighborCount; i++) {
         const PackedNeighborEntry &neighbor = neighbors[i];
 
-        // Reject neighbors with invalid node IDs (0 or placeholders)
         if (neighbor.nodeId == 0 || isPlaceholderNode(neighbor.nodeId)) {
             LOG_WARN("[SR] Skipping invalid neighbor node ID: %08x", neighbor.nodeId);
             continue;
         }
 
-        // Create gateway relationship ONLY for nodes we cannot hear directly.
-        // Direct = our Reported observation of them (us→them). The reverse of an RF hearing is
-        // only Inferred, and a peer listing us is Mirrored — neither means we hear them.
-        // Checking Reported them→us never fired after the Inferred-reverse change and wrongly
-        // parked neighbours we hear as downstream of the topology sender.
-        const bool hasDirectConnection =
-            neighbor.nodeId == ourNode || hasReportedDirectEdge(neighbor.nodeId);
+        // Inferred and mirrored reverse links do not prove local RF reception.
+        const bool hasDirectConnection = neighbor.nodeId == ourNode || hasReportedDirectEdge(neighbor.nodeId);
 
         char neighborName[48];
         getNodeDisplayName(neighbor.nodeId, neighborName, sizeof(neighborName));
 
-        // A sender we do not hear must not reinstall sender→us: Dijkstra would treat us as a
-        // last hop to them from a stale list after they moved behind a relay.
-        // Install Mirrored edges before parking so horizon admission can classify from evidence.
+        // An old list must not invent a last hop through us after its sender moves behind a relay.
         if (neighbor.nodeId != ourNode || senderIsDirect) {
             updateGraphWithNeighbor(p->from, neighbor.nodeId, neighbor.rssi, neighbor.snr, neighbor.hearsUs);
         }
@@ -1040,13 +1034,9 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
             if (neighbor.nodeId != ourNode && routingGraph) {
                 routingGraph->clearDownstreamForDestination(neighbor.nodeId);
             }
-            LOG_INFO("[SR]   -> %s: HAS direct connection, sender confirms reachability",
-                    neighborName);
+            LOG_INFO("[SR]   -> %s: HAS direct connection, sender confirms reachability", neighborName);
         } else if (neighbor.hearsUs) {
-            // Prefer admitting into the edge ball when depth allows (L1 lists L2 with hearsUs,
-            // or L2 lists L3). Otherwise park as list-downstream of the sender.
-            float etxForDownstream =
-                NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr, currentCostingSpreadingFactor());
+            float etxForDownstream = NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr, currentCostingSpreadingFactor());
             bool admitted = false;
             if (routingGraph) {
                 admitted = routingGraph->tryAdmitListedPublisher(p->from, neighbor.nodeId, senderIsDirect, nowSecs);
@@ -1057,34 +1047,35 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
                 }
                 LOG_INFO("[SR]   -> %s: admitted to edge ball via %s", neighborName, senderNameForTopo);
             } else if (routingGraph) {
-                LOG_INFO("[SR]   -> %s: no direct connection, list-downstream of %s",
-                        neighborName, senderNameForTopo);
-                // evenIfRelayHasEdge: Mirrored sender→listed edge was just installed.
-                routingGraph->updateDownstreamListed(neighbor.nodeId, p->from, etxForDownstream, nowSecs,
-                                                     /*evenIfRelayHasEdge=*/true);
+                LOG_INFO("[SR]   -> %s: no direct connection, list-downstream of %s", neighborName, senderNameForTopo);
+
+                routingGraph->updateDownstreamListed(neighbor.nodeId, p->from, etxForDownstream, nowSecs, true);
             }
         } else {
-            LOG_INFO("[SR]   -> %s: asymmetric (hearsUs=false), not downstream of %s",
-                    neighborName, senderNameForTopo);
+            LOG_INFO("[SR]   -> %s: asymmetric (hearsUs=false), not downstream of %s", neighborName, senderNameForTopo);
         }
     }
 
-    // Authoritative hearsUs override: the topology source is authoritative about who it can hear.
-    // If another node claims hearsUs=true on its edge to the source, but the source didn't list
-    // that node as a neighbor, clear the flag — the source can't actually hear that node.
-    // The rule needs the source's complete list: chunks of a multi-packet report are gathered in
-    // pendingListed and the rule runs on the last chunk. A chunk whose first packet was missed leaves
-    // the flags untouched.
+    // Only a complete, contiguous list justifies retracting links omitted by the sender.
+    // Legacy chunks lack sequence numbers, so missing chunks must leave prior evidence intact.
     PendingListed &pl = pendingListed[pendingListedSlot(p->from)];
     if (!hdr.continuation) {
         pl.valid = true;
         pl.sender = p->from;
         pl.version = receivedVersion;
         pl.count = 0;
+        pl.nextChunk = 1;
     }
     const NodeNum *listedIds = nullptr;
     uint8_t listedCount = 0;
+    if (hdr.continuation && pl.valid && pl.sender == p->from &&
+        (pl.version != receivedVersion || hdr.chunkIndex != pl.nextChunk)) {
+        pl.valid = false;
+    }
     if (pl.valid && pl.sender == p->from && pl.version == receivedVersion) {
+        if (hdr.continuation) {
+            pl.nextChunk++;
+        }
         for (uint8_t i = 0; i < neighborCount; i++) {
             if (pl.count < NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE) {
                 pl.ids[pl.count++] = neighbors[i].nodeId;
@@ -1100,11 +1091,12 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
             pl.valid = false;
         }
     } else if (hdr.continuation) {
-        LOG_INFO("[SR] Chunk from %08x (v%u) without its first packet: hearsUs kept",
-                 p->from, receivedVersion);
-        pl.valid = false;
+        LOG_INFO("[SR] Chunk from %08x (v%u) without its first packet: hearsUs kept", p->from, receivedVersion);
+        if (pl.sender == p->from) {
+            pl.valid = false;
+        }
     }
-    if (routingGraph && listedIds && listedCount > 0) {
+    if (routingGraph && listedIds && !bootBroadcast) {
         NodeNum allNodes[NEIGHBOR_GRAPH_MAX_NEIGHBORS];
         size_t nodeCount = routingGraph->getAllNodeIds(allNodes, NEIGHBOR_GRAPH_MAX_NEIGHBORS);
         for (size_t n = 0; n < nodeCount; n++) {
@@ -1118,7 +1110,6 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
             }
             for (uint8_t e = 0; e < nodeEdges->edgeCount; e++) {
                 if (nodeEdges->edges[e].to == p->from && nodeEdges->edges[e].hearsUs) {
-                    // Check if the source listed this node as a neighbor (whole list, all chunks)
                     bool foundInNeighborList = false;
                     for (uint8_t i = 0; i < listedCount; i++) {
                         if (listedIds[i] == nodeId) {
@@ -1129,213 +1120,37 @@ void SignalRoutingModule::preProcessSignalRoutingPacket(const meshtastic_MeshPac
                     if (!foundInNeighborList) {
                         char nodeName[48];
                         getNodeDisplayName(nodeId, nodeName, sizeof(nodeName));
-                        LOG_INFO("[SR] hearsUs cleared on %s -> %s: not in %s's list",
-                                 nodeName, senderNameForTopo, nodeName);
+                        LOG_INFO("[SR] hearsUs cleared on %s -> %s: not in %s's list", nodeName, senderNameForTopo,
+                                 senderNameForTopo);
                         routingGraph->setEdgeHearsUs(nodeId, p->from, false);
                     }
                 }
             }
         }
-        // The list is authoritative about the sender's own edges too, not only about who hears
-        // it: an entry that has gone is a link the sender no longer has. Without this a
-        // neighbour it dropped survived to the graph TTL and stayed in its coverage set.
+        // Omitted neighbors otherwise retain false coverage until the much longer graph TTL.
         if (routingGraph->retainListedEdges(p->from, listedIds, listedCount)) {
             LOG_INFO("[SR] %08x dropped entries from its list: stale edges removed", p->from);
-            routingGraph->pruneUnreachableFromRoot(millis() / 1000);
+            routingGraph->pruneUnreachableFromRoot(nowSeconds());
         }
     }
 
-    // Record that this version was pre-processed so handleReceivedProtobuf can skip redundant work
-    // (the accepted-version table was updated at the acceptance check above).
-    setTopologyVersion(lastPreProcessedVersion, lastPreProcessedVersionCount, p->from, receivedVersion, nowMs);
-
+    setTopologyVersion(lastPreProcessedVersion, lastPreProcessedVersionCount, p->from, receivedVersion, nowMs, p->id, chunkBit);
 }
 meshtastic_MeshPacket *SignalRoutingModule::allocReply()
 {
-    // Never send unicast replies to SR broadcasts — they cause stock nodes
-    // to generate NO_RESPONSE NAKs (portnum=5) that flood the mesh.
-    // Instead, SR nodes respond to empty broadcasts by triggering an early
-    // broadcast of their own topology.
+    // Unicast replies to SR broadcasts trigger NO_RESPONSE floods on stock nodes.
     ignoreRequest = true;
     return nullptr;
 }
 
 bool SignalRoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshtastic_SignalRoutingInfo *p)
 {
-    // Reject packets from invalid node IDs (0 is invalid)
-    if (mp.from == 0) {
-        LOG_INFO("[SR] SR broadcast from node ID 0 ignored");
-        return false;
+    if (p) {
+        processTopology(mp, *p);
     }
-
-    // Note: Graph may have already been updated by preProcessSignalRoutingPacket()
-    // This is intentional - we want up-to-date data for relay decisions
-    if (!routingGraph || !p) return false;
-
-    char senderName[64];
-    getNodeDisplayName(mp.from, senderName, sizeof(senderName));
-
-    // Decode packed neighbors and header
-    PackedHeader hdr = {};
-    PackedNeighborEntry neighbors[MAX_SIGNAL_ROUTING_NEIGHBORS];
-    uint8_t neighborCount = decodePackedNeighbors(p->packed_neighbors.bytes, p->packed_neighbors.size,
-                                                   neighbors, MAX_SIGNAL_ROUTING_NEIGHBORS, &hdr);
-
-    // V2 packets land on field 3 but fail the format_version check — treat as stock node, skip
-    if (hdr.formatVersion != PACKED_NEIGHBOR_FORMAT_VERSION) {
-        return false;
-    }
-
-    // Mark sender based on their claimed SR capability
-    CapabilityStatus newStatus = hdr.signalRoutingActive ? CapabilityStatus::SRactive : CapabilityStatus::Passive;
-    CapabilityStatus oldStatus = getCapabilityStatus(mp.from);
-    trackNodeCapability(mp.from, newStatus);
-
-    if (oldStatus != newStatus) {
-        LOG_INFO("[SR] Capability update: %s changed from %d to %d",
-                senderName, (int)oldStatus, (int)newStatus);
-    }
-
-    // Inactive SR roles don't participate in routing decisions - skip topology learning from broadcasts
-    if (!isActiveRoutingRole()) {
-        LOG_INFO("[SR] Passive: caps from %s tracked (%d)",
-                  senderName, neighborCount);
-        return false;
-    }
-
-    // Same gate as preProcess. shouldRelay() is skipped when we stock-flood (thin topology) or
-    // hop_limit is already 0; this path used to reject without noteTopologyStale, so RestartClimb
-    // never armed and Czar kept last=26 across Inno v=1,2,3.
-    uint32_t nowMs = millis();
-    if (nowMs == 0) nowMs = 1;
-    bool bootBroadcast = neighborCount == 0 && hdr.topologyVersion == 0;
-    bool directCompleteList = hdr.isCompleteList() && neighborCount > 0 && isDirectPacket(mp);
-    if (gateTopologyVersion(mp.from, hdr.topologyVersion, bootBroadcast, directCompleteList, nowMs) ==
-        SrTopologyVerdict::Stale) {
-        return false;
-    }
-
-    if (!topologySenderHorizonOk(mp.from, isDirectPacket(mp), neighbors, neighborCount)) {
-        LOG_INFO("[SR] Horizon: ignore topology from %s (unqualified far publisher)", senderName);
-        return false;
-    }
-
-    if (neighborCount == 0) {
-        LOG_INFO("[SR] %s is online (SR v%d, %s) - no neighbors detected yet",
-                 senderName, hdr.routingVersion,
-                 hdr.signalRoutingActive ? "SR-active" : "passive");
-
-        if (hdr.signalRoutingActive) {
-            routingGraph->clearDownstreamForRelay(mp.from);
-        }
-
-        return false;
-    }
-
-    LOG_INFO("[SR] RECEIVED: %s reports %d neighbors (SR v%d, %s)",
-             senderName, neighborCount, hdr.routingVersion,
-             hdr.signalRoutingActive ? "SR-active" : "passive");
-
-    if (!hdr.signalRoutingActive) {
-        LOG_INFO("[SR] Topology from passive SR node %08x: edges stored", mp.from);
-    }
-
-    // Check if preProcessSignalRoutingPacket already handled edge clearing and rebuilding. It runs first
-    // for every SR broadcast an active role receives *when shouldRelay() runs*. Missing lastPreProcessed
-    // entry used to compare version 0==0 and skip a real v=0 list.
-    const TopologyVersionEntry *preEnt =
-        findTopologyEntry(lastPreProcessedVersion, lastPreProcessedVersionCount, mp.from);
-    bool alreadyPreProcessed = preEnt && preEnt->version == hdr.topologyVersion;
-
-    if (!alreadyPreProcessed) {
-        // Clear inferred edges pointing TO this node that were created before we knew it was SR-capable
-        routingGraph->clearInferredEdgesToNode(mp.from);
-
-        uint32_t rxTime = millis() / 1000;
-        for (uint8_t i = 0; i < neighborCount; i++) {
-            const PackedNeighborEntry &neighbor = neighbors[i];
-
-            if (neighbor.nodeId == 0 || isPlaceholderNode(neighbor.nodeId)) {
-                continue;
-            }
-
-            float etx = NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr, currentCostingSpreadingFactor());
-
-            NodeNum ourNode = nodeDB ? nodeDB->getNodeNum() : 0;
-            if (neighbor.nodeId == ourNode && !hasReportedDirectEdge(mp.from)) {
-                continue;
-            }
-
-            // The sender published only that it hears this neighbour. The reverse direction is
-            // our assumption of symmetry, so it must not outrank — and permanently block — the
-            // neighbour's own published measurement of the sender, nor price the delivery.
-            routingGraph->updateEdge(neighbor.nodeId, mp.from, etx, rxTime,
-                                     Edge::Source::Inferred);
-            routingGraph->updateEdge(mp.from, neighbor.nodeId, etx, rxTime,
-                                     Edge::Source::Mirrored);
-
-            routingGraph->setEdgeHearsUs(mp.from, neighbor.nodeId, neighbor.hearsUs);
-            noteTopologySenderHearsUs(mp.from, neighbor.nodeId);
-        }
-        setTopologyVersion(lastPreProcessedVersion, lastPreProcessedVersionCount, mp.from, hdr.topologyVersion, nowMs);
-    } else {
-        LOG_INFO("[SR] Edge rebuild skipped for %s (pre-processed version %u)",
-                 senderName, hdr.routingVersion);
-    }
-
-    // Always process gateway relations and logging (even if edges were already built)
-    for (uint8_t i = 0; i < neighborCount; i++) {
-        const PackedNeighborEntry &neighbor = neighbors[i];
-
-        if (neighbor.nodeId == 0 || isPlaceholderNode(neighbor.nodeId)) {
-            continue;
-        }
-
-        char neighborName[64];
-        getNodeDisplayName(neighbor.nodeId, neighborName, sizeof(neighborName));
-
-        float etx = NeighborGraph::calculateETX(neighbor.rssi, neighbor.snr, currentCostingSpreadingFactor());
-
-        const char *quality;
-        if (etx < 2.0f) quality = "excellent";
-        else if (etx < 4.0f) quality = "good";
-        else if (etx < 8.0f) quality = "fair";
-        else quality = "poor";
-
-        LOG_INFO("  ├── %s: %s link (%s, ETX=%.1f, var=%u)",
-                 neighborName,
-                 neighbor.signalRoutingActive ? "SR-active" : "SR-inactive",
-                 quality, etx,
-                 neighbor.etxVariance);
-
-        // If the sender is SR-capable and reports this neighbor as directly reachable,
-        // clear downstream entries for this neighbor
-        if (hdr.signalRoutingActive) {
-            NodeNum relayForNeighbor = routingGraph->getDownstreamRelay(neighbor.nodeId);
-            if (relayForNeighbor != 0 && relayForNeighbor != mp.from) {
-                char gwName[64];
-                getNodeDisplayName(relayForNeighbor, gwName, sizeof(gwName));
-                LOG_INFO("[SR] Downstream cleared %s (direct %s, was %s)",
-                         neighborName, senderName, gwName);
-                routingGraph->clearDownstreamForDestination(neighbor.nodeId);
-            }
-        }
-    }
-
-    // Log network topology summary
-    LOG_INFO("[SR] Network topology updated - %s now connected to %d neighbors",
-             senderName, neighborCount);
-
-    // Allow others to see this packet too
     return false;
 }
 
-/**
- * Log the current network topology graph in a readable format
- */
-// Placeholder node system for unknown relays
-// Use high NodeNum values that won't conflict with real nodes
-// One definition, in the graph: NeighborGraph must know which node ids are routing artefacts.
 #define PLACEHOLDER_BASE Edge::PLACEHOLDER_NODE_BASE
 
 bool SignalRoutingModule::isPlaceholderNode(NodeNum nodeId) const
@@ -1351,59 +1166,43 @@ NodeNum SignalRoutingModule::createPlaceholderNode(uint8_t relayId)
 bool SignalRoutingModule::resolvePlaceholder(NodeNum placeholderId, NodeNum realNodeId)
 {
     if (!isPlaceholderNode(placeholderId)) {
-        return false; // Not a placeholder
+        return false;
     }
 
     if (isPlaceholderNode(realNodeId)) {
-        return false; // Can't resolve to another placeholder
+        return false;
     }
 
-    // Check if this placeholder is already resolved
     uint8_t relayId = placeholderId & 0xFF;
     NodeNum alreadyResolved = resolveRelayIdentity(relayId);
     if (alreadyResolved != 0) {
         if (alreadyResolved == realNodeId) {
-            return false; // Already resolved to this node, nothing to do
+            return false;
         }
-        LOG_WARN("[SR] Placeholder %08x already %08x, not %08x",
-                placeholderId, alreadyResolved, realNodeId);
-        return false; // Already resolved to a different node
+        LOG_WARN("[SR] Placeholder %08x already %08x, not %08x", placeholderId, alreadyResolved, realNodeId);
+        return false;
     }
 
-
-    // Update relay identity cache - this ensures future relay resolutions work
     rememberRelayIdentity(realNodeId, relayId);
 
-    // Update gateway relationships
     replaceGatewayNode(placeholderId, realNodeId);
 
-    // Transfer ONLY legitimate graph edges from placeholder to real node
-    // Placeholders are used for inferred connectivity and should not have edges that represent
-    // actual neighbor relationships. Only transfer reverse edges from our node to the placeholder,
-    // which represent actual radio connectivity that should be preserved.
     if (routingGraph) {
         NodeNum ourNode = nodeDB->getNodeNum();
 
-        // Only transfer reverse edges (where our node had a direct link to the placeholder)
-        // These represent actual radio connectivity that should be preserved
-        const NodeEdges* ourEdges = routingGraph->getEdgesFrom(ourNode);
+        const NodeEdges *ourEdges = routingGraph->getEdgesFrom(ourNode);
         if (ourEdges) {
             for (uint8_t i = 0; i < ourEdges->edgeCount; i++) {
                 if (ourEdges->edges[i].to == placeholderId) {
                     float etx = ourEdges->edges[i].getEtx();
-                    // Create equivalent edge from our node to real node
-                    routingGraph->updateEdge(ourNode, realNodeId, etx, millis() / 1000);
+
+                    routingGraph->updateEdge(ourNode, realNodeId, etx, nowSeconds());
                 }
             }
         }
 
-        // Remove the placeholder node from the graph
-        // (downstream entries already transferred by replaceGatewayNode above)
         routingGraph->removeNode(placeholderId);
 
-        // Also explicitly remove any orphaned edges pointing to the placeholder
-        // (removeNode may not find the placeholder if it was already aged out,
-        // but edges from our node to it can still linger in our edge list)
         routingGraph->removeEdgesTo(placeholderId);
 
         LOG_INFO("[SR] Resolved placeholder %08x -> real node %08x", placeholderId, realNodeId);
@@ -1420,13 +1219,12 @@ NodeNum SignalRoutingModule::getPlaceholderForRelay(uint8_t relayId) const
 
 void SignalRoutingModule::replaceGatewayNode(NodeNum oldNode, NodeNum newNode)
 {
-    if (oldNode == newNode || !routingGraph) return;
+    if (oldNode == newNode || !routingGraph)
+        return;
 
-    // Transfer downstream entries from old relay to new relay
     size_t transferred = routingGraph->transferDownstream(oldNode, newNode);
     if (transferred > 0) {
-        LOG_INFO("[SR] Transferred %u downstream entries from %08x to %08x",
-                 (unsigned)transferred, oldNode, newNode);
+        LOG_INFO("[SR] Transferred %u downstream entries from %08x to %08x", (unsigned)transferred, oldNode, newNode);
     }
     routingGraph->clearDownstreamForDestination(oldNode);
 }
@@ -1437,10 +1235,9 @@ bool SignalRoutingModule::isPlaceholderConnectedToUs(NodeNum placeholderId) cons
         return false;
     }
 
-    // Check if the placeholder has edges connected to our node
     NodeNum ourNode = nodeDB->getNodeNum();
 
-    const NodeEdges* edges = routingGraph->getEdgesFrom(placeholderId);
+    const NodeEdges *edges = routingGraph->getEdgesFrom(placeholderId);
     if (edges) {
         for (uint8_t i = 0; i < edges->edgeCount; i++) {
             if (edges->edges[i].to == ourNode) {
@@ -1466,22 +1263,18 @@ bool SignalRoutingModule::hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum 
         if (neighbor == heardFrom || neighbor == myNode || isPlaceholderNode(neighbor))
             continue;
 
-        // Only consider SR-active neighbors
         CapabilityStatus status = getCapabilityStatus(neighbor);
         if (status != CapabilityStatus::SRactive)
             continue;
 
-        // Unicast: a neighbour that *could* hear the transmitter is not enough — they must
-        // already hold this copy, otherwise we may be the sole hearer.
-        if (destination != 0 &&
-            !routingGraph->hasNodeTransmitted(neighbor, packetId, millis() / 1000))
+        // We may be the sole hearer until another relay actually holds this copy.
+        if (destination != 0 && !routingGraph->hasNodeTransmitted(neighbor, packetId, nowSeconds()))
             continue;
 
         const NodeEdges *neighborEdges = routingGraph->getEdgesFrom(neighbor);
         if (!neighborEdges)
             continue;
 
-        // Check if this SR neighbor also has heardFrom as a neighbor
         bool neighborHearsSource = false;
         for (uint8_t j = 0; j < neighborEdges->edgeCount; j++) {
             if (neighborEdges->edges[j].to == heardFrom) {
@@ -1492,7 +1285,6 @@ bool SignalRoutingModule::hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum 
         if (!neighborHearsSource)
             continue;
 
-        // For unicasts, also check if the neighbor can reach the destination
         if (destination != 0) {
             bool canReachDest = false;
             for (uint8_t j = 0; j < neighborEdges->edgeCount; j++) {
@@ -1502,13 +1294,10 @@ bool SignalRoutingModule::hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum 
                 }
             }
             if (!canReachDest) {
-                // Check if destination is downstream of this neighbor (in piko's table)
-                canReachDest = routingGraph->isDownstream(destination) &&
-                               routingGraph->getDownstreamRelay(destination) == neighbor;
+                canReachDest =
+                    routingGraph->isDownstream(destination) && routingGraph->getDownstreamRelay(destination) == neighbor;
             }
             if (!canReachDest) {
-                // Check if this neighbor has a route to the destination via its own neighbors
-                // (destination is a neighbor-of-neighbor, i.e. the neighbor can relay to reach it)
                 for (uint8_t j = 0; j < neighborEdges->edgeCount; j++) {
                     NodeNum neighborOfNeighbor = neighborEdges->edges[j].to;
                     if (neighborOfNeighbor == myNode || neighborOfNeighbor == heardFrom)
@@ -1524,7 +1313,7 @@ bool SignalRoutingModule::hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum 
                     }
                     if (canReachDest)
                         break;
-                    // Also check if destination is downstream of the neighbor's neighbor
+
                     if (routingGraph->isDownstream(destination) &&
                         routingGraph->getDownstreamRelay(destination) == neighborOfNeighbor) {
                         canReachDest = true;
@@ -1536,32 +1325,26 @@ bool SignalRoutingModule::hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum 
                 continue;
         }
 
-        // For unicasts: the SR neighbor hears the source and can reach the destination — sufficient
         if (destination != 0) {
             char neighborName[64];
             getNodeDisplayName(neighbor, neighborName, sizeof(neighborName));
-            LOG_INFO("[SR] SR neighbor %s hears %08x, reaches dest",
-                     neighborName, heardFrom);
+            LOG_INFO("[SR] SR neighbor %s hears %08x, reaches dest", neighborName, heardFrom);
             return true;
         }
 
-        // For broadcasts: build a combined coverage set from the transmitter and the SR neighbor.
-        // If piko has any neighbor not in that set, piko has unique coverage and should still relay.
         NodeSet coveredNodes;
         coveredNodes.insert(heardFrom);
         coveredNodes.insert(neighbor);
 
-        // Add all nodes covered by the transmitter
         const NodeEdges *transmitterEdges = routingGraph->getEdgesFrom(heardFrom);
         if (transmitterEdges) {
             for (uint8_t j = 0; j < transmitterEdges->edgeCount; j++)
                 coveredNodes.insert(transmitterEdges->edges[j].to);
         }
-        // Add all nodes covered by the SR neighbor
+
         for (uint8_t j = 0; j < neighborEdges->edgeCount; j++)
             coveredNodes.insert(neighborEdges->edges[j].to);
 
-        // Check if piko has any neighbor not in the combined coverage set
         bool pikoHasUniqueCoverage = false;
         for (uint8_t m = 0; m < myEdges->edgeCount; m++) {
             NodeNum myNeighbor = myEdges->edges[m].to;
@@ -1576,14 +1359,12 @@ bool SignalRoutingModule::hasBetterPositionedSRNeighbor(NodeNum myNode, NodeNum 
         if (!pikoHasUniqueCoverage) {
             char neighborName[64];
             getNodeDisplayName(neighbor, neighborName, sizeof(neighborName));
-            LOG_INFO("[SR] SR neighbor %s hears %08x and covers all our unique nodes",
-                     neighborName, heardFrom);
+            LOG_INFO("[SR] SR neighbor %s hears %08x and covers all our unique nodes", neighborName, heardFrom);
             return true;
         }
     }
     return false;
 }
-
 
 static const char *horizonClassTag(NodeClass c)
 {
@@ -1605,20 +1386,17 @@ void SignalRoutingModule::logNetworkTopology()
 #ifdef DEBUG_MUTE
     return;
 #else
-    if (!routingGraph) return;
+    if (!routingGraph)
+        return;
 
-    // Use fixed-size arrays only, no heap allocations
     NodeNum nodeBuf[NEIGHBOR_GRAPH_MAX_NEIGHBORS];
     size_t rawNodeCount = routingGraph->getAllNodeIds(nodeBuf, NEIGHBOR_GRAPH_MAX_NEIGHBORS);
 
-    // For passive nodes: only show nodes that have edges (direct neighbors)
-    // For active nodes: show all nodes in graph
     size_t nodeCount = rawNodeCount;
     if (!isActiveRoutingRole()) {
-        // Filter to only nodes with edges
         size_t filteredCount = 0;
         for (size_t i = 0; i < rawNodeCount; i++) {
-            const NodeEdges* edges = routingGraph->getEdgesFrom(nodeBuf[i]);
+            const NodeEdges *edges = routingGraph->getEdgesFrom(nodeBuf[i]);
             if (edges && edges->edgeCount > 0) {
                 nodeBuf[filteredCount++] = nodeBuf[i];
             }
@@ -1632,15 +1410,13 @@ void SignalRoutingModule::logNetworkTopology()
     }
 
     NodeNum ourNode = nodeDB->getNodeNum();
-    // Single shared name buffer to minimize stack usage in nested loops
+    // Nested diagnostic loops otherwise consume scarce loop-thread stack space.
     char nameBuf[80];
     getNodeDisplayName(ourNode, nameBuf, sizeof(nameBuf));
 
-    // Get our direct edges
-    const NodeEdges* ourEdges = routingGraph->getEdgesFrom(ourNode);
+    const NodeEdges *ourEdges = routingGraph->getEdgesFrom(ourNode);
     uint8_t directCount = ourEdges ? ourEdges->edgeCount : 0;
 
-    // Horizon class census across the ball (Unknown / placeholders omitted).
     uint8_t l1Count = 0, l2Count = 0, l3Count = 0;
     for (size_t i = 0; i < rawNodeCount; i++) {
         switch (routingGraph->getNodeClass(nodeBuf[i])) {
@@ -1658,37 +1434,39 @@ void SignalRoutingModule::logNetworkTopology()
         }
     }
 
-    LOG_INFO("[SR] Network Topology: %d nodes, %u direct neighbors (L1=%u L2=%u L3=%u)", nodeCount,
-             directCount, static_cast<unsigned>(l1Count), static_cast<unsigned>(l2Count),
-             static_cast<unsigned>(l3Count));
+    LOG_INFO("[SR] Network Topology: %d nodes, %u direct neighbors (L1=%u L2=%u L3=%u)", nodeCount, directCount,
+             static_cast<unsigned>(l1Count), static_cast<unsigned>(l2Count), static_cast<unsigned>(l3Count));
     LOG_INFO("[SR] %s (us)", nameBuf);
 
     if (!ourEdges || ourEdges->edgeCount == 0) {
         LOG_INFO("[SR]   (no direct neighbors)");
     } else {
-        // Display each direct neighbor and their downstream nodes
         for (uint8_t i = 0; i < ourEdges->edgeCount; i++) {
-            const Edge& edge = ourEdges->edges[i];
+            const Edge &edge = ourEdges->edges[i];
 
             getNodeDisplayName(edge.to, nameBuf, sizeof(nameBuf));
 
             CapabilityStatus neighborStatus = getCapabilityStatus(edge.to);
-            const char* nprefix = "";
+            const char *nprefix = "";
             if (neighborStatus == CapabilityStatus::SRactive) {
                 nprefix = "[SR-active] ";
             } else if (neighborStatus == CapabilityStatus::Passive) {
                 nprefix = "[SR-passive] ";
             }
-            const char* nclass = horizonClassTag(routingGraph->getNodeClass(edge.to));
+            const char *nclass = horizonClassTag(routingGraph->getNodeClass(edge.to));
 
             float etx = edge.getEtx();
-            const char* quality;
-            if (etx < 2.0f) quality = "excellent";
-            else if (etx < 4.0f) quality = "good";
-            else if (etx < 8.0f) quality = "fair";
-            else quality = "poor";
+            const char *quality;
+            if (etx < 2.0f)
+                quality = "excellent";
+            else if (etx < 4.0f)
+                quality = "good";
+            else if (etx < 8.0f)
+                quality = "fair";
+            else
+                quality = "poor";
 
-            int32_t age = computeAgeSecs(edge.lastUpdate, millis() / 1000);
+            int32_t age = computeAgeSecs(edge.lastUpdate, nowSeconds());
             char ageBuf[16];
             if (age < 0) {
                 snprintf(ageBuf, sizeof(ageBuf), "-");
@@ -1697,66 +1475,67 @@ void SignalRoutingModule::logNetworkTopology()
             }
 
             bool isLast = (i == ourEdges->edgeCount - 1);
-            const char* branch = isLast ? "\\-" : "+-";
-            const char* cont = isLast ? " " : "|";
+            const char *branch = isLast ? "\\-" : "+-";
+            const char *cont = isLast ? " " : "|";
 
-            // Get the neighbor's own edges (nodes that can hear them = their coverage)
-            const NodeEdges* neighborEdges = routingGraph->getEdgesFrom(edge.to);
+            const NodeEdges *neighborEdges = routingGraph->getEdgesFrom(edge.to);
             uint8_t listenerCount = neighborEdges ? neighborEdges->edgeCount : 0;
 
-            // Get downstream nodes that route through this neighbor
             static constexpr size_t MAX_DS_DISPLAY = 16;
             NodeNum dsBuf[MAX_DS_DISPLAY];
             uint16_t dsCosts[MAX_DS_DISPLAY];
             size_t totalDsCount = routingGraph->getDownstreamCountForRelay(edge.to);
             size_t dsCount = routingGraph->getDownstreamNodesForRelay(edge.to, dsBuf, dsCosts, MAX_DS_DISPLAY);
 
-            const char* bidir = edge.hearsUs ? ", hearsUs" : "";
-            LOG_INFO("[SR]   %s %s%s%s: %s (ETX=%.1f, %ss, covers %u, relay for %u down%s)",
-                     branch, nclass, nprefix, nameBuf, quality, etx, ageBuf,
-                     static_cast<unsigned int>(listenerCount), static_cast<unsigned int>(totalDsCount), bidir);
+            const char *bidir = edge.hearsUs ? ", hearsUs" : "";
+            LOG_INFO("[SR]   %s %s%s%s: %s (ETX=%.1f, %ss, covers %u, relay for %u down%s)", branch, nclass, nprefix, nameBuf,
+                     quality, etx, ageBuf, static_cast<unsigned int>(listenerCount), static_cast<unsigned int>(totalDsCount),
+                     bidir);
 
-            // Show nodes that can hear this neighbor (their topology-reported edges)
             if (listenerCount > 0) {
                 for (uint8_t n = 0; n < listenerCount; n++) {
-                    const Edge& nEdge = neighborEdges->edges[n];
+                    const Edge &nEdge = neighborEdges->edges[n];
                     getNodeDisplayName(nEdge.to, nameBuf, sizeof(nameBuf));
 
                     CapabilityStatus lStatus = getCapabilityStatus(nEdge.to);
-                    const char* lprefix = "";
-                    if (lStatus == CapabilityStatus::SRactive) lprefix = "[SR-active] ";
-                    else if (lStatus == CapabilityStatus::Passive) lprefix = "[SR-passive] ";
-                    const char* lclass = horizonClassTag(routingGraph->getNodeClass(nEdge.to));
+                    const char *lprefix = "";
+                    if (lStatus == CapabilityStatus::SRactive)
+                        lprefix = "[SR-active] ";
+                    else if (lStatus == CapabilityStatus::Passive)
+                        lprefix = "[SR-passive] ";
+                    const char *lclass = horizonClassTag(routingGraph->getNodeClass(nEdge.to));
 
                     bool lLast = (n == listenerCount - 1) && (totalDsCount == 0);
-                    const char* lBranch = lLast ? "\\-" : "+-";
-                    LOG_INFO("[SR]   %s    %s %s%s%s (ETX=%.1f)", cont, lBranch, lclass, lprefix, nameBuf,
-                             nEdge.getEtx());
+                    const char *lBranch = lLast ? "\\-" : "+-";
+                    LOG_INFO("[SR]   %s    %s %s%s%s (ETX=%.1f)", cont, lBranch, lclass, lprefix, nameBuf, nEdge.getEtx());
                 }
             }
 
-            // Show all downstream nodes in pages of MAX_DS_DISPLAY
             if (totalDsCount > 0) {
                 size_t printed = 0;
                 while (printed < totalDsCount) {
                     dsCount = routingGraph->getDownstreamNodesForRelay(edge.to, dsBuf, dsCosts, MAX_DS_DISPLAY, printed);
-                    if (dsCount == 0) break;
+                    if (dsCount == 0)
+                        break;
                     for (size_t d = 0; d < dsCount; d++) {
                         getNodeDisplayName(dsBuf[d], nameBuf, sizeof(nameBuf));
 
                         CapabilityStatus dsStatus = getCapabilityStatus(dsBuf[d]);
-                        const char* dsprefix = "";
-                        if (dsStatus == CapabilityStatus::SRactive) dsprefix = "[SR-active] ";
-                        else if (dsStatus == CapabilityStatus::Passive) dsprefix = "[SR-passive] ";
+                        const char *dsprefix = "";
+                        if (dsStatus == CapabilityStatus::SRactive)
+                            dsprefix = "[SR-active] ";
+                        else if (dsStatus == CapabilityStatus::Passive)
+                            dsprefix = "[SR-passive] ";
 
                         bool dsLast = (printed + 1 == totalDsCount);
-                        const char* dsBranch = dsLast ? "\\-" : "+-";
+                        const char *dsBranch = dsLast ? "\\-" : "+-";
                         float dsCost = dsCosts[d] / 100.0f;
-                        // Show Dijkstra route cost if available (more accurate than flat downstream cost)
-                        Route dsRoute = routingGraph->calculateRoute(dsBuf[d], millis() / 1000, routePolicy());
+
+                        Route dsRoute = routingGraph->calculateRoute(dsBuf[d], nowSeconds(), routePolicy());
                         if (dsRoute.nextHop != 0 && dsRoute.costFixed < 0xFFFF) {
                             float routeCost = dsRoute.getCost();
-                            LOG_INFO("[SR]   %s    %s [downstream] %s%s (routeETX=%.1f, dsETX=%.1f)", cont, dsBranch, dsprefix, nameBuf, routeCost, dsCost);
+                            LOG_INFO("[SR]   %s    %s [downstream] %s%s (routeETX=%.1f, dsETX=%.1f)", cont, dsBranch, dsprefix,
+                                     nameBuf, routeCost, dsCost);
                         } else {
                             LOG_INFO("[SR]   %s    %s [downstream] %s%s (dsETX=%.1f)", cont, dsBranch, dsprefix, nameBuf, dsCost);
                         }
@@ -1767,25 +1546,15 @@ void SignalRoutingModule::logNetworkTopology()
         }
     }
 
-    // Add legend explaining ETX to signal quality mapping
     LOG_INFO("[SR] ETX map: 1.0~-60dB/10dB, 2.0~-90dB/0dB, 4.0~-110dB/-5dB");
     LOG_INFO("[SR] Topology logging complete");
-#endif // !DEBUG_MUTE
+#endif
 }
 
 void SignalRoutingModule::observeRelayedPacket(const meshtastic_MeshPacket &mp)
 {
-    // Measuring a relayer we heard is first-hand observation, not inference: the RSSI and SNR
-    // come off the relayer's own frame, exactly as they do for a frame that arrived direct. So
-    // every node that publishes topology records it, whatever its role. Only the node that
-    // hears a relayer can supply the transmit-direction evidence coverage needs about it
-    // ("does that router reach me?"), and a node that never records it stays permanently
-    // uncovered, so each of its neighbours holds unique coverage of it and relays. What the
-    // active-routing class gates is the inference below — who sits behind the gateway — which
-    // only a node that ranks relays uses.
-    // Entry conditions are checked by callers (handleReceived / duplicate path); still refuse
-    // MQTT / direct / missing relay so a bare call is safe.
-    if (mp.via_mqtt || isDirectPacket(mp) || mp.relay_node == 0) {
+    // Passive publishers also need measured relayer links; omitting them creates false unique coverage.
+    if (!routingGraph || !nodeDB || mp.via_mqtt || isDirectPacket(mp) || mp.relay_node == 0) {
         return;
     }
     int32_t rxRssi = mp.rx_rssi;
@@ -1797,268 +1566,184 @@ void SignalRoutingModule::observeRelayedPacket(const meshtastic_MeshPacket &mp)
         const bool activeRouting = isActiveRoutingRole();
         NodeNum inferredRelayer = resolveRelayIdentity(mp.relay_node, rxRssi, rxSnr);
 
-    // If still not resolved, try known nodes (both direct neighbors and topology-known nodes)
-    // We need to check ALL edges, not just Reported ones, because the relay might be
-    // a node we only know through topology broadcasts (Mirrored edges)
-    // Only when the byte names exactly one of our neighbours. Two neighbours sharing a low
-    // byte are indistinguishable in a relayed frame, and the identity decides which node a
-    // measured, published edge is written to: name the wrong one and a peer credits it with
-    // covering us and stops relaying to us. No answer is the safe answer — the caller falls
-    // back to a placeholder, which is never published.
-    if (inferredRelayer == 0 && routingGraph && nodeDB) {
-        const NodeEdges* myEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
-        if (myEdges) {
-            NodeNum onlyMatch = 0;
-            bool ambiguous = false;
-            for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
-                NodeNum neighbor = myEdges->edges[i].to;
-                if ((neighbor & 0xFF) == mp.relay_node && !isPlaceholderNode(neighbor)) {
-                    if (onlyMatch != 0 && onlyMatch != neighbor) {
-                        ambiguous = true;
-                        break;
+        // A relay may be known only through topology; ambiguous bytes cannot justify measured coverage.
+        if (inferredRelayer == 0 && routingGraph && nodeDB) {
+            const NodeEdges *myEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
+            if (myEdges) {
+                NodeNum onlyMatch = 0;
+                bool ambiguous = false;
+                for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+                    NodeNum neighbor = myEdges->edges[i].to;
+                    if ((neighbor & 0xFF) == mp.relay_node && !isPlaceholderNode(neighbor)) {
+                        if (onlyMatch != 0 && onlyMatch != neighbor) {
+                            ambiguous = true;
+                            break;
+                        }
+                        onlyMatch = neighbor;
                     }
-                    onlyMatch = neighbor;
+                }
+                if (ambiguous) {
+                    LOG_INFO("[SR] Relay 0x%02x matches more than one neighbour: not resolved", mp.relay_node);
+                } else if (onlyMatch != 0) {
+                    inferredRelayer = onlyMatch;
+
+                    rememberRelayIdentity(onlyMatch, mp.relay_node);
+                    LOG_INFO("[SR] Resolved relay 0x%02x to known node %08x", mp.relay_node, onlyMatch);
                 }
             }
-            if (ambiguous) {
-                LOG_INFO("[SR] Relay 0x%02x matches more than one neighbour: not resolved",
-                         mp.relay_node);
-            } else if (onlyMatch != 0) {
-                inferredRelayer = onlyMatch;
-                // Remember this mapping for future use
-                rememberRelayIdentity(onlyMatch, mp.relay_node);
-                LOG_INFO("[SR] Resolved relay 0x%02x to known node %08x",
-                         mp.relay_node, onlyMatch);
-            }
-        }
-    }
-
-    // If we still can't resolve the relay identity, create a placeholder node
-    if (inferredRelayer == 0) {
-        inferredRelayer = createPlaceholderNode(mp.relay_node);
-        // Only log on first encounter — placeholder IDs are deterministic so
-        // the same ID is returned on every unresolved packet for this relay byte.
-        if (!routingGraph->getEdgesFrom(inferredRelayer)) {
-            LOG_INFO("[SR] Created placeholder %08x for unknown relay 0x%02x",
-                     inferredRelayer, mp.relay_node);
-        }
-    }
-
-    // Our own echo teaches us nothing about who is behind whom: a peer relaying a packet we
-    // just transmitted got it from us, so recording the sender as downstream of that peer
-    // invents a path back through ourselves. The two nodes then name each other as next hop
-    // for that destination and a unicast bounces between them.
-    bool ownEcho = routingGraph && nodeDB &&
-                   routingGraph->hasNodeTransmitted(nodeDB->getNodeNum(), mp.id, millis() / 1000);
-    if (ownEcho) {
-        LOG_INFO("[SR] Own echo 0x%08x via 0x%02x: no inference", mp.id, mp.relay_node);
-    }
-    if (!ownEcho && inferredRelayer != 0 && inferredRelayer != mp.from) {
-        // Remember this relay identity mapping for future use (only for real nodes, not placeholders)
-        if (!isPlaceholderNode(inferredRelayer)) {
-            rememberRelayIdentity(inferredRelayer, mp.relay_node);
         }
 
-        // We know that inferredRelayer relayed a packet from mp.from
-        // This establishes both a gateway relationship and direct connectivity inference
-        LOG_INFO("[SR] Inferred gateway relationship: %08x relayed by %08x",
-                 mp.from, inferredRelayer);
+        if (inferredRelayer == 0) {
+            inferredRelayer = createPlaceholderNode(mp.relay_node);
 
-        // Track that both the original sender and relayer are active
-        trackNodeCapability(mp.from, CapabilityStatus::Unknown);
-        trackNodeCapability(inferredRelayer, CapabilityStatus::Unknown);
-
-        // Relay node is actively participating, tracked via SR capability system
-
-        // Record gateway relationship: inferredRelayer is gateway for mp.from
-        // when we have a Reported edge to the relayer. A former direct neighbour heard
-        // only through that relayer is retracted immediately — waiting for publisher
-        // silence left travelling unicasts aimed at a dead last hop.
-        // Exception: we already recorded this packet id from the sender (direct observe path).
-        // A later matched copy via a neighbour is a desk duplicate, not evidence they left.
-        bool hasDirectConnectionToRelay = hasReportedDirectEdge(inferredRelayer);
-        bool wasDirectNeighbor = hasReportedDirectEdge(mp.from);
-        uint32_t nowSecs = millis() / 1000;
-        bool alreadyHeardDirect =
-            mp.id != 0 && routingGraph && routingGraph->hasNodeTransmitted(mp.from, mp.id, nowSecs);
-        bool travelling = wasDirectNeighbor && !alreadyHeardDirect;
-        if (travelling && nodeDB) {
-            if (routingGraph->retractDirectLink(nodeDB->getNodeNum(), mp.from)) {
-                removeDirectSignal(mp.from);
-                markTopologyDirty();
-                LOG_INFO("[SR] %08x heard only via %08x: direct link retracted",
-                         mp.from, inferredRelayer);
+            if (!routingGraph->getEdgesFrom(inferredRelayer)) {
+                LOG_INFO("[SR] Created placeholder %08x for unknown relay 0x%02x", inferredRelayer, mp.relay_node);
             }
         }
 
-        // Infer downstream when the relay hears us. A topology publisher (SR-active or
-        // passive) must also list that relay; a source that never lists anyone leaves the
-        // observation as the only signal. Hop count then decides which usable paths we keep:
-        // - Former direct neighbour heard only via this relay: they moved.
-        // - Single-hop (hop_start - hop_limit == 1): sender went through inferredRelayer.
-        // - Multi-hop, non-publisher (Unknown/Legacy): stock nodes never advertise
-        //   their own topology, so relay observation is the only signal we have.
-        // - Multi-hop publisher that was never our neighbour: skip — Dijkstra on published
-        //   edges is the multi-hop TX path; a forwarded copy is not.
-        // Without the two facts above, the frame only says we heard the originator along the
-        // way, which is not a path we can send.
-        bool singleHopRelay = (mp.hop_start - mp.hop_limit) == 1;
-        CapabilityStatus sourceStatus = getCapabilityStatus(mp.from);
-        bool sourcePublishes = (sourceStatus == CapabilityStatus::SRactive ||
-                                sourceStatus == CapabilityStatus::Passive);
-        // Hearing the originator via a relay is the other direction from delivering to them.
-        // Keep the row when we can send to the relay. A publisher must also list it.
-        bool relayHearsUs = false;
-        if (nodeDB) {
-            const NodeEdges *mine = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
-            if (mine) {
-                for (uint8_t i = 0; i < mine->edgeCount; i++) {
-                    if (mine->edges[i].to == inferredRelayer && mine->edges[i].hearsUs) {
-                        relayHearsUs = true;
+        // Treating our echo as downstream evidence invents a route through ourselves and causes forwarding loops.
+        bool ownEcho = routingGraph && nodeDB && routingGraph->hasNodeTransmitted(nodeDB->getNodeNum(), mp.id, nowSeconds());
+        if (ownEcho) {
+            LOG_INFO("[SR] Own echo 0x%08x via 0x%02x: no inference", mp.id, mp.relay_node);
+        }
+        if (!ownEcho && inferredRelayer != 0 && inferredRelayer != mp.from) {
+            if (!isPlaceholderNode(inferredRelayer)) {
+                rememberRelayIdentity(inferredRelayer, mp.relay_node);
+            }
+
+            LOG_INFO("[SR] Inferred gateway relationship: %08x relayed by %08x", mp.from, inferredRelayer);
+
+            trackNodeCapability(mp.from, CapabilityStatus::Unknown);
+            trackNodeCapability(inferredRelayer, CapabilityStatus::Unknown);
+
+            bool hasDirectConnectionToRelay = hasReportedDirectEdge(inferredRelayer);
+            bool wasDirectNeighbor = hasReportedDirectEdge(mp.from);
+            uint32_t nowSecs = nowSeconds();
+            bool alreadyHeardDirect = mp.id != 0 && routingGraph && routingGraph->hasNodeTransmitted(mp.from, mp.id, nowSecs);
+            bool travelling = wasDirectNeighbor && !alreadyHeardDirect;
+            if (travelling && nodeDB) {
+                if (routingGraph->retractDirectLink(nodeDB->getNodeNum(), mp.from)) {
+                    removeDirectSignal(mp.from);
+                    markTopologyDirty();
+                    LOG_INFO("[SR] %08x heard only via %08x: direct link retracted", mp.from, inferredRelayer);
+                }
+            }
+
+            // Hearing an originator through a relay does not prove a usable return path.
+            bool singleHopRelay = (mp.hop_start - mp.hop_limit) == 1;
+            CapabilityStatus sourceStatus = getCapabilityStatus(mp.from);
+            bool sourcePublishes = (sourceStatus == CapabilityStatus::SRactive || sourceStatus == CapabilityStatus::Passive);
+
+            bool relayHearsUs = false;
+            if (nodeDB) {
+                const NodeEdges *mine = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
+                if (mine) {
+                    for (uint8_t i = 0; i < mine->edgeCount; i++) {
+                        if (mine->edges[i].to == inferredRelayer && mine->edges[i].hearsUs) {
+                            relayHearsUs = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            bool destinationListsRelay = false;
+            const NodeEdges *originEdges = routingGraph->getEdgesFrom(mp.from);
+            if (originEdges) {
+                for (uint8_t i = 0; i < originEdges->edgeCount; i++) {
+                    if (originEdges->edges[i].to == inferredRelayer) {
+                        destinationListsRelay = true;
                         break;
                     }
                 }
             }
-        }
-        bool destinationListsRelay = false;
-        const NodeEdges *originEdges = routingGraph->getEdgesFrom(mp.from);
-        if (originEdges) {
-            for (uint8_t i = 0; i < originEdges->edgeCount; i++) {
-                if (originEdges->edges[i].to == inferredRelayer) {
-                    destinationListsRelay = true;
-                    break;
+            NodeNum existingParent = routingGraph->getDownstreamRelay(mp.from);
+            // A live parent needs stronger replacement evidence than a forwarded copy.
+            bool stealsWithoutList =
+                existingParent != 0 && existingParent != inferredRelayer && !destinationListsRelay && !travelling;
+
+            const bool destInBall = routingGraph->getEdgesFrom(mp.from) != nullptr;
+            NodeNum listParent = 0;
+            uint16_t listCost = 0;
+            const bool listParked = routingGraph->listDownstream(mp.from, listParent, listCost);
+            const bool stealOk = travelling || (!destInBall && !listParked);
+            if (activeRouting && hasDirectConnectionToRelay && relayHearsUs && (destinationListsRelay || !sourcePublishes) &&
+                (travelling || singleHopRelay || !sourcePublishes) && !stealsWithoutList && stealOk) {
+                // A multihop inferred path must not be priced as one measured good link.
+                uint8_t hopsUsed = mp.hop_start > mp.hop_limit ? mp.hop_start - mp.hop_limit : 1;
+                float inferredEtx = NeighborGraph::calculateETX(-70, 5.0f, currentCostingSpreadingFactor()) * hopsUsed;
+                routingGraph->updateDownstreamExclusive(mp.from, inferredRelayer, inferredEtx, nowSeconds(), travelling);
+                if (!singleHopRelay && !travelling) {
+                    LOG_INFO("[SR] Downstream: %08x via %08x (%d hops, stock)", mp.from, inferredRelayer,
+                             mp.hop_start - mp.hop_limit);
+                } else {
+                    LOG_INFO("[SR] Downstream: %08x via %08x", mp.from, inferredRelayer);
                 }
+            } else if (activeRouting && hasDirectConnectionToRelay && stealsWithoutList) {
+                LOG_INFO("[SR] No downstream %08x via %08x: keeping parent %08x (no list claim)", mp.from, inferredRelayer,
+                         existingParent);
+            } else if (activeRouting && hasDirectConnectionToRelay && (travelling || singleHopRelay || !sourcePublishes) &&
+                       (!relayHearsUs || (sourcePublishes && !destinationListsRelay))) {
+                LOG_INFO("[SR] No downstream %08x via %08x: relay hears us %d, originator lists relay %d", mp.from,
+                         inferredRelayer, relayHearsUs, destinationListsRelay);
+            } else if (activeRouting && hasDirectConnectionToRelay && !singleHopRelay) {
+                LOG_INFO("[SR] No downstream %08x via %08x: %d hops, SR", mp.from, inferredRelayer, mp.hop_start - mp.hop_limit);
             }
-        }
-        NodeNum existingParent = routingGraph->getDownstreamRelay(mp.from);
-        // Sticky: a forwarded copy must not displace a live parent unless this relayer is on
-        // the originator's published list (TX-path evidence).
-        bool stealsWithoutList = existingParent != 0 && existingParent != inferredRelayer &&
-                                 !destinationListsRelay && !travelling;
-        // Ball / list-downstream stay; a travelling former neighbour still parks behind the
-        // hop we heard so unicasts do not keep the dead last hop.
-        const bool destInBall = routingGraph->getEdgesFrom(mp.from) != nullptr;
-        NodeNum listParent = 0;
-        uint16_t listCost = 0;
-        const bool listParked = routingGraph->listDownstream(mp.from, listParent, listCost);
-        const bool stealOk = travelling || (!destInBall && !listParked);
-        if (activeRouting && hasDirectConnectionToRelay && relayHearsUs &&
-            (destinationListsRelay || !sourcePublishes) &&
-            (travelling || singleHopRelay || !sourcePublishes) &&
-            !stealsWithoutList && stealOk) {
-            // Nominal link per hop travelled: the relay's link to the source is not what we measured,
-            // and a multi-hop path must not price like a single good link.
-            uint8_t hopsUsed = mp.hop_start > mp.hop_limit ? mp.hop_start - mp.hop_limit : 1;
-            float inferredEtx = NeighborGraph::calculateETX(-70, 5.0f, currentCostingSpreadingFactor()) * hopsUsed;
-            routingGraph->updateDownstreamExclusive(mp.from, inferredRelayer, inferredEtx, millis() / 1000,
-                                                    travelling);
-            if (!singleHopRelay && !travelling) {
-                LOG_INFO("[SR] Downstream: %08x via %08x (%d hops, stock)",
-                         mp.from, inferredRelayer, mp.hop_start - mp.hop_limit);
+
+            // A stock relay supplies no topology; its forwarding proves only that it heard the originator.
+            bool relayerIsLegacy = getCapabilityStatus(inferredRelayer) == CapabilityStatus::Legacy;
+            if (activeRouting && relayerIsLegacy) {
+                LOG_INFO("[SR] Inferred: stock %08x hears %08x (relay seen)", inferredRelayer, mp.from);
+
+                uint32_t monotonicTimestamp = nowSeconds();
+                int32_t defaultRssi = -70;
+                float defaultSnr = 5.0f;
+
+                routingGraph->updateEdge(inferredRelayer, mp.from,
+                                         NeighborGraph::calculateETX(defaultRssi, defaultSnr, currentCostingSpreadingFactor()),
+                                         monotonicTimestamp, Edge::Source::Inferred);
             } else {
-                LOG_INFO("[SR] Downstream: %08x via %08x", mp.from, inferredRelayer);
+                LOG_INFO("[SR] No inference: %08x not Legacy (%d)", inferredRelayer, (int)getCapabilityStatus(inferredRelayer));
             }
-        } else if (activeRouting && hasDirectConnectionToRelay && stealsWithoutList) {
-            LOG_INFO("[SR] No downstream %08x via %08x: keeping parent %08x (no list claim)",
-                     mp.from, inferredRelayer, existingParent);
-        } else if (activeRouting && hasDirectConnectionToRelay &&
-                   (travelling || singleHopRelay || !sourcePublishes) &&
-                   (!relayHearsUs || (sourcePublishes && !destinationListsRelay))) {
-            LOG_INFO("[SR] No downstream %08x via %08x: relay hears us %d, originator lists relay %d",
-                     mp.from, inferredRelayer, relayHearsUs, destinationListsRelay);
-        } else if (activeRouting && hasDirectConnectionToRelay && !singleHopRelay) {
-            LOG_INFO("[SR] No downstream %08x via %08x: %d hops, SR",
-                     mp.from, inferredRelayer, mp.hop_start - mp.hop_limit);
-        }
 
-        // Infer directed connectivity from relayer to sender when the relayer is a stock node.
-        // SR-aware nodes broadcast their topology, so we don't need to infer connectivity for them.
-        // Observing a relay proves only one direction: relayer → sender. The reverse is not assumed.
-        bool relayerIsLegacy = getCapabilityStatus(inferredRelayer) == CapabilityStatus::Legacy;
-        if (activeRouting && relayerIsLegacy) {
-            // Since the stock relayer successfully relayed a packet from the sender,
-            // we know the relayer can hear the sender (inferredRelayer → mp.from).
-            LOG_INFO("[SR] Inferred: stock %08x hears %08x (relay seen)",
-                     inferredRelayer, mp.from);
+            // Relays that rarely originate still supply direct-link measurements whenever they forward a frame.
+            if (hasSignalData && !isPlaceholderNode(inferredRelayer)) {
+                uint32_t monotonicTimestamp = nowSeconds();
+                int changeType = refreshReportedDirectNeighbor(inferredRelayer, rxRssi, rxSnr, monotonicTimestamp);
+                if (changeType == EDGE_SIGNIFICANT_CHANGE) {
+                    markTopologyDirty();
+                }
+            }
 
-            uint32_t monotonicTimestamp = millis() / 1000;
-            int32_t defaultRssi = -70; // default RSSI for inferred connectivity
-            float defaultSnr = 5.0f;  // default SNR for inferred connectivity
+            if (routingGraph) {
+                uint32_t currentTime = nowSeconds();
 
-            routingGraph->updateEdge(inferredRelayer, mp.from,
-                                     NeighborGraph::calculateETX(defaultRssi, defaultSnr, currentCostingSpreadingFactor()),
-                                     monotonicTimestamp, Edge::Source::Inferred);
-        } else {
-            LOG_INFO("[SR] No inference: %08x not Legacy (%d)",
-                     inferredRelayer, (int)getCapabilityStatus(inferredRelayer));
-        }
-
-        // A relayed frame is a direct RF transmission from its relayer, whatever originated the
-        // payload it carries, so the RSSI and SNR we took off it measure our link to that
-        // relayer as well as a frame it originated would. The measurement therefore establishes
-        // the link rather than only refreshing one: requiring an existing Reported edge meant a
-        // router that relays constantly and originates almost never was measured hundreds of
-        // times and recorded not once. What a relayed frame cannot supply is identity — it
-        // names its relayer in one byte — so an unresolved relayer stays a placeholder, and a
-        // placeholder is never recorded here and never published.
-        if (hasSignalData && !isPlaceholderNode(inferredRelayer)) {
-            uint32_t monotonicTimestamp = millis() / 1000;
-            int changeType = refreshReportedDirectNeighbor(inferredRelayer, rxRssi, rxSnr, monotonicTimestamp);
-            if (changeType == EDGE_SIGNIFICANT_CHANGE) {
-                markTopologyDirty();
+                if (activeRouting) {
+                    routingGraph->recordNodeTransmission(mp.from, mp.id, currentTime);
+                    routingGraph->recordNodeTransmission(inferredRelayer, mp.id, currentTime);
+                }
             }
         }
 
-        // Record transmission for contention window tracking
-        if (routingGraph) {
-            uint32_t currentTime = millis() / 1000;  // Use monotonic time
-            // Contention-window tracking feeds the relay ranking, which only an active node runs.
-            if (activeRouting) {
-                routingGraph->recordNodeTransmission(mp.from, mp.id, currentTime);
-                routingGraph->recordNodeTransmission(inferredRelayer, mp.id, currentTime);
+        if (nodeDB && inferredRelayer != 0 && !isPlaceholderNode(inferredRelayer)) {
+            NodeNum ourNode = nodeDB->getNodeNum();
+            if (inferredRelayer != ourNode && (mp.from == ourNode || isCommittedRelay(mp.id))) {
+                markStockNodeRelayedOurPacket(inferredRelayer);
             }
         }
-    }
-    // Hearing them retransmit a packet we originated (or already committed to relay) is the
-    // proof they hear us. That is true of our own echo; gating it on !ownEcho left mute
-    // nodes publishing hearsUs=false on a neighbour that had just relayed them.
-    if (nodeDB && inferredRelayer != 0 && !isPlaceholderNode(inferredRelayer)) {
-        NodeNum ourNode = nodeDB->getNodeNum();
-        if (inferredRelayer != ourNode && (mp.from == ourNode || isCommittedRelay(mp.id))) {
-            markStockNodeRelayedOurPacket(inferredRelayer);
-        }
-    }
     }
 }
 
 ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &mp)
 {
-    // Sanity check: reject packets with obviously corrupted payload sizes
-    // Max valid payload is ~237 bytes for LoRa; anything over 256 is definitely garbage
-    if (mp.which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
-        mp.decoded.payload.size > meshtastic_Constants_DATA_PAYLOAD_LEN) {
-        LOG_WARN("[SR] Bad payload size: %u bytes (max %u)",
-                 mp.decoded.payload.size, meshtastic_Constants_DATA_PAYLOAD_LEN);
+    if (!routingGraph || !nodeDB) {
         return ProcessMessage::CONTINUE;
     }
 
-    // Update node activity for packet reception and relay tracking
-    // For active nodes: track all packets (needed for full topology and routing)
-    // For passive nodes: only track direct packets (only need direct neighbors)
-    // We'll check this after determining if packet is direct (below)
-    bool shouldUpdateNodeActivity = false;
-
-
-    // Only track DIRECT neighbors - packets heard directly over radio with no relays
-    // Conditions for a direct neighbor:
-    // 1. Has valid signal data (normalizeRxSignal: unset 0/0 refused; clipped RSSI=0 remapped)
-    // 2. Not received via MQTT
-    // 3. Direct detection using hopStart and hopLimit:
-    //    - hopStart == hopLimit: packet hasn't been relayed (direct transmission)
-    //    - In SR, we keep hopLimit >= 1 even for passive nodes, so direct means no decrement from original
-    //
-    // relay_node can be ambiguous when multiple nodes share the same last byte,
-    // so hopStart/hopLimit is more reliable for detecting direct neighbors.
+    if (mp.which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
+        mp.decoded.payload.size > meshtastic_Constants_DATA_PAYLOAD_LEN) {
+        LOG_WARN("[SR] Bad payload size: %u bytes (max %u)", mp.decoded.payload.size, meshtastic_Constants_DATA_PAYLOAD_LEN);
+        return ProcessMessage::CONTINUE;
+    }
 
     int32_t rxRssi = mp.rx_rssi;
     const float rxSnr = mp.rx_snr;
@@ -2068,39 +1753,25 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
     bool isDirectFromSender = isDirectPacket(mp);
     uint8_t fromLastByte = mp.from & 0xFF;
 
-    // Debug logging to understand packet reception and relay state
     if (hasSignalData && notViaMqtt) {
-        LOG_INFO("[SR] Packet from 0x%08x: relay=0x%02x hs=%d hl=%d direct=%d",
-                  mp.from, mp.relay_node, mp.hop_start, mp.hop_limit, isDirectFromSender);
+        LOG_INFO("[SR] Packet from 0x%08x: relay=0x%02x hs=%d hl=%d direct=%d", mp.from, mp.relay_node, mp.hop_start,
+                 mp.hop_limit, isDirectFromSender);
     }
 
-    // Update node activity only when appropriate:
-    // - Active nodes: all packets (need full topology)
-    // - Passive nodes: only direct packets (only need direct neighbors)
-    if (shouldUpdateNodeActivity || isActiveRoutingRole() || (hasSignalData && notViaMqtt && isDirectFromSender)) {
+    if (isActiveRoutingRole() || (hasSignalData && notViaMqtt && isDirectFromSender)) {
         updateNodeActivityForPacketAndRelay(&mp);
     }
 
-    // Update SignalRouting graph for directly-heard nodes
-    // Active routing nodes: track all nodes for topology-based routing
-    // Passive nodes: only track directly-heard nodes (don't relay, so no point in tracking relayed nodes)
     if (routingGraph && notViaMqtt) {
         if (hasSignalData && isDirectFromSender) {
-            // Direct reception - add to graph and clear any stale downstream relationship
-            updateNeighborInfo(mp.from, rxRssi, rxSnr, mp.rx_time);
+            updateNeighborInfo(mp.from, rxRssi, rxSnr);
             routingGraph->clearDownstreamForDestination(mp.from);
-        } else if (isActiveRoutingRole() && !isDirectFromSender && mp.relay_node != 0) {
-            // Relayed packet from active routing node - update activity for topology
-            routingGraph->updateNodeActivity(mp.from, millis() / 1000);
         }
-        // Passive nodes skip relayed packets entirely
     }
 
     if (hasSignalData && notViaMqtt && isDirectFromSender) {
-        // Check if this sender matches a known placeholder
         NodeNum placeholderId = getPlaceholderForRelay(fromLastByte);
         if (isPlaceholderNode(placeholderId)) {
-            // This sender matches a placeholder - resolve it
             if (resolvePlaceholder(placeholderId, mp.from)) {
                 LOG_INFO("[SR] Direct contact: resolved placeholder %08x with node %08x", placeholderId, mp.from);
             }
@@ -2109,13 +1780,8 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
         rememberRelayIdentity(mp.from, fromLastByte);
         trackNodeCapability(mp.from, CapabilityStatus::Unknown);
 
-        // A frame that reached us direct and names our byte as its next hop proves the sender
-        // hears us: a next hop is learned from traffic received, so it could only have chosen us
-        // by hearing us. The sender's own list carries the same evidence, but it can be a
-        // broadcast interval away, and until then a reply to that neighbour cannot be framed as
-        // a last hop — it goes out with a spare hop and gets relayed.
-        if (mp.to != NODENUM_BROADCAST && mp.next_hop != 0 &&
-            mp.next_hop == static_cast<uint8_t>(nodeDB->getNodeNum() & 0xFF)) {
+        // Naming us as next hop proves the sender hears us before its next topology list arrives.
+        if (mp.to != NODENUM_BROADCAST && mp.next_hop != 0 && mp.next_hop == static_cast<uint8_t>(nodeDB->getNodeNum() & 0xFF)) {
             if (confirmSenderHearsUs(routingGraph, nodeDB->getNodeNum(), mp.from)) {
                 LOG_INFO("[SR] %08x routes through us: hearsUs confirmed", mp.from);
             }
@@ -2124,100 +1790,31 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
         char senderName[64];
         getNodeDisplayName(mp.from, senderName, sizeof(senderName));
 
-        float etx =
-            NeighborGraph::calculateETX(rxRssi, rxSnr, currentCostingSpreadingFactor());
+        float etx = NeighborGraph::calculateETX(rxRssi, rxSnr, currentCostingSpreadingFactor());
 
-        // When a node is confirmed as a direct neighbor, clear any downstream entries that
-        // listed it as a destination reachable via some other relay — those are now obsolete.
-        // Note: clearDownstreamForDestination (what we want here) is different from
-        // clearDownstreamForRelay (which would incorrectly remove MB9c as a relay for others).
+        LOG_INFO("[SR] Direct neighbor %s: RSSI=%d, SNR=%.1f, ETX=%.2f", senderName, rxRssi, rxSnr, etx);
+
         if (routingGraph) {
-            routingGraph->clearDownstreamForDestination(mp.from);
-        }
-
-        LOG_INFO("[SR] Direct neighbor %s: RSSI=%d, SNR=%.1f, ETX=%.2f",
-                 senderName, rxRssi, rxSnr, etx);
-
-        // Record that this node transmitted (for contention window tracking)
-        if (routingGraph) {
-            uint32_t currentTime = millis() / 1000;  // Use monotonic time
+            uint32_t currentTime = nowSeconds();
             routingGraph->recordNodeTransmission(mp.from, mp.id, currentTime);
-        }
-        // A passive role never reaches preProcessSignalRoutingPacket (shouldRelay() returns before
-        // calling it), so it never saw a neighbour's empty boot broadcast and never answered it. It
-        // still broadcasts topology, and a rebooted neighbour depends on that listing to learn that
-        // we hear it: two nodes spent 24 minutes without hearsUs on their edge to a phone node this
-        // way. Detect the bootstrap request here and schedule the same jittered reply active nodes send.
-        if (!isActiveRoutingRole() && mp.which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
-            mp.decoded.portnum == meshtastic_PortNum_SIGNAL_ROUTING_APP) {
-            meshtastic_SignalRoutingInfo info = meshtastic_SignalRoutingInfo_init_zero;
-            if (pb_decode_from_bytes(mp.decoded.payload.bytes, mp.decoded.payload.size, &meshtastic_SignalRoutingInfo_msg,
-                                     &info)) {
-                PackedHeader hdr = {};
-                PackedNeighborEntry bootNeighbors[MAX_SIGNAL_ROUTING_NEIGHBORS];
-                uint8_t bootCount = decodePackedNeighbors(info.packed_neighbors.bytes, info.packed_neighbors.size,
-                                                          bootNeighbors, MAX_SIGNAL_ROUTING_NEIGHBORS, &hdr);
-                if (hdr.formatVersion == PACKED_NEIGHBOR_FORMAT_VERSION && bootCount == 0 && hdr.signalRoutingActive) {
-                    LOG_INFO("[SR] Passive: boot broadcast from %s, topology reply scheduled",
-                             senderName);
-                    scheduleEmptyTopologyReply(mp.from, mp.id);
-                }
-            }
         }
     } else if (notViaMqtt && !isDirectFromSender && mp.relay_node != 0) {
         observeRelayedPacket(mp);
     }
 
     if (mp.which_payload_variant == meshtastic_MeshPacket_decoded_tag) {
-        handleSniffedPayload(mp, isDirectFromSender);
-    }
-
-    // Periodic graph maintenance with stability safeguards (CLIENT_MUTE maintains direct neighbors, others do full maintenance)
-    if (routingGraph && canSendTopology()) {
-        // Use monotonic time (seconds since boot) for aging to avoid RTC sync issues
-        uint32_t currentTime = millis() / 1000;
-        if (currentTime - lastGraphUpdate > GRAPH_MAINTENANCE_INTERVAL_SECS) {
-            uint32_t nodeCountBefore = routingGraph->getNodeCount();
-            
-            // Single TTL for all nodes in the graph; a publisher's own cadence retires our direct
-            // link to it far sooner (pruneSilentPublishers).
-            uint8_t directBefore = routingGraph->countDirectNeighbors();
-            routingGraph->ageEdges(currentTime, cfgNodeTtlSecs);
-            NeighborGraph::CoveragePolicy livenessPolicy = coveragePolicy();
-            if (routingGraph->pruneSilentPublishers(nodeDB->getNodeNum(), currentTime, PUBLISHER_SILENCE_SECS,
-                                                    &livenessPolicy) > 0) {
-                markTopologyDirty();
-            }
-
-            uint32_t nodeCountAfter = routingGraph->getNodeCount();
-            lastGraphUpdate = currentTime;
-
-            if (nodeCountBefore != nodeCountAfter) {
-                LOG_INFO("[SR] Graph aged: %u -> %u nodes", nodeCountBefore, nodeCountAfter);
-                uint8_t directAfter = routingGraph->countDirectNeighbors();
-                if (directAfter < directBefore) {
-                    LOG_INFO("[SR] Direct neighbor lost during aging — marking topology dirty");
-                    markTopologyDirty();
-                }
-            } else {
-                LOG_INFO("[SR] Graph aged (no node count change)");
-            }
-
-            syncDirectSignalsWithGraph();
-
-            // Safety check: ensure we still have our own node
-            if (!routingGraph->getEdgesFrom(nodeDB->getNodeNum())) {
-                LOG_WARN("[SR] Graph aging removed local node edges - topology unstable");
-            }
+        handleSniffedPayload(mp);
+        if (mp.decoded.portnum == meshtastic_PortNum_SIGNAL_ROUTING_APP) {
+            preProcessSignalRoutingPacket(&mp);
         }
     }
+
+    maintainGraph(nowSeconds());
 
     return ProcessMessage::CONTINUE;
 }
 
-// A named-backup relay must stamp a hop that is neither empty, nor the designation already on
-// the packet, nor the node that handed us the frame. Clearing the byte is not another path:
-// stock floods from the wrong side, and the originator treats the rebroadcast as an implicit ACK.
+// Repeating the failed designation or clearing it cannot establish a distinct backup path.
 static bool namedBackupStampOk(NodeNum pendingStamp, NodeNum heardFrom, uint8_t designatedByte, NodeNum destination,
                                NodeDB *nodeDB)
 {
@@ -2239,7 +1836,10 @@ static bool namedBackupStampOk(NodeNum pendingStamp, NodeNum heardFrom, uint8_t 
 
 bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_MeshPacket *p)
 {
-    if (!routingGraph || !nodeDB) {
+    pendingRelayDelayMs = 0;
+    pendingUnicastNextHop = 0;
+    pendingUnicastFlags = {};
+    if (!p || !routingGraph || !nodeDB) {
         return false;
     }
 
@@ -2247,29 +1847,20 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     NodeNum destination = p->to;
     NodeNum sourceNode = p->from;
     NodeNum heardFrom = resolveHeardFrom(p, sourceNode);
-    uint32_t currentTime = millis() / 1000;
+    uint32_t currentTime = nowSeconds();
 
     char destName[64], heardFromName[64], srcName[64];
     getNodeDisplayName(destination, destName, sizeof(destName));
     getNodeDisplayName(heardFrom, heardFromName, sizeof(heardFromName));
     getNodeDisplayName(sourceNode, srcName, sizeof(srcName));
 
-    // A named next hop that is not the destination itself makes us a backup, and a backup
-    // survives every suppress reason below: those reasons say somebody else is better placed,
-    // not that the designated hop will succeed. Without this, a silent designated hop had no
-    // second chance.
-    bool relayerNamed =
-        p->next_hop != NO_NEXT_HOP_PREFERENCE && p->next_hop != nodeDB->getLastByteOfNodeNum(destination);
-    // The packet names us as its next hop: the sender asked us to carry it, so none of the
-    // "somebody else is better placed" reasons below apply. Without this, a designated hop whose
-    // own route pointed back at the node it heard the frame from went silent and only a backup
-    // carried the packet, a slot late.
-    bool weAreDesignatedHop = p->next_hop != NO_NEXT_HOP_PREFERENCE &&
-                              p->next_hop == nodeDB->getLastByteOfNodeNum(myNode);
+    // Better-placed candidates can still fail; a designated hop needs a backup.
+    bool relayerNamed = p->next_hop != NO_NEXT_HOP_PREFERENCE && p->next_hop != nodeDB->getLastByteOfNodeNum(destination);
+    // A sender explicitly waiting on us cannot recover through candidates we assume are better placed.
+    bool weAreDesignatedHop = p->next_hop != NO_NEXT_HOP_PREFERENCE && p->next_hop == nodeDB->getLastByteOfNodeNum(myNode);
     const char *suppressReason = nullptr;
 
-    // If src and dst are both downstream of the same relay, that relay handles delivery —
-    // only once it is known to hold this copy. Otherwise we may be the sole hearer.
+    // Shared gateway geometry alone does not prove the gateway received this copy.
     NodeNum sourceRelay = routingGraph->getDownstreamRelay(sourceNode);
     NodeNum destRelay = routingGraph->getDownstreamRelay(destination);
     if (!weAreDesignatedHop && sourceRelay != 0 && sourceRelay == destRelay && sourceRelay != myNode &&
@@ -2283,19 +1874,18 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         suppressReason = "src and dst share a relay";
     }
 
-    // If heardFrom can finish delivery itself, it holds the packet already — don't relay back.
-    // An edge to the destination is not enough: it only says heardFrom hears the destination.
-    if (heardFrom != 0 && heardFrom != myNode && heardFrom != sourceNode && !suppressReason &&
-        !weAreDesignatedHop) {
+    if (heardFrom != 0 && heardFrom != myNode && heardFrom != sourceNode && !suppressReason && !weAreDesignatedHop) {
         bool heardFromCanReachDest = routingGraph->unicastCanFinish(heardFrom, destination, routePolicy());
         if (heardFromCanReachDest) {
-            LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: heardFrom %s reaches dst", p->id, srcName, destName, heardFromName);
+            LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: heardFrom %s reaches dst", p->id, srcName, destName,
+                     heardFromName);
             if (!relayerNamed) {
                 return false;
             }
             suppressReason = "heardFrom can finish";
         } else if (hasBetterPositionedSRNeighbor(myNode, heardFrom, destination, p->id)) {
-            LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: neighbor covering %s reaches dst", p->id, srcName, destName, heardFromName);
+            LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: neighbor covering %s reaches dst", p->id, srcName, destName,
+                     heardFromName);
             if (!relayerNamed) {
                 return false;
             }
@@ -2303,15 +1893,11 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         }
     }
 
-    // No route of our own. Designated → NO_ROUTE NACK (not a weak flood). Undesignated flood →
-    // broadcast unique coverage. Named backup keeps the suppressReason path below.
     bool routeVerified = false;
     NodeNum myNextHop = getNextHop(destination, sourceNode, heardFrom, false, &routeVerified);
-    // Direct edge only: unicastCanFinish is true for non-publishing dests without an edge, which
-    // would skip the flood-coverage path for every NodeDB-only destination.
+    // Treating an unknown nonpublisher as a final hop would bypass flood coverage for NodeDB-only destinations.
     const bool canFinish = hasDirectConnectivity(myNode, destination);
-    // Cost ranking when the picker found a path (or we can finish). Stamp-on-air may still be
-    // cleared later; that is independent. No path at all → coverage (undesignated) / NACK (us).
+
     const bool hasCostPath = canFinish || myNextHop != 0;
     if (weAreDesignatedHop && myNextHop == 0 && !canFinish) {
         LOG_INFO("[SR-DEC] UNICAST NACK 0x%08x %s->%s: designated with no route", p->id, srcName, destName);
@@ -2322,26 +1908,12 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     }
     if (!hasCostPath && !weAreDesignatedHop) {
         if (!relayerNamed) {
-            LOG_INFO("[SR-DEC] UNICAST FLOOD-COVER 0x%08x %s->%s: no path, unique coverage", p->id, srcName,
-                     destName);
+            LOG_INFO("[SR-DEC] UNICAST FLOOD-COVER 0x%08x %s->%s: no path, unique coverage", p->id, srcName, destName);
             return shouldRelayBroadcast(p, true);
         }
         LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: no route via SR topology", p->id, srcName, destName);
         suppressReason = "no route of our own";
     }
-
-    // --- Slot-based relay coordination ---
-    //
-    // If p->next_hop is set, slot 0 is reserved for the designated next_hop node.
-    // SR candidates (self + SR-active direct neighbors that heard this copy and can reach destination)
-    // are sorted ascending by cost-to-destination and assigned subsequent slots:
-    //   - Direct edge to destination            → etxFixed (range ~100–32767)
-    //   - Edge to the shared next hop (proxy)   → etxFixed | 0x8000 (always after direct)
-    //   - No usable path                        → skip
-    //
-    // Each node independently picks the same ordering; the one assigned our slot sets
-    // pendingRelayDelayMs and returns true. A heard copy cancels that backup only when the
-    // transmitter can finish or is ranked ahead with a path.
 
     uint32_t halfAirtime = SR_FALLBACK_HALF_AIRTIME_MS;
     uint32_t airtimeMs = 300;
@@ -2350,22 +1922,12 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         halfAirtime = std::max(airtimeMs / 2, SR_MIN_RUNG_SPACING_MS);
     }
 
-    // The next hop we will stamp on our relayed copy: SR's route pick, or none when the route
-    // picker fell back to "relay it ourselves" (our own byte must never go on the wire: legacy nodes
-    // would refuse the packet and SR peers would wait for a second copy from us).
+    // Stamping our own byte makes stock peers refuse the copy and SR peers wait for us again.
     pendingUnicastNextHop = (myNextHop == myNode) ? 0 : myNextHop;
-    // Path pick before guessed-route clearing: Routing ACK retrace suppress needs to know whether
-    // we still have an onward hop that is not the transmitter we heard.
+
     const NodeNum onwardHop = pendingUnicastNextHop;
     pendingUnicastFlags = {};
-    // Containment. A route the search could only complete by admitting an unconfirmed hop is a
-    // guess: the node it names never proved it hears the destination, and a stamped designation
-    // makes every other candidate stand down and wait for a copy that node may have no way to
-    // send. Never stamp one. And if the guess points back at the node that handed us the packet,
-    // carrying it moves the frame away from its destination, onto our own side of the mesh where
-    // the only path anyone knows is the one it arrived on — drop it, unless the frame named us as
-    // its next hop, because then the sender is waiting on us specifically and its retries would
-    // designate us again.
+    // An unconfirmed designation makes every backup wait for a hop that may be unable to deliver.
     if (!routeVerified && pendingUnicastNextHop != 0) {
         if (pendingUnicastNextHop == heardFrom && !weAreDesignatedHop) {
             LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: guessed route runs back", p->id, srcName, destName);
@@ -2374,38 +1936,24 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         LOG_INFO("[SR] Guessed route to %s: no next hop stamped", destName);
         pendingUnicastNextHop = 0;
     }
-    // Named as next hop while our only route runs back to the node that handed us the packet:
-    // forward it, but never back the way it came. It named us because its own route points at us,
-    // so stamping it would bounce the frame between the two of us until the hop limit runs out.
+    // The previous transmitter already routed through us; designating it again creates a forwarding loop.
     if (weAreDesignatedHop && pendingUnicastNextHop == heardFrom) {
-        LOG_INFO("[SR] Designated hop 0x%08x: route back to %s, no next hop",
-                 p->id, heardFromName);
+        LOG_INFO("[SR] Designated hop 0x%08x: route back to %s, no next hop", p->id, heardFromName);
         pendingUnicastNextHop = 0;
     }
-    // Strong onward hop: stamp it. Weak: flood on the air (next unset) but remember the intended
-    // peer in nominatedNextHop so only that node can cancel our follow-up.
+    // A weak hop needs flood assistance, while its intended peer remains the only valid cancellation witness.
     if (pendingUnicastNextHop != 0) {
         const NodeNum intended = pendingUnicastNextHop;
         pendingUnicastFlags.nominatedNextHop = intended;
-        const bool strong =
-            (intended == destination) ? hasStrongDeliveryHop(destination) : hasStrongHopTo(intended);
+        const bool strong = (intended == destination) ? hasStrongDeliveryHop(destination) : hasStrongHopTo(intended);
         if (!strong) {
             LOG_INFO("[SR] Weak hop to %08x: flooding (no next_hop stamp)", intended);
             pendingUnicastNextHop = 0;
         }
     }
-    // A backup transmits only when it will stamp a different hop from the one already on the
-    // packet and from the node it heard the packet from. Naming the designated hop again, or
-    // clearing the byte, is not another path: stock nodes flood from the wrong side of the
-    // mesh, and the originator treats any rebroadcast as an implicit ack and stops retrying.
-    // Leave the designated copy in place. If that node stays silent, its own retries repeat
-    // the stamp and then flood. A flood salvage slot is the exception: it deliberately
-    // clears next_hop after named hops have had their chance. Applied after ranking.
+    // A repeated designation gives the originator an implicit ACK without providing a new delivery path.
 
-    // Heard straight from the source, and the source's own topology lists the destination: a
-    // Routing ACK on a true local link is not relayed when we cannot improve delivery (no onward
-    // hop, hop is back at the transmitter, or dest already heard this TX). A hub that still has a
-    // path toward a multi-hop originator must carry the receipt.
+    // Relaying local receipts adds contention; remote receipts still need a path to their originator.
     uint32_t destAckWaitMs = 0;
     uint32_t destAckDurationMs = 0;
     {
@@ -2428,67 +1976,40 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         }
         if (srcToDest) {
             if (p->decoded.portnum == meshtastic_PortNum_ROUTING_APP && p->decoded.request_id != 0) {
-                const bool localMeasured =
-                    Edge::isMeasured(srcToDest->source) &&
-                    srcToDest->getEtx() <= cfgPoorLinkEtxThreshold;
+                const bool localMeasured = Edge::isMeasured(srcToDest->source) && srcToDest->getEtx() <= cfgPoorLinkEtxThreshold;
                 const bool noUsefulOnward = onwardHop == 0 || onwardHop == heardFrom;
                 const bool destAlreadyHasIt = srcToDest->hearsUs && hasReportedDirectEdge(destination);
                 if (localMeasured && (noUsefulOnward || destAlreadyHasIt)) {
-                    LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: routing ACK retraces the link",
-                             p->id, srcName, destName);
+                    LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: routing ACK retraces the link", p->id, srcName, destName);
                     return false;
                 }
             }
             if (srcToDest->hearsUs) {
                 destAckWaitMs = destAckDurationMs;
-                LOG_INFO("[SR] Unicast 0x%08x: %s hears %s directly, waiting %ums for ACK",
-                         p->id, destName, srcName, destAckWaitMs);
+                LOG_INFO("[SR] Unicast 0x%08x: %s hears %s directly, waiting %ums for ACK", p->id, destName, srcName,
+                         destAckWaitMs);
             }
         }
     }
 
-    // Costs are compared in half-ETX buckets. Each node prices its own link from its own
-    // measurements and a peer's link from the peer's packed report, so near-equal costs differ by a
-    // few hundredths in a direction that varies per node; exact comparison ranked two colocated
-    // nodes in opposite orders and both took the same slot. Within a bucket the node-id tie-break
-    // below decides identically everywhere.
-    auto getCandidateCost = [&](NodeNum node) -> uint16_t {
-        return unicastCandidateCost(node, destination, myNextHop);
-    };
+    // Quantization prevents small measurement differences from reversing candidate order at colocated peers.
+    auto getCandidateCost = [&](NodeNum node) -> uint16_t { return unicastCandidateCost(node, destination, myNextHop); };
 
     const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
 
-    // Every wait here is a floor on when our relay may key up, measured from the frame we just
-    // heard, so the floors compose by max and never by addition: waiting for the destination's
-    // own answer already carries us well past stock's contention boundary.
-    //   - stock's contention floor: below it a stock neighbour is still inside its own window,
-    //     so it cannot have heard our copy, will not cancel its own, and the duplicate we were
-    //     avoiding happens anyway.
-    //   - the destination's chance to answer, when the source's list says it hears the source.
+    // These waits share the same origin; adding them would pay twice for the same contention window.
     const uint32_t earliestMs = std::max(ladderTransitionMs(), destAckWaitMs);
-    // The designated next hop's reservation, and zero when no next hop is named. It used to be
-    // seeded with the floor above, which made it unconditionally non-zero and left both of the
-    // branches that test it unreachable: every candidate took the reservation path, ranked slot 0
-    // never saw the contention floor, and the leader wait below was computed and never used.
+
     uint32_t slotDelay = 0;
     bool shouldRelay = false;
     uint32_t myDelay = 0;
 
-    // Phase 1: If the packet has a designated next_hop, slot 0 belongs to it.
-    // If we ARE the designated next_hop (SR node), relay immediately at slot 0.
-    // Otherwise reserve slot 0 with a width matching the next_hop's expected timing:
-    //   - SR next_hop: halfAirtime (they relay at 0ms, dupe suppression handles us)
-    //   - Stock next_hop: worst-case stock CLIENT delay, so we don't fire before they do
-    // A next hop equal to the destination's own byte names no relayer: the source expects direct
-    // delivery (stock learns the destination as its own next hop from a direct reply). Nobody owns
-    // slot 0 then; the cost ranking below decides as for an unnamed hop.
     if (relayerNamed) {
         uint8_t ourLastByte = nodeDB->getLastByteOfNodeNum(myNode);
         if (ourLastByte == p->next_hop) {
-            LOG_INFO("[SR-DEC] UNICAST RELAY 0x%08x %s->%s: designated next_hop (slot 0, %ums)",
-                     p->id, srcName, destName, earliestMs);
-            // Keep an intermediate nomination from the strong/weak stamp above; only overwrite
-            // when this leg is itself a priced last hop to the destination.
+            LOG_INFO("[SR-DEC] UNICAST RELAY 0x%08x %s->%s: designated next_hop (slot 0, %ums)", p->id, srcName, destName,
+                     earliestMs);
+
             const NodeNum keepNominated = pendingUnicastFlags.nominatedNextHop;
             pendingUnicastFlags = {};
             if (getCandidateCost(myNode) < UNICAST_DOWNSTREAM_TIER) {
@@ -2502,42 +2023,27 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
             return true;
         }
 
-        // Determine slot 0 width: long enough for the designated node's relay to have left the air.
-        //   - SR next_hop: it queues its relay behind its own contention delay (up to 2^CW slots at the
-        //     current utilization) and then needs one airtime. A half-airtime reservation let a peer
-        //     pre-empt a healthy designated node by 200 ms in the field.
-        //   - Stock/unknown next_hop: worst-case stock CLIENT delay plus one airtime.
+        // Backups must allow the designated relay to contend and finish its frame before taking over.
         NodeNum nextHopNode = resolveRelayIdentity(p->next_hop);
         bool nextHopIsSR = (nextHopNode != 0 && getCapabilityStatus(nextHopNode) == CapabilityStatus::SRactive);
-        // How long until the designated node's copy has left the air. The two cases start their
-        // clocks in different places, so they compose differently:
-        //   - an SR peer obeys this same model, keys up at the floor, and then needs its own
-        //     contention delay plus one airtime on top of it.
-        //   - a stock node knows nothing of the floor and starts contending the moment it hears
-        //     the frame, so its copy is clear after its own worst case plus one airtime. Adding
-        //     the floor on top would count the same silence twice; we simply never go earlier
-        //     than our own floor either, which is a max.
-        uint32_t reserve = halfAirtime; // fallback if no radio interface
+        // The stock and SR timing models anchor contention differently; their waits cannot be combined identically.
+        uint32_t reserve = halfAirtime;
         bool haveRadio = router && router->getRadioInterface();
         if (haveRadio) {
             RadioInterface *radio = router->getRadioInterface();
-            reserve = airtimeMs + (nextHopIsSR ? radio->getTxDelayMsecMaxAtUtil()
-                                               : radio->getTxDelayMsecWeightedWorst(p->rx_snr));
+            reserve =
+                airtimeMs + (nextHopIsSR ? radio->getTxDelayMsecMaxAtUtil() : radio->getTxDelayMsecWeightedWorst(p->rx_snr));
         }
         slotDelay = (nextHopIsSR || !haveRadio) ? earliestMs + reserve : std::max(earliestMs, reserve);
-        LOG_INFO("[SR] Unicast slot 0ms: %s next_hop 0x%02x (%ums reserved)", nextHopIsSR ? "SR" : "stock/unknown",
-                 p->next_hop, reserve);
+        LOG_INFO("[SR] Unicast slot 0ms: %s next_hop 0x%02x (%ums reserved)", nextHopIsSR ? "SR" : "stock/unknown", p->next_hop,
+                 reserve);
     }
 
-    // A suppressed backup does not rank: the reasons above already said peers are better placed.
-    // It waits behind the designated reserve at its own rung of the node-id ladder, so several
-    // backups do not answer a silent designated hop together — and only when it can stamp a
-    // different next hop (same gate as the ranked path below).
     if (suppressReason) {
         if (relayerNamed && !weAreDesignatedHop &&
             !namedBackupStampOk(pendingUnicastNextHop, heardFrom, p->next_hop, destination, nodeDB)) {
-            LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: backup has no next hop past 0x%02x (%s)",
-                     p->id, srcName, destName, p->next_hop, suppressReason);
+            LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: backup has no next hop past 0x%02x (%s)", p->id, srcName, destName,
+                     p->next_hop, suppressReason);
             pendingUnicastNextHop = 0;
             pendingUnicastFlags = {};
             return false;
@@ -2571,15 +2077,12 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         return true;
     }
 
-    // Phase 2: SR candidates (including self) sorted by cost to destination.
     UnicastCandidate srCandidates[8];
     uint8_t srCount = 0;
 
     uint16_t myCost = getCandidateCost(myNode);
 
-    // When getNextHop() returns myNode, the route exists but has no coordinated SR next hop.
-    // getCandidateCost() returns UINT16_MAX in this case (no self-loop edge), so use a
-    // best-effort sentinel cost (0xFFFE) to add self as the sole relay candidate.
+    // The self-relay fallback has no self-loop cost but must remain available as a last resort.
     if (myCost == UINT16_MAX && myNextHop == myNode) {
         myCost = 0xFFFEu;
         LOG_INFO("[SR] Best-effort self relay: no coordinated next hop");
@@ -2614,8 +2117,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         }
     }
 
-    // Insertion sort ascending by cost; tiebreak by node ID (packet ID parity: even→lowest wins, odd→highest wins).
-    // This mirrors the broadcast scheduler tiebreak so all nodes compute an identical ordering.
+    // A shared parity tie-break keeps independently computed relay orders consistent while rotating the burden.
     bool preferHighNodeId = (p->id & 1) != 0;
     for (uint8_t i = 1; i < srCount; i++) {
         UnicastCandidate key = srCandidates[i];
@@ -2623,8 +2125,8 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         while (j >= 0) {
             bool costHigher = srCandidates[j].cost > key.cost;
             bool costEqual = srCandidates[j].cost == key.cost;
-            bool tiebreakLoses = costEqual && (preferHighNodeId ? srCandidates[j].nodeId < key.nodeId
-                                                                : srCandidates[j].nodeId > key.nodeId);
+            bool tiebreakLoses =
+                costEqual && (preferHighNodeId ? srCandidates[j].nodeId < key.nodeId : srCandidates[j].nodeId > key.nodeId);
             if (!costHigher && !tiebreakLoses) {
                 break;
             }
@@ -2642,16 +2144,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         return false;
     }
 
-    // Ordinal slot delay.
-    //
-    // Candidates hold slots in ranked order. Slot 0 keys up at the earliest floor that applies to
-    // it, never at once. Every later slot first waits for the leader's relay to have left the air,
-    // then slots space out by half an airtime. peerRelayWait (turnaround + contention + airtime)
-    // is measured from t=0; when earliestMs is larger (LONG_FAST floor), the leader keys later, so
-    // clear time is earliestMs + airtime. Taking only peerRelayWait undercut the floor. When Phase
-    // 1 reserved slot 0 for a designated next hop, the ranked candidates follow that reservation
-    // instead. Last-hop backup waits for dest's ACK of the early last hop. A non-final flood slot
-    // waits for the named hop ahead of it, then airtime plus the nominated hop's carry wait.
+    // The leader must finish after its actual contention floor; using its nominal wait can undercut slow presets.
     uint32_t leaderWait = 2 * halfAirtime;
     if (router && router->getRadioInterface()) {
         leaderWait = airtimeMs + router->getRadioInterface()->getTxDelayMsecMaxAtUtil();
@@ -2663,8 +2156,8 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
     const uint32_t jitterRange = std::max(halfAirtime / 2, SR_MIN_TIE_BREAK_RANGE_MS);
     const uint32_t jitter = (((uint32_t)(myNode ^ p->id)) % jitterRange) + 1;
 
-    LOG_INFO("[SR] Uni slots 0x%08x to %s: half=%ums %u cands leader=%ums j=%dms",
-             p->id, destName, halfAirtime, srCount, leaderWait, (int)jitter);
+    LOG_INFO("[SR] Uni slots 0x%08x to %s: half=%ums %u cands leader=%ums j=%dms", p->id, destName, halfAirtime, srCount,
+             leaderWait, (int)jitter);
 
     uint8_t slotIndex = 0;
     int16_t mySlot = -1;
@@ -2710,8 +2203,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
             uint8_t namedSlot = mySlot > 0 ? (uint8_t)(mySlot - 1) : 0;
             totalDelay = (int64_t)srUnicastSlotDelayMs(slotDelay, namedSlot, earliestMs, leaderWait, halfAirtime);
             totalDelay += (int64_t)airtimeMs;
-            const NodeNum carryPeer = pendingUnicastNextHop != 0 ? pendingUnicastNextHop
-                                                                : pendingUnicastFlags.nominatedNextHop;
+            const NodeNum carryPeer = pendingUnicastNextHop != 0 ? pendingUnicastNextHop : pendingUnicastFlags.nominatedNextHop;
             totalDelay += (int64_t)nextHopCarryWaitMs(carryPeer, airtimeMs, p->rx_snr);
         } else {
             totalDelay = (int64_t)srUnicastSlotDelayMs(slotDelay, (uint8_t)mySlot, earliestMs, leaderWait, halfAirtime);
@@ -2736,8 +2228,8 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
 
     if (shouldRelay && relayerNamed && !weAreDesignatedHop && !pendingUnicastFlags.nonfinalFlood) {
         if (!namedBackupStampOk(pendingUnicastNextHop, heardFrom, p->next_hop, destination, nodeDB)) {
-            LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: backup has no next hop past 0x%02x",
-                     p->id, srcName, destName, p->next_hop);
+            LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: backup has no next hop past 0x%02x", p->id, srcName, destName,
+                     p->next_hop);
             pendingUnicastNextHop = 0;
             pendingUnicastFlags = {};
             return false;
@@ -2746,8 +2238,8 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
         pendingUnicastFlags.armedHopLimit = p->hop_limit;
     }
 
-    LOG_INFO("[SR-DEC] UNICAST %s 0x%08x %s->%s via %s (delay=%ums)",
-             shouldRelay ? "RELAY" : "SUPPRESS", p->id, srcName, destName, heardFromName, shouldRelay ? myDelay : 0u);
+    LOG_INFO("[SR-DEC] UNICAST %s 0x%08x %s->%s via %s (delay=%ums)", shouldRelay ? "RELAY" : "SUPPRESS", p->id, srcName,
+             destName, heardFromName, shouldRelay ? myDelay : 0u);
 
     if (shouldRelay) {
         pendingRelayDelayMs = myDelay;
@@ -2759,7 +2251,7 @@ bool SignalRoutingModule::shouldRelayUnicastForCoordination(const meshtastic_Mes
 
 bool SignalRoutingModule::capsLastHop(const meshtastic_MeshPacket *p)
 {
-    if (!routingGraph || !nodeDB) {
+    if (!p || !routingGraph || !nodeDB) {
         return false;
     }
     if (isBroadcast(p->to)) {
@@ -2774,7 +2266,6 @@ bool SignalRoutingModule::capsLastHop(const meshtastic_MeshPacket *p)
         return false;
     }
 
-    // Destination must be a direct neighbor confirmed to hear us.
     bool destIsDirectAndHearsUs = false;
     for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
         if (myEdges->edges[i].to == destination && myEdges->edges[i].hearsUs) {
@@ -2786,8 +2277,7 @@ bool SignalRoutingModule::capsLastHop(const meshtastic_MeshPacket *p)
         return false;
     }
 
-    // Only limit hops if at least one other direct neighbor is not SR-active (stock firmware).
-    // SR nodes suppress relays themselves via the slot-based algorithm.
+    // SR peers coordinate themselves; the reduced last-hop budget is needed only to restrain stock relays.
     bool hasStockNeighbor = false;
     for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
         NodeNum nb = myEdges->edges[i].to;
@@ -2804,44 +2294,32 @@ bool SignalRoutingModule::capsLastHop(const meshtastic_MeshPacket *p)
 
 bool SignalRoutingModule::shouldUseSignalBasedRouting(const meshtastic_MeshPacket *p)
 {
-    // This function only checks if SR is available and operational.
-    // All actual routing decisions are made in shouldRelay().
-
     if (!p || !signalBasedRoutingEnabled || !routingGraph || !nodeDB) {
         return false;
     }
 
-    // Update SR graph timestamps for any packet we process
     updateNodeActivityForPacketAndRelay(p);
 
-    // Don't use SR for packets addressed to us - let them be delivered normally
     if (!isBroadcast(p->to) && p->to == nodeDB->getNodeNum()) {
         return false;
     }
 
-    // For broadcasts: check if we have enough SR neighbors
     if (isBroadcast(p->to)) {
-        // Passive roles can still veto relays through shouldRelay
         if (!isActiveRoutingRole()) {
             return true;
         }
         return topologyHealthyForBroadcast();
     }
 
-    // For unicasts: SR is available if we have any neighbors and are active role
-    // shouldRelay() will handle unknown destinations and routing decisions
     if (!isActiveRoutingRole()) {
         return false;
     }
 
-    // Use SR for unicasts if we have topology (at least one SR neighbor)
-    // This allows shouldRelay() to make informed decisions about routing
     return topologyHealthyForBroadcast();
 }
 
 void SignalRoutingModule::commitRelay(PacketId packetId, NodeNum originalHeardFrom, uint32_t txDelayMs)
 {
-    // Don't add duplicates
     for (uint8_t i = 0; i < committedRelayCount; i++) {
         if (committedRelays[i].packetId == packetId)
             return;
@@ -2854,7 +2332,6 @@ void SignalRoutingModule::commitRelay(PacketId packetId, NodeNum originalHeardFr
     if (committedRelayCount < MAX_COMMITTED_RELAYS) {
         committedRelays[committedRelayCount++] = entry;
     } else {
-        // Overwrite oldest entry
         memmove(committedRelays, committedRelays + 1, (MAX_COMMITTED_RELAYS - 1) * sizeof(CommittedRelay));
         committedRelays[MAX_COMMITTED_RELAYS - 1] = entry;
     }
@@ -2866,8 +2343,7 @@ void SignalRoutingModule::observeForGraph(const meshtastic_MeshPacket &mp)
     if (!routingGraph || mp.via_mqtt) {
         return;
     }
-    // Same test the receive path uses: unset 0/0 refused; clipped RSSI=0 remapped to a strong
-    // sentinel so it is not stored as the Meshtastic "no reading" value.
+
     int32_t rxRssi = mp.rx_rssi;
     if (!NeighborGraph::normalizeRxSignal(rxRssi, mp.rx_snr)) {
         return;
@@ -2875,7 +2351,7 @@ void SignalRoutingModule::observeForGraph(const meshtastic_MeshPacket &mp)
     if (!isDirectPacket(mp)) {
         return;
     }
-    updateNeighborInfo(mp.from, rxRssi, mp.rx_snr, mp.rx_time);
+    updateNeighborInfo(mp.from, rxRssi, mp.rx_snr);
     routingGraph->clearDownstreamForDestination(mp.from);
 }
 
@@ -2948,15 +2424,11 @@ bool SignalRoutingModule::hasAnyHearsUsNeighbor() const
 
 void SignalRoutingModule::maybeScheduleBroadcastRetransmit(const meshtastic_MeshPacket *p)
 {
-    // Originated: the ladder that may carry this frame is other nodes' and we have not built a
-    // candidate set for it, so only the stock window bounds the wait. Erring short is the failure
-    // that matters here, and the stock worst case is the larger of the two at every preset until a
-    // ladder exists to compare against.
+    // An originator has not built its peers' ladder, so the stock worst case is its available insurance bound.
     scheduleT1Broadcast(p, 0, false, 0);
 }
 
-void SignalRoutingModule::armDeferredBroadcastRetransmit(const meshtastic_MeshPacket *p, uint32_t staggerMs,
-                                                         uint8_t ladderRungs)
+void SignalRoutingModule::armDeferredBroadcastRetransmit(const meshtastic_MeshPacket *p, uint32_t staggerMs, uint8_t ladderRungs)
 {
     scheduleT1Broadcast(p, staggerMs, true, ladderRungs);
 }
@@ -2970,89 +2442,71 @@ void SignalRoutingModule::scheduleT1Broadcast(const meshtastic_MeshPacket *p, ui
     if (!isBroadcast(p->to)) {
         return;
     }
-    // SR topology packets use their own interval-based scheduling; skip them
+
     if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
         p->decoded.portnum == meshtastic_PortNum_SIGNAL_ROUTING_APP) {
         return;
     }
-    // Originated broadcasts insure themselves; a relay we committed to needs no insurance (the
-    // relay is the copy). Everything else reaches here only through the deferred path.
+
     NodeNum myNode = nodeDB->getNodeNum();
     bool isOriginated = (p->from == 0 || p->from == myNode);
     if (!deferred && !isOriginated) {
         return;
     }
-    // A deferred copy is a relay: it needs a hop to spend.
+
     if (deferred && p->hop_limit == 0) {
         return;
     }
-    // Guard: when firing T1 we re-enter send(); prevent scheduling T2
+
     if (isRetransmitting) {
         return;
     }
-    // Respect config: T1 retransmit insurance may be disabled
-    if (!t1RetransmitEnabled) {
+
+    if (!signalBasedRoutingEnabled || !t1RetransmitEnabled) {
         return;
     }
-    // Require at least one confirmed relay neighbor (hearsUs = true)
+
     if (!hasAnyHearsUsNeighbor()) {
         LOG_DEBUG("[SR] No hearsUs neighbor: no T1 for 0x%08x", p->id);
         return;
     }
-    // Skip if this packet already has a slot (active or canceled) — prevents T2
+
     for (uint8_t i = 0; i < MAX_PENDING_RETRANSMITS; i++) {
         if (pendingRetransmits[i].packetId == p->id) {
             return;
         }
     }
-    // T1 delay = worst-case ROUTER_LATE window (SNR=+10 → CWsize=CWmax) + one packet airtime,
-    // ensuring every ROUTER_LATE node has had time to fire before we retransmit.
+
     uint32_t latestRelayWindowMs = 0;
     uint32_t airtimeMs = 0;
     if (router && router->getRadioInterface()) {
         latestRelayWindowMs = router->getRadioInterface()->getTxDelayMsecWeightedWorst(10.0f);
         airtimeMs = router->getRadioInterface()->getPacketTime(p);
     } else {
-        latestRelayWindowMs = 10000; // 10 s fallback
+        latestRelayWindowMs = 10000;
         airtimeMs = 500;
     }
-    // The ladder is the other thing that can still key up, and it is not bounded by the stock
-    // window: a rung is a half-airtime apart, so at a slow preset with a full-size frame the last
-    // rung passes the worst stock draw after a handful of candidates. Take whichever is later —
-    // these are floors on the same instant, so they compose by max, never by addition.
-    // Counted from the ladder itself, not estimated from the neighbour list. `ladderRungs` is the
-    // candidate set the ranking actually built — stock reservations already excluded, because the
-    // stock worst case above spans the window they sit in.
+    // Slow-preset relay ladders can outlast stock contention; insurance must wait for both.
     const uint32_t halfAirtimeMs = std::max(airtimeMs / 2, SR_MIN_RUNG_SPACING_MS);
-    const uint32_t ladderSpanMs =
-        ladderTransitionMs() + static_cast<uint32_t>(ladderRungs) * halfAirtimeMs;
+    const uint32_t ladderSpanMs = ladderTransitionMs() + static_cast<uint32_t>(ladderRungs) * halfAirtimeMs;
     if (ladderSpanMs > latestRelayWindowMs) {
         latestRelayWindowMs = ladderSpanMs;
     }
     uint32_t fireDelayMs = latestRelayWindowMs + airtimeMs + staggerMs;
 
-    // Allocate the copy before Router::send() encrypts the original in place
     meshtastic_MeshPacket *copy = packetPool.allocCopy(*p);
     if (!copy) {
         LOG_WARN("[SR] Pool exhausted: no T1 for 0x%08x", p->id);
         return;
     }
-    // The snapshot is taken before Router::send() strips want_ack from a broadcast, so the copy
-    // still carries a flag the wire never does. Firing it then re-enters ReliableRouter::send(),
-    // whose startRetransmission() calls stopRetransmission() first and so resets the originator's
-    // interval — which is why an insured broadcast went out four times, at +0, +2.8, +8.0 and
-    // +13.4 s, instead of twice. Clear it here, on the copy only: the flag is read from the
-    // original's pending record, which is untouched, so the implicit ACK to the phone still works.
+    // An ACK-requesting insurance copy would restart ReliableRouter retries and multiply broadcasts.
     copy->want_ack = false;
     if (deferred) {
-        // The originated and committed paths store a frame already prepared for TX; a deferred
-        // copy is the frame as received, so spend the hop here or receivers read our late copy as
-        // having travelled zero hops.
+        // Deferred copies have not yet spent their relay hop.
         copy->hop_limit--;
         copy->next_hop = NO_NEXT_HOP_PREFERENCE;
     }
 
-    // Find a free slot — prefer canceled/empty entries
     PendingRetransmit *slot = nullptr;
     for (uint8_t i = 0; i < MAX_PENDING_RETRANSMITS; i++) {
         if (pendingRetransmits[i].packetId == 0 || pendingRetransmits[i].canceled) {
@@ -3065,7 +2519,6 @@ void SignalRoutingModule::scheduleT1Broadcast(const meshtastic_MeshPacket *p, ui
         }
     }
     if (!slot) {
-        // All four slots simultaneously active — extremely rare given MAX_PENDING_RETRANSMITS = 4
         LOG_WARN("[SR] Retransmit slots full: no T1 for 0x%08x", p->id);
         packetPool.release(copy);
         return;
@@ -3076,11 +2529,10 @@ void SignalRoutingModule::scheduleT1Broadcast(const meshtastic_MeshPacket *p, ui
     slot->fireAfterMs = millis() + fireDelayMs;
     slot->canceled = false;
 
-    LOG_INFO("[SR] T1 for 0x%08x (%s) in %ums (win %ums + air %ums + stag %ums)",
-             p->id, deferred ? "deferred" : "originated", fireDelayMs, latestRelayWindowMs, airtimeMs, staggerMs);
+    LOG_INFO("[SR] T1 for 0x%08x (%s) in %ums (win %ums + air %ums + stag %ums)", p->id, deferred ? "deferred" : "originated",
+             fireDelayMs, latestRelayWindowMs, airtimeMs, staggerMs);
 
-    // Ensure runOnce() wakes up in time to fire the retransmit
-    setIntervalFromNow(fireDelayMs);
+    wakeWithin(fireDelayMs);
 }
 
 void SignalRoutingModule::cancelBroadcastRetransmit(PacketId packetId)
@@ -3192,7 +2644,7 @@ uint32_t SignalRoutingModule::namedForwardFollowupDelayMs(NodeNum nextHop, uint3
 {
     uint32_t carry = nextHopCarryWaitMs(nextHop, airtimeMs, rxSnr);
     uint32_t halfAirtime = std::max(airtimeMs / 2, SR_MIN_RUNG_SPACING_MS);
-    // Same leader wait as the unicast ranking; our own frame leaves the air within it too.
+
     uint32_t leaderWait = 2 * halfAirtime;
     if (router && router->getRadioInterface()) {
         leaderWait = airtimeMs + router->getRadioInterface()->getTxDelayMsecMaxAtUtil();
@@ -3200,8 +2652,7 @@ uint32_t SignalRoutingModule::namedForwardFollowupDelayMs(NodeNum nextHop, uint3
     leaderWait += SR_PEER_TURNAROUND_MS;
     const uint32_t ownTx = leaderWait;
     uint32_t earliestMs = ladderTransitionMs();
-    // A backup downstream of us has no destination-ACK floor: that floor applies only to the
-    // source's own frame.
+
     uint32_t slot1 = srUnicastSlotDelayMs(0, 1, earliestMs, leaderWait, halfAirtime);
     uint32_t slot1End = slot1 + std::max(halfAirtime / 2, SR_MIN_TIE_BREAK_RANGE_MS) + airtimeMs;
     return ownTx + std::max(carry, slot1End);
@@ -3213,24 +2664,16 @@ bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p,
         *uniqueNeighbor = 0;
     }
     if (!routingGraph || !nodeDB || !p) {
-        return false; // Can't evaluate — keep our relay
+        return false;
     }
 
-    // Resolve the dupe's relay node
     NodeNum dupeRelayer = 0;
     if (p->relay_node != 0) {
         dupeRelayer = resolveRelayIdentity(p->relay_node, p->rx_rssi, p->rx_snr);
         if (dupeRelayer == 0) {
-            // Try matching from our known neighbors
-            NodeNum myNode = nodeDB->getNodeNum();
-            const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
-            if (myEdges) {
-                for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
-                    if ((myEdges->edges[i].to & 0xFF) == p->relay_node && !isPlaceholderNode(myEdges->edges[i].to)) {
-                        dupeRelayer = myEdges->edges[i].to;
-                        break;
-                    }
-                }
+            dupeRelayer = resolveHeardFrom(p, p->from);
+            if (isPlaceholderNode(dupeRelayer)) {
+                dupeRelayer = 0;
             }
         }
     }
@@ -3265,8 +2708,6 @@ bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p,
     char relayerName[64];
     getNodeDisplayName(dupeRelayer, relayerName, sizeof(relayerName));
 
-    // Broadcast: accumulate all transmitters heard for this packet and check whether
-    // they collectively cover all our neighbors.
     CommittedRelay *relay = nullptr;
     for (uint8_t i = 0; i < committedRelayCount; i++) {
         if (committedRelays[i].packetId == p->id) {
@@ -3277,7 +2718,6 @@ bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p,
 
     NodeNum originalHeardFrom = relay ? relay->originalHeardFrom : 0;
 
-    // Add dupeRelayer to the accumulated set if not already present
     if (relay && dupeRelayer != 0 && dupeRelayer != myNode) {
         bool alreadyTracked = false;
         for (uint8_t i = 0; i < relay->heardTransmitterCount; i++) {
@@ -3288,15 +2728,13 @@ bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p,
         }
         if (!alreadyTracked && relay->heardTransmitterCount < MAX_HEARD_TRANSMITTERS) {
             relay->heardTransmitters[relay->heardTransmitterCount++] = dupeRelayer;
-            LOG_INFO("[SR] pkt=0x%08x: accumulated transmitter %s (%u total)",
-                      p->id, relayerName, relay->heardTransmitterCount);
+            LOG_INFO("[SR] pkt=0x%08x: accumulated transmitter %s (%u total)", p->id, relayerName, relay->heardTransmitterCount);
         } else if (!alreadyTracked) {
-            LOG_INFO("[SR] pkt=0x%08x: transmitter table full (%u), cannot add %s",
-                      p->id, relay->heardTransmitterCount, relayerName);
+            LOG_INFO("[SR] pkt=0x%08x: transmitter table full (%u), cannot add %s", p->id, relay->heardTransmitterCount,
+                     relayerName);
         }
     }
 
-    // Build coveredBy: originalHeardFrom + all accumulated transmitters
     NodeNum coveredBy[1 + MAX_HEARD_TRANSMITTERS];
     uint8_t coveredByCount = 0;
     if (originalHeardFrom != 0 && originalHeardFrom != myNode) {
@@ -3311,22 +2749,17 @@ bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p,
         }
     }
 
-    // One rule for whose neighbour it is: confirmation or ownership, then covers() for whether a
-    // copy from us would arrive. The separate stock-coverage election this used to consult is gone.
     NeighborGraph::CoveragePolicy policy = coveragePolicy();
-    NodeNum uniqueFor = routingGraph->uniqueCoverageNeighbor(myNode, coveredBy, coveredByCount,
-                                                             cfgPoorLinkEtxThreshold, &policy);
+    NodeNum uniqueFor = routingGraph->uniqueCoverageNeighbor(myNode, coveredBy, coveredByCount, cfgPoorLinkEtxThreshold, &policy);
     bool unique = uniqueFor != 0;
     if (uniqueNeighbor) {
         *uniqueNeighbor = uniqueFor;
     }
 
     if (unique) {
-        LOG_INFO("[SR] Bcast dupe 0x%08x from %s: %u TX, keeping",
-                  p->id, relayerName, coveredByCount);
+        LOG_INFO("[SR] Bcast dupe 0x%08x from %s: %u TX, keeping", p->id, relayerName, coveredByCount);
     } else {
-        LOG_INFO("[SR] Bcast dupe 0x%08x from %s: %u TX cover all",
-                 p->id, relayerName, coveredByCount);
+        LOG_INFO("[SR] Bcast dupe 0x%08x from %s: %u TX cover all", p->id, relayerName, coveredByCount);
     }
 
     return !unique;
@@ -3334,47 +2767,40 @@ bool SignalRoutingModule::areAllNeighborsCovered(const meshtastic_MeshPacket *p,
 
 bool SignalRoutingModule::shouldRelay(const meshtastic_MeshPacket *p)
 {
+    pendingRelayDelayMs = 0;
+    pendingUnicastNextHop = 0;
+    pendingUnicastFlags = {};
+    if (!p) {
+        return false;
+    }
     if (!routingGraph || !nodeDB) {
-        return true;  // Default to relay if SR unavailable
+        return true;
     }
 
-    // For broadcasts, use the existing broadcast relay logic
     if (isBroadcast(p->to)) {
         return shouldRelayBroadcast(p);
     }
 
-    // === UNICAST RELAY DECISION ===
-    // All unicast routing logic is now consolidated here
-
     char destName[64], senderName[64];
     getNodeDisplayName(p->to, destName, sizeof(destName));
     getNodeDisplayName(p->from, senderName, sizeof(senderName));
-    LOG_INFO("[SR] Considering unicast relay 0x%08x %s to %s (hl=%d)",
-             p->id, senderName, destName, p->hop_limit);
+    LOG_INFO("[SR] Considering unicast relay 0x%08x %s to %s (hl=%d)", p->id, senderName, destName, p->hop_limit);
 
-    // Check if destination is reachable through SR topology
     if (!topologyHealthyForUnicast(p->to)) {
         const uint8_t ourByte = nodeDB->getLastByteOfNodeNum(nodeDB->getNodeNum());
         const uint8_t destByte = nodeDB->getLastByteOfNodeNum(p->to);
         const bool namedForeignNextHop =
             p->next_hop != NO_NEXT_HOP_PREFERENCE && p->next_hop != destByte && p->next_hop != ourByte;
-        const bool weAreDesignated =
-            p->next_hop != NO_NEXT_HOP_PREFERENCE && p->next_hop == ourByte;
+        const bool weAreDesignated = p->next_hop != NO_NEXT_HOP_PREFERENCE && p->next_hop == ourByte;
         const bool knownInNodeDb = nodeDB->getMeshNode(p->to) != nullptr;
         const bool knownDownstream = routingGraph->isDownstream(p->to);
 
-        // A foreign next_hop already owns slot 0 — hand to coordination (named-backup stamp gate).
-        // Designated with no route falls through for NO_ROUTE NACK. Undesignated known dests use
-        // broadcast unique coverage (not delay-0 flood).
         if (namedForeignNextHop && (knownInNodeDb || knownDownstream)) {
-            LOG_INFO("[SR-DEC] UNICAST DEFER 0x%08x %s->%s: named next_hop 0x%02x, no SR route yet",
-                     p->id, senderName, destName, p->next_hop);
-            // Fall through to shouldRelayUnicastForCoordination.
+            LOG_INFO("[SR-DEC] UNICAST DEFER 0x%08x %s->%s: named next_hop 0x%02x, no SR route yet", p->id, senderName, destName,
+                     p->next_hop);
         } else if (weAreDesignated) {
-            // Fall through — coordination NACKs when there is still no stampable hop.
         } else if (knownInNodeDb || knownDownstream) {
-            LOG_INFO("[SR-DEC] UNICAST FLOOD-COVER 0x%08x: %s to %s, no stampable route yet", p->id,
-                     senderName, destName);
+            LOG_INFO("[SR-DEC] UNICAST FLOOD-COVER 0x%08x: %s to %s, no stampable route yet", p->id, senderName, destName);
             return shouldRelayBroadcast(p, true);
         } else {
             LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: unknown destination", p->id, senderName, destName);
@@ -3384,8 +2810,6 @@ bool SignalRoutingModule::shouldRelay(const meshtastic_MeshPacket *p)
 
     NodeNum sourceNode = p->from;
 
-    // Resolve placeholder for the direct sender before the relay decision so connectivity
-    // checks have accurate node identity. handleReceived() also does this, but runs after shouldRelay().
     if (isDirectPacket(*p) && p->relay_node != 0) {
         uint8_t relayByte = p->relay_node;
         NodeNum placeholderId = getPlaceholderForRelay(relayByte);
@@ -3399,13 +2823,11 @@ bool SignalRoutingModule::shouldRelay(const meshtastic_MeshPacket *p)
 
     NodeNum heardFrom = resolveHeardFrom(p, sourceNode);
 
-    // If we heard directly from source, check if next hop already has the packet
     if (heardFrom == sourceNode) {
         NodeNum nextHop = getNextHop(p->to, sourceNode, heardFrom, false);
         if (nextHop != 0 && nextHop != nodeDB->getNodeNum()) {
-            // Check if source and next hop are neighbors
             bool nextHopHeardFromSource = false;
-            const NodeEdges* sourceEdges = routingGraph->getEdgesFrom(sourceNode);
+            const NodeEdges *sourceEdges = routingGraph->getEdgesFrom(sourceNode);
             if (sourceEdges) {
                 for (uint8_t i = 0; i < sourceEdges->edgeCount; i++) {
                     if (sourceEdges->edges[i].to == nextHop) {
@@ -3415,7 +2837,7 @@ bool SignalRoutingModule::shouldRelay(const meshtastic_MeshPacket *p)
                 }
             }
             if (!nextHopHeardFromSource) {
-                const NodeEdges* nextHopEdges = routingGraph->getEdgesFrom(nextHop);
+                const NodeEdges *nextHopEdges = routingGraph->getEdgesFrom(nextHop);
                 if (nextHopEdges) {
                     for (uint8_t i = 0; i < nextHopEdges->edgeCount; i++) {
                         if (nextHopEdges->edges[i].to == sourceNode) {
@@ -3428,53 +2850,42 @@ bool SignalRoutingModule::shouldRelay(const meshtastic_MeshPacket *p)
             if (nextHopHeardFromSource) {
                 char nextHopName[64];
                 getNodeDisplayName(nextHop, nextHopName, sizeof(nextHopName));
-                // The designated next-hop is a graph-neighbor of the source, so it probably
-                // heard the same transmission we did. But topology inference is not the same
-                // as confirmed RF reception: if the next-hop misses this particular frame
-                // (asymmetric/marginal link, collision, busy RX), the packet is lost unless
-                // someone defers a backup relay. Hand off to coordination with a hint to
-                // wait long enough for the next-hop's slot 0 to fire first; if we overhear
-                // its retransmission, perhapsCancelDupe() will cancel our queued relay.
-                //
-                // Suppress outright only when we cannot add value: hop_limit==0 means we
-                // can't relay at all, and hop_limit==1 with no direct edge to destination
-                // means our one-hop relay can't reach the destination either.
+                // Topology cannot prove receipt of this frame; marginal links still require a delayed backup.
                 bool canReachDestDirectly = hasDirectConnectivity(nodeDB->getNodeNum(), p->to);
                 if (p->hop_limit == 0 || (p->hop_limit <= 1 && !canReachDestDirectly)) {
-                    LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: %s heard source, no headroom (hl=%u, dir=%d)",
-                             p->id, senderName, destName, nextHopName, p->hop_limit, canReachDestDirectly);
+                    LOG_INFO("[SR-DEC] UNICAST SUPPRESS 0x%08x %s->%s: %s heard source, no headroom (hl=%u, dir=%d)", p->id,
+                             senderName, destName, nextHopName, p->hop_limit, canReachDestDirectly);
                     return false;
                 }
-                LOG_INFO("[SR-DEC] UNICAST DEFER 0x%08x %s->%s: %s likely has it, backup scheduled",
-                         p->id, senderName, destName, nextHopName);
-                // Fall through to coordination — it will assign us a non-zero slot.
+                LOG_INFO("[SR-DEC] UNICAST DEFER 0x%08x %s->%s: %s likely has it, backup scheduled", p->id, senderName, destName,
+                         nextHopName);
             }
         }
     }
 
-    // Use the contention-based unicast relay coordination
     return shouldRelayUnicastForCoordination(p);
 }
 
 bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, bool unicastFloodCoverage)
 {
-    if (!routingGraph || !nodeDB) {
-        return true;
+    pendingRelayDelayMs = 0;
+    pendingUnicastNextHop = 0;
+    pendingUnicastFlags = {};
+    if (!p) {
+        return false;
+    }
+    if (!p || !routingGraph || !nodeDB) {
+        return p != nullptr;
     }
 
-    // Skip SR processing entirely for packets we sent (detected as rebroadcasts)
-    // This prevents processing our own packets that come back to us
     NodeNum ourNode = nodeDB->getNodeNum();
-    uint32_t currentTime = millis() / 1000;
+    uint32_t currentTime = nowSeconds();
     if (routingGraph->hasNodeTransmitted(ourNode, p->id, currentTime)) {
         LOG_INFO("[SR] Skipping relay decision for rebroadcast of our packet %08x", p->id);
-        return false; // Don't relay our own rebroadcasted packets
+        return false;
     }
 
-    // Special handling for unicast packets being relayed with SR coordination
     if (!isBroadcast(p->to) && !unicastFloodCoverage) {
-        // This is a unicast packet being relayed with SR coordination
-        // Relay decision should be based on our ability to reach the destination
         return shouldRelayUnicastForCoordination(p);
     }
 
@@ -3482,20 +2893,14 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, b
         return false;
     }
 
-    // Compute packet received timestamp once for all SignalRouting operations
-    uint32_t packetReceivedTimestamp = millis() / 1000;
+    uint32_t packetReceivedTimestamp = nowSeconds();
 
-    // Only access decoded fields if packet is actually decoded
     if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
         p->decoded.portnum == meshtastic_PortNum_SIGNAL_ROUTING_APP) {
-        preProcessSignalRoutingPacket(p, packetReceivedTimestamp);
+        preProcessSignalRoutingPacket(p);
     }
 
-    // Now check if our topology is healthy for making relay decisions.
-    // If not healthy the relay goes out unranked: delivering everywhere outranks saving a packet
-    // when the graph cannot say who else is covered. Say so — silently returning true left a
-    // capture showing a relay with no decision behind it, indistinguishable from one the ranking
-    // chose, and that cost a field diagnosis twice.
+    // Thin topology cannot justify suppressing a copy needed for delivery.
     if (!topologyHealthyForBroadcast()) {
         LOG_INFO("[SR] Relay 0x%08x unranked: topology too thin to judge, direct=%u", p->from,
                  (unsigned)(routingGraph ? routingGraph->countDirectNeighbors() : 0));
@@ -3506,62 +2911,41 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, b
     NodeNum sourceNode = p->from;
     NodeNum heardFrom = resolveHeardFrom(p, sourceNode);
 
-    // Downstream awareness: check if WE are the recorded relay for the source or destination
     NodeNum relayForSource = routingGraph->getDownstreamRelay(sourceNode);
     NodeNum relayForDest = routingGraph->getDownstreamRelay(p->to);
     bool weAreRelayForSource = (relayForSource != 0 && relayForSource == myNode);
     bool weAreRelayForDest = (relayForDest != 0 && relayForDest == myNode);
     size_t downstreamCount = (weAreRelayForSource || weAreRelayForDest) ? routingGraph->getDownstreamCountForRelay(myNode) : 0;
 
-    uint32_t relayDecisionTime = packetReceivedTimestamp; // Use the packet received timestamp computed above
+    uint32_t relayDecisionTime = packetReceivedTimestamp;
 
-    // === Slot-based relay coordination ===
-    // Rank all relay candidates and assign time slots spaced by half the packet
-    // airtime.  Each node independently computes the same ordering, picks its
-    // own slot, and schedules TX.  If it hears a relay (dupe) before its slot
-    // fires, existing dupe suppression cancels the queued TX.
-
-    // Half-airtime slot spacing: long enough for busyRx detection, short enough
-    // for fast propagation.
-    uint32_t halfAirtime = SR_FALLBACK_HALF_AIRTIME_MS; // safe default
+    uint32_t halfAirtime = SR_FALLBACK_HALF_AIRTIME_MS;
     if (router && router->getRadioInterface()) {
         uint32_t airtime = router->getRadioInterface()->getPacketTime(p);
         halfAirtime = std::max(airtime / 2, SR_MIN_RUNG_SPACING_MS);
     }
 
-    // What the coverage rules need to know about roles, in one place.
     NeighborGraph::CoveragePolicy coveragePolicy = this->coveragePolicy();
 
-    // Build coverage sets.
-    // Pre-cover nodes that can hear heardFrom (their published lists), not nodes heardFrom
-    // hears. Poor-quality links stay uncovered so a better local copy still gets a slot.
-    // Three NodeSets live here and each is 196 bytes (48 node ids plus a count), which is the
-    // bulk of this function's stack frame -- and this function sits on the deepest call chain on
-    // a thread with a 4 KB stack. They are static and explicitly cleared: unlike a local, a static
-    // keeps last call's contents, so the clear is what makes each call start empty. Safe because
-    // the relay decision runs only on the loop thread and never re-enters itself.
+    // Static scratch sets protect the 4 KB loop stack; relay decisions are serialized and nonrecursive.
     static NodeSet alreadyCovered;
     alreadyCovered.clear();
-    // Pre-coverage: who can hear heardFrom, from their published lists — not whom heardFrom
-    // hears. A copy already on the air uses covers() only; ownership is who *would* carry a
-    // silent neighbour, not evidence this frame reached them.
+    // Ownership predicts a future relay; it does not prove receipt of a frame already on air.
     alreadyCovered.insert(sourceNode);
     alreadyCovered.insert(heardFrom);
     {
         static NodeNum reached[NODE_SET_MAX];
-        size_t n = routingGraph->getCoverageIfRelays(heardFrom, reached, NODE_SET_MAX, nullptr, 0, myNode,
-                                                     &coveragePolicy, /*includeOwned=*/false);
+        size_t n =
+            routingGraph->getCoverageIfRelays(heardFrom, reached, NODE_SET_MAX, nullptr, 0, myNode, &coveragePolicy, false);
         for (size_t i = 0; i < n; i++) {
             alreadyCovered.insert(reached[i]);
         }
     }
 
-    // Build candidates: our direct SR-active neighbors (plus stock routers handled in Phase 1)
     static NodeSet candidates;
     candidates.clear();
     const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
 
-    // Log any of our own neighbors excluded from pre-coverage due to a hopeless delivery link
     const NodeEdges *heardFromEdges = routingGraph->getEdgesFrom(heardFrom);
     if (myEdges && heardFromEdges) {
         for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
@@ -3573,8 +2957,8 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, b
                 if (heardFromEdges->edges[j].to == myNeighbor) {
                     char neighborName[32];
                     getNodeDisplayName(myNeighbor, neighborName, sizeof(neighborName));
-                    LOG_INFO("[SR] Pre-coverage: %s excluded (ETX=%.1f >= %.1f)",
-                              neighborName, heardFromEdges->edges[j].getEtx(), cfgPoorLinkEtxThreshold);
+                    LOG_INFO("[SR] Pre-coverage: %s excluded (ETX=%.1f >= %.1f)", neighborName, heardFromEdges->edges[j].getEtx(),
+                             cfgPoorLinkEtxThreshold);
                     break;
                 }
             }
@@ -3586,73 +2970,37 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, b
             if (neighbor == heardFrom || neighbor == sourceNode || !myEdges->edges[i].hearsUs) {
                 continue;
             }
-            // Only include SR-active nodes and stock routers (stock routers are handled/removed in Phase 1)
+
             if (getCapabilityStatus(neighbor) != CapabilityStatus::SRactive && !isImmediateRelayRouter(neighbor)) {
                 continue;
             }
             candidates.insert(neighbor);
         }
     }
-    // Add ourselves
+
     candidates.insert(myNode);
 
-    // Also add SR-active co-listeners that can hear heardFrom (for stock gateway case)
-    if (myEdges) {
-        for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
-            NodeNum neighbor = myEdges->edges[i].to;
-            if (neighbor == heardFrom || neighbor == sourceNode || !myEdges->edges[i].hearsUs) {
-                continue;
-            }
-            if (getCapabilityStatus(neighbor) != CapabilityStatus::SRactive) {
-                continue;
-            }
-            const NodeEdges *neighborEdges = routingGraph->getEdgesFrom(neighbor);
-            if (neighborEdges) {
-                for (uint8_t j = 0; j < neighborEdges->edgeCount; j++) {
-                    if (neighborEdges->edges[j].to == heardFrom) {
-                        candidates.insert(neighbor);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
     bool preferHighNodeId = (p->id & 1) != 0;
-    // Positions are placed by rule, not spaced by one constant. A reservation takes a slot time
-    // inside the stock-router window, because it orders our *expectation* of a hardware-seeded draw
-    // we cannot compute; a rung of ours is a real transmit time and takes a half-airtime on the
-    // ladder past the transition. The window is the slots immediately below stock's own
-    // router/contention boundary, derived from the two figures the radio already publishes rather
-    // than restating CWmax here. With no radio the window is empty and every position falls on the
-    // ladder, which is the behaviour this replaced.
+    // Stock reservations estimate hardware-seeded timing; SR rungs schedule actual transmissions.
     uint32_t slotTimeMs = 0;
     uint32_t relayFloorMs = 0;
     if (router && router->getRadioInterface()) {
         slotTimeMs = router->getRadioInterface()->getSlotTimeMsec();
         relayFloorMs = router->getRadioInterface()->getRelayFloorMsec();
     }
-    const uint8_t windowPositions = (slotTimeMs > 0 && relayFloorMs > slotTimeMs)
-                                        ? static_cast<uint8_t>(relayFloorMs / slotTimeMs - 1)
-                                        : 0;
+    const uint8_t windowPositions =
+        (slotTimeMs > 0 && relayFloorMs > slotTimeMs) ? static_cast<uint8_t>(relayFloorMs / slotTimeMs - 1) : 0;
     SrPositionAllocator positions(slotTimeMs, halfAirtime, ladderTransitionMs(), windowPositions);
     bool shouldRelay = false;
     uint32_t myDelay = 0;
     const char *decisionReason = "no unique coverage";
-    // Transmissions we expect ahead of ours, stock routers included. Zero means the ranking
-    // handed out no slot at all, so nothing is expected for a late copy to stand in for.
+
     uint8_t slotsGiven = 0;
-    // Stock rebroadcasters hold the earliest slots, so they also come first on the insurance
-    // ladder: our rung is their count plus our place among the SR peers. Counting only the SR
-    // peers put two insurers on the same rung whenever a stock rebroadcaster was present.
+    // Insurance ordering must include earlier stock positions or different insurers can share a rung.
     uint8_t stockCandidates = 0;
-    // How many of slotsGiven are reserved positions held by stock routers rather than rungs held
-    // by ranked SR peers. Two different reasons to stay quiet — one expects a node we do not
-    // coordinate with and whose firing time we cannot compute, the other a node we do — and one
-    // merged reason string cannot say which, so removing the reservation would be invisible.
+
     uint8_t reservedSlots = 0;
-    // Coverage taken off the table by copies already on the air, and by whom. Planned later
-    // slots do not absorb; a heard dupe does.
+
     uint16_t absorbedTotal = 0;
     NodeNum absorbedBy[4] = {0, 0, 0, 0};
     uint8_t absorbedCredit[4] = {0, 0, 0, 0};
@@ -3667,19 +3015,12 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, b
         }
     };
 
-
-    // Deterministic per-packet tie-break for our own rung, strictly positive and no larger than
-    // the range. Two nodes that computed the same rung are separated by this and nothing else, and
-    // the broadcast ladder had none at all — so a pair that ranked a packet alike keyed up in the
-    // same instant, where neither copy cancels the other. Strictly positive rather than centred on
-    // zero, so a rung is never pulled ahead of its own position and into the window it sits behind.
+    // Peers can compute the same rung; positive jitter separates them without advancing either ahead of its floor.
     const uint32_t rungJitterRange = std::max(halfAirtime / 2, SR_MIN_TIE_BREAK_RANGE_MS);
     const uint32_t rungJitter = (((uint32_t)(myNode ^ p->id)) % rungJitterRange) + 1;
 
-    // We are always a candidate, so a count of one means nobody else here can carry this frame.
     uint16_t initialCandidates = candidates.count;
 
-    // Phase 1: Assign first slots to stock routers (they transmit regardless)
     if (myEdges) {
         for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
             NodeNum neighbor = myEdges->edges[i].to;
@@ -3690,10 +3031,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, b
                 continue;
             }
 
-            // Only reserve a slot if the stock router can hear the transmitter.
-            // We infer this from Mirrored edges added when we observe the stock
-            // router relay packets from that node.  Without evidence it heard
-            // the packet, the slot would be wasted and just delays our own TX.
+            // A stock router that missed this frame cannot justify delaying our copy.
             const NodeEdges *stockEdges = routingGraph->getEdgesFrom(neighbor);
             bool canHearTransmitter = false;
             if (stockEdges) {
@@ -3717,8 +3055,8 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, b
             if (routingGraph->hasNodeTransmitted(neighbor, p->id, currentTime)) {
                 uint16_t before = alreadyCovered.count;
                 static NodeNum stockReached[NODE_SET_MAX];
-                size_t n = routingGraph->getCoverageIfRelays(neighbor, stockReached, NODE_SET_MAX, nullptr, 0,
-                                                             myNode, &coveragePolicy, /*includeOwned=*/false);
+                size_t n = routingGraph->getCoverageIfRelays(neighbor, stockReached, NODE_SET_MAX, nullptr, 0, myNode,
+                                                             &coveragePolicy, false);
                 for (size_t i = 0; i < n; i++) {
                     alreadyCovered.insert(stockReached[i]);
                 }
@@ -3734,15 +3072,12 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, b
         }
     }
 
-    // The SR peers that took part in the ranking: the insurance ladder is sized from this set.
     static NodeSet srPeers;
     srPeers = candidates;
 
-
     auto absorbRelayCoverage = [&](NodeNum relay) {
         uint16_t before = alreadyCovered.count;
-        // Same set the ranking admitted: who hears this relay (their lists), plus silent
-        // neighbours it owns. A TX that already happened uses covers() alone instead.
+
         static NodeNum cov[NODE_SET_MAX];
         size_t n = routingGraph->getCoverageIfRelays(relay, cov, NODE_SET_MAX, nullptr, 0, myNode, &coveragePolicy);
         for (size_t i = 0; i < n; i++) {
@@ -3752,17 +3087,11 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, b
         noteAbsorbed(relay, before);
     };
 
-    // Phase 2 snapshot for the scheduling line: whom we uniquely reach before ranking (unc=),
-    // and each candidate's (unique/total, cost bucket) at that moment (cand=). Logged once the
-    // decision is final so via=/slots= are known. Six unc= entries, not three: a shorter list is
-    // a prefix of each node's edge order, so two captures cannot tell a real disagreement from
-    // two truncations of the same set.
     static constexpr uint8_t UNCOVERED_LOG = 6;
     static constexpr uint8_t EVALUATED_LOG = 4;
     NodeNum uncovered[UNCOVERED_LOG];
     uint8_t uncoveredLen = 0;
     {
-        // Static for the same reason as allPacked above: 192 bytes each, on the deepest chain.
         static NodeNum mine[NODE_SET_MAX];
         size_t n = routingGraph->getCoverageIfRelays(myNode, mine, NODE_SET_MAX, nullptr, 0, myNode, &coveragePolicy);
         for (size_t i = 0; i < n && uncoveredLen < UNCOVERED_LOG; i++) {
@@ -3785,8 +3114,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, b
             continue;
         }
         static NodeNum cov[NODE_SET_MAX];
-        size_t total =
-            routingGraph->getCoverageIfRelays(cand, cov, NODE_SET_MAX, nullptr, 0, myNode, &coveragePolicy);
+        size_t total = routingGraph->getCoverageIfRelays(cand, cov, NODE_SET_MAX, nullptr, 0, myNode, &coveragePolicy);
         size_t unique = 0;
         float costSum = 0.0f;
         size_t validCosts = 0;
@@ -3813,8 +3141,6 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, b
     uint16_t preCoveredAtRank = alreadyCovered.count;
     uint16_t candidatesAtRank = candidates.count;
 
-    // Park non-ROUTER SR candidates. Early-window rungs are ROUTER-only; everyone else waits past
-    // stock reservations and SR ROUTER early slots on the late ladder.
     static NodeSet lateCandidates;
     lateCandidates.clear();
     for (uint16_t i = 0; i < candidates.count;) {
@@ -3830,8 +3156,8 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, b
 
     auto placePhase = [&](NodeSet &pool, bool early) {
         while (!pool.empty()) {
-            RelayCandidate best = routingGraph->findBestRelayCandidate(pool, alreadyCovered, currentTime, p->id,
-                                                                       preferHighNodeId, sourceNode, myNode, &coveragePolicy);
+            RelayCandidate best = routingGraph->findBestRelayCandidate(pool, alreadyCovered, currentTime, p->id, preferHighNodeId,
+                                                                       sourceNode, myNode, &coveragePolicy);
             if (best.nodeId == 0) {
                 break;
             }
@@ -3850,64 +3176,40 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, b
                 myDelay = rung + rungJitter;
                 mySlotIndex = slotsGiven;
                 decisionReason = "SR slot assignment";
-                LOG_INFO("[SR] Slot %ums: US (%08x)%s j=%ums", myDelay, myNode, best.tier > 0 ? " (bidi)" : "",
-                         rungJitter);
+                LOG_INFO("[SR] Slot %ums: US (%08x)%s j=%ums", myDelay, myNode, best.tier > 0 ? " (bidi)" : "", rungJitter);
                 break;
             }
 
             LOG_INFO("[SR] Slot %ums: SR node %08x (coverage=%u/%u, cost=%.2f%s)", rung, best.nodeId, best.coverageCount,
                      best.totalCoverage, best.getAvgCost(), best.tier > 0 ? ", bidi" : "");
             slotsGiven++;
-            // Ranked ahead of us, not yet on the air: they get a slot. Unique is vs the
-            // transmitter (and copies already heard). If they never transmit, our later rung
-            // still fires.
+            // An assigned slot is no proof of coverage; our later rung must survive a silent candidate.
         }
     };
 
-    // Phase 2a: SR ROUTER early-window rungs; Phase 2b: every other SR-active role late.
     placePhase(candidates, true);
     if (!shouldRelay) {
         placePhase(lateCandidates, false);
     }
 
-    // Phase 3: Force relay if we are the recorded downstream relay for source
     if (!shouldRelay && (weAreRelayForSource || weAreRelayForDest)) {
         NodeNum forcedFor = weAreRelayForSource ? sourceNode : p->to;
-        LOG_INFO("[SR-DEC] BROADCAST RELAY (forced) 0x%08x: for %08x (down=%u)",
-                 p->id, forcedFor, static_cast<unsigned int>(downstreamCount));
+        LOG_INFO("[SR-DEC] BROADCAST RELAY (forced) 0x%08x: for %08x (down=%u)", p->id, forcedFor,
+                 static_cast<unsigned int>(downstreamCount));
         shouldRelay = true;
         myDelay = positions.firstFreeMs() + rungJitter;
         decisionReason = "downstream relay override";
     }
 
-    // Phase 6: sole candidate. Nobody else here can carry the frame, so there is nothing to
-    // coordinate and our copy is the only witness its transmitter can ever get — the signal a
-    // want_ack sender turns into its implicit ACK. This is also the state a node is in before
-    // it has classified any neighbour, where behaving like a plain rebroadcaster is right.
-    // Undesignated unicast floods skip this: empty unique coverage means stay silent (no flood
-    // NACKs; originator recovers via want_ack / MAX_RETRANSMIT).
+    // The sole broadcast copy is also the sender's implicit delivery acknowledgement.
     if (!unicastFloodCoverage && !shouldRelay && initialCandidates <= 1) {
         shouldRelay = true;
-        // Sole candidate by our own reckoning, which another node may not share: keep the
-        // tie-break so two nodes that both believe they are alone are still separated.
+        // Other nodes may also believe they are alone, so separation is still necessary.
         myDelay = positions.firstFreeMs() + rungJitter;
         decisionReason = "sole candidate";
     }
 
-    // Nobody had coverage to offer, and the originator is waiting to be told its message reached
-    // the mesh. Stock's only delivery confirmation for a broadcast is hearing somebody rebroadcast
-    // it, so suppressing every copy removes the signal it depends on and it retransmits into
-    // silence — the phone reports a failure for a message that in fact arrived everywhere.
-    //
-    // The ranking cannot answer this: it drops a candidate with no unique coverage, because the
-    // cost it ranks on is the mean delivery cost over the unique targets and there is nothing to
-    // price. So this is a second pass with its own price, run only when the ladder came out empty.
-    //
-    // Scoped to a text message that arrived straight from its originator: that is the class whose
-    // delivery a person is shown, and a frame that reached us through a relay was rebroadcast by
-    // definition, so its originator already has its confirmation.
-    // Unicast floods with no path stay silent when coverage is empty — no ack pass (originator
-    // recovers via want_ack / MAX_RETRANSMIT). Broadcast text still answers the sender.
+    // Direct broadcast text still needs an implicit ACK even when every neighbor is already covered.
     if (!unicastFloodCoverage && !shouldRelay && slotsGiven == 0 &&
         p->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
         p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP && isDirectPacket(*p)) {
@@ -3925,16 +3227,11 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, b
     getNodeDisplayName(sourceNode, sourceName, sizeof(sourceName));
     getNodeDisplayName(heardFrom, heardFromName, sizeof(heardFromName));
 
-    // A suppression for a reserved stock router is a different fact from one for a ranked SR
-    // peer: the first expects a node whose schedule we cannot compute, the second a node we
-    // coordinate with. Distinguish them, or the reservation's effect cannot be read from a log.
     if (!shouldRelay && reservedSlots > 0) {
         decisionReason = "stock router expected";
     }
 
-    // One scheduling line with unc= (whom we uniquely reached before ranking) and cand= (each
-    // candidate's unique/total and cost bucket). Without these a capture cannot attribute a
-    // RELAY/SUPPRESS disagreement between two nodes that held the same graph.
+    // These diagnostics distinguish graph disagreement from scheduling disagreement.
     const char *viaTag = "";
     if (strcmp(decisionReason, "SR slot assignment") == 0) {
         viaTag = ", via=rank";
@@ -3946,9 +3243,8 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, b
         viaTag = ", via=ack";
     }
     char sched[544];
-    int sp = snprintf(sched, sizeof(sched),
-                      "[SR] Slot scheduling 0x%08x: halfAirtime=%ums, candidates=%u, pre=%u", p->id, halfAirtime,
-                      (unsigned)candidatesAtRank, (unsigned)preCoveredAtRank);
+    int sp = snprintf(sched, sizeof(sched), "[SR] Slot scheduling 0x%08x: halfAirtime=%ums, candidates=%u, pre=%u", p->id,
+                      halfAirtime, (unsigned)candidatesAtRank, (unsigned)preCoveredAtRank);
     if (sp > 0 && uncoveredLen > 0 && (size_t)sp < sizeof(sched)) {
         sp += snprintf(sched + sp, sizeof(sched) - (size_t)sp, ", unc=");
         for (uint8_t i = 0; i < uncoveredLen && sp > 0 && (size_t)sp < sizeof(sched); i++) {
@@ -3956,19 +3252,20 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, b
         }
     }
     if (sp > 0 && (size_t)sp < sizeof(sched)) {
-        sp += snprintf(sched + sp, sizeof(sched) - (size_t)sp, ", slot=%u, slots=%u", (unsigned)mySlotIndex,
-                       (unsigned)slotsGiven);
+        sp +=
+            snprintf(sched + sp, sizeof(sched) - (size_t)sp, ", slot=%u, slots=%u", (unsigned)mySlotIndex, (unsigned)slotsGiven);
         if (reservedSlots > 0) {
             sp += snprintf(sched + sp, sizeof(sched) - (size_t)sp, "(res=%u)", (unsigned)reservedSlots);
         }
-        sp += snprintf(sched + sp, sizeof(sched) - (size_t)sp, "%s", viaTag);
+        if (sp > 0 && (size_t)sp < sizeof(sched)) {
+            sp += snprintf(sched + sp, sizeof(sched) - (size_t)sp, "%s", viaTag);
+        }
     }
     if (sp > 0 && evaluatedLen > 0 && (size_t)sp < sizeof(sched)) {
         sp += snprintf(sched + sp, sizeof(sched) - (size_t)sp, ", cand=");
         for (uint8_t i = 0; i < evaluatedLen && sp > 0 && (size_t)sp < sizeof(sched); i++) {
-            sp += snprintf(sched + sp, sizeof(sched) - (size_t)sp, "%s!%08x(%u/%u,%u)", i ? "," : "",
-                           evaluated[i].id, (unsigned)evaluated[i].uniqueCov, (unsigned)evaluated[i].totalCov,
-                           (unsigned)evaluated[i].costFixed);
+            sp += snprintf(sched + sp, sizeof(sched) - (size_t)sp, "%s!%08x(%u/%u,%u)", i ? "," : "", evaluated[i].id,
+                           (unsigned)evaluated[i].uniqueCov, (unsigned)evaluated[i].totalCov, (unsigned)evaluated[i].costFixed);
         }
     }
     if (sp > 0) {
@@ -3976,8 +3273,8 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, b
     }
 
     LOG_INFO("[SR-DEC] BROADCAST %s 0x%08x: from %s via %s (%s, delay=%ums, slots=%u/res=%u, abs=%u)",
-             shouldRelay ? "RELAY" : "SUPPRESS", p->id, sourceName, heardFromName, decisionReason, myDelay,
-             (unsigned)slotsGiven, (unsigned)reservedSlots, (unsigned)absorbedTotal);
+             shouldRelay ? "RELAY" : "SUPPRESS", p->id, sourceName, heardFromName, decisionReason, myDelay, (unsigned)slotsGiven,
+             (unsigned)reservedSlots, (unsigned)absorbedTotal);
     for (uint8_t i = 0; i < absorbedCount; i++) {
         LOG_INFO("[SR] Absorbed 0x%08x: %08x covered %u", p->id, absorbedBy[i], (unsigned)absorbedCredit[i]);
     }
@@ -3986,26 +3283,9 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, b
         pendingRelayDelayMs = myDelay;
         routingGraph->recordNodeTransmission(myNode, p->id, currentTime);
     } else if (slotsGiven > 0) {
-        // A late copy still goes on the air when a transmission is expected: the ranking gave a
-        // rung to a stock relay router or a ranked SR peer, or the acknowledgement pass put
-        // somebody ahead of us, and if their copy never comes ours is the redundancy that covers
-        // the loss. Our rung is the insurers ordered ahead of us, one half-airtime apart, in the
-        // packet-id order the relay ladder already tie-breaks on so the burden rotates rather than
-        // always falling on the same node.
-        //
-        // Stock rebroadcasters are deliberately not counted here, though they used to be. A
-        // reserved position is a slot time wide and sits inside the router window; insurance only
-        // fires once that whole window has passed, so charging a half-airtime per stock node delays
-        // every insurer for a window already behind them. A peer that has already transmitted is
-        // skipped for the same kind of reason: it is not going to insure, and counting it pushes
-        // everybody else later for nothing.
-        //
-        // The want_ack witness term that used to widen this is gone: Router::send strips that flag
-        // from every broadcast before transmission, so it was never set on the wire, and the
-        // election behind it is replaced by the acknowledgement pass, which does not need the flag
-        // to know a message is one somebody is waiting on.
+        // Insurance replaces silent ranked relays; stock windows and completed transmissions must not add extra delay.
         uint8_t rank = 0;
-        const uint32_t nowSecs = millis() / 1000;
+        const uint32_t nowSecs = nowSeconds();
         for (uint16_t i = 0; i < srPeers.count; i++) {
             NodeNum peer = srPeers.nodes[i];
             if (peer == myNode) {
@@ -4018,8 +3298,7 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, b
                 rank++;
             }
         }
-        // The ladder we are insuring is exactly this candidate set, so its last rung is
-        // `srPeers.count - 1` rungs past the transition.
+
         const uint8_t ladderRungs = srPeers.count > 0 ? static_cast<uint8_t>(srPeers.count - 1) : 0;
         armDeferredBroadcastRetransmit(p, rank * halfAirtime, ladderRungs);
     }
@@ -4030,13 +3309,14 @@ bool SignalRoutingModule::shouldRelayBroadcast(const meshtastic_MeshPacket *p, b
 NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode, NodeNum heardFrom, bool allowOpportunistic,
                                         bool *verified)
 {
-    if (verified) *verified = false;
+    if (verified)
+        *verified = false;
     if (!routingGraph) {
         LOG_WARN("[SR] No graph available for routing");
         return 0;
     }
 
-    uint32_t currentTime = millis() / 1000;  // Use monotonic time for consistency
+    uint32_t currentTime = nowSeconds();
 
     char destName[64];
     getNodeDisplayName(destination, destName, sizeof(destName));
@@ -4046,9 +3326,7 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
     float routeCost = route.getCost();
 
     if (route.nextHop != 0) {
-        // Confirmed Dijkstra, or a downstream-chain egress (calculateRoute may return the chain
-        // hop with verified=false). Bare inbound-gateway is not stampable unless it is also the
-        // chain egress. Originators clear NodeDB when this is false (field: Dura named MB59).
+        // A bare inbound gateway is not proof that a designated hop can deliver.
         auto stampable = [&]() -> bool {
             if (route.verified) {
                 return true;
@@ -4056,16 +3334,17 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
             NodeNum me = nodeDB ? nodeDB->getNodeNum() : 0;
             return me != 0 && routingGraph->downstreamChainEgress(destination, me).node == route.nextHop;
         };
-        // Suspect first hop: prefer a stampable alternate; never lose the only path.
+
         if (hopHealth.isSuspect(destination, route.nextHop, millis())) {
             NodeNum excluded[1] = {route.nextHop};
             NeighborGraph::RoutePolicy exclPolicy = routePolicy();
             exclPolicy.excluded = excluded;
             exclPolicy.excludedCount = 1;
             Route alt = routingGraph->calculateRoute(destination, currentTime, exclPolicy);
-            bool altStampable = alt.nextHop != 0 && (alt.verified || (nodeDB && nodeDB->getNodeNum() != 0 &&
-                                                                     routingGraph->downstreamChainEgress(destination, nodeDB->getNodeNum()).node ==
-                                                                         alt.nextHop));
+            bool altStampable =
+                alt.nextHop != 0 &&
+                (alt.verified || (nodeDB && nodeDB->getNodeNum() != 0 &&
+                                  routingGraph->downstreamChainEgress(destination, nodeDB->getNodeNum()).node == alt.nextHop));
             if (altStampable) {
                 route = alt;
                 routeCost = route.getCost();
@@ -4078,13 +3357,9 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
                  route.verified ? "" : ", unverified");
 
         if (routeCost > 10.0f) {
-            LOG_WARN("[SR] High-cost route to %s (%.2f) - poor link quality expected",
-                    destName, routeCost);
+            LOG_WARN("[SR] High-cost route to %s (%.2f) - poor link quality expected", destName, routeCost);
         }
 
-        // Verify the next hop can hear the transmitting node (heardFrom). If not, we check
-        // whether hearsUs allows us to forward anyway (see below), then fall back to
-        // opportunistic routing or best-effort self relay.
         bool nextHopCanHearTransmitter = true;
         bool connectivityUnknown = false;
 
@@ -4096,18 +3371,14 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
                 getNodeDisplayName(heardFrom, heardFromName, sizeof(heardFromName));
 
                 if (connectivityUnknown) {
-                    LOG_INFO("[SR] Route via %s rejected: %s unverifiable",
-                             nextHopName, heardFromName);
+                    LOG_INFO("[SR] Route via %s rejected: %s unverifiable", nextHopName, heardFromName);
                 } else {
-                    LOG_INFO("[SR] Route via %s rejected - no connectivity to transmitter %s",
-                             nextHopName, heardFromName);
+                    LOG_INFO("[SR] Route via %s rejected - no connectivity to transmitter %s", nextHopName, heardFromName);
                 }
             }
         }
 
-        // The copy we are about to send is transmitted by us, not by heardFrom. A next hop that
-        // hears the previous relay but not us will never see this frame, and stamping them makes
-        // every stock node stand down waiting for a relay that cannot happen from here.
+        // The next hop must hear our radio; connectivity to the previous transmitter cannot deliver this copy.
         NodeNum myNodeForStamp = nodeDB ? nodeDB->getNodeNum() : 0;
         bool nextHopHearsUs = (route.nextHop == destination || route.nextHop == myNodeForStamp);
         if (!nextHopHearsUs && myNodeForStamp != 0) {
@@ -4127,38 +3398,33 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
         }
 
         if (nextHopCanHearTransmitter) {
-            // Even if we have a route, check if any neighbor has a significantly better route
-            // This ensures unicasts are forwarded to better-positioned nodes
-            if (allowOpportunistic && routeCost > 2.0f) { // Only check if our route is not excellent
+            if (allowOpportunistic && routeCost > 2.0f) {
                 NodeNum betterNeighbor = findBetterPositionedNeighbor(destination, sourceNode, heardFrom, routeCost, currentTime);
                 if (betterNeighbor != 0) {
                     return betterNeighbor;
                 }
             }
 
-            if (verified) *verified = stampable();
+            if (verified)
+                *verified = stampable();
             return route.nextHop;
         }
-        
-        // If the next hop has confirmed it hears us (hearsUs), forwarding to it will work
-        // regardless of whether the original sender's connectivity can be verified — we are
-        // the one retransmitting.
+
         NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
         if (myNode != 0) {
             const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
             if (myEdges) {
                 for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
                     if (myEdges->edges[i].to == route.nextHop && myEdges->edges[i].hearsUs) {
-                        LOG_INFO("[SR] Route via %s kept: unverified but hearsUs",
-                                 nextHopName);
-            if (verified) *verified = stampable();
-            return route.nextHop;
+                        LOG_INFO("[SR] Route via %s kept: unverified but hearsUs", nextHopName);
+                        if (verified)
+                            *verified = stampable();
+                        return route.nextHop;
                     }
                 }
             }
         }
 
-        // Next hop can't hear transmitter - try to find alternative through opportunistic routing
         if (allowOpportunistic) {
             NodeNum betterNeighbor = findBetterPositionedNeighbor(destination, sourceNode, heardFrom,
                                                                   std::numeric_limits<float>::infinity(), currentTime);
@@ -4170,29 +3436,24 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
             }
         }
 
-        // No usable next hop — signal best-effort self relay by returning our own node ID.
         if (myNode != 0) {
             LOG_INFO("[SR] No verified next hop, no hearsUs: self relay");
             return myNode;
         }
     }
 
-    // Fallback 1: walk dest along downstream until a neighbour we hear.
     NodeNum relayForDest = routingGraph->downstreamChainEgress(destination, nodeDB ? nodeDB->getNodeNum() : 0).node;
     if (relayForDest != 0 && nodeDB) {
-        // Verify relay can hear transmitter before using it
         bool relayCanHearTransmitter = true;
         bool connectivityUnknown = false;
         if (heardFrom != 0 && relayForDest != heardFrom) {
             relayCanHearTransmitter = hasVerifiedConnectivity(heardFrom, relayForDest, &connectivityUnknown);
         }
 
-        // Only use relay if we can verify connectivity (be conservative with stock nodes)
-        // and that relay hears the copy we would transmit. Connectivity to the previous
-        // transmitter is not enough: this frame leaves our radio.
+        // An opportunistic hop needs confirmed delivery from our radio, not just from the previous transmitter.
         bool relayHearsUs = false;
         if (relayCanHearTransmitter && !connectivityUnknown) {
-            const NodeEdges* myEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
+            const NodeEdges *myEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
             if (myEdges) {
                 for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
                     if (myEdges->edges[i].to == relayForDest && myEdges->edges[i].hearsUs) {
@@ -4202,7 +3463,8 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
                         char gwName[64];
                         getNodeDisplayName(relayForDest, gwName, sizeof(gwName));
                         LOG_INFO("[SR] No direct route to %s, but forwarding to relay %s", destName, gwName);
-                        if (verified) *verified = true;
+                        if (verified)
+                            *verified = true;
                         return relayForDest;
                     }
                 }
@@ -4224,25 +3486,20 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
         }
     }
 
-    // Fallback 2: opportunistic forward — find neighbor with better position for destination
-    // Only do this if opportunistic forwarding is allowed
     if (allowOpportunistic) {
-        NodeNum betterNeighbor = findBetterPositionedNeighbor(destination, sourceNode, heardFrom,
-                                                            std::numeric_limits<float>::infinity(), currentTime);
+        NodeNum betterNeighbor =
+            findBetterPositionedNeighbor(destination, sourceNode, heardFrom, std::numeric_limits<float>::infinity(), currentTime);
         if (betterNeighbor != 0) {
             return betterNeighbor;
         }
     }
 
-    // Fallback 3: Special case for unicast packets to direct neighbors that didn't hear the transmission
-    // If we received this as a relayed packet (heardFrom != sourceNode) and destination is our direct neighbor,
-    // we should deliver it directly since the destination didn't hear the original transmission
     NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
     if (routingGraph && nodeDB && myNode != 0 && heardFrom != sourceNode) {
         bool isDirectNeighbor = false;
         float directEtx = 1e9f;
 
-        const NodeEdges* myEdges = routingGraph->getEdgesFrom(myNode);
+        const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
         if (myEdges) {
             for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
                 if (myEdges->edges[i].to == destination) {
@@ -4254,31 +3511,25 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
         }
 
         if (isDirectNeighbor) {
-            LOG_INFO("[SR] Deliver direct to %s (ETX=%.2f)",
-                     destName, directEtx);
-            return destination; // Deliver directly to our neighbor
+            LOG_INFO("[SR] Deliver direct to %s (ETX=%.2f)", destName, directEtx);
+            return destination;
         }
     }
 
-    // Fallback 4: if we are recorded as the relay for this destination, we can deliver directly
-    // This handles true relay scenarios where we have unique connectivity that other SR nodes don't
-    if (routingGraph->getDownstreamRelay(destination) == myNode) {
+    if (myNode != 0 && routingGraph->getDownstreamRelay(destination) == myNode) {
         LOG_INFO("[SR] We are the designated relay for %s - delivering directly", destName);
-        // Refresh the downstream entry since we're actively using it
-        routingGraph->updateDownstream(destination, myNode, 1.0f, millis() / 1000);
-        return destination; // We are the relay, deliver directly
+
+        routingGraph->updateDownstream(destination, myNode, 1.0f, nowSeconds());
+        return destination;
     }
 
-    // Fallback 5: if the destination only has us as a neighbor (effective relay scenario),
-    // we should try to deliver directly even without formal relay designation
-    // This handles cases like FMC6 where a node only connects through us
     if (routingGraph && nodeDB) {
         const NodeEdges *destEdges = routingGraph->getEdgesFrom(destination);
         if (destEdges && destEdges->edgeCount == 1 && destEdges->edges[0].to == myNode) {
             LOG_INFO("[SR] %s connects only via us: direct", destName);
-            // Record ourselves as relay for this destination since we're the only connection
-            routingGraph->updateDownstream(destination, myNode, 1.0f, millis() / 1000);
-            return destination; // We are the effective relay, deliver directly
+
+            routingGraph->updateDownstream(destination, myNode, 1.0f, nowSeconds());
+            return destination;
         }
     }
 
@@ -4287,7 +3538,8 @@ NodeNum SignalRoutingModule::getNextHop(NodeNum destination, NodeNum sourceNode,
 }
 
 NodeNum SignalRoutingModule::findBetterPositionedNeighbor(NodeNum destination, NodeNum sourceNode, NodeNum heardFrom,
-                                                         float ourRouteCost, uint32_t currentTime) {
+                                                          float ourRouteCost, uint32_t currentTime)
+{
     if (!routingGraph || !nodeDB) {
         return 0;
     }
@@ -4296,7 +3548,7 @@ NodeNum SignalRoutingModule::findBetterPositionedNeighbor(NodeNum destination, N
     NodeNum bestNeighbor = 0;
     float bestNeighborRouteCost = ourRouteCost;
 
-    const NodeEdges* myEdges = routingGraph->getEdgesFrom(myNode);
+    const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
     if (!myEdges) {
         return 0;
     }
@@ -4304,31 +3556,28 @@ NodeNum SignalRoutingModule::findBetterPositionedNeighbor(NodeNum destination, N
     for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
         NodeNum neighbor = myEdges->edges[i].to;
 
-        // Don't forward back to source or heardFrom nodes
-        if (neighbor == sourceNode || neighbor == heardFrom) {
+        if (neighbor == sourceNode || neighbor == heardFrom || !myEdges->edges[i].hearsUs || !isNodeRoutable(neighbor)) {
             continue;
         }
 
-        // CRITICAL: Only consider neighbors that can hear the transmitting node (heardFrom)
-        // If they didn't hear the transmission, they can't relay it
         if (heardFrom != 0) {
             bool connectivityUnknown = false;
             bool canHearTransmitter = hasVerifiedConnectivity(heardFrom, neighbor, &connectivityUnknown);
             if (!canHearTransmitter) {
-                // Skip if no connectivity, or if connectivity is unknown (stock node - be conservative)
                 continue;
             }
         }
 
-        // Check if this neighbor has a direct connection to the destination
-        const NodeEdges* neighborEdges = routingGraph->getEdgesFrom(neighbor);
+        const NodeEdges *neighborEdges = routingGraph->getEdgesFrom(neighbor);
         if (neighborEdges) {
             for (uint8_t j = 0; j < neighborEdges->edgeCount; j++) {
                 if (neighborEdges->edges[j].to == destination) {
-                    float directEtx = neighborEdges->edges[j].getEtx();
-                    // If neighbor has a direct connection that's significantly better than our route cost,
-                    // forward to them. Direct connection ETX should be much better than multi-hop route cost.
-                    if (directEtx < ourRouteCost - 1.0f && directEtx < bestNeighborRouteCost) {
+                    float directEtx =
+                        routingGraph->deliveryHopCost(neighbor, destination, publishesTopology(destination), currentTime);
+                    directEtx += myEdges->edges[i].getEtx();
+
+                    if (routingGraph->canDeliver(neighbor, destination, routePolicy()) && directEtx < ourRouteCost - 1.0f &&
+                        directEtx < bestNeighborRouteCost) {
                         bestNeighbor = neighbor;
                         bestNeighborRouteCost = directEtx;
                     }
@@ -4342,17 +3591,11 @@ NodeNum SignalRoutingModule::findBetterPositionedNeighbor(NodeNum destination, N
         char nhName[64], destName[64];
         getNodeDisplayName(bestNeighbor, nhName, sizeof(nhName));
         getNodeDisplayName(destination, destName, sizeof(destName));
-        LOG_INFO("[SR] Better neighbor %s for %s (cost %.2f, its ETX %.2f)",
-                 nhName, destName, ourRouteCost, bestNeighborRouteCost);
+        LOG_INFO("[SR] Better neighbor %s for %s (cost %.2f, its ETX %.2f)", nhName, destName, ourRouteCost,
+                 bestNeighborRouteCost);
     }
 
     return bestNeighbor;
-}
-
-void SignalRoutingModule::upsertDirectSignal(NodeNum nodeId, int8_t rssi, int8_t snr, uint32_t nowSecs)
-{
-    upsertDirectNeighborSignal(directSignals, directSignalCount, NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE, nodeId, rssi, snr,
-                               nowSecs);
 }
 
 const DirectNeighborSignal *SignalRoutingModule::lookupDirectSignal(NodeNum nodeId) const
@@ -4400,68 +3643,43 @@ void SignalRoutingModule::syncDirectSignalsWithGraph()
     }
 }
 
-void SignalRoutingModule::updateNeighborInfo(NodeNum nodeId, int32_t rssi, float snr, uint32_t lastRxTime)
+void SignalRoutingModule::updateNeighborInfo(NodeNum nodeId, int32_t rssi, float snr)
 {
-    if (!routingGraph || !nodeDB) return;
+    if (!routingGraph || !nodeDB)
+        return;
 
-    // IMPORTANT: Use monotonic time (seconds since boot) for edge timestamps, not RTC time
-    uint32_t monotonicTimestamp = millis() / 1000;
-    (void)lastRxTime;  // Unused - we use monotonic time instead
+    uint32_t monotonicTimestamp = nowSeconds();
 
     int changeType = refreshReportedDirectNeighbor(nodeId, rssi, snr, monotonicTimestamp);
 
-    // If significant change, consider sending an update sooner
     if (changeType != EDGE_NO_CHANGE) {
         char neighborName[64];
         getNodeDisplayName(nodeId, neighborName, sizeof(neighborName));
 
         if (changeType == EDGE_NEW) {
-            // We now have a DIRECT connection to this node - clear any downstream entries
-            // that were created based on topology broadcasts before we heard from them directly
             routingGraph->clearDownstreamForDestination(nodeId);
 
-            LOG_INFO("[SR] Topology changed: new neighbor %s (total nodes: %u)", neighborName, static_cast<unsigned int>(routingGraph->getNodeCount()));
+            LOG_INFO("[SR] Topology changed: new neighbor %s (total nodes: %u)", neighborName,
+                     static_cast<unsigned int>(routingGraph->getNodeCount()));
             markTopologyDirty();
         } else if (changeType == EDGE_SIGNIFICANT_CHANGE) {
-            LOG_INFO("[SR] Topology changed: ETX change for %s (total nodes: %u)", neighborName, static_cast<unsigned int>(routingGraph->getNodeCount()));
+            LOG_INFO("[SR] Topology changed: ETX change for %s (total nodes: %u)", neighborName,
+                     static_cast<unsigned int>(routingGraph->getNodeCount()));
             markTopologyDirty();
         }
-
-    }
-}
-
-bool SignalRoutingModule::isSignalBasedCapable(NodeNum nodeId) const
-{
-    if (!nodeDB) {
-        return false;
-    }
-    if (nodeId == nodeDB->getNodeNum()) {
-        return isActiveRoutingRole();
-    }
-
-    CapabilityStatus status = getCapabilityStatus(nodeId);
-    return status == CapabilityStatus::SRactive;
-}
-
-void SignalRoutingModule::updateNodeActivityForPacket(NodeNum nodeId)
-{
-    if (routingGraph) {
-        routingGraph->updateNodeActivity(nodeId, millis() / 1000);
     }
 }
 
 void SignalRoutingModule::updateNodeActivityForPacketAndRelay(const meshtastic_MeshPacket *p)
 {
-    if (!routingGraph || !nodeDB) return;
+    if (!p || !routingGraph || !nodeDB || p->via_mqtt)
+        return;
 
-    uint32_t currentTime = millis() / 1000;
+    uint32_t currentTime = nowSeconds();
     NodeNum ourNodeId = nodeDB->getNodeNum();
 
-    // Update original sender activity
     routingGraph->updateNodeActivity(p->from, currentTime);
 
-    // Update relay node activity if this is a relayed packet
-    // Only update if relay node is not us and not the sender (safety checks)
     if (p->relay_node != 0) {
         NodeNum relayNodeId = resolveRelayIdentity(p->relay_node, p->rx_rssi, p->rx_snr);
         if (relayNodeId != 0 && relayNodeId != ourNodeId && relayNodeId != p->from) {
@@ -4470,8 +3688,6 @@ void SignalRoutingModule::updateNodeActivityForPacketAndRelay(const meshtastic_M
     }
 }
 
-
-
 void SignalRoutingModule::handleNodeInfoPacket(const meshtastic_MeshPacket &mp)
 {
     meshtastic_User user = meshtastic_User_init_zero;
@@ -4479,8 +3695,7 @@ void SignalRoutingModule::handleNodeInfoPacket(const meshtastic_MeshPacket &mp)
         return;
     }
 
-    // Only update capability status if the node is not already known to be SR-capable
-    // NodeInfo packets don't contain SR capability info, so don't downgrade from SR-active/inactive to Unknown
+    // NodeInfo has no SR capability evidence and must not override a proved topology capability.
     CapabilityStatus currentStatus = getCapabilityStatus(mp.from);
     if (currentStatus != CapabilityStatus::SRactive && currentStatus != CapabilityStatus::Passive) {
         CapabilityStatus status = capabilityFromRole(user.role);
@@ -4490,8 +3705,7 @@ void SignalRoutingModule::handleNodeInfoPacket(const meshtastic_MeshPacket &mp)
     }
 
     if (user.has_is_unmessagable && user.is_unmessagable) {
-        // Don't downgrade SR-capable nodes — they proved their capability via topology broadcasts.
-        // is_unmessagable just means the node doesn't handle user messages, not that it can't route.
+        // Refusing user messages does not imply inability to relay.
         CapabilityStatus current = getCapabilityStatus(mp.from);
         if (current != CapabilityStatus::SRactive && current != CapabilityStatus::Passive) {
             trackNodeCapability(mp.from, CapabilityStatus::Legacy);
@@ -4499,98 +3713,17 @@ void SignalRoutingModule::handleNodeInfoPacket(const meshtastic_MeshPacket &mp)
     }
 }
 
-void SignalRoutingModule::handleSniffedPayload(const meshtastic_MeshPacket &mp, bool isDirectNeighbor)
+void SignalRoutingModule::handleSniffedPayload(const meshtastic_MeshPacket &mp)
 {
     switch (mp.decoded.portnum) {
     case meshtastic_PortNum_NODEINFO_APP:
         handleNodeInfoPacket(mp);
-        break;
-    case meshtastic_PortNum_POSITION_APP:
-        handlePositionPacket(mp, isDirectNeighbor);
-        break;
-    case meshtastic_PortNum_TELEMETRY_APP:
-        handleTelemetryPacket(mp);
         break;
     case meshtastic_PortNum_ROUTING_APP:
         handleRoutingControlPacket(mp);
         break;
     default:
         break;
-    }
-}
-
-void SignalRoutingModule::handlePositionPacket(const meshtastic_MeshPacket &mp, bool isDirectNeighbor)
-{
-    meshtastic_Position position = meshtastic_Position_init_zero;
-    if (!pb_decode_from_bytes(mp.decoded.payload.bytes, mp.decoded.payload.size, &meshtastic_Position_msg, &position)) {
-        return;
-    }
-
-    char senderName[64];
-    getNodeDisplayName(mp.from, senderName, sizeof(senderName));
-
-    double latitude = position.has_latitude_i ? position.latitude_i / 1e7 : 0.0;
-    double longitude = position.has_longitude_i ? position.longitude_i / 1e7 : 0.0;
-    uint32_t dop = position.PDOP;
-    uint32_t speed = position.has_ground_speed ? position.ground_speed : 0;
-
-    LOG_INFO("[SR] Pos from %s (direct=%s) %.5f %.5f %u m/s PDOP=%u "
-              "rssi=%d snr=%.1f",
-              senderName, isDirectNeighbor ? "true" : "false", latitude, longitude, speed, dop, mp.rx_rssi, mp.rx_snr);
-
-    int32_t rxRssi = mp.rx_rssi;
-    if (isDirectNeighbor && NeighborGraph::normalizeRxSignal(rxRssi, mp.rx_snr)) {
-        updateNeighborInfo(mp.from, rxRssi, mp.rx_snr, mp.rx_time);
-    }
-}
-
-void SignalRoutingModule::handleTelemetryPacket(const meshtastic_MeshPacket &mp)
-{
-    meshtastic_Telemetry telemetry = meshtastic_Telemetry_init_zero;
-    if (!pb_decode_from_bytes(mp.decoded.payload.bytes, mp.decoded.payload.size, &meshtastic_Telemetry_msg, &telemetry)) {
-        return;
-    }
-
-    char senderName[64];
-    getNodeDisplayName(mp.from, senderName, sizeof(senderName));
-
-    switch (telemetry.which_variant) {
-    case meshtastic_Telemetry_device_metrics_tag: {
-        const meshtastic_DeviceMetrics &metrics = telemetry.variant.device_metrics;
-        int battery = metrics.has_battery_level ? static_cast<int>(metrics.battery_level) : 0;
-        float voltage = metrics.has_voltage ? metrics.voltage : 0.0f;
-        float air = metrics.has_air_util_tx ? metrics.air_util_tx : 0.0f;
-        LOG_INFO("[SR] Dev metrics %s batt=%s%d%% volt=%s%.2fV air=%s%.1f%%",
-                  senderName, metrics.has_battery_level ? "" : "~", battery, metrics.has_voltage ? "" : "~", voltage,
-                  metrics.has_air_util_tx ? "" : "~", air);
-        break;
-    }
-    case meshtastic_Telemetry_environment_metrics_tag: {
-        const meshtastic_EnvironmentMetrics &env = telemetry.variant.environment_metrics;
-        LOG_INFO("[SR] Env from %s t=%s%.1fC h=%s%.1f%% p=%s%.1fhPa",
-                  senderName, env.has_temperature ? "" : "~",
-                  env.has_temperature ? env.temperature : 0.0f, env.has_relative_humidity ? "" : "~",
-                  env.has_relative_humidity ? env.relative_humidity : 0.0f, env.has_barometric_pressure ? "" : "~",
-                  env.has_barometric_pressure ? env.barometric_pressure : 0.0f);
-        break;
-    }
-    case meshtastic_Telemetry_air_quality_metrics_tag:
-    case meshtastic_Telemetry_power_metrics_tag:
-    case meshtastic_Telemetry_local_stats_tag:
-    case meshtastic_Telemetry_health_metrics_tag:
-    case meshtastic_Telemetry_host_metrics_tag:
-        LOG_INFO("[SR] Telemetry variant %u from %s", telemetry.which_variant, senderName);
-        break;
-    default:
-        LOG_WARN("[SR] Unknown telemetry variant %u from %s", telemetry.which_variant, senderName);
-        break;
-    }
-
-    CapabilityStatus currentStatus = getCapabilityStatus(mp.from);
-    if (currentStatus != CapabilityStatus::Unknown) {
-        // Only refresh timestamp for nodes with known capability status
-        // Unknown nodes stay unknown until they prove their capability via SR packets
-        trackNodeCapability(mp.from, currentStatus);
     }
 }
 
@@ -4603,27 +3736,22 @@ void SignalRoutingModule::handleRoutingControlPacket(const meshtastic_MeshPacket
 
     char senderName[64];
     getNodeDisplayName(mp.from, senderName, sizeof(senderName));
-    
-    // Only resolve placeholders if the routing packet itself is from a direct sender
+
     bool isDirectRoutingPacket = isDirectPacket(mp);
 
     switch (routing.which_variant) {
     case meshtastic_Routing_route_request_tag:
-        LOG_INFO("[SR] Routing request from %s with %u hops recorded", senderName,
-                  routing.route_request.route_count);
+        LOG_INFO("[SR] Routing request from %s with %u hops recorded", senderName, routing.route_request.route_count);
 
-        // Check for placeholder resolution in route_request hops
-        // Only resolve if: 1) routing packet is from direct sender, and 2) hop node is direct neighbor of ours
         if (isDirectRoutingPacket) {
             for (size_t i = 0; i < routing.route_request.route_count; i++) {
                 NodeNum hopNode = routing.route_request.route[i];
                 uint8_t hopLastByte = hopNode & 0xFF;
                 NodeNum placeholderId = getPlaceholderForRelay(hopLastByte);
                 if (isPlaceholderNode(placeholderId) && isPlaceholderConnectedToUs(placeholderId)) {
-                    // Additional check: the hop node must be a direct neighbor of ours (Reported edge)
                     bool isDirectNeighbor = false;
                     NodeNum ourNode = nodeDB->getNodeNum();
-                    const NodeEdges* ourEdges = routingGraph->getEdgesFrom(ourNode);
+                    const NodeEdges *ourEdges = routingGraph->getEdgesFrom(ourNode);
                     if (ourEdges) {
                         for (uint8_t j = 0; j < ourEdges->edgeCount; j++) {
                             if (ourEdges->edges[j].to == hopNode && ourEdges->edges[j].source == Edge::Source::Reported) {
@@ -4647,18 +3775,15 @@ void SignalRoutingModule::handleRoutingControlPacket(const meshtastic_MeshPacket
     case meshtastic_Routing_route_reply_tag:
         LOG_INFO("[SR] Routing reply from %s for %u hops", senderName, routing.route_reply.route_back_count);
 
-        // Check for placeholder resolution in route_reply hops
-        // Only resolve if: 1) routing packet is from direct sender, and 2) hop node is direct neighbor of ours
         if (isDirectRoutingPacket) {
             for (size_t i = 0; i < routing.route_reply.route_back_count; i++) {
                 NodeNum hopNode = routing.route_reply.route_back[i];
                 uint8_t hopLastByte = hopNode & 0xFF;
                 NodeNum placeholderId = getPlaceholderForRelay(hopLastByte);
                 if (isPlaceholderNode(placeholderId) && isPlaceholderConnectedToUs(placeholderId)) {
-                    // Additional check: the hop node must be a direct neighbor of ours (Reported edge)
                     bool isDirectNeighbor = false;
                     NodeNum ourNode = nodeDB->getNodeNum();
-                    const NodeEdges* ourEdges = routingGraph->getEdgesFrom(ourNode);
+                    const NodeEdges *ourEdges = routingGraph->getEdgesFrom(ourNode);
                     if (ourEdges) {
                         for (uint8_t j = 0; j < ourEdges->edgeCount; j++) {
                             if (ourEdges->edges[j].to == hopNode && ourEdges->edges[j].source == Edge::Source::Reported) {
@@ -4723,19 +3848,14 @@ bool SignalRoutingModule::isActiveRoutingRole() const
 
 bool SignalRoutingModule::canSendTopology() const
 {
-    // Returns true if this node can send topology broadcasts
-    // This includes:
-    // - Active routing roles (ROUTER, REPEATER, CLIENT, etc.)
-    // - Passive roles (CLIENT_MUTE, TRACKER, SENSOR, TAK, etc.) to announce themselves as SR-aware
     switch (config.device.role) {
-    // Active routing roles
     case meshtastic_Config_DeviceConfig_Role_ROUTER:
     case meshtastic_Config_DeviceConfig_Role_ROUTER_LATE:
     case meshtastic_Config_DeviceConfig_Role_ROUTER_CLIENT:
     case meshtastic_Config_DeviceConfig_Role_REPEATER:
     case meshtastic_Config_DeviceConfig_Role_CLIENT:
     case meshtastic_Config_DeviceConfig_Role_CLIENT_BASE:
-    // Passive roles that participate in SR
+
     case meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE:
     case meshtastic_Config_DeviceConfig_Role_TRACKER:
     case meshtastic_Config_DeviceConfig_Role_SENSOR:
@@ -4748,12 +3868,9 @@ bool SignalRoutingModule::canSendTopology() const
     }
 }
 
-SignalRoutingModule::CapabilityStatus SignalRoutingModule::capabilityFromRole(
-    meshtastic_Config_DeviceConfig_Role role) const
+SignalRoutingModule::CapabilityStatus SignalRoutingModule::capabilityFromRole(meshtastic_Config_DeviceConfig_Role role) const
 {
-    // Role alone cannot determine SR capability — stock firmware uses the same roles.
-    // Only mark as Legacy for roles that definitely cannot participate in routing.
-    // SR-passive/SR-active status is set exclusively when we receive an actual SR topology packet.
+    // Stock firmware uses the same roles, so a role cannot prove SR capability.
     switch (role) {
     case meshtastic_Config_DeviceConfig_Role_LOST_AND_FOUND:
     case meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE:
@@ -4770,11 +3887,14 @@ void SignalRoutingModule::trackNodeCapability(NodeNum nodeId, CapabilityStatus s
         return;
     }
 
-    uint32_t now = millis() / 1000;  // Use monotonic time for TTL calculations
+    uint32_t now = nowSeconds();
 
-    // Lite mode: linear search in fixed array
     for (uint8_t i = 0; i < capabilityRecordCount; i++) {
         if (capabilityRecords[i].nodeId == nodeId) {
+            // Ordinary traffic cannot prove that a peer still runs SR firmware.
+            if (status == CapabilityStatus::Unknown) {
+                return;
+            }
             capabilityRecords[i].record.lastUpdated = now;
             if (status == CapabilityStatus::SRactive || status == CapabilityStatus::Passive) {
                 capabilityRecords[i].record.status = status;
@@ -4784,7 +3904,7 @@ void SignalRoutingModule::trackNodeCapability(NodeNum nodeId, CapabilityStatus s
             return;
         }
     }
-    // Add new entry
+
     if (capabilityRecordCount < MAX_CAPABILITY_RECORDS) {
         capabilityRecords[capabilityRecordCount].nodeId = nodeId;
         capabilityRecords[capabilityRecordCount].record.lastUpdated = now;
@@ -4797,16 +3917,13 @@ void SignalRoutingModule::pruneCapabilityCache(uint32_t nowSecs)
 {
     NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
 
-    // Lite mode: remove stale entries by swapping with last
     for (uint8_t i = 0; i < capabilityRecordCount;) {
-        // Never prune our own node's capability record
         if (capabilityRecords[i].nodeId == myNode) {
             i++;
             continue;
         }
 
         if ((nowSecs - capabilityRecords[i].record.lastUpdated) > CAPABILITY_TTL_SECS) {
-            // When an SR node's capability expires, clear hearsUs so we stop counting it for coverage
             if (routingGraph && (capabilityRecords[i].record.status == CapabilityStatus::SRactive ||
                                  capabilityRecords[i].record.status == CapabilityStatus::Passive)) {
                 NodeNum expiredNode = capabilityRecords[i].nodeId;
@@ -4823,33 +3940,28 @@ void SignalRoutingModule::pruneCapabilityCache(uint32_t nowSecs)
     }
 }
 
-// Gateway pruning now handled by NeighborGraph's downstream table aging
-
 SignalRoutingModule::CapabilityStatus SignalRoutingModule::getCapabilityStatus(NodeNum nodeId) const
 {
-    uint32_t now = millis() / 1000;  // Use monotonic time for TTL calculations
+    uint32_t now = nowSeconds();
 
-    // Special case: local node capability based on its role
     if (nodeDB && nodeId == nodeDB->getNodeNum()) {
         if (!signalBasedRoutingEnabled) {
-            return CapabilityStatus::Legacy;  // SR module disabled
+            return CapabilityStatus::Legacy;
         }
 
         if (isActiveRoutingRole()) {
-            return CapabilityStatus::SRactive;  // Active routing roles are SR-active
+            return CapabilityStatus::SRactive;
         } else if (canSendTopology()) {
-            return CapabilityStatus::Passive;  // Can send topology (passive roles)
+            return CapabilityStatus::Passive;
         } else {
-            return CapabilityStatus::Legacy;  // Can't send topology, doesn't participate in SR
+            return CapabilityStatus::Legacy;
         }
     }
 
     NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
 
-    // Lite mode: linear search
     for (uint8_t i = 0; i < capabilityRecordCount; i++) {
         if (capabilityRecords[i].nodeId == nodeId) {
-            // Never return Unknown for our own node
             if (capabilityRecords[i].nodeId == myNode) {
                 return capabilityRecords[i].record.status;
             }
@@ -4864,65 +3976,67 @@ SignalRoutingModule::CapabilityStatus SignalRoutingModule::getCapabilityStatus(N
     return CapabilityStatus::Unknown;
 }
 
-// A stock node in a role that rebroadcasts early regardless of SR. Used for Phase 1 slot
-// reservations — we give these a window position and assume they transmit. An SR node (active or
-// passive) publishes topology and is ranked instead, never reserved for. ROUTER_LATE is excluded:
-// it deliberately delays, so waiting for it would slow SR relays.
+// Stock ROUTER_LATE intentionally delays, so reserving an early position for it would slow SR peers.
 bool SignalRoutingModule::isImmediateRelayRouter(NodeNum nodeId) const
 {
-    if (!nodeDB) return false;
+    if (!nodeDB)
+        return false;
     if (publishesTopology(nodeId)) {
         return false;
     }
     const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(nodeId);
-    if (!node || !node->has_user) return false;
+    if (!node || !node->has_user)
+        return false;
     auto role = node->user.role;
-    return role == meshtastic_Config_DeviceConfig_Role_ROUTER ||
-           role == meshtastic_Config_DeviceConfig_Role_REPEATER ||
+    return role == meshtastic_Config_DeviceConfig_Role_ROUTER || role == meshtastic_Config_DeviceConfig_Role_REPEATER ||
            role == meshtastic_Config_DeviceConfig_Role_ROUTER_CLIENT;
 }
 
 bool SignalRoutingModule::willNotCancelForUs(NodeNum nodeId) const
 {
-    if (!nodeDB) return false;
-    // An SR node coordinates with us and cancels on coverage, whatever its role.
-    if (getCapabilityStatus(nodeId) == CapabilityStatus::SRactive) return false;
+    if (!nodeDB)
+        return false;
+
+    if (getCapabilityStatus(nodeId) == CapabilityStatus::SRactive)
+        return false;
     const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(nodeId);
-    if (!node || !node->has_user) return false;
+    if (!node || !node->has_user)
+        return false;
     auto role = node->user.role;
-    return role == meshtastic_Config_DeviceConfig_Role_ROUTER ||
-           role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE;
+    return role == meshtastic_Config_DeviceConfig_Role_ROUTER || role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE;
 }
 
 bool SignalRoutingModule::planAcknowledgement(const meshtastic_MeshPacket *p, NodeNum sourceNode, NodeNum heardFrom,
                                               uint32_t halfAirtime, uint32_t *delayMsOut, uint8_t *slotsAheadOut)
 {
-    if (!p || !routingGraph || !nodeDB) return false;
+    if (!p || !routingGraph || !nodeDB)
+        return false;
     NodeNum myNode = nodeDB->getNodeNum();
-    if (!isActiveRoutingRole()) return false;
+    if (!isActiveRoutingRole())
+        return false;
     const NodeEdges *myEdges = routingGraph->getEdgesFrom(myNode);
-    if (!myEdges) return false;
+    if (!myEdges)
+        return false;
 
     NeighborGraph::CoveragePolicy policy = coveragePolicy();
 
-    // Stand down for a neighbour that will rebroadcast regardless and will not cancel for us: its
-    // copy is the acknowledgement and ours would only add to it. A stock CLIENT is not such a
-    // node — it floods later than our rung and cancels on hearing us, so answering first removes
-    // its copy rather than adding to ours.
+    // A noncanceling stock relay already supplies the ACK; an extra SR copy would only add contention.
     for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
         NodeNum neighbor = myEdges->edges[i].to;
-        if (neighbor == 0 || neighbor == sourceNode) continue;
-        if (!willNotCancelForUs(neighbor)) continue;
+        if (neighbor == 0 || neighbor == sourceNode)
+            continue;
+        if (!willNotCancelForUs(neighbor))
+            continue;
         const NodeEdges *theirs = routingGraph->getEdgesFrom(neighbor);
-        if (!theirs) continue;
+        if (!theirs)
+            continue;
         for (uint8_t j = 0; j < theirs->edgeCount; j++) {
-            if (theirs->edges[j].to == heardFrom) return false;
+            if (theirs->edges[j].to == heardFrom)
+                return false;
         }
     }
 
-    // Rank the candidates we can hear that the source can be shown to hear, ourselves included.
-    // Both halves matter: without the first, an answer we cannot hear never cancels our own rung
-    // and every candidate transmits.
+    // An acknowledgement we cannot hear will not cancel our own rung.
     struct Entry {
         NodeNum node;
         uint16_t cost;
@@ -4935,17 +4049,19 @@ bool SignalRoutingModule::planAcknowledgement(const meshtastic_MeshPacket *p, No
     }
     for (uint8_t i = 0; i < myEdges->edgeCount && count < NODE_SET_MAX; i++) {
         NodeNum neighbor = myEdges->edges[i].to;
-        if (neighbor == 0 || neighbor == sourceNode || neighbor == myNode) continue;
+        if (neighbor == 0 || neighbor == sourceNode || neighbor == myNode)
+            continue;
         bool usable = getCapabilityStatus(neighbor) == CapabilityStatus::SRactive || isImmediateRelayRouter(neighbor);
-        if (!usable) continue;
+        if (!usable)
+            continue;
         if (routingGraph->acknowledgementPrice(neighbor, sourceNode, policy, &cost)) {
             entries[count++] = {neighbor, cost};
         }
     }
-    if (count == 0) return false;
+    if (count == 0)
+        return false;
 
-    // Bucketed price first, then the ladder's own tie-break so the work rotates across packets
-    // rather than always falling to the same node.
+    // A parity tie-break rotates acknowledgement work without destabilizing cost ordering.
     bool preferHighNodeId = (p->id & 1) != 0;
     for (uint8_t i = 1; i < count; i++) {
         Entry key = entries[i];
@@ -4954,7 +4070,8 @@ bool SignalRoutingModule::planAcknowledgement(const meshtastic_MeshPacket *p, No
             uint16_t a = key.cost / SR_OWNER_COST_BUCKET;
             uint16_t b = entries[j].cost / SR_OWNER_COST_BUCKET;
             bool better = a != b ? a < b : (preferHighNodeId ? key.node > entries[j].node : key.node < entries[j].node);
-            if (!better) break;
+            if (!better)
+                break;
             entries[j + 1] = entries[j];
             j--;
         }
@@ -4965,13 +4082,14 @@ bool SignalRoutingModule::planAcknowledgement(const meshtastic_MeshPacket *p, No
     uint8_t ahead = 0;
     for (uint8_t i = 0; i < count; i++) {
         if (entries[i].node == myNode) {
-            if (delayMsOut) *delayMsOut = delay;
-            if (slotsAheadOut) *slotsAheadOut = ahead;
-            LOG_INFO("[SR] Acknowledging 0x%08x for %08x at %ums (%u ahead of us)", p->id, sourceNode, delay,
-                     (unsigned)ahead);
+            if (delayMsOut)
+                *delayMsOut = delay;
+            if (slotsAheadOut)
+                *slotsAheadOut = ahead;
+            LOG_INFO("[SR] Acknowledging 0x%08x for %08x at %ums (%u ahead of us)", p->id, sourceNode, delay, (unsigned)ahead);
             return true;
         }
-        // A rung ahead of ours we are waiting on, so T1 insures the answer if it never comes.
+
         ahead++;
         delay += halfAirtime;
     }
@@ -5000,18 +4118,15 @@ bool SignalRoutingModule::isLegacyRouter(NodeNum nodeId) const
     }
 }
 
-
-/**
- * Mark the edge to a stock node as hearsUs (confirmed bidirectional link).
- * Called when we observe a stock node relaying a packet we transmitted.
- */
 void SignalRoutingModule::markStockNodeRelayedOurPacket(NodeNum stockNode)
 {
-    if (!routingGraph || !nodeDB || stockNode == 0) return;
+    if (!routingGraph || !nodeDB || stockNode == 0)
+        return;
 
     NodeNum myNode = nodeDB->getNodeNum();
     NodeEdges *myEdges = const_cast<NodeEdges *>(routingGraph->getEdgesFrom(myNode));
-    if (!myEdges) return;
+    if (!myEdges)
+        return;
 
     for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
         if (myEdges->edges[i].to == stockNode) {
@@ -5026,30 +4141,18 @@ void SignalRoutingModule::markStockNodeRelayedOurPacket(NodeNum stockNode)
     }
 }
 
-/**
- * Check if a node is routable (can be used as intermediate hop for routing)
- * Mute nodes are not routable since they don't relay packets
- */
-bool SignalRoutingModule::isNodeRoutable(NodeNum nodeId) const {
-    // Mute nodes don't relay, so they cannot be used as intermediate routing hops
-    if (config.device.role == meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE &&
-        nodeId == nodeDB->getNodeNum()) {
-        // Local mute node - not routable
+bool SignalRoutingModule::isNodeRoutable(NodeNum nodeId) const
+{
+    if (config.device.role == meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE && nodeId == nodeDB->getNodeNum()) {
         return false;
     }
 
-    // Check if this is a known mute node (signal_routing_active = false)
-    // For remote nodes, we use the capability tracking
     CapabilityStatus status = getCapabilityStatus(nodeId);
-    // SR-passive nodes (CLIENT_MUTE, TRACKER, SENSOR, ...) broadcast topology but never relay, so a
-    // route through one is dead. They remain reachable as destinations: calculateRoute() only applies
-    // this filter to intermediate hops.
+    // A passive publisher can be a destination but cannot deliver another node's traffic.
     if (status == CapabilityStatus::Passive) {
         return false;
     }
     if (status == CapabilityStatus::Legacy) {
-        // Legacy nodes participate in SR routing only if they are routers/repeaters
-        // that will actually relay packets
         return isLegacyRouter(nodeId);
     }
 
@@ -5063,9 +4166,7 @@ bool SignalRoutingModule::topologyHealthyForBroadcast() const
         return false;
     }
 
-    // Check if we have direct SR-capable neighbors for intelligent broadcast routing
-
-    const NodeEdges* nodeEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
+    const NodeEdges *nodeEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
     if (!nodeEdges || nodeEdges->edgeCount == 0) {
         LOG_INFO("[SR] No edges found, returning false");
         return false;
@@ -5077,12 +4178,11 @@ bool SignalRoutingModule::topologyHealthyForBroadcast() const
         CapabilityStatus status = getCapabilityStatus(to);
         if (status == CapabilityStatus::SRactive || status == CapabilityStatus::Unknown) {
             capableNeighbors++;
-        } else if (isLegacyRouter(to)) {
+        } else if (status == CapabilityStatus::Legacy && isLegacyRouter(to)) {
             capableNeighbors++;
         }
     }
 
-    // Need at least 1 direct neighbor that could be SR-capable for meaningful broadcast routing
     return capableNeighbors >= 1;
 }
 
@@ -5092,31 +4192,24 @@ bool SignalRoutingModule::topologyHealthyForUnicast(NodeNum destination) const
         return false;
     }
 
-    // For unicast, we need to know that the destination is reachable through the topology graph
-    // The NodeDB check is unreliable due to RTC sync issues (last_heard may be 0)
-    // If we can find ANY route to the destination, consider it reachable
-
     NodeNum myNode = nodeDB->getNodeNum();
     if (myNode == 0) {
         return false;
     }
 
-    Route route = routingGraph->calculateRoute(destination, millis() / 1000, routePolicy());
+    Route route = routingGraph->calculateRoute(destination, nowSeconds(), routePolicy());
 
     if (route.nextHop != 0) {
-        LOG_INFO("[SR] Node %08x reachable via topology (nextHop=%08x, cost=%.2f)",
-                 destination, route.nextHop, route.getCost());
+        LOG_INFO("[SR] Node %08x reachable via topology (nextHop=%08x, cost=%.2f)", destination, route.nextHop, route.getCost());
         return true;
     }
 
-    // Fallback: Check if destination is reachable via a downstream relay
     NodeNum relay = routingGraph->getDownstreamRelay(destination);
     if (relay != 0) {
-        // Check if we can reach the relay (relay must be routable)
-        Route relayRoute = routingGraph->calculateRoute(relay, millis() / 1000, routePolicy());
+        Route relayRoute = routingGraph->calculateRoute(relay, nowSeconds(), routePolicy());
         if (relayRoute.nextHop != 0) {
-            LOG_INFO("[SR] Node %08x via relay %08x (nextHop=%08x, cost=%.2f)",
-                     destination, relay, relayRoute.nextHop, relayRoute.getCost());
+            LOG_INFO("[SR] Node %08x via relay %08x (nextHop=%08x, cost=%.2f)", destination, relay, relayRoute.nextHop,
+                     relayRoute.getCost());
             return true;
         }
     }
@@ -5126,13 +4219,12 @@ bool SignalRoutingModule::topologyHealthyForUnicast(NodeNum destination) const
 
 void SignalRoutingModule::rememberRelayIdentity(NodeNum nodeId, uint8_t relayId)
 {
-    if (relayId == 0 || nodeId == 0) {
+    if (relayId == 0 || nodeId == 0 || isPlaceholderNode(nodeId) || (nodeId & 0xFF) != relayId) {
         return;
     }
 
     uint32_t nowMs = millis();
 
-    // Find or create bucket for this relayId
     RelayIdentityCacheEntry *bucket = nullptr;
     for (uint8_t i = 0; i < relayIdentityCacheCount; i++) {
         if (relayIdentityCache[i].relayId == relayId) {
@@ -5145,9 +4237,9 @@ void SignalRoutingModule::rememberRelayIdentity(NodeNum nodeId, uint8_t relayId)
         bucket->relayId = relayId;
         bucket->entryCount = 0;
     }
-    if (!bucket) return;
+    if (!bucket)
+        return;
 
-    // Prune stale entries in bucket
     for (uint8_t i = 0; i < bucket->entryCount;) {
         if ((nowMs - bucket->entries[i].lastHeardMs) > RELAY_ID_CACHE_TTL_MS) {
             if (i < bucket->entryCount - 1) {
@@ -5159,7 +4251,6 @@ void SignalRoutingModule::rememberRelayIdentity(NodeNum nodeId, uint8_t relayId)
         }
     }
 
-    // Update existing or add new
     for (uint8_t i = 0; i < bucket->entryCount; i++) {
         if (bucket->entries[i].nodeId == nodeId) {
             bucket->entries[i].lastHeardMs = nowMs;
@@ -5177,7 +4268,7 @@ void SignalRoutingModule::pruneRelayIdentityCache(uint32_t nowMs)
 {
     for (uint8_t b = 0; b < relayIdentityCacheCount;) {
         RelayIdentityCacheEntry *bucket = &relayIdentityCache[b];
-        // Prune entries
+
         for (uint8_t i = 0; i < bucket->entryCount;) {
             if ((nowMs - bucket->entries[i].lastHeardMs) > RELAY_ID_CACHE_TTL_MS) {
                 if (i < bucket->entryCount - 1) {
@@ -5188,7 +4279,7 @@ void SignalRoutingModule::pruneRelayIdentityCache(uint32_t nowMs)
                 i++;
             }
         }
-        // Remove empty buckets
+
         if (bucket->entryCount == 0) {
             if (b < relayIdentityCacheCount - 1) {
                 relayIdentityCache[b] = relayIdentityCache[relayIdentityCacheCount - 1];
@@ -5239,7 +4330,7 @@ uint8_t SignalRoutingModule::rateLimitGraphHops(NodeNum nodeId) const
             }
         }
     }
-    Route route = routingGraph->calculateRoute(nodeId, millis());
+    Route route = routingGraph->calculateRoute(nodeId, nowSeconds(), routePolicy());
     if (route.nextHop != 0 && route.hops > 0) {
         return route.hops;
     }
@@ -5253,17 +4344,15 @@ NodeNum SignalRoutingModule::resolveRelayIdentity(uint8_t relayId, int16_t rxRss
 {
     uint32_t nowMs = millis();
     NodeNum bestNode = 0;
-    uint32_t newest = 0;
+    uint8_t nonDirectCount = 0;
 
-    // Collect direct neighbor candidates (up to 4 per bucket)
     struct DirectCandidate {
         NodeNum nodeId;
-        uint16_t edgeEtx; // ETX * 100 from the edge
+        uint16_t edgeEtx;
     };
     DirectCandidate directCandidates[4];
     uint8_t directCount = 0;
 
-    // Determine our direct neighbors for tiebreaking
     NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
     const NodeEdges *myEdges = (routingGraph && myNode) ? routingGraph->getEdgesFrom(myNode) : nullptr;
 
@@ -5286,35 +4375,56 @@ NodeNum SignalRoutingModule::resolveRelayIdentity(uint8_t relayId, int16_t rxRss
                 if ((nowMs - bucket->entries[i].lastHeardMs) > RELAY_ID_CACHE_TTL_MS) {
                     continue;
                 }
-                uint32_t t = bucket->entries[i].lastHeardMs;
                 NodeNum n = bucket->entries[i].nodeId;
                 int32_t edgeEtx = getDirectEdgeEtx(n);
                 if (edgeEtx >= 0 && directCount < 4) {
                     directCandidates[directCount++] = {n, static_cast<uint16_t>(edgeEtx)};
                 } else if (edgeEtx < 0) {
-                    if (t >= newest) { newest = t; bestNode = n; }
+                    nonDirectCount++;
+                    bestNode = n;
                 }
             }
             break;
         }
     }
 
-    // Pick best direct neighbor
+    if (myEdges) {
+        for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
+            const Edge &edge = myEdges->edges[i];
+            if ((edge.to & 0xFF) != relayId || isPlaceholderNode(edge.to) || edge.source != Edge::Source::Reported) {
+                continue;
+            }
+            bool present = false;
+            for (uint8_t j = 0; j < directCount; j++) {
+                present |= directCandidates[j].nodeId == edge.to;
+            }
+            if (!present) {
+                if (directCount == 4) {
+                    return 0;
+                }
+                directCandidates[directCount++] = {edge.to, edge.etxFixed};
+            }
+        }
+    }
+
     NodeNum bestDirectNode = 0;
+    if (relayId == 0) {
+        return 0;
+    }
     if (directCount == 1) {
         bestDirectNode = directCandidates[0].nodeId;
-    } else if (directCount > 1 && rxRssi != 0) {
-        // Multiple direct neighbors share this relay byte — use packet ETX to disambiguate.
-        // Equal ETX distance is still ambiguous: naming the wrong full ID writes coverage to
-        // a node that never transmitted (Czar vs Z00b both 0x8c).
-        float packetEtx = NeighborGraph::calculateETX(rxRssi, rxSnr, currentCostingSpreadingFactor());
+    } else if (directCount > 1 && (rxRssi != 0 || rxSnr > 0.0f)) {
+        int32_t normalizedRssi = rxRssi;
+        if (!NeighborGraph::normalizeRxSignal(normalizedRssi, rxSnr)) {
+            return 0;
+        }
+        float packetEtx = NeighborGraph::calculateETX(normalizedRssi, rxSnr, currentCostingSpreadingFactor());
         uint16_t packetEtxFixed = static_cast<uint16_t>(packetEtx * 100.0f);
         uint16_t bestDiff = UINT16_MAX;
         bool tied = false;
         for (uint8_t i = 0; i < directCount; i++) {
-            uint16_t diff = (packetEtxFixed > directCandidates[i].edgeEtx)
-                                ? (packetEtxFixed - directCandidates[i].edgeEtx)
-                                : (directCandidates[i].edgeEtx - packetEtxFixed);
+            uint16_t diff = (packetEtxFixed > directCandidates[i].edgeEtx) ? (packetEtxFixed - directCandidates[i].edgeEtx)
+                                                                           : (directCandidates[i].edgeEtx - packetEtxFixed);
             if (diff < bestDiff) {
                 bestDiff = diff;
                 bestDirectNode = directCandidates[i].nodeId;
@@ -5327,20 +4437,14 @@ NodeNum SignalRoutingModule::resolveRelayIdentity(uint8_t relayId, int16_t rxRss
             bestDirectNode = 0;
         }
     }
-    // directCount > 1 with no RSSI: leave unresolved (same rule as match-relay-byte ambiguity).
-    // Picking "newest" used to collapse distinct full IDs that share a last byte.
 
-    // Prefer direct neighbor over non-neighbor when there's a collision
-    NodeNum result = bestDirectNode ? bestDirectNode : bestNode;
+    NodeNum result = directCount > 0 ? bestDirectNode : (nonDirectCount == 1 ? bestNode : 0);
 
-    // Don't return placeholders - they should be resolved to real nodes
     if (isPlaceholderNode(result)) {
         return 0;
     }
     return result;
 }
-
-
 
 NodeNum SignalRoutingModule::resolveHeardFrom(const meshtastic_MeshPacket *p, NodeNum sourceNode) const
 {
@@ -5357,11 +4461,7 @@ NodeNum SignalRoutingModule::resolveHeardFrom(const meshtastic_MeshPacket *p, No
         return resolved;
     }
 
-    // Our own edge list — the nodes we have measured — and only when the byte names exactly one
-    // real node in it. Two of our neighbours sharing a low byte are indistinguishable in a relayed
-    // frame, and this identity decides who we treat as having transmitted, so a guess prices and
-    // publishes a link to the wrong node and has a peer credit coverage that does not exist.
-    // Ambiguity falls through to the placeholder below, which is never published.
+    // Guessing a colliding relay identity invents measured links and credits nonexistent coverage.
     NodeNum placeholderMatch = 0;
     if (routingGraph && nodeDB) {
         const NodeEdges *myEdges = routingGraph->getEdgesFrom(nodeDB->getNodeNum());
@@ -5374,7 +4474,6 @@ NodeNum SignalRoutingModule::resolveHeardFrom(const meshtastic_MeshPacket *p, No
                     continue;
                 }
                 if (isPlaceholderNode(candidate)) {
-                    // Remember the placeholder in case no real node matches
                     placeholderMatch = candidate;
                     continue;
                 }
@@ -5385,23 +4484,19 @@ NodeNum SignalRoutingModule::resolveHeardFrom(const meshtastic_MeshPacket *p, No
                 onlyMatch = candidate;
             }
             if (!ambiguous && onlyMatch != 0) {
-                // Remember this mapping for future use
-                const_cast<SignalRoutingModule*>(this)->rememberRelayIdentity(onlyMatch, p->relay_node);
+                const_cast<SignalRoutingModule *>(this)->rememberRelayIdentity(onlyMatch, p->relay_node);
                 return onlyMatch;
             }
         }
     }
 
-    // Return placeholder if we found one in the graph
     if (placeholderMatch != 0) {
         return placeholderMatch;
     }
 
-    // Last resort: synthesize placeholder ID from relay byte so we never
-    // falsely claim the packet came directly from the source
+    // An unresolved relay byte must not falsely turn a forwarded frame into direct-originator evidence.
     return 0xFF000000 | p->relay_node;
 }
-
 
 bool SignalRoutingModule::hasDirectConnectivity(NodeNum nodeA, NodeNum nodeB)
 {
@@ -5409,8 +4504,7 @@ bool SignalRoutingModule::hasDirectConnectivity(NodeNum nodeA, NodeNum nodeB)
         return false;
     }
 
-    // Check if nodeA has a direct edge to nodeB
-    const NodeEdges* edges = routingGraph->getEdgesFrom(nodeA);
+    const NodeEdges *edges = routingGraph->getEdgesFrom(nodeA);
     if (edges) {
         for (uint8_t i = 0; i < edges->edgeCount; i++) {
             if (edges->edges[i].to == nodeB) {
@@ -5422,72 +4516,56 @@ bool SignalRoutingModule::hasDirectConnectivity(NodeNum nodeA, NodeNum nodeB)
     return false;
 }
 
-// Enhanced connectivity check that considers stock firmware limitations
-// Returns: true = verified connectivity, false = no connectivity or unknown
-// The unknownOut parameter indicates if we couldn't verify (stock node involved)
-bool SignalRoutingModule::hasVerifiedConnectivity(NodeNum transmitter, NodeNum receiver, bool* unknownOut)
+bool SignalRoutingModule::hasVerifiedConnectivity(NodeNum transmitter, NodeNum receiver, bool *unknownOut)
 {
     if (!routingGraph || !nodeDB) {
-        if (unknownOut) *unknownOut = true;
+        if (unknownOut)
+            *unknownOut = true;
         return false;
     }
 
-    // Get capability status of both nodes
     CapabilityStatus txStatus = getCapabilityStatus(transmitter);
     CapabilityStatus rxStatus = getCapabilityStatus(receiver);
-    
-    bool txIsStock = isPlaceholderNode(transmitter) || 
-                     txStatus == CapabilityStatus::Legacy || 
-                     txStatus == CapabilityStatus::Unknown;
-    bool rxIsStock = isPlaceholderNode(receiver) || 
-                     rxStatus == CapabilityStatus::Legacy || 
-                     rxStatus == CapabilityStatus::Unknown;
 
-    // If both are stock, we have no topology data - unknown
+    bool txIsStock =
+        isPlaceholderNode(transmitter) || txStatus == CapabilityStatus::Legacy || txStatus == CapabilityStatus::Unknown;
+    bool rxIsStock = isPlaceholderNode(receiver) || rxStatus == CapabilityStatus::Legacy || rxStatus == CapabilityStatus::Unknown;
+
     if (txIsStock && rxIsStock) {
-        if (unknownOut) *unknownOut = true;
+        if (unknownOut)
+            *unknownOut = true;
         return false;
     }
 
-    // Check both directions for edges:
-    // 1. transmitter → receiver: transmitter reported hearing receiver
-    // 2. receiver → transmitter: receiver reported hearing transmitter
-    
     bool foundEdge = false;
-    
-    // Check transmitter → receiver (only useful if transmitter is SR-active)
+
     if (!txIsStock) {
         if (hasDirectConnectivity(transmitter, receiver)) {
             foundEdge = true;
         }
     }
-    
-    // Check receiver → transmitter (only useful if receiver is SR-active)
+
     if (!foundEdge && !rxIsStock) {
         if (hasDirectConnectivity(receiver, transmitter)) {
             foundEdge = true;
         }
     }
-    
+
     if (foundEdge) {
-        if (unknownOut) *unknownOut = false;
+        if (unknownOut)
+            *unknownOut = false;
         return true;
     }
-    
-    // No edge found. Determine if this is "unknown" or "no connectivity"
-    // If the SR-active node has edges but none to the stock node, it's likely no connectivity
-    // But if the SR-active node has very few edges or the stock node is new, it could be unknown
-    
+
     if (txIsStock || rxIsStock) {
-        // One node is stock - we can't be certain, mark as unknown
-        if (unknownOut) *unknownOut = true;
+        if (unknownOut)
+            *unknownOut = true;
     } else {
-        // Both are SR-active and no edge exists - they likely can't hear each other
-        if (unknownOut) *unknownOut = false;
+        if (unknownOut)
+            *unknownOut = false;
     }
 
     return false;
 }
 
-#endif // !MESHTASTIC_EXCLUDE_SIGNALROUTING
-
+#endif

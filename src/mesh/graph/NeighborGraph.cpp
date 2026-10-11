@@ -9,6 +9,11 @@
 
 NeighborGraph::NeighborGraph() : neighborCount(0), downstreamCount(0), relayStateCount(0), routeCacheCount(0) {}
 
+uint32_t NeighborGraph::nowSeconds() const
+{
+    return graphClock.seconds(millis());
+}
+
 uint16_t Edge::silenceEtxFixedFromAge(uint32_t ageSecs, uint32_t periodSecs)
 {
     const uint32_t half = periodSecs / 2;
@@ -522,7 +527,7 @@ NodeEdges *NeighborGraph::findOrCreateNeighbor(NodeNum nodeId)
     }
 
     NodeNum myNode = nodeDB ? nodeDB->getNodeNum() : 0;
-    uint32_t currentTime = millis() / 1000;
+    uint32_t currentTime = nowSeconds();
 
     if (neighborCount >= NEIGHBOR_GRAPH_MAX_NEIGHBORS) {
         // Soft create: demote if possible, else legacy quiet eviction without inventing a parent.
@@ -1397,7 +1402,7 @@ NodeNum NeighborGraph::getDownstreamRelay(NodeNum destination) const
 
 bool NeighborGraph::downstreamRelayAndCost(NodeNum destination, NodeNum &relayOut, uint16_t &costOut) const
 {
-    uint32_t now = millis() / 1000;
+    uint32_t now = nowSeconds();
     NodeNum bestRelay = 0;
     uint16_t bestCost = UINT16_MAX;
     for (uint16_t i = 0; i < downstreamCount; i++) {
@@ -1466,7 +1471,7 @@ bool NeighborGraph::isDownstream(NodeNum destination) const
 size_t NeighborGraph::getDownstreamCountForRelay(NodeNum relay) const
 {
     size_t count = 0;
-    uint32_t now = millis() / 1000;
+    uint32_t now = nowSeconds();
     for (uint16_t i = 0; i < downstreamCount; i++) {
         if (downstream[i].relay == relay && (now - downstream[i].lastUpdate) < nodeTtlSecs) {
             count++;
@@ -1480,7 +1485,7 @@ size_t NeighborGraph::getDownstreamNodesForRelay(NodeNum relay, NodeNum *outArra
 {
     size_t count = 0;
     size_t skipped = 0;
-    uint32_t now = millis() / 1000;
+    uint32_t now = nowSeconds();
     for (uint16_t i = 0; i < downstreamCount && count < maxCount; i++) {
         if (downstream[i].relay == relay && (now - downstream[i].lastUpdate) < nodeTtlSecs) {
             if (skipped < skipCount) {
@@ -1499,7 +1504,7 @@ bool NeighborGraph::isRelayFor(NodeNum myNode, NodeNum destination) const
 {
     for (uint16_t i = 0; i < downstreamCount; i++) {
         if (downstream[i].destination == destination && downstream[i].relay == myNode) {
-            uint32_t now = millis() / 1000;
+            uint32_t now = nowSeconds();
             if ((now - downstream[i].lastUpdate) < nodeTtlSecs) {
                 return true;
             }
@@ -1527,7 +1532,7 @@ size_t NeighborGraph::transferDownstream(NodeNum oldRelay, NodeNum newRelay)
     if (oldRelay == 0 || newRelay == 0 || oldRelay == newRelay) {
         return 0;
     }
-    uint32_t now = millis() / 1000;
+    uint32_t now = nowSeconds();
     size_t count = 0;
     // First pass: add entries under newRelay (preserve listLearned)
     for (uint16_t i = 0; i < downstreamCount; i++) {
@@ -1974,7 +1979,7 @@ bool NeighborGraph::retractDirectLink(NodeNum myNode, NodeNum neighbor, bool pru
     removeEdge(neighbor, myNode);
     if (removed) {
         if (pruneAfter) {
-            pruneUnreachableFromRoot(millis() / 1000);
+            pruneUnreachableFromRoot(nowSeconds());
         }
         routeCacheCount = 0;
     }
@@ -2115,7 +2120,7 @@ bool NeighborGraph::unicastCanFinish(NodeNum node, NodeNum destination, const Ro
         return true;
     }
     bool publishes = policy.publishes && policy.publishes(policy.ctx, destination);
-    const uint32_t nowSecs = millis() / 1000;
+    const uint32_t nowSecs = nowSeconds();
     return canDeliver(node, destination, policy) && deliveryHopCost(node, destination, publishes, nowSecs) > 0.0f;
 }
 
@@ -2134,7 +2139,7 @@ uint16_t NeighborGraph::unicastCandidateCost(NodeNum node, NodeNum destination, 
         // cheaper reverse number. The shared-next-hop arm below stays on the raw price: two
         // neighbours a few hundredths apart have to remain one bucket.
         bool publishes = policy.publishes && policy.publishes(policy.ctx, to);
-        const uint32_t nowSecs = millis() / 1000;
+        const uint32_t nowSecs = nowSeconds();
         float cost = deliveryHopCost(from, to, publishes, nowSecs);
         if (cost <= 0.0f) {
             return UINT16_MAX;

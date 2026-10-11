@@ -113,18 +113,11 @@ Passive SR nodes (TRACKER, SENSOR, TAK, or non-active-routing configured nodes) 
 
 SignalRouting determines if a packet was received directly from the sender using a two-part check in `isDirectPacket()`:
 
-```cpp
-bool SignalRoutingModule::isDirectPacket(const meshtastic_MeshPacket &mp)
-{
-    if (mp.hop_start != mp.hop_limit)
-        return false;
-    // If relay_node is set and doesn't match the sender's last byte,
-    // a different node relayed this (stock nodes may not decrement hop_limit)
-    if (mp.relay_node != 0 && mp.relay_node != (mp.from & 0xFF))
-        return false;
-    return true;
-}
-```
+`SignalRoutingModule::isDirectPacket()` combines the hop counters with the relay identity
+hint. Equal initial and remaining hop counts are necessary, but not sufficient,
+because some stock nodes may relay without decrementing the hop limit. When the
+relay byte identifies a node other than the originator, the packet is treated as
+relayed.
 
 **How it works:**
 1. **Hop counter check** (`hop_start == hop_limit`): When a sender transmits a packet, `hop_start` is set to the initial hop limit. Each relay decrements `hop_limit`. If they are equal, the packet has not been decremented by any relay.
@@ -167,7 +160,7 @@ All discovery mechanisms are used to maintain comprehensive network topology:
 
 1. **Direct Neighbor Detection**: When receiving packets directly with signal data (RSSI/SNR), immediate neighbor relationships are established with calculated ETX values. Decode success is not required: `encryptedOk` is set so `handleReceived` runs for undecoded LoRa frames, and a direct header (`isDirectPacket`, not via MQTT) records the sender as an ordinary direct neighbour. Silence for the existing neighbour liveliness window ages the edge out; there is no separate stranger TTL.
 
-2. **Topology Broadcasts**: Periodically broadcast their complete neighbor list using a packed binary format (8 bytes/neighbor) for comprehensive topology learning from other nodes' perspectives. The periodic **Network Topology** dump tags ball members with Horizon class (`[L1]` / `[L2]` / `[L3]` / `[L?]`) and prints a header census `(L1=a L2=b L3=c)`; list-downstream / orphan rows stay marked `[downstream]` (not a ball class). Each entry carries the neighbor's node ID, RSSI, SNR, capability flags, and ETX variance — giving every node the same link stability view. **Transmit path:** a local `directSignals[]` side table (sized to `NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE`, same as direct edge slots) caches the real measured RSSI/SNR from direct RX (`updateNeighborInfo()` only); topology packing reads from that table rather than approximating signal from stored ETX. **Receive path:** mirrored/downstream links remain ETX-only in RAM; merge still uses `calculateETX(reported_rssi, reported_snr)`. The `hop_limit` of every SR topology packet is capped at `cfgBroadcastMaxHops` (default `SR_BROADCAST_MAX_HOPS`), even if the user has configured a higher limit, to bound topology gossip propagation in large networks. **Multi-packet lists:** more than `MAX_SIGNAL_ROUTING_NEIGHBORS` (28) neighbours go out as several chunks of the same topology version, spaced 2× the packet airtime. Header flag bits mark them (`0x02` more chunks follow, `0x04` not the first chunk); a packet with neither flag is a complete list. The authoritative hearsUs override (below) needs the complete list, so receivers gather the listed ids across chunks and run it on the last one; a continuation whose first chunk was missed leaves the flags untouched. The periodic timer is not reset by originated packets: they prove the node is alive but carry no neighbour list. **Version acceptance:** each broadcast carries the sender's u8 topology version. A report is processed when its version repeats or moves forward from the last accepted one by less than 128 (wraparound-safe), when it is the sender's header-only boot broadcast with version 0, direct or relayed (the sender's counter restarted, so the tracked version is reset to 0 and the next neighbour list is version 1; the boot packet itself consumes version 0), when nothing has been accepted from that sender for two broadcast intervals plus 20 seconds (`2 × topology_broadcast_secs + 20`, any version is taken as the new base), when the received version sits more than 7 counts behind the last accepted one (a restarted counter such as 26→1, not a delayed copy of v=25; logged `counter restarted`), when the boot broadcast was lost and rejected reports then climb in the new epoch (v=1 then v=2, or v=1 then v=3 if one list was missed; delayed old reports sit 1–2 behind `last` and do not climb), or when a **complete neighbour list is heard from the originator** (`isDirectPacket`) even though the counter looks slightly backwards — the neighbour is transmitting now, so that list replaces what we stored; a relayed copy of a near-behind version stays stale so a delayed old report cannot clobber a newer one. Ingest uses the same gate in `handleReceivedProtobuf` as in `preProcessSignalRoutingPacket`, so a node that stock-floods instead of SR-relaying still records stale rejects and still rebases. These rules apply a rebooted neighbour's list without waiting for that neighbour's counter to catch up, and without rebooting the receiver; each such re-base is logged as `Topology version resync`. Anything else is logged as `Ignoring stale topology` and does not touch the graph.
+2. **Topology Broadcasts**: Periodically broadcast their complete neighbor list using a packed binary format (8 bytes/neighbor) for comprehensive topology learning from other nodes' perspectives. The periodic **Network Topology** dump tags ball members with Horizon class (`[L1]` / `[L2]` / `[L3]` / `[L?]`) and prints a header census `(L1=a L2=b L3=c)`; list-downstream / orphan rows stay marked `[downstream]` (not a ball class). Each entry carries the neighbor's node ID, RSSI, SNR, capability flags, and ETX variance — giving every node the same link stability view. **Transmit path:** a local `directSignals[]` side table (sized to `NEIGHBOR_GRAPH_MAX_EDGES_PER_NODE`, same as direct edge slots) caches the real measured RSSI/SNR from direct RX (`updateNeighborInfo()` only); topology packing reads from that table rather than approximating signal from stored ETX. **Receive path:** mirrored/downstream links remain ETX-only in RAM; merge still uses `calculateETX(reported_rssi, reported_snr)`. The `hop_limit` of every SR topology packet is capped at `cfgBroadcastMaxHops` (default `SR_BROADCAST_MAX_HOPS`), even if the user has configured a higher limit, to bound topology gossip propagation in large networks. **Multi-packet lists:** more than `MAX_SIGNAL_ROUTING_NEIGHBORS` (28) neighbours go out as several chunks of the same topology version, spaced 2× the packet airtime. Header flag bits mark them (`0x02` more chunks follow, `0x04` not the first chunk); a packet with neither flag is a complete list. Receivers apply the authoritative hearsUs override (below) only after collecting a complete, contiguous list. A missing or out-of-order chunk preserves existing hearsUs and topology edges. `SignalRoutingModule::processTopology()` remembers processed chunk indexes for the current version, so a delayed duplicate first or middle chunk cannot reset collection or block final retraction; legacy chunks without indexes use packet identity and never authorize retraction when incomplete. The periodic timer is not reset by originated packets: they prove the node is alive but carry no neighbour list. **Version acceptance:** each broadcast carries the sender's u8 topology version. A report is processed when its version repeats or moves forward from the last accepted one by less than 128 (wraparound-safe), when it is the sender's header-only boot broadcast with version 0, direct or relayed (the sender's counter restarted, so the tracked version is reset to 0 and the next neighbour list is version 1; the boot packet itself consumes version 0), when nothing has been accepted from that sender for two broadcast intervals plus 20 seconds (`2 × topology_broadcast_secs + 20`, any version is taken as the new base), when the received version sits more than 7 counts behind the last accepted one (a restarted counter such as 26→1, not a delayed copy of v=25; logged `counter restarted`), when the boot broadcast was lost and rejected reports then climb in the new epoch (v=1 then v=2, or v=1 then v=3 if one list was missed; delayed old reports sit 1–2 behind `last` and do not climb), or when a **complete neighbour list is heard from the originator** (`isDirectPacket`) even though the counter looks slightly backwards — the neighbour is transmitting now, so that list replaces what we stored; a relayed copy of a near-behind version stays stale so a delayed old report cannot clobber a newer one. The same topology processor serves normal receive handling and relay-decision preprocessing, so a node that stock-floods instead of SR-relaying still ingests topology and applies the same version and duplicate checks. These rules apply a rebooted neighbour's list without waiting for that neighbour's counter to catch up, and without rebooting the receiver; each such re-base is logged as `Topology version resync`. Anything else is logged as `Ignoring stale topology` and does not touch the graph.
 
 3. **Relayed Packet Inference**: When receiving a relayed packet, gateway relationships are inferred between the original sender and the relay node. If the relay node is a stock (Legacy) firmware node, a directed edge is also recorded from the relay to the sender — observing a successful relay proves the relay can hear the sender, regardless of the sender's firmware type. The reverse edge is not assumed. Both are priced at a nominal link (RSSI −70, SNR 5), never at the measured strength of the relay's own link to us: a downstream entry stands for a path and is priced per hop the packet travelled, while an inferred edge stands for the single hop from the relay to the sender and is priced as one, whatever route the packet took to reach us.
    **Travelling neighbour:** a sender we still listed as a Reported direct neighbour, heard only
@@ -227,39 +220,13 @@ By limiting topology to Level 1 direct neighbors, passive nodes minimize memory 
 
 SignalRouting calculates unicast routes and coordinates delivery for reliable packet transmission:
 
-```cpp
-NodeNum SignalRoutingModule::getNextHop(NodeNum destination, ...) {
-    // 1. Check direct connection (1-hop route)
-    const NodeEdges* myEdges = routingGraph->getEdgesFrom(myNode);
-    for each direct neighbor:
-        if (neighbor == destination) return destination; // Direct route
-
-    // 2. Find multi-hop routes with Dijkstra run backwards from the destination
-    //    over "who hears whom" (see Edge Direction in Route Calculation below),
-    //    with silence-aware variance on each hop. A downstream chain onto a
-    //    neighbour we hear is stampable even when Dijkstra did not verify the path.
-    Route route = routingGraph->calculateRoute(destination, currentTime);
-    if (route.nextHop != 0) {
-        return route.nextHop; // Multi-hop route found
-    }
-
-    // 3. Fallback options: gateway routes, opportunistic forwarding
-    return findBestFallbackOption(destination, ...);
-}
-
-// Special handling for relayed unicast packets to direct neighbors
-bool shouldDeliverDirectToNeighbor(NodeNum destination, NodeNum heardFrom) {
-    // If we received this as a relayed packet and destination is our direct neighbor,
-    // deliver directly since the destination didn't hear the original transmission
-    if (heardFrom != sourceNode && isDirectNeighbor(destination)) {
-        // Check if better positioned neighbors exist before delivering directly
-        if (!hasBetterPositionedNeighborForDirectDelivery(destination, ourRouteCost)) {
-            return destination; // Deliver directly
-        }
-    }
-    return 0; // Use normal routing
-}
-```
+`NeighborGraph::calculateRoute()` supplies the ETX-weighted multi-hop route after
+`SignalRoutingModule` checks for a direct connection. If that route is unavailable,
+`SignalRoutingModule` considers gateway and opportunistic forwarding fallbacks. For
+a relayed unicast whose destination is a direct neighbor, it can deliver directly
+when no better-positioned neighbor should take the packet first. These decisions
+are coordinated through `SignalRoutingModule::shouldRelay()` and its routing
+helpers.
 
 ### Edge Direction in Route Calculation
 
@@ -738,7 +705,7 @@ With bidi priority: NodeB gets tier 1 (bidi to NodeA), relays first. Stock nodes
 
 ### Channel-Utilization-Based Relay Gating
 
-`ChannelQoS` gradually drops lower priority relay traffic as channel utilization increases, preserving bandwidth for user messages and critical control traffic. It acts as a prerequisite gate in `perhapsRebroadcast()` — checked before SR's relay decision logic.
+`ChannelQoS::classifyTier()` classifies decoded application packets before relay selection. Text priority follows `Channels::getPrimaryIndex()`, so changing the configured primary channel changes which text receives the critical exemption. Encrypted or otherwise undecoded payloads are LOW because their application port cannot be inspected. The gate runs before SR relay selection.
 
 **Priority tiers** (lowest dropped first):
 
@@ -746,10 +713,10 @@ With bidi priority: NodeB gets tier 1 (bidi to NodeA), relays first. Stock nodes
 |------|-------------|------------------------|
 | LOW | Telemetry, position, nodeinfo, unknown/undecoded | 25% |
 | MEDIUM | Text on non-primary channel | 30% |
-| HIGH | Routing, SR routing, traceroute, ACKs | 38% |
+| HIGH | Routing control, SR routing, traceroute | 38% |
 | CRITICAL | Text on primary channel, admin | Never dropped |
 
-Thresholds align with stock firmware's existing channel utilization limits (25% polite, 40% impolite). The QoS filter only gates relay decisions — packets addressed to us are always delivered locally.
+`ChannelQoS::canRelay()` drops a relay at or above the tier threshold. Critical traffic bypasses the utilization read entirely; a missing `AirTime` instance reports zero utilization. The filter only gates relay attempts, while local packet delivery remains the receive path's responsibility.
 
 `ChannelQoS` is orthogonal to `NodeRateLimiter` (per-node abuse detection) and stock `AirTime` TX blocking (blocks our originations). QoS handles aggregate channel load for relay decisions.
 
@@ -782,15 +749,15 @@ Each tracked **originator** gets four independent buckets:
 | OTHER | every other decoded portnum | 4 |
 | UNKNOWN | undecodable packets: no key for the channel, PKI traffic for other nodes | 12 |
 
-Originator clear threshold is **half the trip** (minimum 1): a limited originator
-recovers at the window roll once its count for that window is below half the
-threshold that tripped it. Half, not the RELAY bucket's quarter, because these
-thresholds are small — a quarter of OTHER's 4 is 1, which would demand a
-completely silent window. A clear of 0 would mean sticky-until-silent, and since
-every packet arriving while limited restarts that window, an originator that kept
-talking could never recover at all. Up to 16 originators
-are tracked; eviction prefers nodes not in our graph, then farthest by graph hops
-(never frame `hop_start`/`hop_limit`).
+Originator clear threshold is **half the trip** (minimum 1): at a window boundary,
+a limited originator recovers if its completed-window count is below half the
+trip threshold. Traffic during the next window does not extend the previous ban.
+Half is used because these thresholds are small: a quarter of OTHER's trip count
+would make recovery require an entirely silent window. Up to 16 originators are
+tracked; eviction prefers entries without an active limit, then nodes outside our
+graph, then farther graph hops (never frame `hop_start`/`hop_limit`). If every
+tracked originator is still limited, a new originator fails closed until a slot
+becomes safe to reuse.
 
 While any originator bucket for a node is limited, **unicast frames addressed to
 that node on the default public channel** are logged and dropped without charging
@@ -822,9 +789,13 @@ RELAY uses an **airtime budget**: trip capacity is ~`60 ×` the current frame's
 estimated airtime (so slower presets allow fewer packets before tripping), then
 tightened when local channel utilization is high, and clamped to floors/ceilings.
 While RELAY-limited, all rebroadcast candidates from that key are dropped; at
-window end, if charged airtime is below the clear budget (~15/60 of trip), the
-ban lifts. Dupe/upgrade rebroadcast paths consult `wouldDrop()` so a limited
-packet is not amplified without re-charging.
+a window boundary, if charged airtime is below the clear budget (~15/60 of
+trip), the ban lifts. `wouldDrop()` applies the same time-aware recovery decision
+as `shouldDrop()`, so a read-only duplicate or retry gate cannot preserve an idle
+ban forever. Eviction skips entries whose active limit has not cleared; when all
+relay slots are protected, a new resolved relay fails closed. Dupe/upgrade
+rebroadcast paths consult `wouldDrop()` so a limited packet is not amplified
+without re-charging.
 
 Direct first-hop frames key RELAY on the originator NodeID when `relay_node` is
 absent or matches the sender; multi-hop frames use resolved last-hop identity
@@ -893,9 +864,15 @@ exemption.
 - `ADMIN_APP` is **not** exempt by portnum (PKI admin is opaque on the relay path
   and lands in UNKNOWN; the destination is covered by `isToUs`).
 
-Thresholds for originator text/routing/other and the window remain overridable via
-`moduleConfig.node_rate_limiter` (`enabled` is the kill-switch). RELAY budgets are
+The text, routing, and other originator thresholds and the window remain overridable via
+`moduleConfig.node_rate_limiter` (`enabled` is the kill-switch); UNKNOWN keeps its firmware default. Oversized window and threshold settings are capped before use. RELAY budgets are
 firmware defaults only in v1.
+
+Bucket windows use unsigned elapsed-time comparisons, saturating counters, and
+bounded airtime/window configuration so wraparound or oversized settings cannot
+turn a full budget into an empty one. Young-node age and boot warm-up are latched
+after they expire, so a `millis()` rollover does not make established peers young
+again or restart the warm-up exemption.
 
 ## Benefits for Mesh Network Reliability
 
@@ -947,16 +924,10 @@ SignalRouting considerations:
 
 The `NeighborGraph` class uses fixed-size arrays (~24 KB heap) and runs on all platforms including ESP32-C3, supporting 400+ mesh nodes with no dynamic allocation.
 
-**Memory Structure:**
-```cpp
-class NeighborGraph {
-    NodeEdges neighbors[32];              // Graph node slots (32 nodes × 32 edges each, ~17 KB)
-    DownstreamEntry downstream[900];      // Remote node routing table
-    RelayState relayStates[32];           // Transmission tracking for contention
-    Route routeCache[32];                 // Cached Dijkstra results
-    // Total: ~24 KB fixed allocation
-};
-```
+`NeighborGraph` keeps node edges, downstream reachability, relay transmission
+history, and cached routes in bounded storage. See `NeighborGraph` and its
+`NodeEdges`, `DownstreamEntry`, `RelayState`, and `Route` types for the current
+layout and target-specific limits.
 
 **Core Data Types:**
 
@@ -988,16 +959,10 @@ class NeighborGraph {
 
 ### Downstream Routing Table
 
-The downstream table tracks which remote (multi-hop) nodes are reachable through which direct neighbor (relay):
-
-```cpp
-struct DownstreamEntry {
-    NodeNum destination; // Remote node
-    NodeNum relay;       // Which direct neighbor reaches it
-    uint16_t costFixed;  // Cumulative ETX × 100
-    uint32_t lastUpdate; // For aging
-};
-```
+The downstream table tracks which remote (multi-hop) nodes are reachable through
+which direct neighbor (relay). `DownstreamEntry` stores destination, relay,
+cumulative ETX cost, and update time; `NeighborGraph::downstreamChainEgress()` can
+walk a chain when a direct Dijkstra route is unavailable.
 
 - Updated when SR topology broadcasts report neighbor lists from relay nodes
 - Supports multiple relays per destination (entries with different relay fields)
@@ -1023,27 +988,17 @@ Placeholders are only created for nodes **we** hear directly — not for nodes r
 
 ### Relay Byte Matching
 
-Unicast relay coordination uses relay byte matching (last byte of `p->relay_node`) to detect when the designated relay has already transmitted a packet. To prevent false positives from byte collisions across distant nodes, relay byte checks are **guarded by direct-edge verification**:
-
-```cpp
-// Only match relay bytes against nodes we have direct edges to
-if (relayForDest != 0 && (relayForDest & 0xFF) == p->relay_node &&
-    routingGraph->getEdgesFrom(relayForDest) != nullptr) {
-    // Relay already transmitted — don't duplicate
-    return false;
-}
-```
+Relay-byte matching is only a hint because the on-air field carries eight bits. `SignalRoutingModule::resolveRelayIdentity()` checks it against known direct links and signal measurements. A collision that remains ambiguous resolves to no node, avoiding false transmission evidence or coverage claims.
 
 ### Timing and Synchronization
 
-SignalRouting uses **monotonic time** (time since boot) for all graph operations to ensure consistency:
-
-- **Graph aging**: Edge expiration and node cleanup
-- **Route caching**: Cache validity and expiration (`ROUTE_CACHE_TIMEOUT_SECS` — not runtime-configurable)
-- **Transmission tracking**: Contention window timing
-- **Edge timestamps**: Connection update times
-
-This prevents issues with RTC updates that could cause time jumps, ensuring reliable graph maintenance and routing decisions.
+`NeighborGraph::nowSeconds()` supplies the graph's shared **monotonic time** to
+both `SignalRoutingModule` and graph operations. `SrMonotonicClock` carries
+fractional seconds across `millis()` rollover, so producers and expiry checks keep
+using the same time base after roughly 49 days of uptime. The clock drives graph
+aging, route-cache validity, transmission tracking, and edge timestamps. This
+avoids RTC jumps and prevents fresh downstream entries from appearing expired
+when the millisecond counter wraps.
 
 **Hardware Adaptation:**
 - **STM32WL**: SR disabled entirely (64KB RAM limit)
@@ -1071,35 +1026,20 @@ All SR tuning parameters can be set at runtime via the Meshtastic admin interfac
 
 ### Compile-Time Constants
 
-The default values for the configurable parameters above are defined in `SignalRoutingModule.h` and `NeighborGraph.h`:
-
-```cpp
-// SignalRoutingModule.h
-#define SIGNAL_ROUTING_BROADCAST_SECS           // periodic topology broadcast interval (10 min)
-#define SIGNAL_ROUTING_DIRTY_BROADCAST_SECS     // minimum gap before early dirty broadcast (5 min)
-#define SR_BROADCAST_MAX_HOPS                   // hop_limit cap for topology packets
-#define MAX_SIGNAL_ROUTING_NEIGHBORS            // neighbors per broadcast payload (packed binary, fits 233-byte limit)
-
-// SignalRoutingModule.h (private, class scope)
-static constexpr uint32_t NODE_TTL_SECS;   // graph aging TTL for all nodes
-static constexpr uint32_t RELAY_ID_CACHE_TTL_MS;  // relay byte → NodeNum cache
-static constexpr uint32_t ROUTE_CACHE_TIMEOUT_SECS;      // Dijkstra result cache validity
-static constexpr uint32_t CAPABILITY_TTL_SECS;  // node capability cache
-static constexpr uint32_t PUBLISHER_SILENCE_SECS;  // retract our direct link to a silent publisher
-
-// NeighborGraph.h (private instance variable)
-float etxChangeThreshold = 0.5f;   // absolute ETX delta for a significant edge change (base; per-edge etxVariance added)
-uint8_t etxVariance;               // EWMA of |ETX change| × 20 on each edge — stored on the wire; live silence is local
-uint32_t lastHeardSecs;            // last RF hear as on-air TX on our Reported RX edge; 0 = no silence surcharge
-static constexpr uint32_t TOPOLOGY_BROADCAST_SECS;  // same T as SIGNAL_ROUTING_BROADCAST_SECS
-```
+The defaults and limits are maintained alongside their owners in
+`SignalRoutingModule.h` and `NeighborGraph.h`. `SignalRoutingModule` owns topology
+cadence, hop limits, node aging, capability and relay-identity lifetimes, and the
+publisher silence horizon. `NeighborGraph` owns route-cache timing, ETX change
+sensitivity, edge variance, and last-heard state. Runtime intervals are bounded
+before conversion to milliseconds, hop limits are capped at the protocol maximum,
+and non-finite or non-positive ETX thresholds are ignored.
 
 ### Prompt Dirty-Topology Rebroadcast (`markTopologyDirty()`)
 
-All topology change sites (new neighbor added, neighbor removed, placeholder resolved, topology received from a direct SR neighbor, etc.) call `markTopologyDirty()` instead of setting `topologyDirty = true` directly. `markTopologyDirty()` does two things atomically:
-
-1. Sets `topologyDirty = true`
-2. Calls `setIntervalFromNow(wakeIn)` to wake `runOnce()` as soon as `cfgDirtyBroadcastSecs` has elapsed since the last broadcast (immediately if it already has)
+Topology changes call `SignalRoutingModule::markTopologyDirty()`. It marks the
+pending list stale and uses `SignalRoutingModule::wakeWithin()` to bring
+`runOnce()` forward to the dirty-broadcast deadline without postponing an earlier
+bootstrap reply or retransmission wakeup.
 
 This ensures topology changes are broadcast promptly rather than waiting a full `cfgBroadcastSecs` cycle, while the `cfgDirtyBroadcastSecs` minimum gap prevents broadcast storms from rapid successive changes.
 
@@ -1118,15 +1058,11 @@ SR tracks each node's capability status to make informed routing decisions:
 
 ### Topology Health Assessment
 
-SignalRouting only activates when network has sufficient capable nodes:
-
-```cpp
-// For broadcast: requires at least 1 direct SR-capable neighbor
-bool topologyHealthy = capableNeighbors >= 1;
-
-// For unicast: requires knowledge of destination node
-bool topologyHealthy = nodeDB->getMeshNode(destination) != nullptr;
-```
+`SignalRoutingModule::topologyHealthyForBroadcast()` requires at least one direct
+SR-capable neighbor. `SignalRoutingModule::topologyHealthyForUnicast()` checks
+whether the destination is known through the graph, NodeDB, or downstream
+reachability. These separate checks let broadcast coordination and unicast routing
+activate when their own minimum topology knowledge is available.
 
 ### Unicast Fallback for Unknown Routes
 

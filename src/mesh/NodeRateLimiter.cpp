@@ -40,6 +40,34 @@ static void getNodeDisplayName(NodeNum nodeId, char *buf, size_t bufSize)
 #endif
 }
 
+template <typename Entry, typename Limited, typename Age, typename InGraph, typename Hops>
+static int selectEvictionCandidate(const Entry *entries, uint8_t count, Limited limited, Age age, InGraph inGraph, Hops hops)
+{
+    int candidate = -1;
+    bool candidateInGraph = false;
+    uint8_t candidateHops = 0;
+    uint32_t candidateAge = 0;
+    for (uint8_t i = 0; i < count; i++) {
+        const auto &entry = entries[i];
+        // Identity churn must not erase active limits when the table fills.
+        if (limited(entry)) {
+            continue;
+        }
+        const bool present = inGraph(entry.nodeId);
+        const uint8_t distance = present ? hops(entry.nodeId) : 0;
+        const uint32_t entryAge = age(entry);
+        if (candidate < 0 || (!present && candidateInGraph) ||
+            (present == candidateInGraph &&
+             (distance > candidateHops || (distance == candidateHops && entryAge > candidateAge)))) {
+            candidate = i;
+            candidateInGraph = present;
+            candidateHops = distance;
+            candidateAge = entryAge;
+        }
+    }
+    return candidate;
+}
+
 NodeRateLimiter *nodeRateLimiter = nullptr;
 
 #if defined(UNIT_TEST)
@@ -111,14 +139,15 @@ void NodeRateLimiter::debugSetBootMs(uint32_t bootMs_)
 {
     bootMs = bootMs_;
     bootKnown = true;
+    bootWarmed = false;
 }
 
 void NodeRateLimiter::debugSeedYoung(NodeNum nodeId, uint32_t firstSeenMs)
 {
-    // Insert directly into young[] (bypasses warm-up→alumni).
     if (findYoung(nodeId) >= 0 || inAlumni(nodeId) || youngCount >= MAX_YOUNG_ENTRIES) {
         return;
     }
+    young[youngCount] = {};
     young[youngCount].nodeId = nodeId;
     young[youngCount].firstSeenMs = firstSeenMs;
     youngCount++;
@@ -157,13 +186,13 @@ uint8_t NodeRateLimiter::debugDestSenders(NodeNum nodeId) const
 }
 #endif
 
-NodeRateLimiter::NodeRateLimiter() : originatorCount(0), relayCount(0), destCount(0)
+NodeRateLimiter::NodeRateLimiter()
 {
     if (moduleConfig.has_node_rate_limiter) {
         const auto &cfg = moduleConfig.node_rate_limiter;
         cfgEnabled = cfg.enabled;
         if (cfg.window_secs != 0) {
-            cfgWindowMs = cfg.window_secs * 1000u;
+            cfgWindowMs = std::min<uint32_t>(cfg.window_secs, INT32_MAX / 1000u) * 1000u;
         }
         if (cfg.text_threshold != 0) {
             cfgTextTrip = (uint8_t)std::min<uint32_t>(cfg.text_threshold, 255);
@@ -211,7 +240,7 @@ bool NodeRateLimiter::isRebroadcastCandidate(const meshtastic_MeshPacket *p)
     if (p->hop_limit > 0) {
         return true;
     }
-    // Match NextHopRouter::perhapsRebroadcast: traffic-management exhaust still relays once.
+
 #if HAS_TRAFFIC_MANAGEMENT
     if (trafficManagementModule && trafficManagementModule->shouldExhaustHops(*p)) {
         return true;
@@ -236,8 +265,8 @@ void NodeRateLimiter::relayBudgets(uint32_t airMs, uint32_t &tripMs, uint32_t &c
     if (airMs == 0) {
         airMs = RELAY_REF_AIRTIME_MS;
     }
-    // B_preset: ~60 packet-equivalents at this frame's airtime (modem/preset sensitive).
-    uint32_t baseTrip = RELAY_TRIP_PACKETS * airMs;
+
+    uint32_t baseTrip = RELAY_TRIP_PACKETS * std::min<uint32_t>(airMs, RELAY_TRIP_CEIL_MS);
 
     float scale = 1.0f;
     float chutil = -1.0f;
@@ -264,7 +293,7 @@ void NodeRateLimiter::relayBudgets(uint32_t airMs, uint32_t &tripMs, uint32_t &c
     if (tripMs > RELAY_TRIP_CEIL_MS) {
         tripMs = RELAY_TRIP_CEIL_MS;
     }
-    // Preserve ~15/60 clear ratio
+
     clearMs = (tripMs * RELAY_CLEAR_PACKETS) / RELAY_TRIP_PACKETS;
     if (clearMs < RELAY_CLEAR_FLOOR_MS) {
         clearMs = RELAY_CLEAR_FLOOR_MS;
@@ -300,59 +329,52 @@ uint8_t NodeRateLimiter::graphHopsAway(NodeNum nodeId)
     return signalRoutingModule->rateLimitGraphHops(nodeId);
 }
 
-bool NodeRateLimiter::checkAndUpdateBucket(BucketState &b, uint32_t trip, uint32_t clear, uint32_t charge, uint32_t nowMs,
+uint32_t NodeRateLimiter::originatorClear(uint32_t trip)
+{
+    return std::max<uint32_t>(1, (trip * DEFAULT_CLEAR_RATIO_NUM) / DEFAULT_CLEAR_RATIO_DEN);
+}
+
+bool NodeRateLimiter::bucketLimited(const BucketState &b, uint32_t clear, uint32_t now) const
+{
+    if (!b.limited) {
+        return false;
+    }
+    // Read-only relay and destination gates must recover even when no packet updates the bucket.
+    const uint32_t windows = (now - b.windowStart) / cfgWindowMs;
+    return windows == 0 || (windows == 1 && b.count >= clear);
+}
+
+bool NodeRateLimiter::checkAndUpdateBucket(BucketState &b, uint32_t trip, uint32_t clear, uint32_t charge, uint32_t now,
                                            const char *label, NodeNum nodeId)
 {
-    char nodeName[48];
-    getNodeDisplayName(nodeId, nodeName, sizeof(nodeName));
-
-    // clear==0 (originator default): sticky quiet window — any activity while limited
-    // resets the clock; lift only after a full quiet window (legacy behaviour).
-    // clear>0 (RELAY): fixed window boundary hysteresis — do not reset on activity;
-    // at roll, lift if count < clear.
-    if (b.limited && clear == 0) {
-        if (nowMs - b.windowStart >= cfgWindowMs) {
-            LOG_INFO("[RateLimit] %s %s unlimited after quiet window", nodeName, label);
-            b.limited = false;
-            b.count = 0;
-            b.windowStart = nowMs;
-        } else {
-            b.windowStart = nowMs;
-            LOG_INFO("[RateLimit] %s %s still limited, window reset", nodeName, label);
-            return true;
-        }
-    }
-
-    if (nowMs - b.windowStart >= cfgWindowMs) {
-        if (b.limited && clear > 0) {
-            if (b.count < clear) {
-                LOG_INFO("[RateLimit] %s %s unlimited after window (count=%u clear=%u)", nodeName, label, b.count, clear);
-                b.limited = false;
-            } else {
-                LOG_INFO("[RateLimit] %s %s still limited at window roll (count=%u clear=%u)", nodeName, label, b.count,
-                         clear);
-            }
-        }
+    const bool wasLimited = b.limited;
+    if (now - b.windowStart >= cfgWindowMs) {
+        b.limited = bucketLimited(b, clear, now);
+        const uint32_t windows = (now - b.windowStart) / cfgWindowMs;
+        b.windowStart += windows * cfgWindowMs;
         b.count = 0;
-        b.windowStart = nowMs;
     }
-
-    b.count += charge;
-    if (b.count < charge) {
-        b.count = UINT32_MAX;
-    }
-
+    // Counter wrap would turn heavy traffic into an apparently empty budget.
+    b.count = charge > UINT32_MAX - b.count ? UINT32_MAX : b.count + charge;
     if (!b.limited && b.count >= trip) {
         b.limited = true;
-        b.windowStart = nowMs;
-        LOG_WARN("[RateLimit] %s %s limited at count=%u trip=%u", nodeName, label, b.count, trip);
-        return true;
+        b.windowStart = now;
     }
-
+    if (wasLimited != b.limited) {
+        char nodeName[48];
+        getNodeDisplayName(nodeId, nodeName, sizeof(nodeName));
+        LOG_INFO("[RateLimit] %s %s %s (count=%u trip=%u clear=%u)", nodeName, label, b.limited ? "limited" : "unlimited",
+                 b.count, trip, clear);
+    }
     return b.limited;
 }
 
 NodeRateLimiter::OriginatorEntry *NodeRateLimiter::findOriginator(NodeNum nodeId)
+{
+    return const_cast<OriginatorEntry *>(static_cast<const NodeRateLimiter *>(this)->findOriginator(nodeId));
+}
+
+const NodeRateLimiter::OriginatorEntry *NodeRateLimiter::findOriginator(NodeNum nodeId) const
 {
     for (uint8_t i = 0; i < originatorCount; i++) {
         if (originators[i].nodeId == nodeId) {
@@ -364,51 +386,14 @@ NodeRateLimiter::OriginatorEntry *NodeRateLimiter::findOriginator(NodeNum nodeId
 
 int NodeRateLimiter::findOriginatorEvictionCandidate() const
 {
-    auto isLimited = [](const OriginatorEntry &e) {
-        return e.text.limited || e.routing.limited || e.other.limited || e.unknown.limited;
-    };
-    auto oldestWindow = [](const OriginatorEntry &e) {
-        return std::min(std::min(e.text.windowStart, e.routing.windowStart),
-                        std::min(e.other.windowStart, e.unknown.windowStart));
-    };
-
-    // Prefer not-in-graph among non-limited
-    int candidate = -1;
-    for (int i = 0; i < originatorCount; i++) {
-        if (isLimited(originators[i])) {
-            continue;
-        }
-        bool inGraph = nodeInGraph(originators[i].nodeId);
-        if (candidate == -1) {
-            candidate = i;
-            continue;
-        }
-        bool candInGraph = nodeInGraph(originators[candidate].nodeId);
-        if (!inGraph && candInGraph) {
-            candidate = i;
-            continue;
-        }
-        if (inGraph == candInGraph) {
-            uint8_t hops = graphHopsAway(originators[i].nodeId);
-            uint8_t candHops = graphHopsAway(originators[candidate].nodeId);
-            if (hops > candHops) {
-                candidate = i;
-            } else if (hops == candHops && oldestWindow(originators[i]) < oldestWindow(originators[candidate])) {
-                candidate = i;
-            }
-        }
-    }
-    if (candidate != -1) {
-        return candidate;
-    }
-
-    candidate = 0;
-    for (int i = 1; i < originatorCount; i++) {
-        if (oldestWindow(originators[i]) < oldestWindow(originators[candidate])) {
-            candidate = i;
-        }
-    }
-    return candidate;
+    const uint32_t now = nowMs();
+    return selectEvictionCandidate(
+        originators, originatorCount, [this, now](const OriginatorEntry &e) { return isLimitedOriginator(e.nodeId); },
+        [now](const OriginatorEntry &e) {
+            return std::max(std::max(now - e.text.windowStart, now - e.routing.windowStart),
+                            std::max(now - e.other.windowStart, now - e.unknown.windowStart));
+        },
+        nodeInGraph, graphHopsAway);
 }
 
 NodeRateLimiter::OriginatorEntry *NodeRateLimiter::getOrCreateOriginator(NodeNum nodeId, uint32_t nowMs)
@@ -422,7 +407,11 @@ NodeRateLimiter::OriginatorEntry *NodeRateLimiter::getOrCreateOriginator(NodeNum
     if (originatorCount < MAX_ORIGINATOR_ENTRIES) {
         slot = &originators[originatorCount++];
     } else {
-        slot = &originators[findOriginatorEvictionCandidate()];
+        const int evict = findOriginatorEvictionCandidate();
+        if (evict < 0) {
+            return nullptr;
+        }
+        slot = &originators[evict];
     }
 
     *slot = OriginatorEntry{};
@@ -446,44 +435,10 @@ NodeRateLimiter::RelayEntry *NodeRateLimiter::findRelay(NodeNum nodeId)
 
 int NodeRateLimiter::findRelayEvictionCandidate() const
 {
-    auto oldestWindow = [](const RelayEntry &e) { return e.relay.windowStart; };
-
-    int candidate = -1;
-    for (int i = 0; i < relayCount; i++) {
-        if (relays[i].relay.limited) {
-            continue;
-        }
-        bool inGraph = nodeInGraph(relays[i].nodeId);
-        if (candidate == -1) {
-            candidate = i;
-            continue;
-        }
-        bool candInGraph = nodeInGraph(relays[candidate].nodeId);
-        if (!inGraph && candInGraph) {
-            candidate = i;
-            continue;
-        }
-        if (inGraph == candInGraph) {
-            uint8_t hops = graphHopsAway(relays[i].nodeId);
-            uint8_t candHops = graphHopsAway(relays[candidate].nodeId);
-            if (hops > candHops) {
-                candidate = i;
-            } else if (hops == candHops && oldestWindow(relays[i]) < oldestWindow(relays[candidate])) {
-                candidate = i;
-            }
-        }
-    }
-    if (candidate != -1) {
-        return candidate;
-    }
-
-    candidate = 0;
-    for (int i = 1; i < relayCount; i++) {
-        if (oldestWindow(relays[i]) < oldestWindow(relays[candidate])) {
-            candidate = i;
-        }
-    }
-    return candidate;
+    const uint32_t now = nowMs();
+    return selectEvictionCandidate(
+        relays, relayCount, [this, now](const RelayEntry &e) { return bucketLimited(e.relay, RELAY_CLEAR_FLOOR_MS, now); },
+        [now](const RelayEntry &e) { return now - e.relay.windowStart; }, nodeInGraph, graphHopsAway);
 }
 
 NodeRateLimiter::RelayEntry *NodeRateLimiter::getOrCreateRelay(NodeNum nodeId, uint32_t nowMs)
@@ -497,7 +452,11 @@ NodeRateLimiter::RelayEntry *NodeRateLimiter::getOrCreateRelay(NodeNum nodeId, u
     if (relayCount < MAX_RELAY_ENTRIES) {
         slot = &relays[relayCount++];
     } else {
-        slot = &relays[findRelayEvictionCandidate()];
+        const int evict = findRelayEvictionCandidate();
+        if (evict < 0) {
+            return nullptr;
+        }
+        slot = &relays[evict];
     }
 
     *slot = RelayEntry{};
@@ -528,34 +487,10 @@ const NodeRateLimiter::DestEntry *NodeRateLimiter::findDest(NodeNum nodeId) cons
 
 int NodeRateLimiter::findDestEvictionCandidate() const
 {
-    auto oldestWindow = [](const DestEntry &e) { return e.dest.windowStart; };
-
-    int candidate = -1;
-    for (int i = 0; i < destCount; i++) {
-        if (dests[i].dest.limited) {
-            continue;
-        }
-        bool inGraph = nodeInGraph(dests[i].nodeId);
-        if (candidate == -1) {
-            candidate = i;
-            continue;
-        }
-        bool candInGraph = nodeInGraph(dests[candidate].nodeId);
-        if (!inGraph && candInGraph) {
-            candidate = i;
-            continue;
-        }
-        if (inGraph == candInGraph) {
-            uint8_t hops = graphHopsAway(dests[i].nodeId);
-            uint8_t candHops = graphHopsAway(dests[candidate].nodeId);
-            if (hops > candHops) {
-                candidate = i;
-            } else if (hops == candHops && oldestWindow(dests[i]) < oldestWindow(dests[candidate])) {
-                candidate = i;
-            }
-        }
-    }
-    return candidate;
+    const uint32_t now = nowMs();
+    return selectEvictionCandidate(
+        dests, destCount, [this, now](const DestEntry &e) { return bucketLimited(e.dest, DEST_CLEAR, now); },
+        [now](const DestEntry &e) { return now - e.dest.windowStart; }, nodeInGraph, graphHopsAway);
 }
 
 NodeRateLimiter::DestEntry *NodeRateLimiter::getOrCreateDest(NodeNum nodeId, uint32_t nowMs)
@@ -602,7 +537,9 @@ void NodeRateLimiter::noteBoot(uint32_t now)
 
 bool NodeRateLimiter::warmedUp(uint32_t now) const
 {
-    return bootKnown && (now - bootMs) >= WARMUP_MS;
+    // Established identities must not get another warm-up exemption at clock rollover.
+    bootWarmed |= bootKnown && (now - bootMs) >= WARMUP_MS;
+    return bootWarmed;
 }
 
 int NodeRateLimiter::findYoung(NodeNum nodeId) const
@@ -631,8 +568,7 @@ bool NodeRateLimiter::addAlumni(NodeNum nodeId)
         return true;
     }
     if (alumniCount >= MAX_ALUMNI_ENTRIES) {
-        // Never FIFO-evict: forgetting an established id lets noteOriginator
-        // re-insert it as young. Prefer holding aged entries in young[] instead.
+        // Forgetting an established identity would enroll it as young again.
         return false;
     }
     alumni[alumniCount++] = nodeId;
@@ -649,16 +585,18 @@ void NodeRateLimiter::removeYoungAt(uint8_t idx)
     youngCount--;
 }
 
-bool NodeRateLimiter::youngAgeActive(uint32_t firstSeenMs, uint32_t now)
+bool NodeRateLimiter::youngAgeActive(const YoungSighting &sighting, uint32_t now)
 {
-    return (now - firstSeenMs) < YOUNG_AGE_MS;
+    // Graduation must not reverse after the millisecond clock wraps.
+    sighting.aged |= (now - sighting.firstSeenMs) >= YOUNG_AGE_MS;
+    return !sighting.aged;
 }
 
 uint8_t NodeRateLimiter::activeYoungCount(uint32_t now) const
 {
     uint8_t n = 0;
     for (uint8_t i = 0; i < youngCount; i++) {
-        if (youngAgeActive(young[i].firstSeenMs, now)) {
+        if (youngAgeActive(young[i], now)) {
             n++;
         }
     }
@@ -668,7 +606,7 @@ uint8_t NodeRateLimiter::activeYoungCount(uint32_t now) const
 int NodeRateLimiter::findAgedYoung(uint32_t now) const
 {
     for (uint8_t i = 0; i < youngCount; i++) {
-        if (!youngAgeActive(young[i].firstSeenMs, now)) {
+        if (!youngAgeActive(young[i], now)) {
             return i;
         }
     }
@@ -681,11 +619,10 @@ void NodeRateLimiter::expireIfOld(NodeNum nodeId, uint32_t now)
     if (idx < 0) {
         return;
     }
-    if (youngAgeActive(young[idx].firstSeenMs, now)) {
+    if (youngAgeActive(young[idx], now)) {
         return;
     }
-    // Graduated: remember as alumni when there is room; otherwise leave the
-    // row in young[] so isYoung stays false by age and we never re-youth.
+    // Parking preserves graduation when the alumni table has no room.
     if (addAlumni(nodeId)) {
         removeYoungAt((uint8_t)idx);
     }
@@ -696,6 +633,7 @@ void NodeRateLimiter::insertYoung(NodeNum nodeId, uint32_t now)
     if (youngCount >= MAX_YOUNG_ENTRIES) {
         return;
     }
+    young[youngCount] = {};
     young[youngCount].nodeId = nodeId;
     young[youngCount].firstSeenMs = now;
     youngCount++;
@@ -707,7 +645,7 @@ void NodeRateLimiter::noteOriginator(NodeNum nodeId, uint32_t now)
     if (findYoung(nodeId) >= 0 || inAlumni(nodeId)) {
         return;
     }
-    // Warm-up mesh is established, not young: everyone looks new after boot.
+    // A reboot makes every established peer look new.
     if (!warmedUp(now)) {
         (void)addAlumni(nodeId);
         return;
@@ -716,10 +654,7 @@ void NodeRateLimiter::noteOriginator(NodeNum nodeId, uint32_t now)
         insertYoung(nodeId, now);
         return;
     }
-    // Physical full: reclaim an aged-parked slot so a real new identity still
-    // enters young[] and charges the bucket. Prefer alumni; if alumni is also
-    // full, drop the parked row (rare overflow — may re-youth later) rather
-    // than fail-closed-charging the rest of a busy mesh.
+    // Reclaiming parked rows avoids charging the entire established mesh when alumni storage is exhausted.
     int idx = findAgedYoung(now);
     if (idx < 0) {
         return;
@@ -734,22 +669,22 @@ bool NodeRateLimiter::isYoung(NodeNum nodeId, uint32_t now) const
 {
     int idx = findYoung(nodeId);
     if (idx >= 0) {
-        return youngAgeActive(young[idx].firstSeenMs, now);
+        return youngAgeActive(young[idx], now);
     }
     if (inAlumni(nodeId)) {
         return false;
     }
-    // Fail-closed only when 32 simultaneous *age-active* young; parked rows do not count.
+    // Identity churn must not bypass the shared budget by filling the active-young table.
     return activeYoungCount(now) >= MAX_YOUNG_ENTRIES;
 }
 
 bool NodeRateLimiter::relayAnyLimited() const
 {
-    if (unresolvedRelay.limited) {
+    if (bucketLimited(unresolvedRelay, RELAY_CLEAR_FLOOR_MS, nowMs())) {
         return true;
     }
     for (uint8_t i = 0; i < relayCount; i++) {
-        if (relays[i].relay.limited) {
+        if (bucketLimited(relays[i].relay, RELAY_CLEAR_FLOOR_MS, nowMs())) {
             return true;
         }
     }
@@ -766,7 +701,7 @@ void NodeRateLimiter::maybeAnnounce(uint32_t now, float chutil)
     }
     pendingAnnounceCount = 0;
     for (uint8_t i = 0; i < youngCount && pendingAnnounceCount < ANNOUNCE_MAX_IDS; i++) {
-        if (!youngAgeActive(young[i].firstSeenMs, now)) {
+        if (!youngAgeActive(young[i], now)) {
             continue;
         }
         pendingAnnounceIds[pendingAnnounceCount++] = young[i].nodeId;
@@ -795,7 +730,7 @@ bool NodeRateLimiter::takeYoungAnnounce(NodeNum *ids, uint8_t &count)
 
 bool NodeRateLimiter::isDroppedCoverageTarget(NodeNum nodeId) const
 {
-    if (!nodeId || !warmedUp(nowMs()) || !youngBucket.limited) {
+    if (!cfgEnabled || !nodeId || !warmedUp(nowMs()) || !bucketLimited(youngBucket, YOUNG_CLEAR, nowMs())) {
         return false;
     }
     return isYoung(nodeId, nowMs());
@@ -810,8 +745,12 @@ bool NodeRateLimiter::isLimitedOriginator(NodeNum nodeId) const
         if (originators[i].nodeId != nodeId) {
             continue;
         }
-        return originators[i].text.limited || originators[i].routing.limited || originators[i].other.limited ||
-               originators[i].unknown.limited;
+        const auto &e = originators[i];
+        const uint32_t now = nowMs();
+        return bucketLimited(e.text, originatorClear(cfgTextTrip), now) ||
+               bucketLimited(e.routing, originatorClear(cfgRoutingTrip), now) ||
+               bucketLimited(e.other, originatorClear(cfgOtherTrip), now) ||
+               bucketLimited(e.unknown, originatorClear(cfgUnknownTrip), now);
     }
     return false;
 }
@@ -845,7 +784,7 @@ bool NodeRateLimiter::shouldDropToLimitedDest(const meshtastic_MeshPacket *p) co
 bool NodeRateLimiter::isLimitedDest(NodeNum nodeId) const
 {
     const DestEntry *e = findDest(nodeId);
-    return e && e->dest.limited;
+    return e && bucketLimited(e->dest, DEST_CLEAR, nowMs());
 }
 
 bool NodeRateLimiter::isDestVolumePort(meshtastic_PortNum portnum)
@@ -873,7 +812,7 @@ bool NodeRateLimiter::chargesDestVolume(const meshtastic_MeshPacket *p) const
 
 bool NodeRateLimiter::destWindowWillRoll(const BucketState &b, uint32_t nowMs, uint32_t windowMs)
 {
-    return b.windowStart != 0 && (nowMs - b.windowStart) >= windowMs;
+    return (nowMs - b.windowStart) >= windowMs;
 }
 
 void NodeRateLimiter::rollDestSenders(DestEntry &entry, uint32_t nowMs, uint32_t windowMs)
@@ -920,9 +859,29 @@ bool NodeRateLimiter::chargeDestVolume(const meshtastic_MeshPacket *p)
     DestEntry *entry = findDest(p->to);
     if (entry) {
         rollDestSenders(*entry, now, cfgWindowMs);
-        checkAndUpdateBucket(entry->dest, DEST_TRIP, DEST_CLEAR, 0, now, "dest", entry->nodeId);
+        const uint32_t trip = (entry->dest.limited || entry->senderCount >= DEST_MIN_SENDERS) ? DEST_TRIP : UINT32_MAX;
+        checkAndUpdateBucket(entry->dest, trip, DEST_CLEAR, 0, now, "dest", entry->nodeId);
     }
     return isLimitedDest(p->to);
+}
+
+NodeNum NodeRateLimiter::resolveRelay(const meshtastic_MeshPacket *p)
+{
+    if (p->relay_node == 0) {
+        return 0;
+    }
+    NodeNum resolved = 0;
+#if defined(UNIT_TEST)
+    if (testResolveRelayHook) {
+        resolved = testResolveRelayHook(p->relay_node, p->rx_rssi, p->rx_snr);
+    } else
+#endif
+        if (signalRoutingModule) {
+        resolved = signalRoutingModule->resolveRelayIdentity(p->relay_node, p->rx_rssi, p->rx_snr);
+    }
+    return resolved != 0 && !SignalRoutingModule::isPlaceholderNodeId(resolved) && (!nodeDB || resolved != nodeDB->getNodeNum())
+               ? resolved
+               : 0;
 }
 
 bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
@@ -946,14 +905,12 @@ bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
         lastDestDrop = true;
         return true;
     }
-    pendingAnnounce = false;
     bool drop = false;
     const bool decoded = p->which_payload_variant == meshtastic_MeshPacket_decoded_tag;
     if (decoded) {
         noteOriginator(p->from, nowMs);
     }
 
-    // --- Originator buckets (favorites bypass originator only) ---
     bool favoriteOriginator = false;
     if (nodeDB) {
         const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(p->from);
@@ -984,6 +941,9 @@ bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
         }
 
         OriginatorEntry *entry = getOrCreateOriginator(p->from, nowMs);
+        if (!entry) {
+            return true;
+        }
         BucketState *b;
         const char *label;
         switch (bucket) {
@@ -1004,19 +964,19 @@ bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
             label = "other";
             break;
         }
-        // A limited originator clears when a whole window comes in under the clear level,
-        // instead of needing a fully silent one it can never get while it keeps talking.
-        const uint32_t clear = std::max<uint32_t>(1, (trip * DEFAULT_CLEAR_RATIO_NUM) / DEFAULT_CLEAR_RATIO_DEN);
+        // Traffic that has slowed below hysteresis should recover without needing complete silence.
+        const uint32_t clear = originatorClear(trip);
         if (checkAndUpdateBucket(*b, trip, clear, 1, nowMs, label, entry->nodeId)) {
             drop = true;
         }
     }
 
     if (decoded && warmedUp(nowMs) && isYoung(p->from, nowMs)) {
+        const bool wasLimited = bucketLimited(youngBucket, YOUNG_CLEAR, nowMs);
         if (checkAndUpdateBucket(youngBucket, YOUNG_TRIP, YOUNG_CLEAR, 1, nowMs, "young", 0)) {
             drop = true;
         }
-        if (youngBucket.limited && youngBucket.count == YOUNG_TRIP) {
+        if (!wasLimited && youngBucket.limited) {
             float chutil = 0.0f;
 #if defined(UNIT_TEST)
             if (testChutilOverride >= 0.0f) {
@@ -1030,40 +990,20 @@ bool NodeRateLimiter::shouldDrop(const meshtastic_MeshPacket *p)
         }
     }
 
-    // --- RELAY (rebroadcast candidates only; never favorite-bypassed) ---
     if (isRebroadcastCandidate(p) && !drop) {
-        // If originator already limited we would drop above; B7 N/A. Here !drop means still a candidate.
-        NodeNum resolved = 0;
-        bool resolvedOk = false;
-#if defined(UNIT_TEST)
-        if (testResolveRelayHook && p->relay_node != 0) {
-            resolved = testResolveRelayHook(p->relay_node, p->rx_rssi, p->rx_snr);
-            if (resolved != 0 && !SignalRoutingModule::isPlaceholderNodeId(resolved) &&
-                (!nodeDB || resolved != nodeDB->getNodeNum())) {
-                resolvedOk = true;
-            }
-        } else
-#endif
-            if (p->relay_node != 0 && signalRoutingModule) {
-            resolved = signalRoutingModule->resolveRelayIdentity(p->relay_node, p->rx_rssi, p->rx_snr);
-            if (resolved != 0 && !signalRoutingModule->isPlaceholderNode(resolved) &&
-                (!nodeDB || resolved != nodeDB->getNodeNum())) {
-                resolvedOk = true;
-            }
-        }
-
+        const NodeNum resolved = resolveRelay(p);
         uint32_t airMs = packetAirtimeMs(p);
         uint32_t tripMs = 0;
         uint32_t clearMs = 0;
         relayBudgets(airMs, tripMs, clearMs);
 
-        if (unresolvedRelay.windowStart == 0) {
+        if (unresolvedRelay.count == 0 && !unresolvedRelay.limited) {
             unresolvedRelay.windowStart = nowMs;
         }
 
-        if (resolvedOk) {
+        if (resolved != 0) {
             RelayEntry *re = getOrCreateRelay(resolved, nowMs);
-            if (checkAndUpdateBucket(re->relay, tripMs, clearMs, airMs, nowMs, "relay", re->nodeId)) {
+            if (!re || checkAndUpdateBucket(re->relay, tripMs, clearMs, airMs, nowMs, "relay", re->nodeId)) {
                 drop = true;
             }
         } else if (shouldChargeUnresolvedRelay(signalRoutingModule != nullptr,
@@ -1124,14 +1064,21 @@ bool NodeRateLimiter::wouldDrop(const meshtastic_MeshPacket *p) const
                 b = &originators[i].other;
                 break;
             }
-            if (b && b->limited) {
+            uint32_t trip = bucket == Bucket::TEXT      ? cfgTextTrip
+                            : bucket == Bucket::ROUTING ? cfgRoutingTrip
+                            : bucket == Bucket::UNKNOWN ? cfgUnknownTrip
+                                                        : cfgOtherTrip;
+            if (b && bucketLimited(*b, originatorClear(trip), nowMs())) {
                 return true;
             }
             break;
         }
+        if (!findOriginator(p->from) && originatorCount == MAX_ORIGINATOR_ENTRIES && findOriginatorEvictionCandidate() < 0) {
+            return true;
+        }
     }
 
-    if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag && youngBucket.limited &&
+    if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag && bucketLimited(youngBucket, YOUNG_CLEAR, nowMs()) &&
         warmedUp(nowMs()) && isYoung(p->from, nowMs())) {
         return true;
     }
@@ -1140,34 +1087,25 @@ bool NodeRateLimiter::wouldDrop(const meshtastic_MeshPacket *p) const
         return false;
     }
 
-    NodeNum resolved = 0;
-    bool resolvedOk = false;
-#if defined(UNIT_TEST)
-    if (testResolveRelayHook && p->relay_node != 0) {
-        resolved = testResolveRelayHook(p->relay_node, p->rx_rssi, p->rx_snr);
-        if (resolved != 0 && !SignalRoutingModule::isPlaceholderNodeId(resolved) &&
-            (!nodeDB || resolved != nodeDB->getNodeNum())) {
-            resolvedOk = true;
-        }
-    } else
-#endif
-        if (p->relay_node != 0 && signalRoutingModule) {
-        resolved = signalRoutingModule->resolveRelayIdentity(p->relay_node, p->rx_rssi, p->rx_snr);
-        if (resolved != 0 && !signalRoutingModule->isPlaceholderNode(resolved) &&
-            (!nodeDB || resolved != nodeDB->getNodeNum())) {
-            resolvedOk = true;
-        }
-    }
+    const NodeNum resolved = resolveRelay(p);
 
-    if (resolvedOk) {
+    if (resolved != 0) {
         for (uint8_t i = 0; i < relayCount; i++) {
-            if (relays[i].nodeId == resolved && relays[i].relay.limited) {
-                return true;
+            if (relays[i].nodeId == resolved) {
+                uint32_t tripMs, clearMs;
+                relayBudgets(packetAirtimeMs(p), tripMs, clearMs);
+                return bucketLimited(relays[i].relay, clearMs, nowMs());
             }
         }
+        return relayCount == MAX_RELAY_ENTRIES && findRelayEvictionCandidate() < 0;
+    }
+    if (!shouldChargeUnresolvedRelay(signalRoutingModule != nullptr,
+                                     signalRoutingModule && signalRoutingModule->hasEstablishedGraph())) {
         return false;
     }
-    return unresolvedRelay.limited;
+    uint32_t tripMs, clearMs;
+    relayBudgets(packetAirtimeMs(p), tripMs, clearMs);
+    return bucketLimited(unresolvedRelay, clearMs, nowMs());
 }
 
-#endif // !MESHTASTIC_EXCLUDE_SIGNALROUTING
+#endif
