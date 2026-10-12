@@ -1309,10 +1309,10 @@ void test_a_publisher_we_stopped_hearing_is_nobodys_target()
     TEST_ASSERT_TRUE(graph.admitsCoverage(near, gone, 7.0f, &policy));
 }
 
-void test_routing_through_us_confirms_the_sender_hears_us()
+void test_sender_hears_us_requires_topology_or_relay_proof()
 {
-    // A peer that names us as its next hop learned that from our traffic, so it hears us. Same
-    // evidence as it listing us, but available a broadcast interval sooner.
+    // A topology listing or an observed relay of our packet proves reception. A next-hop hint
+    // remains only a routing intention and has no confirmation entry point.
     constexpr NodeNum me = 0x0A0B0C0D;
     constexpr NodeNum peer = 0x11111111;
     constexpr NodeNum stranger = 0x22222222;
@@ -1333,15 +1333,17 @@ void test_routing_through_us_confirms_the_sender_hears_us()
     };
 
     TEST_ASSERT_FALSE(hearsUs(peer));
-    TEST_ASSERT_TRUE(confirmSenderHearsUs(&graph, me, peer));
-    TEST_ASSERT_TRUE(hearsUs(peer));
-    // Idempotent: only the first tells us anything new.
-    TEST_ASSERT_FALSE(confirmSenderHearsUs(&graph, me, peer));
-    // Nothing is invented for a node we have no edge to, nor for ourselves.
-    TEST_ASSERT_FALSE(confirmSenderHearsUs(&graph, me, stranger));
-    TEST_ASSERT_FALSE(confirmSenderHearsUs(&graph, me, me));
-    // The list path still routes through the same definition.
+    // Nothing is invented unless the peer lists us, or for a node with no edge to us.
     TEST_ASSERT_FALSE(confirmTopologySenderHearsUs(&graph, me, peer, stranger));
+    TEST_ASSERT_FALSE(hearsUs(peer));
+    TEST_ASSERT_FALSE(confirmTopologySenderHearsUs(&graph, me, stranger, me));
+    TEST_ASSERT_TRUE(confirmSenderHearsUs(&graph, me, peer, HearsUsProof::RelayedOurPacket));
+    TEST_ASSERT_TRUE(hearsUs(peer));
+    TEST_ASSERT_FALSE(confirmSenderHearsUs(&graph, me, peer, HearsUsProof::SrTopologyListing));
+
+    graph.setEdgeHearsUs(me, peer, false);
+    TEST_ASSERT_TRUE(confirmTopologySenderHearsUs(&graph, me, peer, me));
+    TEST_ASSERT_TRUE(hearsUs(peer));
 }
 
 void test_a_guess_never_outranks_or_prices_a_measurement()
@@ -2453,35 +2455,31 @@ void test_round_trip_worst_case_is_bounded()
 // (see the comment on each), not by re-deriving them from this module's own interpolation code —
 // restating the implementation would not catch a wrong constant.
 
-// SHORT_SLOW's threshold is -10 dB; SNR == -10 dB is exactly zero margin — the single most
-// consequential point on the curve, because it is exactly where ETX crosses the 7.0 coverage
-// ceiling. RSSI is pinned at the RSSI factor's saturating end (-60, >= the breakpoint) so the RSSI
-// term is exactly 1.0 and cannot mask a change in the margin term. Expected:
-// 1 / (marginProb[3] * 1.0) = 1 / 0.15 = 6.6667.
+// SHORT_SLOW's threshold is -10 dB; SNR == -10 dB is exactly zero margin. RSSI is pinned at the
+// RSSI factor's saturating end (-60, >= the breakpoint), so the RSSI term is exactly 1.0. The
+// conservative curve prices a zero-margin link above the 7.0 strong-hop ceiling:
+// 1 / 0.10 = 10.0.
 void test_margin_at_threshold_pins_the_zero_margin_probability()
 {
     float etx = NeighborGraph::calculateETX(-60, -10.0f, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW);
-    TEST_ASSERT_FLOAT_WITHIN(0.001f, 6.6667f, etx);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 10.0f, etx);
 }
 
 // 1 dB below SHORT_SLOW's threshold (SNR -11.0, margin -1.0) interpolates between
-// marginBreakDb[2] = -2 (prob 0.10) and marginBreakDb[3] = 0 (prob 0.15): prob =
-// 0.10 + 0.5*(0.15-0.10) = 0.125, ETX = 8.0 exactly. Moving marginBreakDb[3] to -1.0 puts this same
-// margin exactly on the (moved) breakpoint, collapsing the result to marginProb[3] = 0.15 and ETX
-// 6.6667 instead — a large, easily-detected swing that the zero-margin test above cannot
-// distinguish from a marginProb[3] mutation on its own.
+// marginBreakDb[2] = -2 (prob 0.065) and marginBreakDb[3] = 0 (prob 0.10): prob = 0.0825,
+// ETX = 12.1212. This independently pins the zero-margin breakpoint location.
 void test_margin_one_db_below_threshold_pins_the_zero_margin_breakpoint()
 {
     float etx = NeighborGraph::calculateETX(-60, -11.0f, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW);
-    TEST_ASSERT_FLOAT_WITHIN(0.001f, 8.0f, etx);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 12.1212f, etx);
 }
 
-// SNR -15.0 at SHORT_SLOW is margin -5.0, exactly marginBreakDb[1]: prob = marginProb[1] = 0.05,
-// ETX = 20.0 exactly. Isolated from the other three mutations above (touches only index 1).
+// SNR -15.0 at SHORT_SLOW is margin -5.0, exactly marginBreakDb[1]: prob = marginProb[1] = 0.035,
+// ETX = 28.5714 exactly.
 void test_margin_five_db_below_threshold_pins_the_low_breakpoint_probability()
 {
     float etx = NeighborGraph::calculateETX(-60, -15.0f, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW);
-    TEST_ASSERT_FLOAT_WITHIN(0.001f, 20.0f, etx);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 28.5714f, etx);
 }
 
 // Margin pinned at the saturation point (SNR +7.0 at SHORT_SLOW is margin +17.0, so delivery
@@ -2989,6 +2987,7 @@ void test_strong_delivery_hop_respects_poor_link_ceiling()
         void hear(NodeNum n, int32_t rssi, float snr) { updateNeighborInfo(n, rssi, snr); }
         bool strong(NodeNum dest) const { return hasStrongDeliveryHop(dest); }
         bool strongHop(NodeNum peer) const { return hasStrongHopTo(peer); }
+        bool caps(const meshtastic_MeshPacket *p) { return capsLastHop(p); }
         NeighborGraph *g() { return routingGraph; }
     };
     GraphWriter module;
@@ -3008,6 +3007,31 @@ void test_strong_delivery_hop_respects_poor_link_ceiling()
     TEST_ASSERT_TRUE(module.hasPricedDeliveryHop(weak));
     TEST_ASSERT_FALSE(module.strong(weak));
     TEST_ASSERT_FALSE(module.strongHop(weak));
+
+    meshtastic_MeshPacket packet = meshtastic_MeshPacket_init_zero;
+    packet.to = strong;
+    TEST_ASSERT_TRUE(module.caps(&packet));
+    packet.to = weak;
+    TEST_ASSERT_FALSE(module.caps(&packet));
+
+    // The strong-hop gate must use the same delivery score as route ranking. This
+    // link's raw ETX passes the ceiling, but its measured ETX variance pushes the
+    // priced delivery cost over it.
+    constexpr float borderlineEtx = 5.2f;
+    module.g()->updateEdge(me, strong, borderlineEtx, millis() / 1000, Edge::Source::Reported);
+    module.g()->setEdgeHearsUs(me, strong, true);
+    auto *myEdges = const_cast<NodeEdges *>(module.g()->getEdgesFrom(me));
+    TEST_ASSERT_NOT_NULL(myEdges);
+    bool foundStrongEdge = false;
+    for (uint8_t i = 0; i < myEdges->edgeCount; ++i) {
+        if (myEdges->edges[i].to == strong) {
+            myEdges->edges[i].etxVariance = 43;
+            foundStrongEdge = true;
+            break;
+        }
+    }
+    TEST_ASSERT_TRUE(foundStrongEdge);
+    TEST_ASSERT_FALSE_MESSAGE(module.strongHop(strong), "variance must affect the flood-versus-stamp decision");
 }
 
 // Named-backup cancel: strong designated copies cancel without finish proof; weak floods do not
@@ -3755,7 +3779,7 @@ void setup()
     RUN_TEST(test_unique_coverage_of_a_publisher_that_listed_us);
     RUN_TEST(test_unique_coverage_skips_a_publisher_that_did_not_list_us);
     RUN_TEST(test_a_publisher_we_stopped_hearing_is_nobodys_target);
-    RUN_TEST(test_routing_through_us_confirms_the_sender_hears_us);
+    RUN_TEST(test_sender_hears_us_requires_topology_or_relay_proof);
     RUN_TEST(test_a_guess_never_outranks_or_prices_a_measurement);
     RUN_TEST(test_a_silent_publisher_loses_our_direct_link);
     RUN_TEST(test_topology_does_not_park_a_heard_neighbour_as_downstream);

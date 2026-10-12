@@ -1780,13 +1780,6 @@ ProcessMessage SignalRoutingModule::handleReceived(const meshtastic_MeshPacket &
         rememberRelayIdentity(mp.from, fromLastByte);
         trackNodeCapability(mp.from, CapabilityStatus::Unknown);
 
-        // Naming us as next hop proves the sender hears us before its next topology list arrives.
-        if (mp.to != NODENUM_BROADCAST && mp.next_hop != 0 && mp.next_hop == static_cast<uint8_t>(nodeDB->getNodeNum() & 0xFF)) {
-            if (confirmSenderHearsUs(routingGraph, nodeDB->getNodeNum(), mp.from)) {
-                LOG_INFO("[SR] %08x routes through us: hearsUs confirmed", mp.from);
-            }
-        }
-
         char senderName[64];
         getNodeDisplayName(mp.from, senderName, sizeof(senderName));
 
@@ -2277,6 +2270,12 @@ bool SignalRoutingModule::capsLastHop(const meshtastic_MeshPacket *p)
         return false;
     }
 
+    // Naming a weak direct destination suppresses the flood that could find another path.
+    // Keep the originated-packet shortcut only when this direct delivery link is strong.
+    if (!hasStrongHopTo(destination)) {
+        return false;
+    }
+
     // SR peers coordinate themselves; the reduced last-hop budget is needed only to restrain stock relays.
     bool hasStockNeighbor = false;
     for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
@@ -2600,7 +2599,11 @@ bool SignalRoutingModule::hasStrongHopTo(NodeNum peer) const
     if (!routingGraph || !nodeDB || peer == 0) {
         return false;
     }
-    float cost = routingGraph->hopCost(nodeDB->getNodeNum(), peer);
+    NodeNum myNode = nodeDB->getNodeNum();
+    // Use the delivery score used by route ranking, including ETX variance and any
+    // uncertainty penalty when a publishing peer has not measured the arrival. A raw
+    // ETX-only check can approve a marginal hop after route scoring already penalized it.
+    float cost = routingGraph->deliveryHopCost(myNode, peer, publishesTopology(peer), nowSeconds());
     return cost > 0.0f && cost <= cfgPoorLinkEtxThreshold;
 }
 
@@ -4106,20 +4109,10 @@ void SignalRoutingModule::markStockNodeRelayedOurPacket(NodeNum stockNode)
         return;
 
     NodeNum myNode = nodeDB->getNodeNum();
-    NodeEdges *myEdges = const_cast<NodeEdges *>(routingGraph->getEdgesFrom(myNode));
-    if (!myEdges)
-        return;
-
-    for (uint8_t i = 0; i < myEdges->edgeCount; i++) {
-        if (myEdges->edges[i].to == stockNode) {
-            if (!myEdges->edges[i].hearsUs) {
-                myEdges->edges[i].hearsUs = true;
-                char nodeName[64];
-                getNodeDisplayName(stockNode, nodeName, sizeof(nodeName));
-                LOG_INFO("[SR] Stock %s relayed ours: link confirmed both ways", nodeName);
-            }
-            return;
-        }
+    if (confirmSenderHearsUs(routingGraph, myNode, stockNode, HearsUsProof::RelayedOurPacket)) {
+        char nodeName[64];
+        getNodeDisplayName(stockNode, nodeName, sizeof(nodeName));
+        LOG_INFO("[SR] Stock %s relayed ours: link confirmed both ways", nodeName);
     }
 }
 

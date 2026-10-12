@@ -397,10 +397,17 @@ static inline bool hasReportedDirectEdgeTo(const NeighborGraph *graph, NodeNum m
     return false;
 }
 
-// Passive publishers never relay our packets, so their lists provide the reachability evidence.
-static inline bool confirmSenderHearsUs(NeighborGraph *graph, NodeNum myNode, NodeNum sender)
+enum class HearsUsProof : uint8_t
 {
-    if (!graph || sender == 0 || sender == myNode) {
+    SrTopologyListing,
+    RelayedOurPacket,
+};
+
+static inline bool confirmSenderHearsUs(NeighborGraph *graph, NodeNum myNode, NodeNum sender, HearsUsProof proof)
+{
+    // Keep the accepted evidence explicit; a next-hop nomination has no proof value.
+    if ((proof != HearsUsProof::SrTopologyListing && proof != HearsUsProof::RelayedOurPacket) || !graph || sender == 0 ||
+        sender == myNode) {
         return false;
     }
     const NodeEdges *myEdges = graph->getEdgesFrom(myNode);
@@ -422,10 +429,8 @@ static inline bool confirmSenderHearsUs(NeighborGraph *graph, NodeNum myNode, No
 
 static inline bool confirmTopologySenderHearsUs(NeighborGraph *graph, NodeNum myNode, NodeNum sender, NodeNum listedNeighbor)
 {
-    if (listedNeighbor != myNode) {
-        return false;
-    }
-    return confirmSenderHearsUs(graph, myNode, sender);
+    return listedNeighbor == myNode &&
+           confirmSenderHearsUs(graph, myNode, sender, HearsUsProof::SrTopologyListing);
 }
 
 // Peers must agree on a passive neighbor's coverage or both choose the first relay slot.

@@ -159,7 +159,7 @@ When topology arrives from node X, any of X's listed neighbors that *we* cannot 
 ```
 [SR] <name> lists us: hearsUs
 [SR] <nodeId> lists <nodeId>: hearsUs
-[SR] <nodeId> routes through us: hearsUs confirmed
+[SR] Stock <name> relayed ours: link confirmed both ways
 [SR] Capability expired for <nodeId> — cleared hearsUs
 ```
 After processing a complete topology broadcast from node X, SR checks all graph nodes that claim `hearsUs=true` on their edge to X. If X did not list that node as a neighbor, the flag is cleared — X is authoritative about who it can hear. This corrects stale bidi claims from nodes X can no longer receive. The override runs only on a complete list: a continuation chunk arriving without its first chunk must not clear anything.
